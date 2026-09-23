@@ -43,4 +43,16 @@ typedef Uint32 SDL_InitFlags;
 
 #define SDL_UINT64_C(c) UINT64_C(c)
 
+/** Byte-order detection (mirrors SDL_endian.h for the common case). */
+#define SDL_LIL_ENDIAN 1234
+#define SDL_BIG_ENDIAN 4321
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#define SDL_BYTEORDER SDL_BIG_ENDIAN
+#else
+#define SDL_BYTEORDER SDL_LIL_ENDIAN
+#endif
+
+/** Generic function pointer (identical to SDL3's SDL_FunctionPointer). */
+typedef void (*SDL_FunctionPointer)(void);
+
 #endif /* SDL_stdinc_h_ */

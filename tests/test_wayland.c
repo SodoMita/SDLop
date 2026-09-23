@@ -109,10 +109,16 @@ int main(void)
         SDL_Delay(10);
     }
 
-    /* relative mouse mode toggle (cursor hide path) */
-    CHECK(SDL_SetWindowRelativeMouseMode(w, true), "relative mode on");
-    CHECK(SDL_GetWindowRelativeMouseMode(w), "relative mode flag");
-    CHECK(SDL_SetWindowRelativeMouseMode(w, false), "relative mode off");
+    /* relative mouse mode toggle: succeeds when the compositor provides a
+     * seat/pointer; on a seat-less headless compositor it must fail and
+     * roll the state back (SDL3 semantics). The full success path is
+     * covered deterministically by test_pointer_lock (mini compositor). */
+    if (SDL_SetWindowRelativeMouseMode(w, true)) {
+        CHECK(SDL_GetWindowRelativeMouseMode(w), "relative mode flag");
+        CHECK(SDL_SetWindowRelativeMouseMode(w, false), "relative mode off");
+    } else {
+        CHECK(!SDL_GetWindowRelativeMouseMode(w), "relative mode flag rolled back on failure");
+    }
     for (int i = 0; i < 5; i++) {
         SDL_PumpEvents();
         SDL_Delay(10);

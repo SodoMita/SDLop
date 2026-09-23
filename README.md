@@ -38,7 +38,11 @@ int main(void) {
 |---|---|
 | Linux / Wayland (wl_compositor + xdg-shell, wl_seat fallback input) | ✅ done, tested against Weston 14 |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
-| `dummy` (offscreen) driver | ✅ done, used for headless CI |
+| Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
+| OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
+| Vulkan WSI (`SDL_Vulkan_*`, lavapipe) | ✅ done, verified by swapchain read-back |
+| Pointer lock (`zwp_pointer_constraints` + `zwp_relative_pointer`) | ✅ done, tested against a mini compositor |
+| `dummy` (offscreen) driver | ✅ done, used for headless CI (incl. RAM-framebuffer surfaces) |
 | Web (Emscripten) | 🔜 next (driver interface ready) |
 | Windows / Win32, macOS / Cocoa | 🔜 after web |
 
@@ -91,8 +95,18 @@ Raw input path (synthetic uinput device, 2000 events):
 
 (includes the uinput→evdev kernel round-trip; real hardware is similar)
 
+Rendering — 640×480 through Weston (headless), pure software rasterizers:
+
+| path | result |
+|---|---|
+| software surface: full-window fill + present | ≈11 000 fps (≈3.5 GPix/s; the pixels **are** the shm buffer, zero copy) |
+| OpenGL ES 3.2 (llvmpipe): glClear + swap | ≈3 400 fps (≈1.0 GPix/s) |
+| Vulkan (lavapipe): swapchain clear + present | verified by read-back, present-paced |
+| software plasma (per-pixel `sin`, 640×480) | ≈35 fps (compute-bound, not presentation-bound) |
+
 Reproduce: `cmake --build build && ./build/bench_events && ./build/bench_events_sdl3`
-and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`).
+and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
+`WAYLAND_DISPLAY=wayland-0 ./build/bench_render` for the rendering numbers.
 
 ## API surface (SDL3-compatible)
 
@@ -103,8 +117,14 @@ Video · `SDL_CreateWindow` `SDL_DestroyWindow` `SDL_ShowWindow` `SDL_HideWindow
 Events · `SDL_PumpEvents` `SDL_PollEvent` `SDL_WaitEvent` `SDL_WaitEventTimeout` `SDL_PushEvent` `SDL_HasEvent` `SDL_HasEvents` `SDL_FlushEvent` `SDL_FlushEvents` `SDL_RegisterEvents` `SDL_QuitRequested` `SDL_GetWindowFromEvent`
 Keyboard · `SDL_GetKeyboardState` `SDL_GetKeyState` `SDL_ResetKeyboard` `SDL_GetModState` `SDL_SetModState` `SDL_GetKeyboardFocus` `SDL_GetKeyFromScancode` `SDL_GetScancodeFromKey` `SDL_GetScancodeName` `SDL_GetKeyName`
 Mouse · `SDL_GetMouseState` `SDL_GetRelativeMouseState` `SDL_GetMouseFocus` `SDL_SetWindowRelativeMouseMode` `SDL_GetWindowRelativeMouseMode`
+Surfaces · `SDL_CreateSurface` `SDL_CreateSurfaceFrom` `SDL_DestroySurface` `SDL_GetWindowSurface` `SDL_UpdateWindowSurface` `SDL_UpdateWindowSurfaceRects` `SDL_DestroyWindowSurface` `SDL_WindowHasSurface` `SDL_FillSurfaceRect` `SDL_FillSurfaceRects` `SDL_ReadSurfacePixel` `SDL_LockSurface` `SDL_UnlockSurface` `SDL_MapSurfaceRGB` `SDL_MapSurfaceRGBA` `SDL_MapRGB` `SDL_MapRGBA`
+OpenGL · `SDL_GL_SetAttribute` `SDL_GL_GetAttribute` `SDL_GL_CreateContext` `SDL_GL_DestroyContext` `SDL_GL_MakeCurrent` `SDL_GL_GetCurrentContext` `SDL_GL_GetCurrentWindow` `SDL_GL_SwapWindow` `SDL_GL_SetSwapInterval` `SDL_GL_GetSwapInterval` `SDL_GL_GetProcAddress` `SDL_GL_ResetAttributes`
+Vulkan · `SDL_Vulkan_LoadLibrary` `SDL_Vulkan_GetVkGetInstanceProcAddr` `SDL_Vulkan_GetInstanceExtensions` `SDL_Vulkan_CreateSurface` `SDL_Vulkan_DestroySurface` `SDL_Vulkan_GetPresentationSupport` `SDL_Vulkan_UnloadLibrary`
 Log · `SDL_Log` `SDL_LogMessage` `SDL_LogVerbose` `SDL_LogDebug` `SDL_LogInfo` `SDL_LogWarn` `SDL_LogError`
-Types · `SDL_Event` (128 B, same layout) · `SDL_Scancode` (full SDL3 list) · `SDL_Keycode`/`SDLK_*` · `SDL_Keymod` · `SDL_WindowFlags` · `SDL_MouseWheelDirection`
+Types · `SDL_Event` (128 B, same layout) · `SDL_Scancode` (full SDL3 list) · `SDL_Keycode`/`SDLK_*` · `SDL_Keymod` · `SDL_WindowFlags` · `SDL_MouseWheelDirection` · `SDL_Surface` (48 B, same layout) · `SDL_PixelFormat`/`SDL_PIXELFORMAT_*` · `SDL_BlendMode` · `SDL_Rect`/`SDL_FRect` · `SDL_GLAttr`/`SDL_GLProfile`
+
+`struct`/enum/constant ABI is byte-identical to SDL3 3.2.10 (verified by an
+offset/value harness compiled against both header sets).
 
 ### SDLop extensions (`<SDL3/SDLop.h>`) — the asyncinput-style API
 
@@ -141,9 +161,11 @@ cmake --build build -j
 ctest --test-dir build            # headless tests
 ```
 
-Deps: `wayland-client`, `xkbcommon`, `wayland-protocols` + `wayland-scanner`
-(all standard on Wayland distros). Static `libsdlop.a` and shared
-`libSDLop.so` are produced. Link: `-lsdlop -lwayland-client -lxkbcommon -lpthread`.
+Deps: `wayland-client`, `xkbcommon`, `egl`, `glesv2`, `wayland-protocols` +
+`wayland-scanner` (all standard on Wayland distros). Static `libsdlop.a` and
+shared `libSDLop.so` are produced. Link:
+`-lsdlop -lwayland-client -lxkbcommon -lEGL -lGLESv2 -lpthread -ldl`.
+libVulkan and libwayland-egl are `dlopen`-ed at runtime, not linked.
 
 Tests that need privileges/compositor skip cleanly:
 
@@ -160,6 +182,16 @@ sudo ./build/test_evdev_uinput                     # raw evdev end-to-end
   automatic SDL-queue fallback when raw input is unavailable.
 - `examples/raw_latency.c` — measures kernel→callback latency percentiles
   (asyncinput `read_keys` equivalent).
+- `examples/surface_plasma.c` — software rendering: plasma drawn straight
+  into the zero-copy shm window surface.
+- `examples/gl_triangle.c` — OpenGL ES 2 triangle via EGL (llvmpipe on
+  GPU-less systems), with center-pixel read-back.
+- `examples/vulkan_clear.c` — full Vulkan swapchain loop (lavapipe) via
+  `SDL_Vulkan_*`, cycling clear color verified by `vkCmdCopyImageToBuffer`
+  read-back.
+- `tests/mini_compositor.c` — a tiny purpose-built Wayland compositor
+  (wl_seat + pointer-constraints + relative-pointer) that makes the pointer
+  lock integration testable without a seat-capable compositor.
 
 ## Notes & limitations
 
@@ -167,10 +199,16 @@ sudo ./build/test_evdev_uinput                     # raw evdev end-to-end
   otherwise SDLop silently uses Wayland seat input. Like asyncinput, the raw
   path bypasses compositor keyboard focus/layout.
 - Wayland cannot position windows: `SDL_SetWindowPosition` returns false.
-- Relative mouse mode hides the cursor and streams deltas from evdev;
-  `zwp_pointer_constraints` (true pointer lock) is on the list.
+- Relative mouse mode uses real pointer lock (`zwp_pointer_constraints` +
+  `zwp_relative_pointer`) on Wayland when the compositor has a seat/pointer,
+  and raw evdev deltas when the worker thread is active; the window-system
+  fallback streams deltas from the relative-pointer protocol.
 - `SDL_WINDOW_BORDERLESS` is inherent (no client-side decorations yet).
-- No rendering API by design; `SDLop_SetWindowClearColor` tints the window.
+- Software surfaces are XRGB8888 wl_shm buffers (zero copy); the GL and
+  Vulkan paths were validated against Mesa's software rasterizers
+  (llvmpipe/lavapipe) but work with any EGL/Vulkan driver.
+- `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
+  content yet.
 
 ## Why "faster"?
 

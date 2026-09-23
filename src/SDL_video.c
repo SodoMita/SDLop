@@ -157,6 +157,12 @@ void SDL_DestroyWindow(SDL_Window *window)
         return;
     }
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DESTROYED, 0, 0);
+    if (window->surface) {
+        /* drivers that own the pixel storage null this out themselves;
+         * otherwise (dummy RAM buffers) free it here */
+        SDL_DestroySurface(window->surface);
+        window->surface = NULL;
+    }
     if (sdlop.video) {
         sdlop.video->DestroyWindow(sdlop.video, window);
     }

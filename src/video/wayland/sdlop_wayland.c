@@ -12,6 +12,10 @@
 
 #include "internal/sdlop_internal.h"
 #include "internal/scancode_evdev.h"
+#include "sdlop_wayland_internal.h"
+
+#include "pointer-constraints-client-protocol.h"
+#include "relative-pointer-client-protocol.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -39,6 +43,11 @@ typedef struct WaylandWindowData
     bool mapped;
     uint32_t toplevel_states;
     int pending_w, pending_h;
+
+    /* GL presentation state (managed by sdlop_wayland_gl.c) */
+    void *gl_surface; /* EGLSurface */
+    void *gl_egl_window; /* wl_egl_window backing the EGLSurface */
+    bool gl_active;
 } WaylandWindowData;
 
 typedef struct WaylandDeviceData
@@ -56,9 +65,21 @@ typedef struct WaylandDeviceData
 
     SDL_Window *pointer_focus;
     float axis_x_acc, axis_y_acc;
+
+    /* relative mouse mode (pointer lock) */
+    struct zwp_pointer_constraints_v1 *pointer_constraints;
+    struct zwp_relative_pointer_manager_v1 *relative_manager;
+    struct zwp_locked_pointer_v1 *locked_pointer;
+    struct zwp_relative_pointer_v1 *relative_pointer;
+    SDL_Window *relative_lock_window;
+    float rel_x_acc, rel_y_acc;
 } WaylandDeviceData;
 
 static WaylandDeviceData wl_data;
+
+/* forward decls (pointer lock helpers, defined below) */
+static bool wayland_arm_pointer_lock(SDL_Window *window);
+static void wayland_release_pointer_lock(void);
 
 /* ------------------------------------------------------------------ */
 /* shm buffers                                                         */
@@ -125,6 +146,16 @@ static bool window_create_buffer(SDL_Window *window, int w, int h)
     wd->shm_size = size;
     wd->buffer_w = w;
     wd->buffer_h = h;
+
+    /* keep an existing window surface in sync with the new buffer
+     * (SDL3 semantics: the surface survives resizes) */
+    SDLOP_Wayland_GL_WindowResized(window);
+    if (window->surface) {
+        window->surface->w = w;
+        window->surface->h = h;
+        window->surface->pitch = (int)stride;
+        window->surface->pixels = map;
+    }
     return true;
 }
 
@@ -134,10 +165,109 @@ static void window_commit(SDL_Window *window)
     if (!wd || !wd->configured || !wd->buffer) {
         return;
     }
+    if (wd->gl_active) {
+        return; /* EGL owns buffer management for this window now */
+    }
     wl_surface_attach(wd->surface, wd->buffer, 0, 0);
     wl_surface_damage_buffer(wd->surface, 0, 0, INT32_MAX, INT32_MAX);
     wl_surface_commit(wd->surface);
     wd->mapped = true;
+}
+
+/* ------------------------------------------------------------------ */
+/* software window surface (zero copy: pixels ARE the shm buffer)      */
+/* ------------------------------------------------------------------ */
+
+static bool wayland_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface)
+{
+    (void)device;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd) {
+        return SDL_SetError("Invalid window");
+    }
+    if (!wd->buffer) {
+        if (!window_create_buffer(window, window->w, window->h)) {
+            return false;
+        }
+    }
+    SDL_Surface *s = SDL_CreateSurfaceFrom(window->w, window->h, SDL_PIXELFORMAT_XRGB8888, wd->shm_map, window->w * 4);
+    if (!s) {
+        return false;
+    }
+    *surface = s;
+    return true;
+}
+
+static bool wayland_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, const SDL_Rect *rects, int numrects)
+{
+    (void)device;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || !wd->configured || wd->gl_active) {
+        return SDL_SetError("Window surface is not presentable");
+    }
+    wl_surface_attach(wd->surface, wd->buffer, 0, 0);
+    if (rects && numrects > 0) {
+        for (int i = 0; i < numrects; i++) {
+            wl_surface_damage_buffer(wd->surface, rects[i].x, rects[i].y, rects[i].w, rects[i].h);
+        }
+    } else {
+        wl_surface_damage_buffer(wd->surface, 0, 0, wd->buffer_w, wd->buffer_h);
+    }
+    wl_surface_commit(wd->surface);
+    wl_display_flush(wl_data.display);
+    wd->mapped = true;
+    return true;
+}
+
+static void wayland_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    /* the surface wraps the shm buffer; free the SDL_Surface struct only */
+    if (window->surface) {
+        SDL_DestroySurface(window->surface);
+        window->surface = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* internals shared with the GL/Vulkan modules                         */
+/* ------------------------------------------------------------------ */
+
+struct wl_display *SDLOP_Wayland_GetDisplay(void)
+{
+    return wl_data.display;
+}
+
+struct wl_surface *SDLOP_Wayland_GetWindowSurfaceHandle(SDL_Window *window)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    return wd ? wd->surface : NULL;
+}
+
+void SDLOP_Wayland_SetGLActive(SDL_Window *window, bool active)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    if (wd) {
+        wd->gl_active = active;
+    }
+}
+
+bool SDLOP_Wayland_IsGLActive(SDL_Window *window)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    return wd ? wd->gl_active : false;
+}
+
+void *SDLOP_Wayland_GetGLSurfaceSlot(SDL_Window *window)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    return wd ? &wd->gl_surface : NULL;
+}
+
+void *SDLOP_Wayland_GetGLEGLWindowSlot(SDL_Window *window)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    return wd ? &wd->gl_egl_window : NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -473,7 +603,11 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
 
     if (sdlop.relative_mode_window == window) {
-        wl_pointer_set_cursor(pointer, serial, NULL, 0, 0); /* hide */
+        if (!wl_data.locked_pointer) {
+            wayland_arm_pointer_lock(window); /* re-arm after policy unlock */
+        } else {
+            wl_pointer_set_cursor(pointer, serial, NULL, 0, 0); /* hide */
+        }
     } else {
         set_default_cursor(pointer, serial);
     }
@@ -573,6 +707,14 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
     if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) {
         SDLOP_SendMouseWheel(d->axis_x_acc, d->axis_y_acc, SDLOP_MonotonicNS());
         d->axis_x_acc = d->axis_y_acc = 0.0f;
+    }
+    /* relative mouse mode: flush accumulated relative-pointer motion
+     * (skipped when the raw evdev worker owns the mouse) */
+    if (d->relative_pointer && (d->rel_x_acc != 0.0f || d->rel_y_acc != 0.0f)) {
+        if (!SDLOP_RawInputMouseActive()) {
+            SDLOP_SendMouseMotion(SDLOP_NO_POS, SDLOP_NO_POS, d->rel_x_acc, d->rel_y_acc, SDLOP_MonotonicNS());
+        }
+        d->rel_x_acc = d->rel_y_acc = 0.0f;
     }
 }
 
@@ -692,6 +834,10 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         d->seat_version = version < 9 ? version : 9;
         d->seat = wl_registry_bind(registry, name, &wl_seat_interface, d->seat_version);
         wl_seat_add_listener(d->seat, &seat_listener, d);
+    } else if (strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0 && !d->pointer_constraints) {
+        d->pointer_constraints = wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, 1);
+    } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0 && !d->relative_manager) {
+        d->relative_manager = wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, 1);
     }
 }
 
@@ -746,6 +892,13 @@ static bool wayland_Init(SDLop_VideoDevice *device)
 static void wayland_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    wayland_release_pointer_lock();
+    if (wl_data.pointer_constraints) {
+        zwp_pointer_constraints_v1_destroy(wl_data.pointer_constraints);
+    }
+    if (wl_data.relative_manager) {
+        zwp_relative_pointer_manager_v1_destroy(wl_data.relative_manager);
+    }
     if (wl_data.keyboard) {
         wl_keyboard_destroy(wl_data.keyboard);
     }
@@ -829,6 +982,15 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     if (wl_data.pointer_focus == window) {
         wl_data.pointer_focus = NULL;
+    }
+    if (wl_data.relative_lock_window == window) {
+        wayland_release_pointer_lock();
+        wl_data.relative_lock_window = NULL;
+    }
+    SDLOP_Wayland_GL_WindowDestroyed(window);
+    if (window->surface) {
+        SDL_DestroySurface(window->surface);
+        window->surface = NULL;
     }
     if (wd->toplevel) {
         xdg_toplevel_destroy(wd->toplevel);
@@ -973,15 +1135,101 @@ static void wayland_SetWindowClearColor(SDLop_VideoDevice *device, SDL_Window *w
     wl_display_flush(wl_data.display);
 }
 
+/* ------------------------------------------------------------------ */
+/* relative mouse mode via zwp_pointer_constraints + relative_pointer  */
+/* ------------------------------------------------------------------ */
+
+static void relative_pointer_motion(void *data, struct zwp_relative_pointer_v1 *rp,
+                                    uint32_t utime_hi, uint32_t utime_lo,
+                                    wl_fixed_t dx, wl_fixed_t dy,
+                                    wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel)
+{
+    (void)data;
+    (void)rp;
+    (void)utime_hi;
+    (void)utime_lo;
+    (void)dx;
+    (void)dy;
+    /* accumulated and flushed on the wl_pointer frame; unaccelerated
+     * deltas match SDL3's wayland behavior */
+    wl_data.rel_x_acc += (float)wl_fixed_to_double(dx_unaccel);
+    wl_data.rel_y_acc += (float)wl_fixed_to_double(dy_unaccel);
+}
+
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+    relative_pointer_motion,
+};
+
+static void locked_pointer_locked(void *data, struct zwp_locked_pointer_v1 *lp)
+{
+    (void)data;
+    (void)lp;
+    wl_pointer_set_cursor(wl_data.pointer, 0, NULL, 0, 0); /* hide */
+}
+
+static void locked_pointer_unlocked(void *data, struct zwp_locked_pointer_v1 *lp)
+{
+    (void)data;
+    (void)lp;
+    /* compositor released the lock (e.g. policy); relative motion stops.
+     * The lock is re-armed on the next pointer enter while mode is on. */
+    if (wl_data.locked_pointer) {
+        zwp_locked_pointer_v1_destroy(wl_data.locked_pointer);
+        wl_data.locked_pointer = NULL;
+    }
+}
+
+static const struct zwp_locked_pointer_v1_listener locked_pointer_listener = {
+    locked_pointer_locked,
+    locked_pointer_unlocked,
+};
+
+static void wayland_release_pointer_lock(void)
+{
+    if (wl_data.locked_pointer) {
+        zwp_locked_pointer_v1_destroy(wl_data.locked_pointer);
+        wl_data.locked_pointer = NULL;
+    }
+    if (wl_data.relative_pointer) {
+        zwp_relative_pointer_v1_destroy(wl_data.relative_pointer);
+        wl_data.relative_pointer = NULL;
+    }
+    wl_data.rel_x_acc = wl_data.rel_y_acc = 0.0f;
+}
+
+static bool wayland_arm_pointer_lock(SDL_Window *window)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || !wl_data.pointer || !wl_data.relative_manager || !wl_data.pointer_constraints) {
+        return SDL_SetError("Wayland compositor lacks pointer-constraints/relative-pointer support");
+    }
+    wayland_release_pointer_lock();
+
+    wl_data.relative_pointer =
+        zwp_relative_pointer_manager_v1_get_relative_pointer(wl_data.relative_manager, wl_data.pointer);
+    zwp_relative_pointer_v1_add_listener(wl_data.relative_pointer, &relative_pointer_listener, &wl_data);
+
+    wl_data.locked_pointer = zwp_pointer_constraints_v1_lock_pointer(
+        wl_data.pointer_constraints, wd->surface, wl_data.pointer, NULL,
+        ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+    zwp_locked_pointer_v1_add_listener(wl_data.locked_pointer, &locked_pointer_listener, &wl_data);
+    wl_display_flush(wl_data.display);
+    wl_data.relative_lock_window = window;
+    return true;
+}
+
 static bool wayland_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Window *window, bool enabled)
 {
     (void)device;
-    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     if (enabled) {
-        /* hide the cursor; true pointer lock needs zwp_pointer_constraints
-         * (not wired yet) - relative deltas come from raw evdev */
-        if (wl_data.pointer && wd) {
-            wl_pointer_set_cursor(wl_data.pointer, 0, NULL, 0, 0);
+        return wayland_arm_pointer_lock(window);
+    }
+    if (wl_data.relative_lock_window == window) {
+        wayland_release_pointer_lock();
+        wl_data.relative_lock_window = NULL;
+        /* restore the visible cursor */
+        if (wl_data.pointer && wl_data.pointer_focus == window) {
+            set_default_cursor(wl_data.pointer, 0);
         }
     }
     return true;
@@ -1038,4 +1286,21 @@ SDLop_VideoDevice SDLop_wayland_device = {
     wayland_SetWindowRelativeMouseMode,
     wayland_PumpEvents,
     wayland_GetEventFD,
+
+    /* software surface */
+    wayland_CreateWindowFramebuffer,
+    wayland_UpdateWindowFramebuffer,
+    wayland_DestroyWindowFramebuffer,
+
+    /* OpenGL (EGL, llvmpipe) - implemented in sdlop_wayland_gl.c */
+    SDLOP_Wayland_GL_CreateContext,
+    SDLOP_Wayland_GL_MakeCurrent,
+    SDLOP_Wayland_GL_SwapBuffers,
+    SDLOP_Wayland_GL_DeleteContext,
+    SDLOP_Wayland_GL_GetProcAddressThunk,
+    SDLOP_Wayland_GL_SetSwapInterval,
+    SDLOP_Wayland_GL_GetSwapInterval,
+
+    /* Vulkan (lavapipe) - implemented in sdlop_wayland_vulkan.c */
+    SDLOP_Wayland_Vulkan_CreateSurface,
 };

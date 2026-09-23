@@ -130,6 +130,9 @@ bool SDL_SetWindowRelativeMouseMode(SDL_Window *window, bool enabled)
     if (!window) {
         return SDL_SetError("Invalid window");
     }
+    SDL_Window *prev_mode_window = sdlop.relative_mode_window;
+    Uint64 prev_flags = window->flags;
+
     if (enabled) {
         sdlop.relative_mode_window = window;
         window->flags |= SDL_WINDOW_MOUSE_RELATIVE_MODE;
@@ -139,8 +142,13 @@ bool SDL_SetWindowRelativeMouseMode(SDL_Window *window, bool enabled)
         }
         window->flags &= ~SDL_WINDOW_MOUSE_RELATIVE_MODE;
     }
-    if (sdlop.video && sdlop.video->SetWindowRelativeMouseMode) {
-        sdlop.video->SetWindowRelativeMouseMode(sdlop.video, window, enabled);
+    if (sdlop.video && sdlop.video->SetWindowRelativeMouseMode &&
+        !sdlop.video->SetWindowRelativeMouseMode(sdlop.video, window, enabled)) {
+        /* driver refused (e.g. compositor lacks pointer-constraints);
+         * restore the previous state like SDL3 does */
+        sdlop.relative_mode_window = prev_mode_window;
+        window->flags = prev_flags;
+        return false;
     }
     return true;
 }

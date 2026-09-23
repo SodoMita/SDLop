@@ -62,6 +62,18 @@ static bool dummy_SetWindowTitle(SDLop_VideoDevice *device, SDL_Window *window)
 static bool dummy_SetWindowSize(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
+    /* keep an existing software surface in sync (SDL3 semantics: the
+     * surface survives resizes) */
+    if (window->surface) {
+        void *pixels = realloc(window->surface->pixels, (size_t)window->w * 4u * (size_t)window->h);
+        if (!pixels) {
+            return SDL_OutOfMemory();
+        }
+        window->surface->pixels = pixels;
+        window->surface->w = window->w;
+        window->surface->h = window->h;
+        window->surface->pitch = window->w * 4;
+    }
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
     return true;
@@ -148,6 +160,102 @@ static int dummy_GetEventFD(SDLop_VideoDevice *device)
     return -1;
 }
 
+/* software surface: plain RAM framebuffer */
+
+static bool dummy_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface)
+{
+    (void)device;
+    SDL_Surface *s = SDL_CreateSurface(window->w, window->h, SDL_PIXELFORMAT_XRGB8888);
+    if (!s) {
+        return false;
+    }
+    *surface = s;
+    return true;
+}
+
+static bool dummy_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, const SDL_Rect *rects, int numrects)
+{
+    (void)device;
+    (void)window;
+    (void)rects;
+    (void)numrects;
+    return true; /* nowhere to present */
+}
+
+static void dummy_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    if (window->surface) {
+        SDL_DestroySurface(window->surface);
+        window->surface = NULL;
+    }
+}
+
+static bool dummy_NotSupportedGL(void)
+{
+    return SDL_SetError("The dummy video driver does not support OpenGL/Vulkan");
+}
+
+static void *dummy_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    dummy_NotSupportedGL();
+    return NULL;
+}
+
+static bool dummy_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, void *context)
+{
+    (void)device;
+    (void)window;
+    (void)context;
+    return dummy_NotSupportedGL();
+}
+
+static bool dummy_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    return dummy_NotSupportedGL();
+}
+
+static void dummy_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
+{
+    (void)device;
+    (void)context;
+}
+
+static SDL_FunctionPointer dummy_GL_GetProcAddress(SDLop_VideoDevice *device, const char *proc)
+{
+    (void)device;
+    (void)proc;
+    return NULL;
+}
+
+static bool dummy_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval)
+{
+    (void)device;
+    (void)interval;
+    return true;
+}
+
+static bool dummy_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval)
+{
+    (void)device;
+    *interval = 0;
+    return true;
+}
+
+static bool dummy_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface)
+{
+    (void)device;
+    (void)window;
+    (void)instance;
+    (void)allocator;
+    (void)surface;
+    return dummy_NotSupportedGL();
+}
+
 SDLop_VideoDevice SDLop_dummy_device = {
     "dummy",
     dummy_Init,
@@ -168,4 +276,15 @@ SDLop_VideoDevice SDLop_dummy_device = {
     dummy_SetWindowRelativeMouseMode,
     dummy_PumpEvents,
     dummy_GetEventFD,
+    dummy_CreateWindowFramebuffer,
+    dummy_UpdateWindowFramebuffer,
+    dummy_DestroyWindowFramebuffer,
+    dummy_GL_CreateContext,
+    dummy_GL_MakeCurrent,
+    dummy_GL_SwapBuffers,
+    dummy_GL_DeleteContext,
+    dummy_GL_GetProcAddress,
+    dummy_GL_SetSwapInterval,
+    dummy_GL_GetSwapInterval,
+    dummy_Vulkan_CreateSurface,
 };

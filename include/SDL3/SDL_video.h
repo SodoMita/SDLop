@@ -12,11 +12,16 @@
 
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_error.h>
+#include <SDL3/SDL_pixels.h>
+#include <SDL3/SDL_rect.h>
 
 /**
  * The type used to identify a window (opaque window handle).
  */
 typedef struct SDL_Window SDL_Window;
+
+/* Forward declaration for the software-rendering surface API. */
+typedef struct SDL_Surface SDL_Surface;
 
 /** Window flags (identical values to SDL3). */
 typedef Uint64 SDL_WindowFlags;
@@ -174,5 +179,162 @@ extern int SDL_GetNumVideoDrivers(void);
  * Get the name of a built in video driver.
  */
 extern const char *SDL_GetVideoDriver(int index);
+
+/* ------------------------------------------------------------------ */
+/* Software rendering (window surface)                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Get the SDL surface associated with the window (creates it on first
+ * call). On Wayland this maps directly onto the window's shared-memory
+ * buffer - zero copy.
+ *
+ * The surface is owned by the window; do not SDL_DestroySurface() it. It
+ * follows the window size (use SDL_SetWindowSize / handle
+ * SDL_EVENT_WINDOW_RESIZED and re-query pitch/pixels).
+ *
+ * \returns the surface or NULL on failure.
+ */
+extern SDL_Surface *SDL_GetWindowSurface(SDL_Window *window);
+
+/**
+ * Copy the window surface to the screen (commits the buffer).
+ */
+extern bool SDL_UpdateWindowSurface(SDL_Window *window);
+
+/**
+ * Copy areas of the window surface to the screen.
+ */
+extern bool SDL_UpdateWindowSurfaceRects(SDL_Window *window, const SDL_Rect *rects, int numrects);
+
+/**
+ * Return whether the window has a surface associated with it.
+ */
+extern bool SDL_WindowHasSurface(SDL_Window *window);
+
+/**
+ * Destroy the surface associated with the window.
+ */
+extern bool SDL_DestroyWindowSurface(SDL_Window *window);
+
+/* ------------------------------------------------------------------ */
+/* OpenGL (EGL on Wayland; llvmpipe provides the software rasterizer)  */
+/* ------------------------------------------------------------------ */
+
+/** Opaque type for an OpenGL context. */
+typedef struct SDL_GLContext_t *SDL_GLContext;
+
+/** Attributes for SDL_GL_SetAttribute()/SDL_GL_GetAttribute()
+ * (identical order/values to SDL3). */
+typedef enum SDL_GLAttr
+{
+    SDL_GL_RED_SIZE,
+    SDL_GL_GREEN_SIZE,
+    SDL_GL_BLUE_SIZE,
+    SDL_GL_ALPHA_SIZE,
+    SDL_GL_BUFFER_SIZE,
+    SDL_GL_DOUBLEBUFFER,
+    SDL_GL_DEPTH_SIZE,
+    SDL_GL_STENCIL_SIZE,
+    SDL_GL_ACCUM_RED_SIZE,
+    SDL_GL_ACCUM_GREEN_SIZE,
+    SDL_GL_ACCUM_BLUE_SIZE,
+    SDL_GL_ACCUM_ALPHA_SIZE,
+    SDL_GL_STEREO,
+    SDL_GL_MULTISAMPLEBUFFERS,
+    SDL_GL_MULTISAMPLESAMPLES,
+    SDL_GL_ACCELERATED_VISUAL,
+    SDL_GL_RETAINED_BACKING,
+    SDL_GL_CONTEXT_MAJOR_VERSION,
+    SDL_GL_CONTEXT_MINOR_VERSION,
+    SDL_GL_CONTEXT_FLAGS,
+    SDL_GL_CONTEXT_PROFILE_MASK,
+    SDL_GL_SHARE_WITH_CURRENT_CONTEXT,
+    SDL_GL_FRAMEBUFFER_SRGB_CAPABLE,
+    SDL_GL_CONTEXT_RELEASE_BEHAVIOR,
+    SDL_GL_CONTEXT_RESET_NOTIFICATION,
+    SDL_GL_CONTEXT_NO_ERROR,
+    SDL_GL_FLOATBUFFERS,
+    SDL_GL_EGL_PLATFORM
+} SDL_GLAttr;
+
+#define SDL_GL_CONTEXT_PROFILE_CORE           0x0001
+#define SDL_GL_CONTEXT_PROFILE_COMPATIBILITY  0x0002
+#define SDL_GL_CONTEXT_PROFILE_ES             0x0004 /**< GLX_CONTEXT_ES2_PROFILE_BIT_EXT */
+
+#define SDL_GL_CONTEXT_DEBUG_FLAG              0x0001
+#define SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG 0x0002
+#define SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG      0x0004
+#define SDL_GL_CONTEXT_RESET_ISOLATION_FLAG    0x0008
+
+/**
+ * Load the OpenGL library (no-op on SDLop; EGL is linked in).
+ */
+extern bool SDL_GL_LoadLibrary(const char *path);
+
+/**
+ * Get an OpenGL function by name (EGL/GL driver entry points).
+ */
+extern SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc);
+
+/**
+ * Unload the OpenGL library (no-op on SDLop).
+ */
+extern void SDL_GL_UnloadLibrary(void);
+
+/**
+ * Reset all OpenGL attributes to their default values.
+ */
+extern void SDL_GL_ResetAttributes(void);
+
+/**
+ * Set an OpenGL window attribute before context creation.
+ */
+extern bool SDL_GL_SetAttribute(SDL_GLAttr attr, int value);
+
+/**
+ * Get the actual value for an attribute from the current context.
+ */
+extern bool SDL_GL_GetAttribute(SDL_GLAttr attr, int *value);
+
+/**
+ * Create an OpenGL context for the given window and make it current.
+ */
+extern SDL_GLContext SDL_GL_CreateContext(SDL_Window *window);
+
+/**
+ * Set up an OpenGL context for rendering into an OpenGL window.
+ */
+extern bool SDL_GL_MakeCurrent(SDL_Window *window, SDL_GLContext context);
+
+/**
+ * Get the currently active OpenGL window.
+ */
+extern SDL_Window *SDL_GL_GetCurrentWindow(void);
+
+/**
+ * Get the currently active OpenGL context.
+ */
+extern SDL_GLContext SDL_GL_GetCurrentContext(void);
+
+/**
+ * Set the swap interval for the current OpenGL context (0 = no vsync).
+ */
+extern bool SDL_GL_SetSwapInterval(int interval);
+
+/**
+ * Get the swap interval for the current OpenGL context.
+ */
+extern bool SDL_GL_GetSwapInterval(int *interval);
+
+/**
+ * Update a window with OpenGL rendering (presents to Wayland).
+ */
+extern bool SDL_GL_SwapWindow(SDL_Window *window);
+
+/**
+ * Delete an OpenGL context.
+ */
+extern void SDL_GL_DestroyContext(SDL_GLContext context);
 
 #endif /* SDL_video_h_ */

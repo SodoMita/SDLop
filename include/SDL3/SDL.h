@@ -16,12 +16,17 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
+#include <SDL3/SDL_blendmode.h>
+#include <SDL3/SDL_pixels.h>
+#include <SDL3/SDL_rect.h>
 #include <SDL3/SDL_scancode.h>
 #include <SDL3/SDL_keycode.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_video.h>
+#include <SDL3/SDL_surface.h>
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_vulkan.h>
 
 /** SDLop version information */
 #define SDLOP_MAJOR_VERSION 0

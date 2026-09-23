@@ -30,6 +30,7 @@ struct SDL_Window
     int w, h;           /* requested size */
     SDL_WindowFlags flags;
     Uint8 clear_r, clear_g, clear_b;
+    SDL_Surface *surface;   /* software window surface (owned by window) */
     void *driverdata;
     struct SDL_Window *next;
 };
@@ -68,6 +69,23 @@ struct SDLop_VideoDevice
 
     /* fd to poll for window-system activity (-1 if none) */
     int (*GetEventFD)(SDLop_VideoDevice *device);
+
+    /* software rendering: window framebuffer (window surface) */
+    bool (*CreateWindowFramebuffer)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface);
+    bool (*UpdateWindowFramebuffer)(SDLop_VideoDevice *device, SDL_Window *window, const SDL_Rect *rects, int numrects);
+    void (*DestroyWindowFramebuffer)(SDLop_VideoDevice *device, SDL_Window *window);
+
+    /* OpenGL (EGL) */
+    void *(*GL_CreateContext)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*GL_MakeCurrent)(SDLop_VideoDevice *device, SDL_Window *window, void *context);
+    bool (*GL_SwapBuffers)(SDLop_VideoDevice *device, SDL_Window *window);
+    void (*GL_DeleteContext)(SDLop_VideoDevice *device, void *context);
+    SDL_FunctionPointer (*GL_GetProcAddress)(SDLop_VideoDevice *device, const char *proc);
+    bool (*GL_SetSwapInterval)(SDLop_VideoDevice *device, int interval);
+    bool (*GL_GetSwapInterval)(SDLop_VideoDevice *device, int *interval);
+
+    /* Vulkan WSI */
+    bool (*Vulkan_CreateSurface)(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface);
 };
 
 /* Provided by backends */
@@ -186,6 +204,28 @@ void SDLOP_VideoQuit(void);
 void SDLOP_AddWindow(SDL_Window *window);
 void SDLOP_RemoveWindow(SDL_Window *window);
 void SDLOP_SendQuitEvent(void);
+
+/* GL attributes (SDL_gl.c) */
+typedef struct SDLOP_GLAttributes
+{
+    int red_size, green_size, blue_size, alpha_size, buffer_size;
+    int doublebuffer;
+    int depth_size, stencil_size;
+    int accum_red, accum_green, accum_blue, accum_alpha;
+    int stereo;
+    int multisamplebuffers, multisamplesamples;
+    int major_version, minor_version;
+    int flags;
+    int profile_mask;
+    int share_with_current_context;
+    int framebuffer_srgb_capable;
+    int floatbuffers;
+} SDLOP_GLAttributes;
+
+extern SDLOP_GLAttributes sdlop_glattrs;
+
+/* Surface helpers (SDL_surface.c) */
+int SDLOP_BytesPerPixel(SDL_PixelFormat format);
 
 /* Logging of subsystem state */
 extern bool sdlop_quitting;
