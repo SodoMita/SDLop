@@ -6,7 +6,9 @@
 */
 
 #include "internal/sdlop_internal.h"
+#ifndef __EMSCRIPTEN__
 #include <sys/eventfd.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -57,10 +59,14 @@ bool SDL_Init(SDL_InitFlags flags)
         sdlop.next_user_event = SDL_EVENT_USER;
         sdlop.repeat_delay_ms = 500;
         sdlop.repeat_interval_ms = 33;
+#ifndef __EMSCRIPTEN__ /* no fds to wake on the web */
         sdlop.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (sdlop.wake_fd < 0) {
             sdlop.wake_fd = -1;
         }
+#else
+        sdlop.wake_fd = -1;
+#endif
         sdlop.init_done = true;
     }
     if (flags & SDL_INIT_VIDEO) {

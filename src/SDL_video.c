@@ -9,6 +9,9 @@
 #include <strings.h>
 
 static SDLop_VideoDevice *const video_drivers[] = {
+#if SDLop_VIDEO_EMSCRIPTEN
+    &SDLop_emscripten_device,
+#endif
 #if SDLop_VIDEO_WAYLAND
     &SDLop_wayland_device,
 #endif

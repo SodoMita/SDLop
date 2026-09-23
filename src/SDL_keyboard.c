@@ -222,6 +222,23 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
         return (SDL_Keycode)sym;
     }
 
+    /* SDL3 gives these ASCII values rather than scancode-mask codes */
+    if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+        return SDLK_RETURN;
+    }
+    if (sym == XKB_KEY_Escape) {
+        return SDLK_ESCAPE;
+    }
+    if (sym == XKB_KEY_BackSpace) {
+        return SDLK_BACKSPACE;
+    }
+    if (sym == XKB_KEY_Tab || sym == XKB_KEY_ISO_Left_Tab || sym == XKB_KEY_KP_Tab) {
+        return SDLK_TAB;
+    }
+    if (sym == XKB_KEY_Delete) {
+        return SDLK_DELETE;
+    }
+
     /* non-printable keys: scancode | SDLK_SCANCODE_MASK (SDL3 semantics) */
     static const struct { xkb_keysym_t sym; SDL_Scancode sc; } special[] = {
         { XKB_KEY_Escape, SDL_SCANCODE_ESCAPE },
@@ -494,8 +511,22 @@ SDL_Window *SDL_GetKeyboardFocus(void)
 
 SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, bool key_event)
 {
-    (void)modstate;
     Uint16 raw = evdev_from_scancode(scancode);
+    /* SDL3 applies the *passed* modifiers when key_event is set */
+    if (key_event && keymap &&
+        (modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT | SDL_KMOD_CAPS))) {
+        xkb_mod_mask_t mask = 0;
+        if (modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT)) {
+            mask |= (xkb_mod_mask_t)1 << mod_shift;
+        }
+        if (modstate & SDL_KMOD_CAPS) {
+            mask |= (xkb_mod_mask_t)1 << mod_caps;
+        }
+        xkb_state_update_mask(xkb_st_clean, mask, 0, 0, 0, 0, 0);
+        xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)raw + 8);
+        xkb_state_update_mask(xkb_st_clean, 0, 0, 0, 0, 0, 0);
+        return keysym_to_keycode(sym);
+    }
     return SDLOP_KeyboardTranslateKey(raw, key_event, NULL, 0);
 }
 
@@ -507,8 +538,46 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
     if (key & SDLK_SCANCODE_MASK) {
         return (SDL_Scancode)(key & ~SDLK_SCANCODE_MASK);
     }
+    switch (key) {
+    case SDLK_RETURN:    return SDL_SCANCODE_RETURN;
+    case SDLK_ESCAPE:    return SDL_SCANCODE_ESCAPE;
+    case SDLK_BACKSPACE: return SDL_SCANCODE_BACKSPACE;
+    case SDLK_TAB:       return SDL_SCANCODE_TAB;
+    case SDLK_DELETE:    return SDL_SCANCODE_DELETE;
+    default: break;
+    }
     /* printable: look up the base-layout keysym */
-    return symtab_get((xkb_keysym_t)key);
+    SDL_Scancode sc = symtab_get((xkb_keysym_t)key);
+    if (sc != SDL_SCANCODE_UNKNOWN) {
+        return sc;
+    }
+    /* shifted printables (SDL3: SDLK_W resolves to SDL_SCANCODE_W) */
+    static const struct { char ch; SDL_Scancode sc; } shifted_us[] = {
+        { '!', SDL_SCANCODE_1 }, { '@', SDL_SCANCODE_2 }, { '#', SDL_SCANCODE_3 },
+        { '$', SDL_SCANCODE_4 }, { '%', SDL_SCANCODE_5 }, { '^', SDL_SCANCODE_6 },
+        { '&', SDL_SCANCODE_7 }, { '*', SDL_SCANCODE_8 }, { '(', SDL_SCANCODE_9 },
+        { ')', SDL_SCANCODE_0 }, { '_', SDL_SCANCODE_MINUS }, { '+', SDL_SCANCODE_EQUALS },
+        { '{', SDL_SCANCODE_LEFTBRACKET }, { '}', SDL_SCANCODE_RIGHTBRACKET },
+        { '|', SDL_SCANCODE_BACKSLASH }, { ':', SDL_SCANCODE_SEMICOLON },
+        { '"', SDL_SCANCODE_APOSTROPHE }, { '~', SDL_SCANCODE_GRAVE },
+        { '<', SDL_SCANCODE_COMMA }, { '>', SDL_SCANCODE_PERIOD },
+        { '?', SDL_SCANCODE_SLASH },
+    };
+    if (key >= 'A' && key <= 'Z') {
+        if (modstate) {
+            *modstate = SDL_KMOD_LSHIFT;
+        }
+        return (SDL_Scancode)(SDL_SCANCODE_A + (key - 'A'));
+    }
+    for (size_t i = 0; i < SDL_arraysize(shifted_us); i++) {
+        if (shifted_us[i].ch == (char)key) {
+            if (modstate) {
+                *modstate = SDL_KMOD_LSHIFT;
+            }
+            return shifted_us[i].sc;
+        }
+    }
+    return SDL_SCANCODE_UNKNOWN;
 }
 
 /* ------------------------------------------------------------------ */
@@ -532,6 +601,14 @@ const char *SDL_GetKeyName(SDL_Keycode key)
 {
     if (key & SDLK_SCANCODE_MASK) {
         return SDL_GetScancodeName((SDL_Scancode)(key & ~SDLK_SCANCODE_MASK));
+    }
+    switch (key) {
+    case SDLK_RETURN:    return "Return";
+    case SDLK_ESCAPE:    return "Escape";
+    case SDLK_BACKSPACE: return "Backspace";
+    case SDLK_TAB:       return "Tab";
+    case SDLK_DELETE:    return "Delete";
+    default: break;
     }
     if (key >= 0x20 && key < 0x7f) {
         static _Thread_local char namebuf[2] = { 0, 0 };

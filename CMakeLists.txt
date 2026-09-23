@@ -17,6 +17,64 @@ add_compile_definitions(_GNU_SOURCE)
 add_compile_options(-Wall -Wextra)
 
 # ---------------------------------------------------------------------------
+# Web (Emscripten) build: canvas + WebGL driver, no xkbcommon/evdev/wayland
+# ---------------------------------------------------------------------------
+if(EMSCRIPTEN)
+  set(SDLop_WEB_SOURCES
+    src/SDLop_core.c
+    src/SDL_error.c
+    src/SDL_log.c
+    src/SDL_timer.c
+    src/SDL_events.c
+    src/SDL_keyboard_web.c
+    src/SDL_mouse.c
+    src/SDL_video.c
+    src/SDL_surface.c
+    src/SDL_gl.c
+    src/SDL_vulkan.c
+    src/video/emscripten/sdlop_emscripten.c
+    src/video/dummy/sdlop_dummy.c)
+
+  add_library(sdlop STATIC ${SDLop_WEB_SOURCES})
+  add_library(SDLop::SDLop ALIAS sdlop)
+  target_include_directories(sdlop PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_include_directories(sdlop PRIVATE src)
+  target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_EMSCRIPTEN=1)
+  target_link_libraries(sdlop PUBLIC m)
+
+  if(SDLop_BUILD_TESTS)
+    enable_testing()
+    foreach(t test_ring test_events test_surface test_web)
+      add_executable(${t} tests/${t}.c)
+      target_link_libraries(${t} PRIVATE sdlop)
+      target_include_directories(${t} PRIVATE src)
+      target_compile_options(${t} PRIVATE -UNDEBUG)
+      target_link_options(${t} PRIVATE
+        -sENVIRONMENT=node,web -sEXIT_RUNTIME=1 -sALLOW_MEMORY_GROWTH=1)
+      if(t STREQUAL "test_ring")
+        # SPSC ring test uses a worker thread
+        target_compile_options(${t} PRIVATE -pthread)
+        target_link_options(${t} PRIVATE -pthread -sPTHREAD_POOL_SIZE=2)
+      endif()
+      add_test(NAME ${t} COMMAND node ${t}.js)
+    endforeach()
+  endif()
+
+  if(SDLop_BUILD_EXAMPLES)
+    foreach(ex window surface_plasma)
+      add_executable(${ex} examples/${ex}.c)
+      target_link_libraries(${ex} PRIVATE sdlop m)
+      target_link_options(${ex} PRIVATE
+        -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY
+        "-sASYNCIFY_IGNORE_INDIRECT=1")
+    endforeach()
+  endif()
+
+  return()
+endif()
+
+# ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
@@ -212,7 +270,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface)
+  foreach(t test_ring test_scancode test_events test_surface test_web)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)

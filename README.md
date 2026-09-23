@@ -36,14 +36,14 @@ int main(void) {
 
 | Platform | State |
 |---|---|
-| Linux / Wayland (wl_compositor + xdg-shell, wl_seat fallback input) | ✅ done, tested against Weston 14 |
+| Linux / Wayland (wl_compositor + xdg-shell, wl_seat fallback input) | ✅ done, tested against Weston 14 + sway 1.10 (pixman) |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
 | Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
 | OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
 | Vulkan WSI (`SDL_Vulkan_*`, lavapipe) | ✅ done, verified by swapchain read-back |
 | Pointer lock (`zwp_pointer_constraints` + `zwp_relative_pointer`) | ✅ done, tested against a mini compositor |
 | `dummy` (offscreen) driver | ✅ done, used for headless CI (incl. RAM-framebuffer surfaces) |
-| Web (Emscripten) | 🔜 next (driver interface ready) |
+| Web (Emscripten): canvas windows, DOM input, WebGL1/2 | ✅ done, tested in node + headless Chromium 153 |
 | Windows / Win32, macOS / Cocoa | 🔜 after web |
 
 ## Architecture
@@ -174,6 +174,25 @@ WAYLAND_DISPLAY=wayland-0 ctest --test-dir build   # wayland integration test
 sudo ./build/test_evdev_uinput                     # raw evdev end-to-end
 ```
 
+### Web (Emscripten)
+
+```sh
+source /path/to/emsdk/emsdk_env.sh
+emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-web -j
+ctest --test-dir build-web            # runs the .js outputs under node
+tests/run_browser_test.sh build-web   # real DOM+WebGL run in headless chromium
+```
+
+The web build swaps in `src/video/emscripten/` (HTML5 canvas + WebGL via
+`emscripten_webgl_*`, DOM event callbacks feeding the SDL queue) and
+`src/SDL_keyboard_web.c` (static US keymap; no xkbcommon on the web).
+Raw evdev input is unavailable there by design - `SDLop_*` raw APIs report
+unsupported and standard SDL events come from the DOM. `test_web` runs in
+both environments: node (dummy driver + keymap table) and a real browser
+(window on `#canvas`, synthetic `KeyboardEvent`/`MouseEvent`/`WheelEvent`
+through the emscripten callbacks, WebGL context, software-surface blit).
+
 The suite is verified against two compositors (13/13 on both):
 
 | compositor                | renderer | notes                                            |
@@ -233,6 +252,10 @@ Highlights:
   (llvmpipe/lavapipe) but work with any EGL/Vulkan driver.
 - `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
   content yet.
+- Web: the static keymap is US-layout only (browser text input events are
+  not used yet); `SDL_GL_SHARE_WITH_CURRENT_CONTEXT` is ignored (WebGL has no
+  cross-context object sharing);
+  no Vulkan (WebGPU would be the web analog).
 
 ## Why "faster"?
 

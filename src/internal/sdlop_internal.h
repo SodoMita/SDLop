@@ -89,6 +89,7 @@ struct SDLop_VideoDevice
 };
 
 /* Provided by backends */
+extern SDLop_VideoDevice SDLop_emscripten_device;
 extern SDLop_VideoDevice SDLop_wayland_device;
 extern SDLop_VideoDevice SDLop_dummy_device;
 

@@ -236,11 +236,15 @@ int main(void)
 
     expect enter = { .type = SDL_EVENT_WINDOW_MOUSE_ENTER };
     CHECK(pump_until(pred_generic, &enter, 3000), "no WINDOW_MOUSE_ENTER from virtual pointer");
+    /* motion_absolute maps to output space; window coords are relative to
+     * the window origin (bars/decorations may offset it on real compositors) */
+    int win_x = 0, win_y = 0;
+    SDL_GetWindowPosition(w, &win_x, &win_y);
     float mx = -1, my = -1;
     SDL_GetMouseState(&mx, &my);
-    printf("enter at (%.1f, %.1f)\n", mx, my);
-    CHECK(fabsf(mx - 64.0f) < 1.0f && fabsf(my - 64.0f) < 1.0f,
-          "enter position (%.1f,%.1f) != (64,64)", mx, my);
+    printf("enter at (%.1f, %.1f) [window at (%d,%d)]\n", mx, my, win_x, win_y);
+    CHECK(fabsf(mx - (64.0f - win_x)) < 1.0f && fabsf(my - (64.0f - win_y)) < 1.0f,
+          "enter position (%.1f,%.1f) != (64,64) offset by (%d,%d)", mx, my, win_x, win_y);
 
     /* keyboard: sway sends its keymap when SDLop binds wl_keyboard;
      * press W */
@@ -248,7 +252,7 @@ int main(void)
     wl_display_flush(c.dpy);
     expect kd = { .type = SDL_EVENT_KEY_DOWN, .field_i = SDL_SCANCODE_W };
     CHECK(pump_until(pred_generic, &kd, 3000), "no KEY_DOWN for W (scancode W)");
-    CHECK(kd.got_type == SDLK_W, "keycode 0x%X != SDLK_W", kd.got_type);
+    CHECK(kd.got_type == SDLK_w, "keycode 0x%X != SDLK_w", kd.got_type);
 
     zwp_virtual_keyboard_v1_key(c.vkb, now_ms(), KEY_W, WL_KEYBOARD_KEY_STATE_RELEASED);
     wl_display_flush(c.dpy);
@@ -287,7 +291,7 @@ int main(void)
     CHECK(pump_until(pred_generic, &rel, 3000),
           "no relative MOTION (5.5,-2.25) via locked pointer");
     SDL_GetMouseState(&mx, &my);
-    CHECK(fabsf(mx - 64.0f) < 1.0f && fabsf(my - 64.0f) < 1.0f,
+    CHECK(fabsf(mx - (64.0f - win_x)) < 1.0f && fabsf(my - (64.0f - win_y)) < 1.0f,
           "locked pointer drifted to (%.1f,%.1f)", mx, my);
 
     /* unlock; absolute motion must work again. The unlock travels on
@@ -302,7 +306,8 @@ int main(void)
     zwlr_virtual_pointer_v1_motion_absolute(c.vptr, now_ms(), 600, 400, 1280, 720);
     zwlr_virtual_pointer_v1_frame(c.vptr);
     wl_display_flush(c.dpy);
-    expect abs_ = { .type = SDL_EVENT_MOUSE_MOTION, .check_pos = true, .x = 600.0f, .y = 400.0f };
+    expect abs_ = { .type = SDL_EVENT_MOUSE_MOTION, .check_pos = true,
+                    .x = 600.0f - win_x, .y = 400.0f - win_y };
     CHECK(pump_until(pred_generic, &abs_, 3000), "no absolute MOTION (600,400) after unlock");
 
     /* cleanup */

@@ -3,3 +3,5 @@ build/
 *.a
 *.so
 *.so.*
+build/
+build-web/
