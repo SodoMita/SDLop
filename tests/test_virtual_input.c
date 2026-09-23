@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
+#include "internal/sdlop_xkb_dyn.h"
 #include "wlr-virtual-pointer-client-protocol.h"
 #include "virtual-keyboard-client-protocol.h"
 
@@ -211,9 +212,13 @@ int main(void)
 
     /* a virtual keyboard MUST provide a keymap before key events, or the
      * compositor rejects them (no_keymap error) - build the default layout */
-    struct xkb_context *xctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    struct xkb_keymap *xkm = xkb_keymap_new_from_names(xctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    char *km_str = xkb_keymap_get_as_string(xkm, XKB_KEYMAP_FORMAT_TEXT_V1);
+    if (!SDLOP_Xkb_LoadSymbols()) {
+        fprintf(stderr, "xkb symbols: %s\n", SDL_GetError());
+        return 1;
+    }
+    struct xkb_context *xctx = SDLOP_XKB_xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    struct xkb_keymap *xkm = SDLOP_XKB_xkb_keymap_new_from_names(xctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    char *km_str = SDLOP_XKB_xkb_keymap_get_as_string(xkm, XKB_KEYMAP_FORMAT_TEXT_V1);
     size_t km_len = strlen(km_str) + 1;
     int km_fd = memfd_create("keymap", MFD_CLOEXEC);
     if (km_fd < 0 || write(km_fd, km_str, km_len) != (ssize_t)km_len) {
@@ -223,8 +228,8 @@ int main(void)
     zwp_virtual_keyboard_v1_keymap(c.vkb, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, km_fd, (uint32_t)km_len);
     close(km_fd);
     free(km_str);
-    xkb_keymap_unref(xkm);
-    xkb_context_unref(xctx);
+    SDLOP_XKB_xkb_keymap_unref(xkm);
+    SDLOP_XKB_xkb_context_unref(xctx);
 
     wl_display_flush(c.dpy);
     wl_display_roundtrip(c.dpy);

@@ -14,6 +14,12 @@
 #include "internal/scancode_evdev.h"
 #include "sdlop_wayland_internal.h"
 
+/* dlopen-ed libwayland-client (SDL3-style); must precede every
+ * *-client-protocol.h include (their inlines compile against the
+ * SDLOP_WL_* pointers) */
+#include "sdlop_wayland_dyn.h"
+#include "sdlop_egl_dyn.h"
+
 #include "pointer-constraints-client-protocol.h"
 #include "relative-pointer-client-protocol.h"
 
@@ -23,7 +29,6 @@
 #include <unistd.h>
 #include <linux/input-event-codes.h>
 
-#include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 
 typedef struct WaylandWindowData
@@ -868,6 +873,11 @@ static bool wayland_Init(SDLop_VideoDevice *device)
         return SDL_SetError("WAYLAND_DISPLAY not set");
     }
 
+    /* SDL3-style: libwayland-client is dlopen-ed, never linked */
+    if (!SDLOP_Wayland_LoadSymbols()) {
+        return false;
+    }
+
     wl_data.display = wl_display_connect(NULL);
     if (!wl_data.display) {
         return SDL_SetError("Could not connect to Wayland display");
@@ -892,6 +902,7 @@ static bool wayland_Init(SDLop_VideoDevice *device)
 static void wayland_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    SDLOP_EGL_UnloadSymbols();
     wayland_release_pointer_lock();
     if (wl_data.pointer_constraints) {
         zwp_pointer_constraints_v1_destroy(wl_data.pointer_constraints);
@@ -925,6 +936,7 @@ static void wayland_Quit(SDLop_VideoDevice *device)
         wl_display_disconnect(wl_data.display);
     }
     memset(&wl_data, 0, sizeof(wl_data));
+    SDLOP_Wayland_UnloadSymbols();
 }
 
 static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)

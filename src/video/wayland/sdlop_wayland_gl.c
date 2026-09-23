@@ -10,8 +10,7 @@
 
 #include "sdlop_wayland_internal.h"
 
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
+#include "sdlop_egl_dyn.h"
 #include <dlfcn.h>
 #include <string.h>
 
@@ -68,29 +67,32 @@ static bool ensure_egl_display(void)
     if (egl_initialized) {
         return true;
     }
+    if (!SDLOP_EGL_LoadSymbols()) {
+        return false;
+    }
     struct wl_display *wl = SDLOP_Wayland_GetDisplay();
     if (!wl) {
         return SDL_SetError("Wayland display not available");
     }
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
-        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)SDLOP_EGL_eglGetProcAddress("eglGetPlatformDisplayEXT");
     if (get_platform_display) {
         egl_display = get_platform_display(EGL_PLATFORM_WAYLAND_EXT, wl, NULL);
     }
     if (egl_display == EGL_NO_DISPLAY) {
-        egl_display = eglGetDisplay((EGLNativeDisplayType)wl);
+        egl_display = SDLOP_EGL_eglGetDisplay((EGLNativeDisplayType)wl);
     }
     if (egl_display == EGL_NO_DISPLAY) {
         return SDL_SetError("eglGetDisplay failed");
     }
     EGLint major = 0, minor = 0;
-    if (!eglInitialize(egl_display, &major, &minor)) {
+    if (!SDLOP_EGL_eglInitialize(egl_display, &major, &minor)) {
         egl_display = EGL_NO_DISPLAY;
-        return SDL_SetError("eglInitialize failed: 0x%x", eglGetError());
+        return SDL_SetError("eglInitialize failed: 0x%x", SDLOP_EGL_eglGetError());
     }
     egl_initialized = true;
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop EGL %d.%d on Wayland (%s)",
-                major, minor, eglQueryString(egl_display, EGL_VERSION));
+                major, minor, SDLOP_EGL_eglQueryString(egl_display, EGL_VERSION));
     return true;
 }
 
@@ -123,7 +125,7 @@ static bool pick_config(EGLConfig *out, uint32_t api)
 
     EGLConfig configs[32];
     EGLint num = 0;
-    if (!eglChooseConfig(egl_display, attribs, configs, 32, &num) || num == 0) {
+    if (!SDLOP_EGL_eglChooseConfig(egl_display, attribs, configs, 32, &num) || num == 0) {
         return SDL_SetError("eglChooseConfig found no matching config");
     }
     *out = configs[0];
@@ -142,8 +144,8 @@ void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *wind
         ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3);
 
     uint32_t api = want_desktop_gl ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
-    if (!eglBindAPI(api)) {
-        SDL_SetError("eglBindAPI failed: 0x%x", eglGetError());
+    if (!SDLOP_EGL_eglBindAPI(api)) {
+        SDL_SetError("eglBindAPI failed: 0x%x", SDLOP_EGL_eglGetError());
         return NULL;
     }
 
@@ -182,14 +184,14 @@ void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *wind
             share = ((WaylandGLContext *)cur)->ctx;
         }
     }
-    EGLContext ctx = eglCreateContext(egl_display, config, share, ctx_attribs);
+    EGLContext ctx = SDLOP_EGL_eglCreateContext(egl_display, config, share, ctx_attribs);
     if (ctx == EGL_NO_CONTEXT) {
-        return (SDL_SetError("eglCreateContext failed: 0x%x", eglGetError()), NULL);
+        return (SDL_SetError("eglCreateContext failed: 0x%x", SDLOP_EGL_eglGetError()), NULL);
     }
 
     WaylandGLContext *glctx = (WaylandGLContext *)calloc(1, sizeof(*glctx));
     if (!glctx) {
-        eglDestroyContext(egl_display, ctx);
+        SDLOP_EGL_eglDestroyContext(egl_display, ctx);
         SDL_OutOfMemory();
         return NULL;
     }
@@ -203,11 +205,11 @@ static EGLConfig config_for_context(WaylandGLContext *glctx)
 {
     EGLConfig config;
     EGLint id = 0;
-    if (eglQueryContext(egl_display, glctx->ctx, EGL_CONFIG_ID, &id)) {
+    if (SDLOP_EGL_eglQueryContext(egl_display, glctx->ctx, EGL_CONFIG_ID, &id)) {
         EGLint attribs[3] = { EGL_CONFIG_ID, id, EGL_NONE };
         EGLConfig configs[1];
         EGLint num = 0;
-        if (eglChooseConfig(egl_display, attribs, configs, 1, &num) && num == 1) {
+        if (SDLOP_EGL_eglChooseConfig(egl_display, attribs, configs, 1, &num) && num == 1) {
             config = configs[0];
             return config;
         }
@@ -222,13 +224,13 @@ bool SDLOP_Wayland_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window,
         return false;
     }
     if (!context) {
-        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         SDLOP_Wayland_SetGLActive(window, false);
         return true;
     }
     WaylandGLContext *glctx = (WaylandGLContext *)context;
-    if (!eglBindAPI(glctx->api)) {
-        return SDL_SetError("eglBindAPI failed: 0x%x", eglGetError());
+    if (!SDLOP_EGL_eglBindAPI(glctx->api)) {
+        return SDL_SetError("eglBindAPI failed: 0x%x", SDLOP_EGL_eglGetError());
     }
 
     EGLSurface surface = EGL_NO_SURFACE;
@@ -256,19 +258,19 @@ bool SDLOP_Wayland_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window,
             if (!config) {
                 return SDL_SetError("No EGL config for context");
             }
-            *slot = eglCreateWindowSurface(egl_display, config, (EGLNativeWindowType)*eglwin_slot, NULL);
+            *slot = SDLOP_EGL_eglCreateWindowSurface(egl_display, config, (EGLNativeWindowType)*eglwin_slot, NULL);
             if (*slot == NULL) {
-                return SDL_SetError("eglCreateWindowSurface failed: 0x%x", eglGetError());
+                return SDL_SetError("eglCreateWindowSurface failed: 0x%x", SDLOP_EGL_eglGetError());
             }
         }
         surface = (EGLSurface)*slot;
         SDLOP_Wayland_SetGLActive(window, true);
     }
 
-    if (!eglMakeCurrent(egl_display, surface, surface, glctx->ctx)) {
-        return SDL_SetError("eglMakeCurrent failed: 0x%x", eglGetError());
+    if (!SDLOP_EGL_eglMakeCurrent(egl_display, surface, surface, glctx->ctx)) {
+        return SDL_SetError("eglMakeCurrent failed: 0x%x", SDLOP_EGL_eglGetError());
     }
-    eglSwapInterval(egl_display, swap_interval);
+    SDLOP_EGL_eglSwapInterval(egl_display, swap_interval);
     return true;
 }
 
@@ -279,8 +281,8 @@ bool SDLOP_Wayland_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
     if (!slot || !*slot) {
         return SDL_SetError("Window has no GL surface");
     }
-    if (!eglSwapBuffers(egl_display, (EGLSurface)*slot)) {
-        EGLint err = eglGetError();
+    if (!SDLOP_EGL_eglSwapBuffers(egl_display, (EGLSurface)*slot)) {
+        EGLint err = SDLOP_EGL_eglGetError();
         if (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW) {
             /* surface went away (window destroyed/hidden); recreate lazily */
             *slot = NULL;
@@ -298,8 +300,8 @@ void SDLOP_Wayland_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
         return;
     }
     if (egl_initialized) {
-        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglDestroyContext(egl_display, glctx->ctx);
+        SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        SDLOP_EGL_eglDestroyContext(egl_display, glctx->ctx);
     }
     free(glctx);
 }
@@ -309,7 +311,7 @@ void SDLOP_Wayland_GL_WindowDestroyed(SDL_Window *window)
     void **slot = SDLOP_Wayland_GetGLSurfaceSlot(window);
     if (slot && *slot) {
         if (egl_initialized) {
-            eglDestroySurface(egl_display, (EGLSurface)*slot);
+            SDLOP_EGL_eglDestroySurface(egl_display, (EGLSurface)*slot);
         }
         *slot = NULL;
     }
@@ -333,7 +335,7 @@ void SDLOP_Wayland_GL_WindowResized(SDL_Window *window)
 
 SDL_FunctionPointer SDLOP_Wayland_GL_GetProcAddress(const char *proc)
 {
-    SDL_FunctionPointer fn = eglGetProcAddress(proc);
+    SDL_FunctionPointer fn = SDLOP_EGL_eglGetProcAddress(proc);
     if (fn) {
         return fn;
     }
@@ -357,7 +359,7 @@ bool SDLOP_Wayland_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval)
     }
     swap_interval = interval;
     if (egl_initialized) {
-        eglSwapInterval(egl_display, interval);
+        SDLOP_EGL_eglSwapInterval(egl_display, interval);
     }
     return true;
 }

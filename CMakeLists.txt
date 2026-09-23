@@ -92,10 +92,13 @@ set(WL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
 file(MAKE_DIRECTORY ${WL_GEN_DIR})
 
 add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/wayland-client-protocol.h
+  OUTPUT ${WL_GEN_DIR}/wayland-client-protocol.h ${WL_GEN_DIR}/wayland-client-protocol.c
   COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
           ${WAYLAND_CLIENT_DIR}/wayland.xml
           ${WL_GEN_DIR}/wayland-client-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} code
+          ${WAYLAND_CLIENT_DIR}/wayland.xml
+          ${WL_GEN_DIR}/wayland-client-protocol.c
   DEPENDS ${WAYLAND_CLIENT_DIR}/wayland.xml)
 
 add_custom_command(
@@ -190,22 +193,23 @@ set(SDLop_SOURCES
   src/SDL_gl.c
   src/SDL_vulkan.c
   src/internal/sdlop_evdev.c
+  src/sdlop_xkb_dyn.c
   src/video/wayland/sdlop_wayland.c
+  src/video/wayland/sdlop_wayland_dyn.c
+  src/video/wayland/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
+  src/video/wayland/sdlop_wayland_protos.c
   src/video/dummy/sdlop_dummy.c
-  ${WL_GEN_DIR}/xdg-shell-protocol.c
-  ${WL_GEN_DIR}/pointer-constraints-protocol.c
-  ${WL_GEN_DIR}/relative-pointer-protocol.c
 )
 
+# SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
+# at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
+# where those libraries are absent.
 set(SDLop_LIB_DEPS
-  ${WAYLAND_CLIENT_LIBRARIES}
-  ${XKBCOMMON_LIBRARIES}
-  ${EGL_LIBRARIES}
-  ${GLESV2_LIBRARIES}
   pthread
-  dl)
+  dl
+  m)
 set(SDLop_LIB_DIRS
   ${WAYLAND_CLIENT_LIBRARY_DIRS}
   ${XKBCOMMON_LIBRARY_DIRS}

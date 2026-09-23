@@ -1,0 +1,16 @@
+/* SDLop - libxkbcommon symbol list (X-macro; included multiple times with
+ * different SDLOP_XKB_SYM definitions; deliberately no include guard) */
+SDLOP_XKB_SYM(struct xkb_context *, xkb_context_new, (enum xkb_context_flags))
+SDLOP_XKB_SYM(void, xkb_context_unref, (struct xkb_context *))
+SDLOP_XKB_SYM(struct xkb_keymap *, xkb_keymap_new_from_string, (struct xkb_context *, const char *, enum xkb_keymap_format, enum xkb_keymap_compile_flags))
+SDLOP_XKB_SYM(struct xkb_keymap *, xkb_keymap_new_from_names, (struct xkb_context *, const struct xkb_rule_names *, enum xkb_keymap_compile_flags))
+SDLOP_XKB_SYM(char *, xkb_keymap_get_as_string, (struct xkb_keymap *, enum xkb_keymap_format))
+SDLOP_XKB_SYM(void, xkb_keymap_unref, (struct xkb_keymap *))
+SDLOP_XKB_SYM(xkb_mod_index_t, xkb_keymap_mod_get_index, (const struct xkb_keymap *, const char *))
+SDLOP_XKB_SYM(int, xkb_keymap_key_repeats, (const struct xkb_keymap *, xkb_keycode_t))
+SDLOP_XKB_SYM(struct xkb_state *, xkb_state_new, (struct xkb_keymap *))
+SDLOP_XKB_SYM(void, xkb_state_unref, (struct xkb_state *))
+SDLOP_XKB_SYM(int, xkb_state_update_mask, (struct xkb_state *, xkb_mod_mask_t, xkb_mod_mask_t, xkb_mod_mask_t, xkb_layout_index_t, xkb_layout_index_t, xkb_layout_index_t))
+SDLOP_XKB_SYM(xkb_keysym_t, xkb_state_key_get_one_sym, (struct xkb_state *, xkb_keycode_t))
+SDLOP_XKB_SYM(int, xkb_state_key_get_utf8, (struct xkb_state *, xkb_keycode_t, char *, size_t))
+SDLOP_XKB_SYM(enum xkb_state_component, xkb_state_mod_index_is_active, (struct xkb_state *, xkb_mod_index_t, enum xkb_state_component))

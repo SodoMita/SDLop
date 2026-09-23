@@ -11,7 +11,7 @@
 
 #include "internal/sdlop_internal.h"
 #include "internal/scancode_evdev.h"
-#include <xkbcommon/xkbcommon.h>
+#include "internal/sdlop_xkb_dyn.h"
 
 /* ------------------------------------------------------------------ */
 /* scancode -> evdev reverse table (built once)                        */
@@ -80,14 +80,14 @@ static SDL_Scancode symtab_get(xkb_keysym_t sym)
 
 static void find_mod_indices(void)
 {
-    mod_shift  = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_SHIFT);   /* "Shift" */
-    mod_ctrl   = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_CTRL);    /* "Control" */
-    mod_alt    = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_ALT);     /* "Mod1" */
-    mod_super  = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_LOGO);    /* "Mod4" */
-    mod_caps   = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_CAPS);    /* "Lock" */
-    mod_num    = xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_NUM);     /* "Mod2" */
-    mod_altgr  = xkb_keymap_mod_get_index(keymap, "Mod5");   /* "Mod5" */
-    mod_level5 = xkb_keymap_mod_get_index(keymap, "Mod3");               /* ISO_Level5_Shift */
+    mod_shift  = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_SHIFT);   /* "Shift" */
+    mod_ctrl   = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_CTRL);    /* "Control" */
+    mod_alt    = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_ALT);     /* "Mod1" */
+    mod_super  = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_LOGO);    /* "Mod4" */
+    mod_caps   = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_CAPS);    /* "Lock" */
+    mod_num    = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, XKB_MOD_NAME_NUM);     /* "Mod2" */
+    mod_altgr  = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, "Mod5");   /* "Mod5" */
+    mod_level5 = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, "Mod3");               /* ISO_Level5_Shift */
 }
 
 /* Build sym->scancode map and remember key names from the base layout */
@@ -99,7 +99,7 @@ static void build_symtab(void)
         if (sc == SDL_SCANCODE_UNKNOWN) {
             continue;
         }
-        xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)evdev + 8);
+        xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)evdev + 8);
         if (sym != XKB_KEY_NoSymbol) {
             symtab_put(sym, sc);
             /* also index unshifted letters (a-z) so SDLK_a finds A key */
@@ -112,22 +112,22 @@ static void build_symtab(void)
 
 static bool set_keymap(struct xkb_keymap *new_keymap)
 {
-    struct xkb_state *new_state = xkb_state_new(new_keymap);
-    struct xkb_state *new_clean = xkb_state_new(new_keymap);
+    struct xkb_state *new_state = SDLOP_XKB_xkb_state_new(new_keymap);
+    struct xkb_state *new_clean = SDLOP_XKB_xkb_state_new(new_keymap);
     if (!new_state || !new_clean) {
-        xkb_state_unref(new_state);
-        xkb_state_unref(new_clean);
-        xkb_keymap_unref(new_keymap);
-        return SDL_SetError("xkb_state_new() failed");
+        SDLOP_XKB_xkb_state_unref(new_state);
+        SDLOP_XKB_xkb_state_unref(new_clean);
+        SDLOP_XKB_xkb_keymap_unref(new_keymap);
+        return SDL_SetError("SDLOP_XKB_xkb_state_new() failed");
     }
     if (xkb_st) {
-        xkb_state_unref(xkb_st);
+        SDLOP_XKB_xkb_state_unref(xkb_st);
     }
     if (xkb_st_clean) {
-        xkb_state_unref(xkb_st_clean);
+        SDLOP_XKB_xkb_state_unref(xkb_st_clean);
     }
     if (keymap) {
-        xkb_keymap_unref(keymap);
+        SDLOP_XKB_xkb_keymap_unref(keymap);
     }
     keymap = new_keymap;
     xkb_st = new_state;
@@ -139,13 +139,16 @@ static bool set_keymap(struct xkb_keymap *new_keymap)
 
 bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
 {
+    if (!SDLOP_Xkb_LoadSymbols()) {
+        return false;
+    }
     if (!xkb_ctx) {
-        xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        xkb_ctx = SDLOP_XKB_xkb_context_new(XKB_CONTEXT_NO_FLAGS);
         if (!xkb_ctx) {
-            return SDL_SetError("xkb_context_new() failed");
+            return SDL_SetError("SDLOP_XKB_xkb_context_new() failed");
         }
     }
-    struct xkb_keymap *km = xkb_keymap_new_from_string(xkb_ctx, keymap_string, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    struct xkb_keymap *km = SDLOP_XKB_xkb_keymap_new_from_string(xkb_ctx, keymap_string, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
     if (!km) {
         return SDL_SetError("Could not parse Wayland xkb keymap");
     }
@@ -155,17 +158,20 @@ bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
 
 bool SDLOP_KeyboardSetDefaultKeymap(void)
 {
+    if (!SDLOP_Xkb_LoadSymbols()) {
+        return false;
+    }
     if (!xkb_ctx) {
-        xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        xkb_ctx = SDLOP_XKB_xkb_context_new(XKB_CONTEXT_NO_FLAGS);
         if (!xkb_ctx) {
-            return SDL_SetError("xkb_context_new() failed");
+            return SDL_SetError("SDLOP_XKB_xkb_context_new() failed");
         }
     }
     if (keymap) {
         return true; /* already have one */
     }
     struct xkb_rule_names names = { 0 };
-    struct xkb_keymap *km = xkb_keymap_new_from_names(xkb_ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    struct xkb_keymap *km = SDLOP_XKB_xkb_keymap_new_from_names(xkb_ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
     if (!km) {
         return SDL_SetError("Could not create default xkb keymap");
     }
@@ -177,31 +183,31 @@ void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 l
     if (!xkb_st) {
         return;
     }
-    xkb_state_update_mask(xkb_st, depressed, latched, locked, 0, 0, 0);
+    SDLOP_XKB_xkb_state_update_mask(xkb_st, depressed, latched, locked, 0, 0, 0);
 
     SDL_Keymod mod = sdlop.modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT | SDL_KMOD_LCTRL | SDL_KMOD_RCTRL | SDL_KMOD_LALT | SDL_KMOD_RALT | SDL_KMOD_LGUI | SDL_KMOD_RGUI);
 
     /* toggle locks come from xkb; left/right bits are tracked from key events */
-    if (xkb_state_mod_index_is_active(xkb_st, mod_caps, XKB_STATE_MODS_EFFECTIVE) == 1) {
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_caps, XKB_STATE_MODS_EFFECTIVE) == 1) {
         mod |= SDL_KMOD_CAPS;
     }
-    if (xkb_state_mod_index_is_active(xkb_st, mod_num, XKB_STATE_MODS_EFFECTIVE) == 1) {
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_num, XKB_STATE_MODS_EFFECTIVE) == 1) {
         mod |= SDL_KMOD_NUM;
     }
-    if (xkb_state_mod_index_is_active(xkb_st, mod_level5, XKB_STATE_MODS_EFFECTIVE) == 1) {
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_level5, XKB_STATE_MODS_EFFECTIVE) == 1) {
         mod |= SDL_KMOD_LEVEL5;
     }
-    if (xkb_state_mod_index_is_active(xkb_st, mod_altgr, XKB_STATE_MODS_EFFECTIVE) == 1) {
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_altgr, XKB_STATE_MODS_EFFECTIVE) == 1) {
         mod |= SDL_KMOD_MODE;
     }
     /* keep L/R modifier bits in sync with xkb effective state */
-    if (xkb_state_mod_index_is_active(xkb_st, mod_shift, XKB_STATE_MODS_EFFECTIVE) != 1) {
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_shift, XKB_STATE_MODS_EFFECTIVE) != 1) {
         mod &= ~(SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT);
     }
-    if (xkb_state_mod_index_is_active(xkb_st, mod_ctrl, XKB_STATE_MODS_EFFECTIVE) != 1) {
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_ctrl, XKB_STATE_MODS_EFFECTIVE) != 1) {
         mod &= ~(SDL_KMOD_LCTRL | SDL_KMOD_RCTRL);
     }
-    if (xkb_state_mod_index_is_active(xkb_st, mod_super, XKB_STATE_MODS_EFFECTIVE) != 1) {
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_super, XKB_STATE_MODS_EFFECTIVE) != 1) {
         mod &= ~(SDL_KMOD_LGUI | SDL_KMOD_RGUI);
     }
     sdlop.modstate = mod;
@@ -315,13 +321,13 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
     xkb_keycode_t xk = (xkb_keycode_t)rawcode + 8; /* evdev -> xkb offset */
 
     /* key code: resolved on the base layout (clean state) like SDL3 */
-    xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_st_clean, xk);
+    xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, xk);
     SDL_Keycode key = keysym_to_keycode(sym);
 
     /* text: from the live state, respecting modifiers */
     if (key_event && text_utf8) {
-        if (xkb_keymap_key_repeats(keymap, xk)) {
-            int len = xkb_state_key_get_utf8(xkb_st, xk, text_utf8, text_size);
+        if (SDLOP_XKB_xkb_keymap_key_repeats(keymap, xk)) {
+            int len = SDLOP_XKB_xkb_state_key_get_utf8(xkb_st, xk, text_utf8, text_size);
             if (len <= 0 || len >= (int)text_size) {
                 text_utf8[0] = '\0';
             } else {
@@ -353,7 +359,7 @@ bool SDLOP_KeyboardKeyRepeats(SDL_Scancode sc)
     if (!evdev) {
         return false;
     }
-    return xkb_keymap_key_repeats(keymap, (xkb_keycode_t)evdev + 8);
+    return SDLOP_XKB_xkb_keymap_key_repeats(keymap, (xkb_keycode_t)evdev + 8);
 }
 
 /* ------------------------------------------------------------------ */
@@ -522,9 +528,9 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
         if (modstate & SDL_KMOD_CAPS) {
             mask |= (xkb_mod_mask_t)1 << mod_caps;
         }
-        xkb_state_update_mask(xkb_st_clean, mask, 0, 0, 0, 0, 0);
-        xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)raw + 8);
-        xkb_state_update_mask(xkb_st_clean, 0, 0, 0, 0, 0, 0);
+        SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, mask, 0, 0, 0, 0, 0);
+        xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)raw + 8);
+        SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, 0, 0, 0, 0, 0, 0);
         return keysym_to_keycode(sym);
     }
     return SDLOP_KeyboardTranslateKey(raw, key_event, NULL, 0);
@@ -621,19 +627,19 @@ const char *SDL_GetKeyName(SDL_Keycode key)
 void SDLOP_KeyboardQuit(void)
 {
     if (xkb_st) {
-        xkb_state_unref(xkb_st);
+        SDLOP_XKB_xkb_state_unref(xkb_st);
         xkb_st = NULL;
     }
     if (xkb_st_clean) {
-        xkb_state_unref(xkb_st_clean);
+        SDLOP_XKB_xkb_state_unref(xkb_st_clean);
         xkb_st_clean = NULL;
     }
     if (keymap) {
-        xkb_keymap_unref(keymap);
+        SDLOP_XKB_xkb_keymap_unref(keymap);
         keymap = NULL;
     }
     if (xkb_ctx) {
-        xkb_context_unref(xkb_ctx);
+        SDLOP_XKB_xkb_context_unref(xkb_ctx);
         xkb_ctx = NULL;
     }
     sdlop.repeat_active = false;
