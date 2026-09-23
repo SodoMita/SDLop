@@ -223,6 +223,7 @@ typedef struct SDLOP_GLAttributes
 } SDLOP_GLAttributes;
 
 extern SDLOP_GLAttributes sdlop_glattrs;
+SDL_GLContext SDLOP_GL_CurrentContext(void);
 
 /* Surface helpers (SDL_surface.c) */
 int SDLOP_BytesPerPixel(SDL_PixelFormat format);

@@ -173,7 +173,15 @@ void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *wind
     }
     ctx_attribs[n++] = EGL_NONE;
 
+    /* SDL_GL_SHARE_WITH_CURRENT_CONTEXT: share with the currently bound
+     * context (EGL requires compatible client APIs for sharing) */
     EGLContext share = EGL_NO_CONTEXT;
+    if (sdlop_glattrs.share_with_current_context) {
+        SDL_GLContext cur = SDLOP_GL_CurrentContext();
+        if (cur) {
+            share = ((WaylandGLContext *)cur)->ctx;
+        }
+    }
     EGLContext ctx = eglCreateContext(egl_display, config, share, ctx_attribs);
     if (ctx == EGL_NO_CONTEXT) {
         return (SDL_SetError("eglCreateContext failed: 0x%x", eglGetError()), NULL);

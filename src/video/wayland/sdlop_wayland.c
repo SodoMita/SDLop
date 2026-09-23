@@ -1200,7 +1200,13 @@ static void wayland_release_pointer_lock(void)
 static bool wayland_arm_pointer_lock(SDL_Window *window)
 {
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
-    if (!wd || !wl_data.pointer || !wl_data.relative_manager || !wl_data.pointer_constraints) {
+    if (!wd) {
+        return SDL_SetError("Invalid window");
+    }
+    if (!wl_data.pointer) {
+        return SDL_SetError("No wl_pointer (compositor seat has no pointer capability)");
+    }
+    if (!wl_data.relative_manager || !wl_data.pointer_constraints) {
         return SDL_SetError("Wayland compositor lacks pointer-constraints/relative-pointer support");
     }
     wayland_release_pointer_lock();

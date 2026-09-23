@@ -257,11 +257,56 @@ if(SDLop_BUILD_TESTS)
   add_dependencies(test_pointer_lock mini_compositor)
   add_test(NAME test_pointer_lock COMMAND test_pointer_lock $<TARGET_FILE:mini_compositor>)
 
+  add_executable(smoke_relative_mode tests/smoke_relative_mode.c)
+  target_link_libraries(smoke_relative_mode PRIVATE sdlop)
+  add_test(NAME smoke_relative_mode COMMAND smoke_relative_mode)
+
+  add_executable(test_gl_matrix tests/test_gl_matrix.c)
+  target_link_libraries(test_gl_matrix PRIVATE sdlop ${GLESV2_LIBRARIES})
+  target_include_directories(test_gl_matrix PRIVATE src ${GLESV2_INCLUDE_DIRS})
+  target_compile_options(test_gl_matrix PRIVATE -UNDEBUG)
+  add_test(NAME test_gl_matrix COMMAND test_gl_matrix)
+
   add_executable(test_vulkan tests/test_vulkan.c)
   target_link_libraries(test_vulkan PRIVATE sdlop Vulkan::Vulkan)
   target_include_directories(test_vulkan PRIVATE src)
   target_compile_options(test_vulkan PRIVATE -UNDEBUG)
   add_test(NAME test_vulkan COMMAND test_vulkan)
+
+  add_executable(test_vulkan_compute tests/test_vulkan_compute.c)
+  target_link_libraries(test_vulkan_compute PRIVATE sdlop Vulkan::Vulkan)
+  target_include_directories(test_vulkan_compute PRIVATE src tests)
+  target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
+  add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
+
+  # wlr virtual-input protocols (vendored XMLs) for the sway end-to-end test
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml
+            ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml
+            ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    DEPENDS ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml)
+
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml
+            ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml
+            ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+    DEPENDS ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
+
+  add_executable(test_virtual_input tests/test_virtual_input.c
+    ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
+  target_link_libraries(test_virtual_input PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
+  target_include_directories(test_virtual_input PRIVATE src ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
+  target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
+  add_test(NAME test_virtual_input COMMAND test_virtual_input)
 endif()
 
 # ---------------------------------------------------------------------------

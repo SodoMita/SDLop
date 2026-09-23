@@ -145,6 +145,11 @@ SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc)
 static SDL_GLContext current_context;
 static SDL_Window *current_window;
 
+SDL_GLContext SDLOP_GL_CurrentContext(void)
+{
+    return current_context;
+}
+
 SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)
 {
     if (!window) {

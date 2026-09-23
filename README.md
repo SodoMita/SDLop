@@ -174,6 +174,30 @@ WAYLAND_DISPLAY=wayland-0 ctest --test-dir build   # wayland integration test
 sudo ./build/test_evdev_uinput                     # raw evdev end-to-end
 ```
 
+The suite is verified against two compositors (13/13 on both):
+
+| compositor                | renderer | notes                                            |
+|---------------------------|----------|--------------------------------------------------|
+| sway 1.10 / wlroots 0.18  | pixman   | full suite incl. virtual input + pointer lock    |
+| weston 14 headless        | GL/no-op | wlr-virtual-input tests skip (protocol absent)   |
+
+Highlights:
+
+- `test_gl_matrix` — ES 2.0, ES 3.0, GL 3.3 core, GL 4.5 core contexts on
+  llvmpipe; FBO clear/read-back per config; `SDL_GL_SHARE_WITH_CURRENT_CONTEXT`
+  verified by reading context A's texture through an FBO in shared context B.
+  (Mesa gives at least the requested version — llvmpipe reports ES 3.2 / 4.5.)
+- `test_vulkan` — instance/device/swapchain, render pass clear, image→buffer
+  read-back, present on lavapipe.
+- `test_vulkan_compute` — compute pipeline from embedded SPIR-V
+  (`tests/shaders/compute_fill.comp`), storage buffer + descriptor set,
+  dispatch + fence, all 256 outputs verified.
+- `test_virtual_input` — end-to-end input against a real compositor via the
+  wlr virtual-input protocols (XMLs vendored from wlroots 0.18 in
+  `tests/protocols/`): pointer enter at an exact position, xkbcommon keymap +
+  key events, buttons, wheel, pointer-lock relative motion, absolute motion
+  after unlock. On sway it drives a second SDLop client connection.
+
 ## Examples
 
 - `examples/window.c` — classic SDL3 loop; **compiles unmodified against real
