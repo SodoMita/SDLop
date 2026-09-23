@@ -30,6 +30,7 @@ struct SDL_Window
     int w, h;           /* requested size */
     SDL_WindowFlags flags;
     Uint8 clear_r, clear_g, clear_b;
+    float display_scale;    /* output scale the window currently sits on */
     SDL_Surface *surface;   /* software window surface (owned by window) */
     void *driverdata;
     struct SDL_Window *next;
@@ -167,6 +168,9 @@ void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns);
 #define SDLOP_NO_POS (-1e30f)
 void SDLOP_SendMouseMotion(float x, float y, float xrel, float yrel, Uint64 timestamp_ns);
 void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 timestamp_ns);
+void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, float y,
+                     float dx, float dy, float pressure, SDL_WindowID windowID,
+                     Uint64 timestamp_ns);
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns);
 
 /* Timestamp helpers */

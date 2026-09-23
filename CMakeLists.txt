@@ -319,6 +319,13 @@ if(SDLop_BUILD_TESTS)
   add_dependencies(test_pointer_lock mini_compositor)
   add_test(NAME test_pointer_lock COMMAND test_pointer_lock $<TARGET_FILE:mini_compositor>)
 
+  add_executable(test_touch tests/test_touch.c)
+  target_link_libraries(test_touch PRIVATE sdlop m)
+  target_include_directories(test_touch PRIVATE src)
+  target_compile_options(test_touch PRIVATE -UNDEBUG)
+  add_dependencies(test_touch mini_compositor)
+  add_test(NAME test_touch COMMAND test_touch $<TARGET_FILE:mini_compositor>)
+
   add_executable(smoke_relative_mode tests/smoke_relative_mode.c)
   target_link_libraries(smoke_relative_mode PRIVATE sdlop)
   add_test(NAME smoke_relative_mode COMMAND smoke_relative_mode)

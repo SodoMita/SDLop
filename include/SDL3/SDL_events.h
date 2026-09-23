@@ -78,6 +78,12 @@ typedef enum SDL_EventType
     SDL_EVENT_MOUSE_ADDED,
     SDL_EVENT_MOUSE_REMOVED,
 
+    /* Touch events */
+    SDL_EVENT_FINGER_DOWN      = 0x700,
+    SDL_EVENT_FINGER_UP,
+    SDL_EVENT_FINGER_MOTION,
+    SDL_EVENT_FINGER_CANCELED,
+
     /* User events */
     SDL_EVENT_USER    = 0x8000,
     SDL_EVENT_LAST    = 0xFFFF
@@ -197,6 +203,24 @@ typedef struct SDL_UserEvent
 /**
  * General event structure. Layout and size identical to SDL3.
  */
+/**
+ * Touch finger event structure (event.tfinger) - field-compatible with SDL3.
+ */
+typedef struct SDL_TouchFingerEvent
+{
+    SDL_EventType type; /**< SDL_EVENT_FINGER_DOWN, SDL_EVENT_FINGER_UP, SDL_EVENT_FINGER_MOTION, or SDL_EVENT_FINGER_CANCELED */
+    Uint32 reserved;
+    Uint64 timestamp;   /**< In nanoseconds, populated using SDL_GetTicksNS() */
+    SDL_TouchID touchID; /**< The touch device id */
+    SDL_FingerID fingerID;
+    float x;            /**< Normalized in the range 0...1 */
+    float y;            /**< Normalized in the range 0...1 */
+    float dx;           /**< Normalized in the range -1...1 */
+    float dy;           /**< Normalized in the range -1...1 */
+    float pressure;     /**< Normalized in the range 0...1 */
+    SDL_WindowID windowID; /**< The window underneath the finger, if any */
+} SDL_TouchFingerEvent;
+
 typedef union SDL_Event
 {
     Uint32 type;                    /**< Event type, shared with all events */
@@ -207,6 +231,7 @@ typedef union SDL_Event
     SDL_MouseMotionEvent motion;    /**< Mouse motion event data */
     SDL_MouseButtonEvent button;    /**< Mouse button event data */
     SDL_MouseWheelEvent wheel;      /**< Mouse wheel event data */
+    SDL_TouchFingerEvent tfinger;   /**< Touch finger event data */
     SDL_QuitEvent quit;             /**< Quit request event data */
     SDL_UserEvent user;             /**< Custom event data */
 

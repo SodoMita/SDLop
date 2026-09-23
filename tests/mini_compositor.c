@@ -38,6 +38,7 @@ struct mini
     struct wl_resource *xdg_surface;
     struct wl_resource *xdg_toplevel;
     struct wl_resource *pointer;
+    struct wl_resource *touch;
     struct wl_resource *locked;
     struct wl_resource *relpointer;
 
@@ -155,6 +156,19 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         wl_pointer_send_frame(M.pointer);
         printf("mini: sent pointer enter\n");
         fflush(stdout);
+        if (M.touch) {
+            /* scripted touch sequence: down(50,60) -> motion(70,80) -> up, id 7 */
+            wl_touch_send_down(M.touch, serial, 0, M.surface_res, 7,
+                               wl_fixed_from_double(50.0), wl_fixed_from_double(60.0));
+            wl_touch_send_frame(M.touch);
+            wl_touch_send_motion(M.touch, 1, 7,
+                                 wl_fixed_from_double(70.0), wl_fixed_from_double(80.0));
+            wl_touch_send_frame(M.touch);
+            wl_touch_send_up(M.touch, wl_display_next_serial(M.display), 2, 7);
+            wl_touch_send_frame(M.touch);
+            printf("mini: sent touch down/motion/up\n");
+            fflush(stdout);
+        }
     }
 }
 
@@ -390,6 +404,19 @@ static void seat_get_pointer(struct wl_client *client, struct wl_resource *res, 
     M.pointer = p;
 }
 
+static const struct wl_touch_interface touch_impl = {
+    .release = res_destroy,
+};
+
+static void seat_get_touch(struct wl_client *client, struct wl_resource *res, uint32_t id)
+{
+    (void)res;
+    struct wl_resource *t = wl_resource_create(client, &wl_touch_interface,
+                                               wl_resource_get_version(res), id);
+    wl_resource_set_implementation(t, &touch_impl, NULL, NULL);
+    M.touch = t;
+}
+
 static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res, uint32_t id)
 {
     (void)res;
@@ -401,6 +428,7 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
 static const struct wl_seat_interface seat_impl = {
     .get_pointer = seat_get_pointer,
     .get_keyboard = seat_get_keyboard,
+    .get_touch = seat_get_touch,
     .release = res_destroy,
 };
 
@@ -409,7 +437,7 @@ static void seat_bind(struct wl_client *client, void *data, uint32_t version, ui
     (void)data;
     struct wl_resource *seat = wl_resource_create(client, &wl_seat_interface, version, id);
     wl_resource_set_implementation(seat, &seat_impl, NULL, NULL);
-    wl_seat_send_capabilities(seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+    wl_seat_send_capabilities(seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_TOUCH);
     if (version >= WL_SEAT_NAME_SINCE_VERSION) {
         wl_seat_send_name(seat, "mini");
     }

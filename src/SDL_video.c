@@ -135,6 +135,7 @@ SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags fl
     window->h = h;
     window->x = 0;
     window->y = 0;
+    window->display_scale = 1.0f;
     window->flags = flags | SDL_WINDOW_HIDDEN; /* shown below unless HIDDEN */
     window->clear_r = 0x20;
     window->clear_g = 0x20;
@@ -408,4 +409,13 @@ void SDLop_SetWindowClearColor(SDL_Window *window, Uint8 r, Uint8 g, Uint8 b)
     if (sdlop.video && sdlop.video->SetWindowClearColor) {
         sdlop.video->SetWindowClearColor(sdlop.video, window);
     }
+}
+
+float SDLCALL SDL_GetWindowDisplayScale(SDL_Window *window)
+{
+    if (!window) {
+        SDL_SetError("Invalid window");
+        return 1.0f;
+    }
+    return window->display_scale;
 }

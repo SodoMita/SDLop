@@ -28,7 +28,8 @@ typedef uint64_t Uint64;
 typedef Uint32 SDL_WindowID;
 typedef Uint32 SDL_MouseID;
 typedef Uint32 SDL_KeyboardID;
-typedef Uint32 SDL_TouchID;
+typedef Uint64 SDL_TouchID;  /* SDL3: SDL_touch.h - Uint64 */
+typedef Uint64 SDL_FingerID; /* SDL3: SDL_touch.h - Uint64 */
 typedef Uint32 SDL_PropertiesID;
 typedef Uint32 SDL_MouseButtonFlags;
 typedef Uint32 SDL_InitFlags;

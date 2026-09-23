@@ -46,6 +46,7 @@ typedef struct WaylandWindowData
 
     bool configured;
     bool mapped;
+    struct wl_output *output; /* output the surface currently intersects */
     uint32_t toplevel_states;
     int pending_w, pending_h;
 
@@ -64,11 +65,26 @@ typedef struct WaylandDeviceData
     struct wl_seat *seat;
     struct wl_keyboard *keyboard;
     struct wl_pointer *pointer;
+    struct wl_touch *touch;
+#define SDLOP_MAX_OUTPUTS 16
+    struct
+    {
+        struct wl_output *output;
+        int32_t scale;
+    } outputs[SDLOP_MAX_OUTPUTS];
+    int num_outputs;
+    struct
+    {
+        bool active;
+        Uint64 id;
+        float nx, ny; /* last normalized position, for dx/dy */
+    } fingers[16];
     struct xdg_wm_base *wm_base;
     uint32_t compositor_version;
     uint32_t seat_version;
 
     SDL_Window *pointer_focus;
+    SDL_Window *touch_focus;
     float axis_x_acc, axis_y_acc;
 
     /* relative mouse mode (pointer lock) */
@@ -784,6 +800,254 @@ static const struct wl_pointer_listener pointer_listener = {
 };
 
 /* ------------------------------------------------------------------ */
+/* wl_touch                                                            */
+/* ------------------------------------------------------------------ */
+
+static float wayland_output_scale(struct wl_output *output)
+{
+    for (int i = 0; i < wl_data.num_outputs; i++) {
+        if (wl_data.outputs[i].output == output) {
+            return (float)wl_data.outputs[i].scale;
+        }
+    }
+    return 1.0f;
+}
+
+static void touch_finger_track(int32_t id, float *nx, float *ny, float *dx, float *dy, bool activate)
+{
+    for (int i = 0; i < (int)SDL_arraysize(wl_data.fingers); i++) {
+        if (wl_data.fingers[i].active && wl_data.fingers[i].id == (Uint64)id) {
+            *dx = *nx - wl_data.fingers[i].nx;
+            *dy = *ny - wl_data.fingers[i].ny;
+            wl_data.fingers[i].nx = *nx;
+            wl_data.fingers[i].ny = *ny;
+            if (!activate) {
+                wl_data.fingers[i].active = false;
+            }
+            return;
+        }
+    }
+    *dx = 0.0f;
+    *dy = 0.0f;
+    if (activate) {
+        for (int i = 0; i < (int)SDL_arraysize(wl_data.fingers); i++) {
+            if (!wl_data.fingers[i].active) {
+                wl_data.fingers[i].active = true;
+                wl_data.fingers[i].id = (Uint64)id;
+                wl_data.fingers[i].nx = *nx;
+                wl_data.fingers[i].ny = *ny;
+                return;
+            }
+        }
+    }
+}
+
+static void touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time,
+                       struct wl_surface *surface, int32_t id, wl_fixed_t x, wl_fixed_t y)
+{
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    (void)touch;
+    (void)serial;
+    (void)time;
+    SDL_Window *window = window_from_surface(surface);
+    if (!window || window->w <= 0 || window->h <= 0) {
+        return;
+    }
+    float nx = (float)(wl_fixed_to_double(x) / window->w);
+    float ny = (float)(wl_fixed_to_double(y) / window->h);
+    if (nx < 0.0f) nx = 0.0f;
+    if (nx > 1.0f) nx = 1.0f;
+    if (ny < 0.0f) ny = 0.0f;
+    if (ny > 1.0f) ny = 1.0f;
+    float dx, dy;
+    touch_finger_track(id, &nx, &ny, &dx, &dy, true);
+    d->touch_focus = window;
+    SDLOP_SendTouch(SDL_EVENT_FINGER_DOWN, (Uint64)(uintptr_t)d->seat, (Uint64)id,
+                    nx, ny, 0.0f, 0.0f, 1.0f, window->id, SDLOP_MonotonicNS());
+}
+
+static void touch_up(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time, int32_t id)
+{
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    (void)touch;
+    (void)serial;
+    (void)time;
+    /* report the last known position */
+    float nx = 0.0f, ny = 0.0f;
+    for (int i = 0; i < (int)SDL_arraysize(d->fingers); i++) {
+        if (d->fingers[i].active && d->fingers[i].id == (Uint64)id) {
+            nx = d->fingers[i].nx;
+            ny = d->fingers[i].ny;
+            break;
+        }
+    }
+    float dx, dy;
+    touch_finger_track(id, &nx, &ny, &dx, &dy, false);
+    SDL_WindowID wid = d->touch_focus ? d->touch_focus->id : 0;
+    SDLOP_SendTouch(SDL_EVENT_FINGER_UP, (Uint64)(uintptr_t)d->seat, (Uint64)id,
+                    nx, ny, 0.0f, 0.0f, 0.0f, wid, SDLOP_MonotonicNS());
+}
+
+static void touch_motion(void *data, struct wl_touch *touch, uint32_t time, int32_t id, wl_fixed_t x, wl_fixed_t y)
+{
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    (void)touch;
+    (void)time;
+    SDL_Window *window = d->touch_focus; /* surface of the active touch sequence */
+    if (!window || window->w <= 0 || window->h <= 0) {
+        return;
+    }
+    float nx = (float)(wl_fixed_to_double(x) / window->w);
+    float ny = (float)(wl_fixed_to_double(y) / window->h);
+    if (nx < 0.0f) nx = 0.0f;
+    if (nx > 1.0f) nx = 1.0f;
+    if (ny < 0.0f) ny = 0.0f;
+    if (ny > 1.0f) ny = 1.0f;
+    float dx, dy;
+    touch_finger_track(id, &nx, &ny, &dx, &dy, true);
+    SDLOP_SendTouch(SDL_EVENT_FINGER_MOTION, (Uint64)(uintptr_t)d->seat, (Uint64)id,
+                    nx, ny, dx, dy, 1.0f, window->id, SDLOP_MonotonicNS());
+}
+
+static void touch_frame(void *data, struct wl_touch *touch)
+{
+    (void)data;
+    (void)touch;
+}
+
+static void touch_cancel(void *data, struct wl_touch *touch)
+{
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    (void)touch;
+    for (int i = 0; i < (int)SDL_arraysize(d->fingers); i++) {
+        if (d->fingers[i].active) {
+            d->fingers[i].active = false;
+            SDLOP_SendTouch(SDL_EVENT_FINGER_CANCELED, (Uint64)(uintptr_t)d->seat, d->fingers[i].id,
+                            d->fingers[i].nx, d->fingers[i].ny, 0.0f, 0.0f, 0.0f, 0, SDLOP_MonotonicNS());
+        }
+    }
+}
+
+static void touch_shape(void *data, struct wl_touch *touch, int32_t id, wl_fixed_t major, wl_fixed_t minor)
+{
+    (void)data; (void)touch; (void)id; (void)major; (void)minor;
+}
+
+static void touch_orientation(void *data, struct wl_touch *touch, int32_t id, wl_fixed_t orientation)
+{
+    (void)data; (void)touch; (void)id; (void)orientation;
+}
+
+static const struct wl_touch_listener touch_listener = {
+    touch_down,
+    touch_up,
+    touch_motion,
+    touch_frame,
+    touch_cancel,
+    touch_shape,
+    touch_orientation,
+};
+
+/* ------------------------------------------------------------------ */
+/* wl_output + per-surface output tracking (display scale)             */
+/* ------------------------------------------------------------------ */
+
+static void output_geometry(void *data, struct wl_output *output, int32_t x, int32_t y,
+                            int32_t physical_width, int32_t physical_height, int32_t subpixel,
+                            const char *make, const char *model, int32_t transform)
+{
+    (void)data; (void)output; (void)x; (void)y; (void)physical_width; (void)physical_height;
+    (void)subpixel; (void)make; (void)model; (void)transform;
+}
+
+static void output_mode(void *data, struct wl_output *output, uint32_t flags, int32_t width, int32_t height, int32_t refresh)
+{
+    (void)data; (void)output; (void)flags; (void)width; (void)height; (void)refresh;
+}
+
+static void output_scale(void *data, struct wl_output *output, int32_t factor)
+{
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    for (int i = 0; i < d->num_outputs; i++) {
+        if (d->outputs[i].output == output) {
+            d->outputs[i].scale = factor;
+            return;
+        }
+    }
+}
+
+static void output_done(void *data, struct wl_output *output)
+{
+    (void)data;
+    float s = wayland_output_scale(output);
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        WaylandWindowData *wd = (WaylandWindowData *)w->driverdata;
+        if (wd && wd->output == output && w->display_scale != s) {
+            w->display_scale = s;
+            SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
+        }
+    }
+}
+
+static void output_name(void *data, struct wl_output *output, const char *name)
+{
+    (void)data; (void)output; (void)name;
+}
+
+static void output_description(void *data, struct wl_output *output, const char *description)
+{
+    (void)data; (void)output; (void)description;
+}
+
+static const struct wl_output_listener output_listener = {
+    output_geometry,
+    output_mode,
+    output_done,
+    output_scale,
+    output_name,
+    output_description,
+};
+
+static void surface_enter(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+    SDL_Window *window = (SDL_Window *)data;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    (void)surface;
+    wd->output = output;
+    float s = wayland_output_scale(output);
+    if (window->display_scale != s) {
+        window->display_scale = s;
+        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
+    }
+}
+
+static void surface_leave(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+    SDL_Window *window = (SDL_Window *)data;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    (void)surface;
+    (void)output;
+    wd->output = NULL; /* scale stays until the next enter (SDL3 behavior) */
+}
+
+static void surface_preferred_buffer_scale(void *data, struct wl_surface *surface, int32_t factor)
+{
+    (void)data; (void)surface; (void)factor;
+}
+
+static void surface_preferred_buffer_transform(void *data, struct wl_surface *surface, uint32_t transform)
+{
+    (void)data; (void)surface; (void)transform;
+}
+
+static const struct wl_surface_listener surface_listener = {
+    surface_enter,
+    surface_leave,
+    surface_preferred_buffer_scale,
+    surface_preferred_buffer_transform,
+};
+
+/* ------------------------------------------------------------------ */
 /* wl_seat                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -804,6 +1068,13 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
+    }
+    if ((caps & WL_SEAT_CAPABILITY_TOUCH) && !d->touch) {
+        d->touch = wl_seat_get_touch(seat);
+        wl_touch_add_listener(d->touch, &touch_listener, d);
+    } else if (!(caps & WL_SEAT_CAPABILITY_TOUCH) && d->touch) {
+        wl_touch_destroy(d->touch);
+        d->touch = NULL;
     }
 }
 
@@ -839,6 +1110,12 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         d->seat_version = version < 9 ? version : 9;
         d->seat = wl_registry_bind(registry, name, &wl_seat_interface, d->seat_version);
         wl_seat_add_listener(d->seat, &seat_listener, d);
+    } else if (strcmp(interface, wl_output_interface.name) == 0 && d->num_outputs < SDLOP_MAX_OUTPUTS) {
+        struct wl_output *o = wl_registry_bind(registry, name, &wl_output_interface, version < 4 ? version : 4);
+        d->outputs[d->num_outputs].output = o;
+        d->outputs[d->num_outputs].scale = 1;
+        d->num_outputs++;
+        wl_output_add_listener(o, &output_listener, d);
     } else if (strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0 && !d->pointer_constraints) {
         d->pointer_constraints = wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, 1);
     } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0 && !d->relative_manager) {
@@ -917,6 +1194,14 @@ static void wayland_Quit(SDLop_VideoDevice *device)
         wl_pointer_destroy(wl_data.pointer);
     }
     if (wl_data.seat) {
+        if (wl_data.touch) {
+            wl_touch_destroy(wl_data.touch);
+            wl_data.touch = NULL;
+        }
+        for (int i = 0; i < wl_data.num_outputs; i++) {
+            wl_output_destroy(wl_data.outputs[i].output);
+        }
+        wl_data.num_outputs = 0;
         wl_seat_destroy(wl_data.seat);
     }
     if (wl_data.wm_base) {
@@ -960,6 +1245,7 @@ static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_SetError("xdg_wm_base_get_xdg_surface failed");
     }
     xdg_surface_add_listener(wd->xsurface, &xsurface_listener, window);
+    wl_surface_add_listener(wd->surface, &surface_listener, window);
     wd->toplevel = xdg_surface_get_toplevel(wd->xsurface);
     if (!wd->toplevel) {
         xdg_surface_destroy(wd->xsurface);

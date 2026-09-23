@@ -337,4 +337,11 @@ extern bool SDL_GL_SwapWindow(SDL_Window *window);
  */
 extern void SDL_GL_DestroyContext(SDL_GLContext context);
 
+/**
+ * Get the content display scale relative to a window's pixel size.
+ *
+ * \\since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC float SDLCALL SDL_GetWindowDisplayScale(SDL_Window *window);
+
 #endif /* SDL_video_h_ */

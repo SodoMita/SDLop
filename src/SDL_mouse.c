@@ -77,6 +77,26 @@ void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 tim
     SDLOP_PushEventInternal(&event);
 }
 
+void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, float y,
+                     float dx, float dy, float pressure, SDL_WindowID windowID,
+                     Uint64 timestamp_ns)
+{
+    SDL_Event event;
+    SDL_zero(event);
+    event.tfinger.type = type;
+    event.tfinger.timestamp = timestamp_ns;
+    event.tfinger.touchID = touchID;
+    event.tfinger.fingerID = fingerID;
+    event.tfinger.x = x;
+    event.tfinger.y = y;
+    event.tfinger.dx = dx;
+    event.tfinger.dy = dy;
+    event.tfinger.pressure = pressure;
+    event.tfinger.windowID = windowID;
+    SDLOP_PushEventInternal(&event);
+}
+
+
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
 {
     if (x == 0.0f && y == 0.0f) {

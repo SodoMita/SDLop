@@ -57,6 +57,11 @@ int main(void)
     CHECK(SDL_GetWindowSize(w, &ww, &hh), "get size");
     CHECK(ww > 0 && hh > 0, "size positive (%dx%d)", ww, hh);
 
+    /* display scale from output tracking (1.0 on headless compositors) */
+    float scale = SDL_GetWindowDisplayScale(w);
+    CHECK(scale >= 1.0f && scale <= 8.0f, "display scale %f out of range", scale);
+    printf("display scale: %g\n", scale);
+
     /* title change */
     CHECK(SDL_SetWindowTitle(w, "renamed"), "set title");
     SDL_PumpEvents();
