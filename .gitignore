@@ -1,7 +1,7 @@
-build/
 *.o
 *.a
 *.so
 *.so.*
 build/
+build-asan/
 build-web/

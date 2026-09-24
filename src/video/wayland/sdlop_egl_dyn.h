@@ -28,23 +28,7 @@ typedef void (*SDLOP_EGLProc)(void);
     typedef rc(*SDLOP_DYNEGL_##fn) params; \
     extern SDLOP_DYNEGL_##fn SDLOP_EGL_##fn;
 
-SDLOP_EGL_SYM(EGLDisplay, eglGetDisplay, (EGLNativeDisplayType))
-SDLOP_EGL_SYM(EGLBoolean, eglInitialize, (EGLDisplay, EGLint *, EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglTerminate, (EGLDisplay))
-SDLOP_EGL_SYM(EGLBoolean, eglChooseConfig, (EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *))
-SDLOP_EGL_SYM(EGLContext, eglCreateContext, (EGLDisplay, EGLConfig, EGLContext, const EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglDestroyContext, (EGLDisplay, EGLContext))
-SDLOP_EGL_SYM(EGLSurface, eglCreateWindowSurface, (EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglDestroySurface, (EGLDisplay, EGLSurface))
-SDLOP_EGL_SYM(EGLBoolean, eglMakeCurrent, (EGLDisplay, EGLSurface, EGLSurface, EGLContext))
-SDLOP_EGL_SYM(EGLBoolean, eglSwapBuffers, (EGLDisplay, EGLSurface))
-SDLOP_EGL_SYM(EGLBoolean, eglSwapInterval, (EGLDisplay, EGLint))
-SDLOP_EGL_SYM(const char *, eglQueryString, (EGLDisplay, EGLint))
-SDLOP_EGL_SYM(EGLBoolean, eglQueryContext, (EGLDisplay, EGLContext, EGLint, EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglQuerySurface, (EGLDisplay, EGLSurface, EGLint, EGLint *))
-SDLOP_EGL_SYM(EGLint, eglGetError, (void))
-SDLOP_EGL_SYM(EGLBoolean, eglBindAPI, (EGLenum))
-SDLOP_EGL_SYM(SDLOP_EGLProc, eglGetProcAddress, (const char *))
+#include "sdlop_egl_sym.h"
 
 #undef SDLOP_EGL_SYM
 

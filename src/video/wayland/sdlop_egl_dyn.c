@@ -12,30 +12,16 @@
 #include <stdlib.h>
 
 #define SDLOP_EGL_SYM(rc, fn, params) SDLOP_DYNEGL_##fn SDLOP_EGL_##fn = NULL;
-SDLOP_EGL_SYM(EGLDisplay, eglGetDisplay, (EGLNativeDisplayType))
-SDLOP_EGL_SYM(EGLBoolean, eglInitialize, (EGLDisplay, EGLint *, EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglTerminate, (EGLDisplay))
-SDLOP_EGL_SYM(EGLBoolean, eglChooseConfig, (EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *))
-SDLOP_EGL_SYM(EGLContext, eglCreateContext, (EGLDisplay, EGLConfig, EGLContext, const EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglDestroyContext, (EGLDisplay, EGLContext))
-SDLOP_EGL_SYM(EGLSurface, eglCreateWindowSurface, (EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglDestroySurface, (EGLDisplay, EGLSurface))
-SDLOP_EGL_SYM(EGLBoolean, eglMakeCurrent, (EGLDisplay, EGLSurface, EGLSurface, EGLContext))
-SDLOP_EGL_SYM(EGLBoolean, eglSwapBuffers, (EGLDisplay, EGLSurface))
-SDLOP_EGL_SYM(EGLBoolean, eglSwapInterval, (EGLDisplay, EGLint))
-SDLOP_EGL_SYM(const char *, eglQueryString, (EGLDisplay, EGLint))
-SDLOP_EGL_SYM(EGLBoolean, eglQueryContext, (EGLDisplay, EGLContext, EGLint, EGLint *))
-SDLOP_EGL_SYM(EGLBoolean, eglQuerySurface, (EGLDisplay, EGLSurface, EGLint, EGLint *))
-SDLOP_EGL_SYM(EGLint, eglGetError, (void))
-SDLOP_EGL_SYM(EGLBoolean, eglBindAPI, (EGLenum))
-SDLOP_EGL_SYM(SDLOP_EGLProc, eglGetProcAddress, (const char *))
+#include "sdlop_egl_sym.h"
 #undef SDLOP_EGL_SYM
 
 static void *egl_lib = NULL;
+static int egl_load_refcount = 0;
 
 bool SDLOP_EGL_LoadSymbols(void)
 {
     if (egl_lib) {
+        egl_load_refcount++;
         return true;
     }
 
@@ -53,58 +39,35 @@ bool SDLOP_EGL_LoadSymbols(void)
 #define SDLOP_EGL_SYM(rc, fn, params)                                  \
     SDLOP_EGL_##fn = (SDLOP_DYNEGL_##fn)(uintptr_t)dlsym(egl_lib, #fn); \
     if (!SDLOP_EGL_##fn) {                                             \
+        if (ok) {                                                      \
+            SDL_SetError("Could not load symbol %s from %s", #fn, libname); \
+        }                                                              \
         ok = false;                                                    \
     }
-    SDLOP_EGL_SYM(EGLDisplay, eglGetDisplay, (EGLNativeDisplayType))
-    SDLOP_EGL_SYM(EGLBoolean, eglInitialize, (EGLDisplay, EGLint *, EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglTerminate, (EGLDisplay))
-    SDLOP_EGL_SYM(EGLBoolean, eglChooseConfig, (EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *))
-    SDLOP_EGL_SYM(EGLContext, eglCreateContext, (EGLDisplay, EGLConfig, EGLContext, const EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglDestroyContext, (EGLDisplay, EGLContext))
-    SDLOP_EGL_SYM(EGLSurface, eglCreateWindowSurface, (EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglDestroySurface, (EGLDisplay, EGLSurface))
-    SDLOP_EGL_SYM(EGLBoolean, eglMakeCurrent, (EGLDisplay, EGLSurface, EGLSurface, EGLContext))
-    SDLOP_EGL_SYM(EGLBoolean, eglSwapBuffers, (EGLDisplay, EGLSurface))
-    SDLOP_EGL_SYM(EGLBoolean, eglSwapInterval, (EGLDisplay, EGLint))
-    SDLOP_EGL_SYM(const char *, eglQueryString, (EGLDisplay, EGLint))
-    SDLOP_EGL_SYM(EGLBoolean, eglQueryContext, (EGLDisplay, EGLContext, EGLint, EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglQuerySurface, (EGLDisplay, EGLSurface, EGLint, EGLint *))
-    SDLOP_EGL_SYM(EGLint, eglGetError, (void))
-    SDLOP_EGL_SYM(EGLBoolean, eglBindAPI, (EGLenum))
-    SDLOP_EGL_SYM(SDLOP_EGLProc, eglGetProcAddress, (const char *))
+#include "sdlop_egl_sym.h"
 #undef SDLOP_EGL_SYM
 
     if (!ok) {
+        /* leave no pointers into the closed library */
+#define SDLOP_EGL_SYM(rc, fn, params) SDLOP_EGL_##fn = NULL;
+#include "sdlop_egl_sym.h"
+#undef SDLOP_EGL_SYM
         dlclose(egl_lib);
         egl_lib = NULL;
-        return SDL_SetError("Could not load all libEGL symbols from %s", libname);
+        return false; /* error already set: first missing symbol */
     }
+    egl_load_refcount = 1;
     return true;
 }
 
 void SDLOP_EGL_UnloadSymbols(void)
 {
-    if (!egl_lib) {
+    if (!egl_lib || --egl_load_refcount > 0) {
         return;
     }
+    egl_load_refcount = 0;
 #define SDLOP_EGL_SYM(rc, fn, params) SDLOP_EGL_##fn = NULL;
-    SDLOP_EGL_SYM(EGLDisplay, eglGetDisplay, (EGLNativeDisplayType))
-    SDLOP_EGL_SYM(EGLBoolean, eglInitialize, (EGLDisplay, EGLint *, EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglTerminate, (EGLDisplay))
-    SDLOP_EGL_SYM(EGLBoolean, eglChooseConfig, (EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *))
-    SDLOP_EGL_SYM(EGLContext, eglCreateContext, (EGLDisplay, EGLConfig, EGLContext, const EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglDestroyContext, (EGLDisplay, EGLContext))
-    SDLOP_EGL_SYM(EGLSurface, eglCreateWindowSurface, (EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglDestroySurface, (EGLDisplay, EGLSurface))
-    SDLOP_EGL_SYM(EGLBoolean, eglMakeCurrent, (EGLDisplay, EGLSurface, EGLSurface, EGLContext))
-    SDLOP_EGL_SYM(EGLBoolean, eglSwapBuffers, (EGLDisplay, EGLSurface))
-    SDLOP_EGL_SYM(EGLBoolean, eglSwapInterval, (EGLDisplay, EGLint))
-    SDLOP_EGL_SYM(const char *, eglQueryString, (EGLDisplay, EGLint))
-    SDLOP_EGL_SYM(EGLBoolean, eglQueryContext, (EGLDisplay, EGLContext, EGLint, EGLint *))
-    SDLOP_EGL_SYM(EGLBoolean, eglQuerySurface, (EGLDisplay, EGLSurface, EGLint, EGLint *))
-    SDLOP_EGL_SYM(EGLint, eglGetError, (void))
-    SDLOP_EGL_SYM(EGLBoolean, eglBindAPI, (EGLenum))
-    SDLOP_EGL_SYM(SDLOP_EGLProc, eglGetProcAddress, (const char *))
+#include "sdlop_egl_sym.h"
 #undef SDLOP_EGL_SYM
     dlclose(egl_lib);
     egl_lib = NULL;

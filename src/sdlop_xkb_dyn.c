@@ -39,15 +39,22 @@ bool SDLOP_Xkb_LoadSymbols(void)
 #define SDLOP_XKB_SYM(rc, fn, params)                                     \
     SDLOP_XKB_##fn = (SDLOP_DYNXKB_##fn)(uintptr_t)dlsym(xkb_lib, #fn);   \
     if (!SDLOP_XKB_##fn) {                                                \
+        if (ok) {                                                         \
+            SDL_SetError("Could not load symbol %s from %s", #fn, libname); \
+        }                                                                 \
         ok = false;                                                       \
     }
 #include "internal/sdlop_xkb_sym.h"
 #undef SDLOP_XKB_SYM
 
     if (!ok) {
+        /* leave no pointers into the closed library */
+#define SDLOP_XKB_SYM(rc, fn, params) SDLOP_XKB_##fn = NULL;
+#include "internal/sdlop_xkb_sym.h"
+#undef SDLOP_XKB_SYM
         dlclose(xkb_lib);
         xkb_lib = NULL;
-        return SDL_SetError("Could not load all libxkbcommon symbols from %s", libname);
+        return false; /* error already set: first missing symbol */
     }
     xkb_load_refcount = 1;
     return true;

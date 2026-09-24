@@ -70,6 +70,7 @@ typedef struct WaylandDeviceData
     struct
     {
         struct wl_output *output;
+        uint32_t name; /* registry name, for global_remove */
         int32_t scale;
     } outputs[SDLOP_MAX_OUTPUTS];
     int num_outputs;
@@ -1113,6 +1114,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, wl_output_interface.name) == 0 && d->num_outputs < SDLOP_MAX_OUTPUTS) {
         struct wl_output *o = wl_registry_bind(registry, name, &wl_output_interface, version < 4 ? version : 4);
         d->outputs[d->num_outputs].output = o;
+        d->outputs[d->num_outputs].name = name;
         d->outputs[d->num_outputs].scale = 1;
         d->num_outputs++;
         wl_output_add_listener(o, &output_listener, d);
@@ -1125,9 +1127,28 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
 
 static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name)
 {
-    (void)data;
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)registry;
-    (void)name;
+
+    for (int i = 0; i < d->num_outputs; i++) {
+        if (d->outputs[i].name != name) {
+            continue;
+        }
+        /* drop window references to the dying output first */
+        for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+            WaylandWindowData *wd = (WaylandWindowData *)w->driverdata;
+            if (wd && wd->output == d->outputs[i].output) {
+                wd->output = NULL; /* keeps its last scale until re-enter */
+            }
+        }
+        wl_output_destroy(d->outputs[i].output);
+        /* compact the list */
+        for (int j = i; j < d->num_outputs - 1; j++) {
+            d->outputs[j] = d->outputs[j + 1];
+        }
+        d->num_outputs--;
+        return;
+    }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -1193,16 +1214,18 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     if (wl_data.pointer) {
         wl_pointer_destroy(wl_data.pointer);
     }
+    for (int i = 0; i < wl_data.num_outputs; i++) {
+        wl_output_destroy(wl_data.outputs[i].output);
+        wl_data.outputs[i].output = NULL;
+    }
+    wl_data.num_outputs = 0;
     if (wl_data.seat) {
         if (wl_data.touch) {
             wl_touch_destroy(wl_data.touch);
             wl_data.touch = NULL;
         }
-        for (int i = 0; i < wl_data.num_outputs; i++) {
-            wl_output_destroy(wl_data.outputs[i].output);
-        }
-        wl_data.num_outputs = 0;
         wl_seat_destroy(wl_data.seat);
+        wl_data.seat = NULL;
     }
     if (wl_data.wm_base) {
         xdg_wm_base_destroy(wl_data.wm_base);

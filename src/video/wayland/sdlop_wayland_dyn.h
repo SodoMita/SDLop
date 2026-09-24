@@ -47,6 +47,8 @@ extern void SDLOP_Wayland_UnloadSymbols(void);
  * The #defines below rename both those definitions and every &wl_x_interface
  * reference in generated code and headers consistently. */
 #include "sdlop_wayland_sym.h"
+#undef SDLOP_WAYLAND_SYM
+#undef SDLOP_WAYLAND_INTERFACE
 
 #ifdef __cplusplus
 }

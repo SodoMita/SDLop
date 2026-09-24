@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
+option(SDLOP_SANITIZERS "Built with sanitizers (tweak leak checks for GPU tests)" OFF)
+
 project(SDLop VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
@@ -400,4 +402,12 @@ if(SDLop_BUILD_BENCHMARKS)
   add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
   target_link_libraries(bench_raw_latency PRIVATE sdlop)
   target_include_directories(bench_raw_latency PRIVATE src tests)
+endif()
+
+if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
+  # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
+  # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
+  # only - every other test keeps full leak checking
+  set_tests_properties(test_gl test_gl_matrix test_vulkan_compute
+    PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
 endif()

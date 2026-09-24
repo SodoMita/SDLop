@@ -186,6 +186,9 @@ int main(void)
     struct ctrl c;
     if (!ctrl_init(&c)) {
         printf("test_virtual_input: SKIP (compositor lacks wlr virtual-input protocols)\n");
+        if (c.dpy) {
+            wl_display_disconnect(c.dpy);
+        }
         return 0;
     }
 
@@ -196,6 +199,7 @@ int main(void)
     SDL_Window *w = SDL_CreateWindow("virtual input", 320, 240, 0);
     CHECK(w != NULL, "create window: %s", SDL_GetError());
     if (!w) {
+        wl_display_disconnect(c.dpy);
         SDL_Quit();
         return 1;
     }
@@ -203,6 +207,20 @@ int main(void)
     CHECK(s != NULL, "window surface: %s", SDL_GetError());
     if (s) {
         SDL_UpdateWindowSurface(w);
+    }
+
+    /* the scripted absolute coordinates below assume a 1280x720 logical
+     * output space (scale 1); skip cleanly instead of failing elsewhere */
+    for (int i = 0; i < 20; i++) {
+        SDL_PumpEvents();
+        SDL_Delay(5);
+    }
+    if (SDL_GetWindowDisplayScale(w) != 1.0f) {
+        printf("test_virtual_input: SKIP (output scale %g != 1)\n",
+               SDL_GetWindowDisplayScale(w));
+        wl_display_disconnect(c.dpy);
+        SDL_Quit();
+        return 0;
     }
 
     /* create the virtual devices; the compositor adds them to the seat,
@@ -319,6 +337,7 @@ int main(void)
     zwp_virtual_keyboard_v1_destroy(c.vkb);
     zwlr_virtual_pointer_v1_destroy(c.vptr);
     zwlr_virtual_pointer_manager_v1_destroy(c.vpm);
+    zwp_virtual_keyboard_manager_v1_destroy(c.vkm);
     wl_seat_destroy(c.seat);
     wl_display_flush(c.dpy);
     wl_display_disconnect(c.dpy);

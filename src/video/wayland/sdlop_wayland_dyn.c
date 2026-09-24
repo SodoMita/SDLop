@@ -14,6 +14,7 @@
 /* pointer definitions (SDLOP_WL_* names are not macro-affected) */
 #define SDLOP_WAYLAND_SYM(rc, fn, params) SDLOP_DYNWL_##fn SDLOP_WL_##fn = NULL;
 #include "sdlop_wayland_sym.h"
+#undef SDLOP_WAYLAND_SYM
 
 static void *wayland_lib = NULL;
 static int wayland_load_refcount = 0;
@@ -46,11 +47,16 @@ bool SDLOP_Wayland_LoadSymbols(void)
         ok = false;                                                                  \
     }
 #include "sdlop_wayland_sym.h"
+#undef SDLOP_WAYLAND_SYM
 
     if (!ok) {
+        /* leave no pointers into the closed library */
+#define SDLOP_WAYLAND_SYM(rc, fn, params) SDLOP_WL_##fn = NULL;
+#include "sdlop_wayland_sym.h"
+#undef SDLOP_WAYLAND_SYM
         dlclose(wayland_lib);
         wayland_lib = NULL;
-        return SDL_SetError("Could not load all libwayland-client symbols from %s", libname);
+        return false; /* error already set: first missing symbol */
     }
     wayland_load_refcount = 1;
     return true;
@@ -65,6 +71,7 @@ void SDLOP_Wayland_UnloadSymbols(void)
 
 #define SDLOP_WAYLAND_SYM(rc, fn, params) SDLOP_WL_##fn = NULL;
 #include "sdlop_wayland_sym.h"
+#undef SDLOP_WAYLAND_SYM
 
     dlclose(wayland_lib);
     wayland_lib = NULL;
