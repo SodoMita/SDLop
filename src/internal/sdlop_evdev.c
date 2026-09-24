@@ -60,7 +60,7 @@ typedef struct SDLOP_CallbackSet
 
 static struct
 {
-    bool running;
+    _Atomic bool running; /* worker loop flag: written by main, read by worker */
     pthread_t thread;
     int epoll_fd;
     int control_fd; /* eventfd used to wake the worker for shutdown */

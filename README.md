@@ -161,11 +161,19 @@ cmake --build build -j
 ctest --test-dir build            # headless tests
 ```
 
-Deps: `wayland-client`, `xkbcommon`, `egl`, `glesv2`, `wayland-protocols` +
-`wayland-scanner` (all standard on Wayland distros). Static `libsdlop.a` and
-shared `libSDLop.so` are produced. Link:
-`-lsdlop -lwayland-client -lxkbcommon -lEGL -lGLESv2 -lpthread -ldl`.
-libVulkan and libwayland-egl are `dlopen`-ed at runtime, not linked.
+Build deps: `wayland-protocols` + `wayland-scanner` (for the generated
+protocol code) and the `wayland-client`/`xkbcommon`/`EGL` **headers** — all
+standard on Wayland distros. Static `libsdlop.a` and shared `libSDLop.so`
+are produced.
+
+Runtime loading is SDL3-style dynamic: `libwayland-client.so.0`,
+`libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1` and `libvulkan.so.1`
+are all `dlopen`-ed on demand — nothing optional is linked
+(`objdump -p libSDLop.so` shows NEEDED: libc only). Apps link just
+`-lsdlop` (plus `-lpthread -ldl -lm` where the toolchain doesn't fold them
+into libc). Missing libs degrade gracefully: no wayland-client -> dummy
+video driver; no xkbcommon -> windowing still works. Override probe names
+with `SDLOP_LIB_WAYLAND` / `SDLOP_LIB_XKB` / `SDLOP_LIB_EGL`.
 
 Tests that need privileges/compositor skip cleanly:
 

@@ -5,5 +5,6 @@
 build/
 build-asan/
 build-ubsan/
+build-tsan/
 build-wextra/
 build-web/
