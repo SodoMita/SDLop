@@ -157,16 +157,26 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         printf("mini: sent pointer enter\n");
         fflush(stdout);
         if (M.touch) {
-            /* scripted touch sequence: down(50,60) -> motion(70,80) -> up, id 7 */
+            /* scripted two-finger sequence:
+             *   down7(50,60) -> down8(100,120) -> motion7(70,80) ->
+             *   motion8(140,160) -> up7 -> cancel (ends finger 8) */
             wl_touch_send_down(M.touch, serial, 0, M.surface_res, 7,
                                wl_fixed_from_double(50.0), wl_fixed_from_double(60.0));
             wl_touch_send_frame(M.touch);
-            wl_touch_send_motion(M.touch, 1, 7,
+            wl_touch_send_down(M.touch, serial, 1, M.surface_res, 8,
+                               wl_fixed_from_double(100.0), wl_fixed_from_double(120.0));
+            wl_touch_send_frame(M.touch);
+            wl_touch_send_motion(M.touch, 2, 7,
                                  wl_fixed_from_double(70.0), wl_fixed_from_double(80.0));
             wl_touch_send_frame(M.touch);
-            wl_touch_send_up(M.touch, wl_display_next_serial(M.display), 2, 7);
+            wl_touch_send_motion(M.touch, 3, 8,
+                                 wl_fixed_from_double(140.0), wl_fixed_from_double(160.0));
             wl_touch_send_frame(M.touch);
-            printf("mini: sent touch down/motion/up\n");
+            wl_touch_send_up(M.touch, wl_display_next_serial(M.display), 4, 7);
+            wl_touch_send_frame(M.touch);
+            wl_touch_send_cancel(M.touch);
+            wl_touch_send_frame(M.touch);
+            printf("mini: sent touch 2-finger sequence + cancel\n");
             fflush(stdout);
         }
     }

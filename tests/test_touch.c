@@ -140,16 +140,34 @@ int main(int argc, char *argv[])
         CHECK(down.last.tfinger.touchID != 0, "touchID is 0");
         CHECK(down.last.tfinger.windowID == SDL_GetWindowID(w), "windowID mismatch");
 
-        /* motion to (70,80): dx=20/320, dy=20/240 */
+        /* second finger goes down while finger 7 is still active
+         * (checks must follow wire order: pump_until consumes what it skips) */
+        finger_expect down2 = { SDL_EVENT_FINGER_DOWN, 100.0f / 320, 120.0f / 240, 0, 0, 1.0f, { 0 } };
+        CHECK(pump_until(pred_finger, &down2, 3000), "no FINGER_DOWN (finger 8) at (100,120)");
+        CHECK(down2.last.tfinger.fingerID == 8, "second fingerID != 8");
+
+        /* finger 7 moves while finger 8 is tracked independently:
+         * dx=20/320, dy=20/240 */
         finger_expect motion = { SDL_EVENT_FINGER_MOTION, 70.0f / 320, 80.0f / 240,
                                  20.0f / 320, 20.0f / 240, 1.0f, { 0 } };
-        CHECK(pump_until(pred_finger, &motion, 3000), "no FINGER_MOTION to (70,80) with dx=20,dy=20");
-        CHECK(motion.last.tfinger.fingerID == 7, "motion fingerID != 7");
+        CHECK(pump_until(pred_finger, &motion, 3000), "no FINGER_MOTION (finger 7) to (70,80) with dx=20,dy=20");
+        CHECK(motion.last.tfinger.fingerID == 7, "motion fingerID != 7 (tracking by id broken)");
+
+        /* finger 8 motion: dx=40/320, dy=40/240 */
+        finger_expect motion2 = { SDL_EVENT_FINGER_MOTION, 140.0f / 320, 160.0f / 240,
+                                  40.0f / 320, 40.0f / 240, 1.0f, { 0 } };
+        CHECK(pump_until(pred_finger, &motion2, 3000), "no FINGER_MOTION (finger 8) to (140,160)");
 
         /* up at the last known position, pressure 0 */
         finger_expect up = { SDL_EVENT_FINGER_UP, 70.0f / 320, 80.0f / 240, 0, 0, 0.0f, { 0 } };
         CHECK(pump_until(pred_finger, &up, 3000), "no FINGER_UP at (70,80)");
         CHECK(up.last.tfinger.fingerID == 7, "up fingerID != 7");
+
+        /* the compositor cancels the sequence: finger 8 gets FINGER_CANCELED
+         * at its last known position, pressure 0 */
+        finger_expect cancel = { SDL_EVENT_FINGER_CANCELED, 140.0f / 320, 160.0f / 240, 0, 0, 0.0f, { 0 } };
+        CHECK(pump_until(pred_finger, &cancel, 3000), "no FINGER_CANCELED (finger 8)");
+        CHECK(cancel.last.tfinger.fingerID == 8, "cancel fingerID != 8");
 
         SDL_DestroyWindowSurface(w);
         SDL_DestroyWindow(w);
