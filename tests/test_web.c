@@ -99,6 +99,7 @@ static void test_keymap_table(void)
     CHECK(strcmp(SDL_GetKeyName(SDLK_ESCAPE), "Escape") == 0, "name of ESCAPE");
 }
 
+__attribute__((unused)) /* kept for interactive debugging of the web shell */
 static bool poll_key(SDL_Scancode sc, bool want_down, const char **text_out)
 {
     bool found = false;

@@ -174,6 +174,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
 
 static void surface_frame(struct wl_client *client, struct wl_resource *res, uint32_t callback_id)
 {
+    (void)res;
     struct wl_resource *cb = wl_resource_create(client, &wl_callback_interface, 1, callback_id);
     wl_callback_send_done(cb, 0);
     wl_resource_destroy(cb);

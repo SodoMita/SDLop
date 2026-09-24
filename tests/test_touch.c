@@ -133,7 +133,7 @@ int main(int argc, char *argv[])
         }
 
         /* down at (50,60)/320x240 */
-        finger_expect down = { SDL_EVENT_FINGER_DOWN, 50.0f / 320, 60.0f / 240, 0, 0, 1.0f, { { 0 } } };
+        finger_expect down = { SDL_EVENT_FINGER_DOWN, 50.0f / 320, 60.0f / 240, 0, 0, 1.0f, { 0 } };
         CHECK(pump_until(pred_finger, &down, 3000), "no FINGER_DOWN at (0.15625,0.25)");
         CHECK(down.last.tfinger.fingerID == 7, "fingerID %llu != 7",
               (unsigned long long)down.last.tfinger.fingerID);
@@ -142,12 +142,12 @@ int main(int argc, char *argv[])
 
         /* motion to (70,80): dx=20/320, dy=20/240 */
         finger_expect motion = { SDL_EVENT_FINGER_MOTION, 70.0f / 320, 80.0f / 240,
-                                 20.0f / 320, 20.0f / 240, 1.0f, { { 0 } } };
+                                 20.0f / 320, 20.0f / 240, 1.0f, { 0 } };
         CHECK(pump_until(pred_finger, &motion, 3000), "no FINGER_MOTION to (70,80) with dx=20,dy=20");
         CHECK(motion.last.tfinger.fingerID == 7, "motion fingerID != 7");
 
         /* up at the last known position, pressure 0 */
-        finger_expect up = { SDL_EVENT_FINGER_UP, 70.0f / 320, 80.0f / 240, 0, 0, 0.0f, { { 0 } } };
+        finger_expect up = { SDL_EVENT_FINGER_UP, 70.0f / 320, 80.0f / 240, 0, 0, 0.0f, { 0 } };
         CHECK(pump_until(pred_finger, &up, 3000), "no FINGER_UP at (70,80)");
         CHECK(up.last.tfinger.fingerID == 7, "up fingerID != 7");
 

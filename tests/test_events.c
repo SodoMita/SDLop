@@ -145,8 +145,10 @@ int main(void)
     float mx = -1, my = -1;
     SDL_MouseButtonFlags b = SDL_GetMouseState(&mx, &my);
     assert(mx == 100.0f && my == 50.0f);
+    assert(b == 0); /* no buttons pressed yet */
     float rx = 0, ry = 0;
     b = SDL_GetRelativeMouseState(&rx, &ry);
+    assert(b == 0);
     assert(rx == 10.0f && ry == 5.0f);
     /* accumulators are cleared by the query */
     SDL_GetRelativeMouseState(&rx, &ry);
@@ -166,6 +168,7 @@ int main(void)
     }
     assert(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK);
     SDLOP_SendMouseButton(false, SDL_BUTTON_LEFT, 0, 0, 0);
+    assert(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK)); /* released */
     SDL_FlushEvent(SDL_EVENT_MOUSE_BUTTON_UP);
 
     /* --- window close request + quit event --- */

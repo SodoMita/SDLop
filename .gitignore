@@ -4,4 +4,6 @@
 *.so.*
 build/
 build-asan/
+build-ubsan/
+build-wextra/
 build-web/
