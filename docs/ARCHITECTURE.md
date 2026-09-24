@@ -1,0 +1,317 @@
+# Architecture
+
+SDLop is one library of small modules with a single internal contract
+(`src/sdlop_internal.h`). Nothing in `src/` includes another module's private
+header: a module either implements public SDL3 API, or exposes `SDLOP_*` helpers
+through the internal header.
+
+```
+                    public API (include/SDL3/*.h, SDL3 3.2.10 names & signatures)
+                                        |
+  +----------------+----------------+---+------------+----------------+-----------+
+  | src/core       | src/timer      | src/events      | src/input     | src/video |
+  | stdinc, error  | ticks, perf    | queue, filters  | async worker  | windows,  |
+  | log, assert    | counter,       | watchers, wait  | record->event | displays, |
+  | properties,    | SDL_AddTimer   | (poll+wakeup fd)| translation   | surfaces  |
+  | hints, init    |                |                 |               |           |
+  +----------------+----------------+-----------------+---------------+-----------+
+                                        |
+                              SDLOP_* internal contract
+                                        |
+             +--------------------------+---------------------------+
+             |                          |                           |
+      src/video/SDL_wayland.c    src/video/SDL_offscreen.c   src/gl/SDL_egl.c
+      src/video/SDL_vulkan.c                                 (SDL_GL_*)
+```
+
+## 1. The video driver vtable
+
+Everything platform-specific about windowing is one struct with function
+pointers (`SDLOP_VideoDriver`): init/quit, create/destroy/show/hide a window,
+resize/maximize/minimize/restore, present, cursor, displays, and two hooks the
+event loop needs —
+
+* `get_event_fd()` / `prepare_read()` — a descriptor `poll()` can block on (the
+  Wayland socket) plus the call a backend must make immediately before blocking
+  (Wayland has to flush its outgoing queue and claim the connection's read flag,
+  or it can deadlock while events sit unflushed);
+* `pump_events()` — drain whatever the platform has queued and turn it into
+  `SDL_Event`s (`SDLOP_OnWindow*` helpers keep window state and events in sync).
+  A backend that owns a socket has to *read* it here, not only in the blocking
+  wait: an application that only ever calls `SDL_PollEvent()` would otherwise
+  never read, the compositor's small outgoing queue would fill up, and it would
+  drop the client;
+* `get_event_timeout_ns()` — "I have work to do at a time of my own choosing",
+  currently used by Wayland's key repeat so a blocked `SDL_WaitEvent()` wakes up
+  in time for the next repeat instead of sleeping through it.
+
+`SDL_PumpEvents()` is a fixed sequence:
+
+```c
+SDLOP_VideoPumpEvents();        /* platform events: window state first */
+SDLOP_PumpRawInput();           /* then the async input records */
+SDLOP_RunMainThreadCallbacks(); /* then anything queued for this thread */
+SDLOP_RunTimerCallbacks();
+```
+
+The order matters: an input record may reference a window, so the window state a
+compositor sent (resize, focus, scale) is applied before the record is translated.
+
+Backends currently: **wayland** (xdg-shell + `wl_shm` XRGB8888 buffers with
+viewporter scaling, `wl_surface_frame` pacing, cursor-shape-v1, pointer
+constraints and the relative pointer; EGL window for GL; Vulkan surface
+creation) and **offscreen** (a window that is a pixel buffer — used by the tests
+and by headless CI). The backend list is compiled per availability; a build with
+`WAYLAND=0` still produces a complete library with `offscreen` alone.
+
+### Displays: a burst of events, closed by `wl_output.done`
+
+A Wayland output is not described by one object: `wl_output` carries the mode,
+the physical geometry and the scale, while `zxdg_output_v1` carries the position
+and size in the *global compositing space* — the only place display coordinates
+exist at all. Each batch ends with `wl_output.done`, and when an `xdg_output` is
+attached the compositor sends **two** of them (one for each object's events), so
+the completion condition is
+
+```c
+event_await_count = 1 + (xdg_output != NULL);
+```
+
+`zxdg_output_v1.done` itself is deprecated from manager version 3 on and newer
+compositors (sway) never send it, which is why the counting is on
+`wl_output.done`. Once a burst is complete the display is recomputed from the raw
+fields (they are never mutated in place, so a repeated burst is idempotent):
+
+* the *logical* size is what SDL reports — a `1024x768` output at scale 2 is a
+  `512x384` display;
+* the display's native scale factor is `native_width / logical_width` when
+  viewporter is available (that ratio is also the only way to see a fractional
+  scale), else the integer `wl_output.scale`;
+* the desktop/current mode is the logical size with `pixel_density` set to that
+  factor, plus the native mode as a fullscreen mode;
+* with `SDL_HINT_VIDEO_WAYLAND_SCALE_TO_DISPLAY` the desktop, the bounds and the
+  content scale switch to physical pixels instead. This is SDL3's model on the
+  nose: **without the hint `SDL_GetDisplayContentScale()` stays 1.0**, and the
+  display stays in logical coordinates.
+
+#### Which output is a window on?
+
+`wl_surface.enter`/`leave` are the only authority on that: the compositor decides
+where a toplevel is shown, so a window tracks the outputs it entered (a small
+array on the window, oldest first) and reports the *last* one as its display —
+exactly SDL3's rule, including the fullscreen exception (a fullscreen window
+belongs to the output it went fullscreen on, which is the first `enter`). The
+position it publishes is that display's top-left, because Wayland has no window
+position and applications (and their mouse math) expect the window's position to
+be inside the display it claims to be on.
+
+Everything else follows from that: an unplugged output is dropped from every
+window's list *before* the display is removed, so the display removal then
+re-homes the window onto a surviving display; and a window that is on no output
+at all (minimized) keeps the display it had, again as in SDL3. The core's
+`SDL_GetDesktopDisplayMode()` asks the backend (`get_display_mode`) when a
+display has no mode yet, which is the normal state between
+`SDL_EVENT_DISPLAY_ADDED` and the first complete event burst.
+
+Display *names* are resolved once, on that first complete burst, in SDL3's order:
+`wl_output.description` ("Dell Inc. DELL U2720Q"), else the `zxdg_output_v1`
+description (pre-v4 compositors only — it is deprecated from v4 on), else the
+`wl_output.geometry()` model string, else the connector name. A later event must
+not be able to rename a display the application already has an ID for, and a
+display that has not been described yet sits at 0,0 with no mode rather than at
+an invented offset.
+
+Window scale has three layers, mirroring SDL3:
+
+| value | where | meaning |
+|---|---|---|
+| `display->scale` | `SDLOP_Display` | native factor of the output |
+| `display->content_scale` | `SDLOP_Display` | what `SDL_GetDisplayContentScale()` returns (1.0 unless scale-to-display) |
+| `window->scale_factor` | `SDL_Window` | native factor of the display the window is on |
+| `window->display_scale` | `SDL_Window` | the scale the window *renders* at: `scale_factor` only with `SDL_WINDOW_HIGH_PIXEL_DENSITY` (or scale-to-display), else 1.0 |
+
+`window->pixel_w/h` is `w/h * display_scale` and the window surface follows it, so
+`SDL_GetWindowSizeInPixels()` and `SDL_GetWindowSize()` differ exactly when the
+application asked them to. Unplugging an output removes its display
+(`registry_global_remove`), re-homes its windows and never reuses the ID; output
+slots in the backend array are never compacted because the compositor holds a
+pointer to the slot as its listener data.
+
+### Pointer constraints: locking and confining the cursor
+
+Wayland has no `XWarpPointer` and no global pointer grab; what it has is
+`zwp_pointer_constraints_v1` (lock/confine the pointer to a surface) and
+`zwp_relative_pointer_v1` (unaccelerated deltas of a locked pointer). Both are
+bound when the compositor advertises them:
+
+* **relative mouse mode** locks the pointer on every window and reports the
+  relative pointer's *unaccelerated* deltas as `SDL_EVENT_MOUSE_MOTION` with
+  `xrel/yrel` set — nothing is clamped, scaled or accelerated on the way;
+* **`SDL_SetWindowMouseGrab`** and **`SDL_SetWindowMouseRect`** confine the
+  pointer (the rect becomes a `wl_region`, and the confine is committed because
+  the region is double buffered);
+* a surface may be locked *or* confined, never both, so every transition
+  destroys the other object first — that is a protocol error otherwise, and it is
+  the reason `relative off` re-confines a grabbed window;
+* without the protocols relative mode still works in the degraded form the
+  backend had before: deltas are derived from the absolute pointer position.
+
+## 2. Input: an async producer instead of a synchronous pump
+
+The input path follows [asyncinput](https://github.com/CoCkMelon/asyncinput)
+rather than SDL3's "read devices when the application pumps" model.
+
+```
+ /dev/input/event*            worker thread                    main thread
+ -----------------            -------------                    -----------
+ epoll_wait  -------------->  struct input_event
+                              (kernel CLOCK_MONOTONIC timestamp)
+                                    |
+                              convert to ticks domain (offset captured at start)
+                                    |
+                              SDLOP_RawInputRecord {kind, code, value, ts, device}
+                                    |
+                              lock-free SPSC ring (64-byte aligned head/tail)
+                                    v
+                             SDLOP_PumpRawInput()  <----- SDL_PumpEvents()
+                                    |
+                              SDLOP_ScancodeFromEvdevKeycode[code]   (generated table)
+                                    |
+                              SDL_Event -> event queue -> SDL_PollEvent()
+```
+
+Design points:
+
+* **One worker, epoll, no libudev.** Devices are found by scanning
+  `/dev/input/event*` and are re-scanned once a second, so hot-plug works without
+  a udev dependency. `epoll_event.data.ptr` points straight at the device, so the
+  wakeup needs no lookup.
+* **Kernel timestamps.** The worker asks for `CLOCK_MONOTONIC` (`EVIOCSCLOCKID`)
+  and converts to the library's tick domain with an offset captured at start, so
+  an event's timestamp is when the hardware generated it — not when the app got
+  around to pumping.
+* **No allocation on the hot path.** Records are fixed-size values in a ring;
+  the ring's head/tail are `_Atomic` and live on separate cache lines.
+* **Zero syscalls when nobody is waiting.** The worker wakes a blocked
+  `SDL_WaitEvent()` through an eventfd; producers only pay for that write when a
+  thread has actually parked, which is what makes the polling case a pure
+  user-space round trip (see [PERFORMANCE.md](PERFORMANCE.md)).
+* **Testability without hardware.** `SDLOP_TEST_INPUT=<fifo>` starts a reader
+  thread that accepts `EV_KEY|EV_REL|EV_ABS <code> <value> [device] [ts]` lines
+  and pushes them through the *same* ring, so the whole translation path is
+  covered by `tests/test_input.c` on a machine with no `/dev/input` at all. The
+  planned X11 backend slots into the same place as a second producer.
+
+Translation (`src/input/SDL_input.c`) is table-driven: `sdlop_scancode_from_evdev`
+maps Linux keycodes to SDL scancodes (generated from upstream's
+`scancodes_linux.h`, so keypad and media keys match SDL3 exactly), and the
+keycode/modifier layer adds shift state, `SDL_GetModState()` bookkeeping, repeat
+gating on text input being active, and UTF-8 text synthesis.
+
+### Keycodes and text: the layout
+
+SDL scancodes are physical keys, but the *keycode* (`event.key.key`) and the text
+a key types depend on the keyboard layout. A backend can therefore register a
+layout:
+
+```c
+typedef struct SDLOP_KeyLayout
+{
+    void (*update_key)(Uint32 evdev_code, bool down);          /* sees every key event */
+    SDL_Keycode (*keycode_from_evdev)(Uint32 evdev_code);      /* e.g. 'A' with shift held */
+    int (*text_from_evdev)(Uint32 evdev_code, char *buf, size_t n);
+} SDLOP_KeyLayout;
+```
+
+`update_key` exists because of the async design: keys normally reach SDL from the
+evdev worker, not from the compositor, so a layout cannot assume anybody else is
+feeding it the modifier state — it has to follow the keys the application
+actually sees. The Wayland backend registers an xkbcommon layout, compiled from,
+in order of preference:
+
+1. `SDLOP_WAYLAND_KEYMAP=<file>` — an explicit XKB keymap file (debugging, or a
+   compositor that sends the wrong one);
+2. the compositor's `wl_keyboard.keymap`;
+3. the local XKB configuration (`XKB_DEFAULT_LAYOUT` and friends) — what a
+   headless or KMS compositor that never sends a keymap gets
+   (`xkb_keymap_new_from_names`);
+4. nothing: SDL's built-in tables derive text and keycodes from scancodes.
+
+A layout that is registered also has the final say on text: if it says a key
+types nothing (a modifier, a dead key), no text is invented from the keycode.
+Text is only sent on press, never while Ctrl or Alt is held, and only for
+applications that turned text input on — SDL3's rules.
+
+Key repeat is a client-side duty on Wayland (`wl_keyboard` never sends repeats):
+`repeat_info` gives the rate and delay, `xkb_keymap_key_repeats()` says whether a
+key repeats at all, and the pump emits the repeats, with the backend timer above
+making sure a blocked wait still wakes up for them.
+
+## 3. Event queue and waiting
+
+A fixed 512-event ring guarded by one mutex, plus a condition variable and a
+wakeup eventfd:
+
+* `SDL_PushEvent` takes the lock, appends, and — **only if a thread is parked** —
+  broadcasts and writes the eventfd. When nobody is waiting, it touches neither.
+* `SDL_PollEvent` pumps, then pops one event under the lock.
+* `SDL_WaitEvent[_Timeout]` pumps, pops, and otherwise parks in `poll()` over
+  {platform event fd, wakeup fd} (or on the condition variable when a backend has
+  no descriptor), with the next timer deadline as the timeout. Because input
+  arrives through the wakeup fd, a waiting application wakes on the event itself.
+* A fixed queue is a deliberate choice: it is a bounded, predictable amount of
+  memory, and overflow is reported ("Event queue is full") rather than turning
+  into unbounded growth in a frame where the app is too busy to pump.
+
+`SDLOP_RunMainThreadCallbacks()` and `SDLOP_RunTimerCallbacks()` are called from
+every pump, so each has an atomic fast path that returns without touching a lock
+or the clock when there is nothing queued and no timer exists.
+
+## 4. Generated code and upstream data
+
+Nothing that is *data* is hand-written; `make regen` rebuilds it:
+
+| generated file | generator | source |
+|---|---|---|
+| `include/SDL3/*.h` (19 of 24) | `tools/sdlop.py` | upstream headers + keep/drop lists |
+| `src/generated/sdlop_keynames.h` | `tools/gen_keynames.py` | `SDL_keycode.h`, `SDL_scancode.h`, `SDL_scancode_names[]` |
+| `src/generated/sdlop_evdev.h` | `tools/gen_evdev.py` | upstream `src/events/scancodes_linux.h` |
+| `src/generated/sdlop_pixelformats.h` | `tools/gen_pixelformats.py` | `SDL_pixelformat.h` |
+| `src/generated/*-protocol.{c,h}` | `wayland-scanner` | wayland-protocols XMLs |
+
+`tools/reference/` keeps the upstream inputs so a regeneration needs no network.
+`tools/check_api.py` re-derives the declaration set from the SDLop headers with
+clang and diffs it against `/usr/include/SDL3/` — that is the guard that the
+"same API" promise still holds, and (with `--lib`) that every function the
+headers declare is actually exported by the built library.
+
+## 5. Rendering surfaces
+
+The library creates surfaces but never draws into them:
+
+* `SDL_GetWindowSurface` gives a software surface the app can fill and blit
+  (`SDL_UpdateWindowSurface` marks it dirty and the backend presents it — a
+  Wayland `wl_shm` buffer attach/commit, a no-op on `offscreen`).
+* `SDL_GL_*` goes through `src/gl/SDL_egl.c`: all fourteen EGL entry points are
+  resolved with `dlsym` from a `dlopen`ed `libEGL.so.1` (the library itself links
+  no EGL at all, so the `DT_NEEDED` set stays `libc libm libwayland-client
+  libwayland-egl libxkbcommon` + the loader), and the platform display is Wayland.
+  The window's `wl_egl_window` is created on demand and kept on the window.
+* `SDL_Vulkan_*` goes through `src/video/SDL_vulkan.c`, which `dlopen`s the
+  Vulkan loader (`libvulkan.so.1` or `SDL_HINT_VULKAN_LIBRARY`), exposes
+  `{VK_KHR_surface, VK_KHR_wayland_surface}` and calls `vkCreateWaylandSurfaceKHR`
+  on the window's `wl_surface`. No Vulkan headers are needed to build: the three
+  types come from `SDL_vulkan.h` and the entry points are looked up by name.
+
+## 6. Conventions
+
+* C11, no C++, no exceptions/exits: every entry point returns a `bool` and calls
+  `SDL_SetError` (or `SDL_InvalidParamError`) on failure, exactly like SDL3.
+* `SDL_InvalidParamError("name")` and `SDL_Unsupported()` are macros taking
+  *quoted literals*.
+* Allocation goes through `SDLOP_Alloc/Calloc/Realloc/Free` so a host can later
+  replace the allocator in one place; nothing is allocated on an input or event
+  hot path.
+* Threads are `pthread`s (the SDLop build assumes a POSIX host for now); the
+  Windows/macOS ports will provide their own worker implementations behind the
+  same ring interface.

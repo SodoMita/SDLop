@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: sdl3-sdlop
+Description: SDLop - lean reimplementation of the SDL3 API (window, input, timing)
+Version: @VER@
+Libs: -L${libdir} -lsdlop
+Libs.private: -lpthread -ldl -lm
+Cflags: -I${includedir}

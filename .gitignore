@@ -1,0 +1,11 @@
+# Build output
+build/
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
+
+# Test rig logs (the Wayland rigs write these under /tmp, but a redirected run
+# can drop them here)
+*.log
