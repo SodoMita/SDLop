@@ -88,6 +88,7 @@ void SDLOP_RemoveWindow(SDL_Window *window)
     }
     if (sdlop.mouse_focus == window) {
         sdlop.mouse_focus = NULL;
+        sdlop.mouse_has_position = false;
     }
     if (sdlop.relative_mode_window == window) {
         sdlop.relative_mode_window = NULL;

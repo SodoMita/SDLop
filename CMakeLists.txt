@@ -417,6 +417,14 @@ if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
   add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
 endif()
 
+# API subset gate: every SDL_* symbol exported by SDLop must also be exported
+# by stock SDL3 (strict-subset property). Skipped when no reference .so given.
+if (SDL3_REFERENCE_LIB AND NOT EMSCRIPTEN)
+  add_test(NAME api_subset_check
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_subset_check.sh
+                   $<TARGET_FILE:sdlop_shared> ${SDL3_REFERENCE_LIB})
+endif()
+
 if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests

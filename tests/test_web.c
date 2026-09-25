@@ -95,7 +95,8 @@ static void test_keymap_table(void)
     /* names */
     CHECK(strcmp(SDL_GetScancodeName(SDL_SCANCODE_RETURN), "Return") == 0,
           "name of RETURN is '%s'", SDL_GetScancodeName(SDL_SCANCODE_RETURN));
-    CHECK(strcmp(SDL_GetKeyName(SDLK_w), "w") == 0, "name of SDLK_w");
+    /* stock SDL3 names a letter key by its printed (capital) letter */
+  CHECK(strcmp(SDL_GetKeyName(SDLK_w), "W") == 0, "name of SDLK_w");
     CHECK(strcmp(SDL_GetKeyName(SDLK_ESCAPE), "Escape") == 0, "name of ESCAPE");
 }
 

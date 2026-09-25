@@ -122,6 +122,8 @@ typedef struct SDLop_Globals
 
     /* mouse state */
     float mouse_x, mouse_y;         /* window-relative position */
+    float mouse_last_x, mouse_last_y; /* last reported position (for deltas) */
+    bool mouse_has_position;        /* false until first motion after focus change */
     float mouse_xrel_acc, mouse_yrel_acc; /* accumulators for GetRelativeMouseState */
     SDL_MouseButtonFlags mouse_buttons;
     SDL_Window *relative_mode_window;
