@@ -35,6 +35,23 @@ TMP=${TMPDIR:-/tmp}/behaviour-check
 
 fail=0
 ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
+
+# Ask the X server which layout it actually has. setxkbmap can exit 0 without the
+# server changing anything (seen on an X server that refuses XkbSetMap: the
+# command reports "Applied rules", the keymap stays as it was), and the layout
+# this rig compares is the whole point of the second leg - so the layout is
+# verified rather than assumed.
+current_layout()
+{
+    setxkbmap -query 2>/dev/null | sed -n 's/^layout:[[:space:]]*//p' | head -1
+}
+
+layout_took()   # layout_took <layout>
+{
+    setxkbmap "$1" 2>/dev/null || return 1
+    sleep 0.2
+    [ "$(current_layout)" = "$1" ]
+}
 bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
 skip() { printf '  SKIP  %s\n' "$1"; }
 note() { printf '  note  %s\n' "$1"; }
@@ -101,6 +118,10 @@ drive()
     # buttons whose keycodes do not depend on the layout.
     setxkbmap "$switch_to"
     sleep 0.4
+    # (If the server ignores the switch, the "both probes announced the live
+    # layout switch" assertion in compare() is what notices: setxkbmap still
+    # rewrites the root property, so an implementation that watches the keymap
+    # change *and* one that watches the property both have to answer.)
     xdotool click 1
     sleep 0.15
     xdotool mousemove --sync $((cx + 25)) $((cy + 15))
@@ -276,6 +297,14 @@ compare()
     layout=$1; tag=$2
     sdlop="$TMP/trace_sdlop$tag.txt"; stock="$TMP/trace_stock$tag.txt"
     printf '\n== layout %s\n' "$layout"
+    # Refuse to compare a leg the server did not actually switch to: both traces
+    # would come from the default layout, the diff would pass, and the thing this
+    # leg exists for - a layout whose symbols and dead keys are not US - would not
+    # have been tested at all. That is the failure mode this check is for.
+    if ! layout_took "$layout"; then
+        skip "this X server did not switch to '$layout' (it reports '$(current_layout)'): setxkbmap exits 0 but the keymap does not change here, so the leg would compare the default layout with itself"
+        return
+    fi
     run_one "$BUILD/tools/behaviour_sdlop" SDLop "$layout" "$sdlop" || return
     if [ "$HAVE_STOCK" != 1 ]; then
         skip "stock SDL3 development files are not installed - SDLop trace in $sdlop"
