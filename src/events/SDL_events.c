@@ -24,6 +24,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #define SDLOP_MAX_WATCHES 16
 #define SDLOP_EVENT_RANGE_BITS 0x10000
@@ -54,6 +55,79 @@ static Uint32 sdlop_next_user_event = SDL_EVENT_USER;
 static Uint32 sdlop_max_user_event = SDL_EVENT_USER;
 
 static int sdlop_wakeup_fd = -1;
+
+/* SDL3 turns SIGINT and SIGTERM into SDL_EVENT_QUIT instead of letting the
+   process die on the spot, so an application gets to shut down cleanly - Ctrl+C
+   in a windowed program is a request, not a kill. A signal handler may only
+   touch async-signal-safe things, hence the flag plus the wakeup eventfd: a
+   thread blocked in SDL_WaitEvent() is woken by it and finds the event. */
+static volatile sig_atomic_t sdlop_quit_signalled;
+
+static void sdlop_signal_handler(int sig)
+{
+    (void)sig;
+    sdlop_quit_signalled = 1;
+    SDLOP_SignalWakeup();          /* async-signal-safe: a write to the wakeup fd */
+}
+
+/* Only a signal that nobody is handling is taken over: an application that
+   installed its own handler keeps it (and gets the signal), which is what SDL3
+   does and what an application embedding the library would expect. */
+static void sdlop_install_signal(int sig)
+{
+    struct sigaction action;
+
+    if (sigaction(sig, NULL, &action) != 0 || action.sa_handler != SIG_DFL) {
+        return;
+    }
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = sdlop_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;           /* poll() must be interrupted, not restarted */
+    sigaction(sig, &action, NULL);
+}
+
+static void sdlop_uninstall_signal(int sig)
+{
+    struct sigaction action;
+
+    if (sigaction(sig, NULL, &action) != 0 || action.sa_handler != sdlop_signal_handler) {
+        return;                    /* somebody replaced it: leave theirs alone */
+    }
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    sigaction(sig, &action, NULL);
+}
+
+void SDLOP_InstallSignalHandlers(void)
+{
+    if (SDL_GetHintBoolean(SDL_HINT_NO_SIGNAL_HANDLERS, false)) {
+        return;                    /* the application wants the default behaviour */
+    }
+    sdlop_install_signal(SIGINT);
+    sdlop_install_signal(SIGTERM);
+}
+
+void SDLOP_QuitSignalHandlers(void)
+{
+    sdlop_uninstall_signal(SIGINT);
+    sdlop_uninstall_signal(SIGTERM);
+}
+
+void SDLOP_QueueSignalQuit(void)
+{
+    SDL_Event event;
+
+    if (!sdlop_quit_signalled) {
+        return;
+    }
+    sdlop_quit_signalled = 0;
+    memset(&event, 0, sizeof(event));
+    event.type = SDL_EVENT_QUIT;
+    event.common.timestamp = SDL_GetTicksNS();
+    SDL_PushEvent(&event);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Wakeup descriptor                                                         */
@@ -198,10 +272,14 @@ void SDLOP_InitEvents(void)
     sdlop_next_user_event = SDL_EVENT_USER;
     sdlop_max_user_event = SDL_EVENT_USER;
     SDLOP_InitWakeup();
+    /* Ctrl+C becomes an event, so an application can shut down in an orderly
+       way (SDL_HINT_NO_SIGNAL_HANDLERS restores the default death). */
+    SDLOP_InstallSignalHandlers();
 }
 
 void SDLOP_QuitEvents(void)
 {
+    SDLOP_QuitSignalHandlers();
     SDLOP_FlushEventsInternal(SDL_EVENT_FIRST, SDL_EVENT_LAST);
     SDLOP_QuitWakeup();
 }
@@ -441,6 +519,20 @@ bool SDL_PollEvent(SDL_Event *event)
 {
     bool ret = false;
 
+    /* An event that is already queued is handed out without pumping first: the
+       pump is the expensive part of the call (poll(2) on the backends'
+       descriptors, the input ring, the due timers), and a queue that has an
+       event in it has just been pumped. SDL_PollEvent is called once per event,
+       so this is the difference between a tight loop that costs a pump per
+       event and one that does not. */
+    pthread_mutex_lock(&sdlop_queue_lock);
+    if (event && sdlop_queue_count > 0) {
+        sdlop_queue_pop_front(event);
+        pthread_mutex_unlock(&sdlop_queue_lock);
+        return true;
+    }
+    pthread_mutex_unlock(&sdlop_queue_lock);
+
     SDL_PumpEvents();
 
     pthread_mutex_lock(&sdlop_queue_lock);
@@ -563,6 +655,9 @@ void SDL_FilterEvents(SDL_EventFilter filter, void *userdata)
 
 void SDL_PumpEvents(void)
 {
+    /* A signal that arrived since the last pump becomes SDL_EVENT_QUIT (see the
+       signal handling above). */
+    SDLOP_QueueSignalQuit();
     /* Platform events first: they carry window state that input events refer to. */
     SDLOP_VideoPumpEvents();
     /* Then the async raw-input records handed over by the input thread. */

@@ -10,8 +10,9 @@
       SDL_Vulkan_GetPresentationSupport
 
   The Vulkan loader is dlopen()ed on demand (there is no link-time dependency on
-  libvulkan), exactly like SDL3 does, and the surface is created through the
-  window's Wayland surface with vkCreateWaylandSurfaceKHR.
+  libvulkan), exactly like SDL3 does, and everything platform specific is asked of
+  the video driver: it knows its surface extension, its vkCreate*SurfaceKHR and
+  its native handles, so this file is the same on Wayland and on X11.
 
   Nothing here needs the Vulkan headers: SDL_vulkan.h defines VkInstance,
   VkPhysicalDevice, VkSurfaceKHR and struct VkAllocationCallbacks itself, and the
@@ -23,41 +24,21 @@
 
 #include <SDL3/SDL_vulkan.h>
 
-#ifdef SDLOP_HAVE_WAYLAND
-#include <wayland-client.h>
-#endif
-
 #include <dlfcn.h>
 
 /* ---------------------------------------------------------------- Vulkan ABI */
 
-#define VK_SUCCESS 0
-#define VK_INCOMPLETE 5
+/* Only the pieces every backend needs live here: the created-surface and
+   presentation-support functions are per platform, so each backend declares its
+   own (see SDL_wayland.c and SDL_x11.c). No Vulkan headers are required - the
+   loader is dlopen()ed and its entry points are looked up by name, so the build
+   works on a machine that has no Vulkan SDK at all. */
 
-#define VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR 1000008000
-#define VK_KHR_SURFACE_EXTENSION_NAME "VK_KHR_surface"
-#define VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME "VK_KHR_wayland_surface"
+#define VK_SUCCESS 0
 
 typedef void *(*PFN_vkGetInstanceProcAddr)(VkInstance instance, const char *name);
-typedef int (*PFN_vkCreateWaylandSurfaceKHR)(VkInstance instance,
-                                            const void *create_info,
-                                            const struct VkAllocationCallbacks *allocator,
-                                            VkSurfaceKHR *surface);
 typedef void (*PFN_vkDestroySurfaceKHR)(VkInstance instance, VkSurfaceKHR surface,
                                         const struct VkAllocationCallbacks *allocator);
-typedef bool (*PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR)(VkPhysicalDevice physical_device,
-                                                                     Uint32 queue_family_index,
-                                                                     struct wl_display *display);
-
-/* struct VkWaylandSurfaceCreateInfoKHR */
-typedef struct
-{
-    Uint32 sType;
-    const void *pNext;
-    Uint32 flags;
-    struct wl_display *display;
-    struct wl_surface *surface;
-} SDLOP_VkWaylandSurfaceCreateInfoKHR;
 
 /* ------------------------------------------------------------- loader state */
 
@@ -68,7 +49,7 @@ static PFN_vkGetInstanceProcAddr sdlop_vk_get_instance_proc_addr;
 
 #define SDLOP_VULKAN_DEFAULT "libvulkan.so.1"
 
-static const char *sdlop_vulkan_result_string(int result)
+static const char *sdlop_vulkan_result_string_impl(int result)
 {
     switch (result) {
     case -1: return "VK_ERROR_OUT_OF_HOST_MEMORY";
@@ -88,17 +69,24 @@ static const char *sdlop_vulkan_result_string(int result)
     return "unknown error";
 }
 
-/* SDLop presents through Wayland; anything else has no WSI functions,
-   which is what SDL3 reports as "Vulkan is not supported by the <driver> driver".*/
+const char *SDLOP_VulkanResultString(int result)
+{
+    return sdlop_vulkan_result_string_impl(result);
+}
+
+/* A driver supports Vulkan when it can create a surface and name the instance
+   extensions it needs - the same three hooks the public API below is built on.
+   Offscreen has none of them, which is exactly SDL3's "Vulkan is not supported by
+   the <driver> driver". */
 static bool sdlop_vulkan_supported(void)
 {
-#ifdef SDLOP_HAVE_WAYLAND
-    const char *driver = SDL_GetCurrentVideoDriver();
-    return driver && SDL_strcmp(driver, "wayland") == 0;
-#else
-    return false;
-#endif
+    const SDLOP_VideoDriver *driver = SDLOP_GetVideoDriver();
+
+    return driver && driver->create_vulkan_surface && driver->get_vulkan_instance_extensions &&
+           driver->vulkan_presentation_support;
 }
+
+
 
 bool SDLOP_VulkanLoad(const char *path)
 {
@@ -151,6 +139,16 @@ void SDLOP_VulkanUnload(void)
     }
 }
 
+/* The entry point a backend needs to do its platform's work (the loader's own
+   vkGetInstanceProcAddr, with the instance already loaded). */
+SDL_FunctionPointer SDLOP_VulkanGetInstanceProc(VkInstance instance, const char *name)
+{
+    if (!sdlop_vk_get_instance_proc_addr) {
+        return NULL;
+    }
+    return (SDL_FunctionPointer)sdlop_vk_get_instance_proc_addr(instance, name);
+}
+
 void SDLOP_VulkanCleanup(void)
 {
     while (sdlop_vulkan_refcount > 0) {
@@ -192,29 +190,16 @@ void SDL_Vulkan_UnloadLibrary(void)
 
 char const *const *SDL_Vulkan_GetInstanceExtensions(Uint32 *count)
 {
-#ifdef SDLOP_HAVE_WAYLAND
-    static const char *const extensions[] = {
-        VK_KHR_SURFACE_EXTENSION_NAME,
-        VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
-    };
-#endif
+    const SDLOP_VideoDriver *driver = SDLOP_GetVideoDriver();
 
+    /* The names are the backend's: VK_KHR_surface plus whatever its platform
+       needs (VK_KHR_wayland_surface, VK_KHR_xlib_surface, ...). */
     if (!sdlop_vulkan_supported()) {
         SDL_SetError("Vulkan is not supported by the %s video driver",
                      SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)");
         return NULL;
     }
-#ifdef SDLOP_HAVE_WAYLAND
-    if (count) {
-        *count = SDL_arraysize(extensions);
-    }
-    return extensions;
-#else
-    if (count) {
-        *count = 0;
-    }
-    return NULL;
-#endif
+    return driver->get_vulkan_instance_extensions(count);
 }
 
 bool SDL_Vulkan_CreateSurface(SDL_Window *window,
@@ -222,7 +207,7 @@ bool SDL_Vulkan_CreateSurface(SDL_Window *window,
                               const struct VkAllocationCallbacks *allocator,
                               VkSurfaceKHR *surface)
 {
-    int result;
+    const SDLOP_VideoDriver *driver = SDLOP_GetVideoDriver();
 
     if (!window) {
         return SDL_InvalidParamError("window");
@@ -239,36 +224,11 @@ bool SDL_Vulkan_CreateSurface(SDL_Window *window,
     if (!sdlop_vulkan_handle) {
         return SDL_SetError("Vulkan is not loaded");
     }
-#ifdef SDLOP_HAVE_WAYLAND
-    {
-        PFN_vkCreateWaylandSurfaceKHR create_surface;
-        SDLOP_VkWaylandSurfaceCreateInfoKHR create_info;
-        struct wl_surface *wl_surface = window->driver.wayland.wl_surface;
-        struct wl_display *wl_display = (struct wl_display *)sdlop_wl_display_handle();
-
-        if (!wl_surface || !wl_display) {
-            return SDL_SetError("The window has no Wayland surface");
-        }
-        create_surface = (PFN_vkCreateWaylandSurfaceKHR)sdlop_vk_get_instance_proc_addr(
-            instance, "vkCreateWaylandSurfaceKHR");
-        if (!create_surface) {
-            return SDL_SetError(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME
-                                " extension is not enabled in the Vulkan instance");
-        }
-        SDL_zero(create_info);
-        create_info.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
-        create_info.display = wl_display;
-        create_info.surface = wl_surface;
-        result = create_surface(instance, &create_info, allocator, surface);
+    if (!sdlop_vulkan_supported()) {
+        return SDL_SetError("Vulkan is not supported by the %s video driver",
+                            SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)");
     }
-#else
-    result = -7;                       /* VK_ERROR_EXTENSION_NOT_PRESENT */
-#endif
-    if (result != VK_SUCCESS) {
-        return SDL_SetError("vkCreateWaylandSurfaceKHR failed: %s",
-                            sdlop_vulkan_result_string(result));
-    }
-    return true;
+    return driver->create_vulkan_surface(window, instance, allocator, surface);
 }
 
 void SDL_Vulkan_DestroySurface(VkInstance instance,
@@ -291,7 +251,7 @@ bool SDL_Vulkan_GetPresentationSupport(VkInstance instance,
                                        VkPhysicalDevice physicalDevice,
                                        Uint32 queueFamilyIndex)
 {
-    PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR get_support;
+    const SDLOP_VideoDriver *driver = SDLOP_GetVideoDriver();
 
     if (!instance) {
         return SDL_InvalidParamError("instance");
@@ -302,17 +262,10 @@ bool SDL_Vulkan_GetPresentationSupport(VkInstance instance,
     if (!sdlop_vk_get_instance_proc_addr) {
         return SDL_SetError("Vulkan is not loaded");
     }
-#ifdef SDLOP_HAVE_WAYLAND
-    get_support = (PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR)
-        sdlop_vk_get_instance_proc_addr(instance,
-                                        "vkGetPhysicalDeviceWaylandPresentationSupportKHR");
-    if (!get_support) {
-        return SDL_SetError(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME
-                            " extension is not enabled in the Vulkan instance");
+    if (!sdlop_vulkan_supported()) {
+        return SDL_SetError("Vulkan is not supported by this video driver");
     }
-    return get_support(physicalDevice, queueFamilyIndex,
-                       (struct wl_display *)sdlop_wl_display_handle());
-#else
-    return SDL_SetError("Vulkan is not supported by this video driver");
-#endif
+    /* Whether this queue family can present to the platform's display is the
+       backend's question: it owns the protocol/visual the query needs. */
+    return driver->vulkan_presentation_support(instance, physicalDevice, queueFamilyIndex);
 }

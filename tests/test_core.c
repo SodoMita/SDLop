@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <signal.h>
 
 static int failures;
 static int checks;
@@ -207,6 +208,16 @@ static void *push_event_thread(void *arg)
     return NULL;
 }
 
+/* SIGTERM arrives on another thread a moment after the main thread blocks: the
+   event it turns into has to wake that wait up, not wait for the next timeout. */
+static void *signal_quit_thread(void *unused)
+{
+    (void)unused;
+    SDL_Delay(20);
+    raise(SIGTERM);
+    return NULL;
+}
+
 static void test_events(void)
 {
     SDL_Event event;
@@ -269,6 +280,21 @@ static void test_events(void)
     }
     CHECK(timer_fired >= 3, "timer fired %u times", timer_fired);
     CHECK(SDL_RemoveTimer(timer), "SDL_RemoveTimer()");
+
+    /* The signal handlers SDL3 installs turn SIGINT/SIGTERM into SDL_EVENT_QUIT
+       instead of killing the process, so an application can shut down cleanly. */
+    {
+        pthread_t thread;
+        Uint64 start, elapsed;
+
+        pthread_create(&thread, NULL, signal_quit_thread, NULL);
+        start = SDL_GetTicks();
+        CHECK(SDL_WaitEventTimeout(&event, 2000), "SDL_WaitEventTimeout() was not woken by SIGTERM");
+        elapsed = SDL_GetTicks() - start;
+        pthread_join(thread, NULL);
+        CHECK(event.type == SDL_EVENT_QUIT, "SIGTERM produced event 0x%x, not SDL_EVENT_QUIT", event.type);
+        CHECK(elapsed < 500, "SIGTERM took %llu ms to reach the queue", (unsigned long long)elapsed);
+    }
 
     SDL_QuitSubSystem(SDL_INIT_EVENTS);
 }

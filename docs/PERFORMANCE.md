@@ -26,39 +26,57 @@ compositor being present.
 
 ## Results (SDL 3.2.10 vs SDLop 0.1.0, x86-64, gcc 14.2, -O2)
 
+`offscreen` driver, so both libraries do the same bookkeeping without a
+compositor in the way:
+
 | operation | SDL3 | SDLop | ratio |
 |---|---:|---:|---:|
-| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 20159 ns | 4034 ns | **5.0x faster** |
-| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 16727 ns | 776 ns | **21.5x faster** |
-| `SDL_PumpEvents` (nothing pending) | 34.0 ns | 9.6 ns | **3.5x faster** |
-| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 37.5 ns | 14.0 ns | **2.7x faster** |
-| `SDL_GetTicks` | 34.3 ns | 28.7 ns | 1.2x faster |
-| `SDL_GetPerformanceCounter` | 27.3 ns | 27.1 ns | tie |
-| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 2132637 ns | 55662 ns | 38.3x faster |
-| `SDL_GetKeyboardState` | 1.9 ns | 1.5 ns | 1.3x faster |
-| `SDL_GetModState` | 1.8 ns | 1.2 ns | 1.5x faster |
+| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 24033 ns | 5986 ns | **4.0x faster** |
+| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 29953 ns | 906 ns | **33.1x faster** |
+| `SDL_PumpEvents` (nothing pending) | 40.2 ns | 11.1 ns | **3.6x faster** |
+| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 43.3 ns | 10.2 ns | **4.3x faster** |
+| `SDL_GetTicks` | 32.8 ns | 27.4 ns | 1.2x faster |
+| `SDL_GetPerformanceCounter` | 24.7 ns | 24.2 ns | tie |
+| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 2518572 ns | 59450 ns | 42.4x faster |
+| `SDL_GetKeyboardState` | 2.7 ns | 2.3 ns | 1.2x faster |
+| `SDL_GetModState` | 2.4 ns | 1.8 ns | 1.3x faster |
+
+And on X11 (Xvfb, a real X window, `XShmPutImage` presentation), where the same
+X server round trips are paid by both libraries:
+
+| operation | SDL3 | SDLop | ratio |
+|---|---:|---:|---:|
+| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 6888884 ns | 4954875 ns | 1.4x faster |
+| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 2064126 ns | 246281 ns | **8.4x faster** |
+| `SDL_PumpEvents` (nothing pending) | 1462.9 ns | 420.8 ns | **3.5x faster** |
+| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 52.3 ns | 16.3 ns | **3.2x faster** |
+| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 3022949 ns | 262164 ns | **11.5x faster** |
+| `SDL_GetTicks` / `SDL_GetPerformanceCounter` | 33.1 / 25.7 ns | 27.6 / 25.3 ns | 1.2x / tie |
 
 Readings of the individual benchmarks:
 
-* **Init/teardown (5.0x).** SDLop has no HIDAPI scan, no udev enumeration of
+* **Init/teardown (4.0x).** SDLop has no HIDAPI scan, no udev enumeration of
   every subsystem, no joystick/audio/haptic probing when only `SDL_INIT_VIDEO`
   was asked for, and it starts exactly one input thread.
-* **Window create/destroy (21.5x).** An SDLop window is a struct, a surface and (on
-  Wayland) a `wl_surface`; there is no renderer, no per-window properties bag, no
-  display-mode list to rebuild, and no `SDL_PumpEvents` in between.
-* **`SDL_PumpEvents` (3.5x).** The offscreen/wayland backends pump with a
-  descriptor and a ring; callbacks and timers return via an atomic fast path
-  before taking any lock or reading the clock. Measured **on the Wayland path**
-  (offscreen is not comparable, it has no socket): the SDLop pump is **299 ns/call**
-  against stock SDL3's **1329 ns/call** — 4.4x — *including* the non-blocking
-  `poll()` that keeps a polling application reading its compositor socket.
-* **`SDL_PushEvent` + `SDL_PollEvent` (2.7x).** A single mutex and a ring copy in
-  each direction, and — the important part — *no syscall when no thread is
-  waiting* (see below).
+* **Window create/destroy (33.1x offscreen, 8.4x on X11).** An SDLop window is a
+  struct, a surface and (on Wayland) a `wl_surface`, or on X11 an `XCreateWindow`
+  and a GC; there is no renderer, no per-window properties bag, no display-mode
+  list to rebuild, and no `SDL_PumpEvents` in between. On X11 the 8.4x is what is
+  left after the X server round trips that both libraries pay.
+* **`SDL_PumpEvents` (3.5x).** The backends pump with a descriptor and a ring;
+  callbacks and timers return via an atomic fast path before taking any lock or
+  reading the clock. Measured **on the Wayland path** (offscreen is not
+  comparable, it has no socket): the SDLop pump was **299 ns/call** against stock
+  SDL3's **1329 ns/call** — 4.4x — *including* the non-blocking `poll()` that
+  keeps a polling application reading its compositor socket. On X11 the pump is
+  421 ns against stock's 1463 ns.
+* **`SDL_PushEvent` + `SDL_PollEvent` (4.3x offscreen, 3.2x on X11).** A single
+  mutex and a ring copy in each direction, *no syscall when no thread is
+  waiting*, and no pump when an event is already queued (see below).
 * **Ticks/performance counter (1.0–1.2x).** Both implementations end up in
   `clock_gettime(CLOCK_MONOTONIC)`; SDLop keeps one cached start offset
   instead of SDL3's more general tick bookkeeping.
-* **`SDL_UpdateWindowSurface` (38x).** Careful with this one: it is *not* a
+* **`SDL_UpdateWindowSurface` (42x).** Careful with this one: it is *not* a
   like-for-like comparison of presentation cost. The `offscreen` driver of stock
   SDL3 pushes the frame through its renderer-side path, while SDLop's offscreen
   present is "the surface is already the window's buffer". The number is real but
@@ -82,9 +100,17 @@ is worth keeping:
    depth first and return immediately when there is nothing to do — no lock, and
    for timers not even a clock read. Pump went 36 ns → 9.6 ns.
 
-Both fixes are pure fast paths: the slow paths (an actual waiter, an actual
-queued callback, an actual timer) are unchanged, and the whole test suite plus
-the Wayland end-to-end checks were re-run after them.
+3. **A pump per polled event** (0.13x on X11 — the first X11 bench run is how
+   this was found: `SDL_PollEvent` pumped on *every* call, so a frame that
+   drained 64 events paid for 64 `poll(2)`s on the X connection). `SDL_PollEvent`
+   now hands out an event that is already queued and only pumps when the queue is
+   empty — the same fast path stock SDL3 has, confirmed by measuring stock on the
+   same X server (26 ns/event there while its own empty-queue poll is 1582 ns).
+   Push/poll went 383 ns → 16 ns per event on X11.
+
+All three fixes are pure fast paths: the slow paths (an actual waiter, an actual
+queued callback, an actual timer, an empty queue) are unchanged, and the whole
+test suite plus the Wayland and X11 end-to-end rigs were re-run after them.
 
 A later round of Wayland work added things a benchmark would only catch
 indirectly, so they are noted here instead: every pump now reads the compositor
@@ -131,9 +157,12 @@ plan; this sandbox has no `/dev/input`, which is exactly why the FIFO hook exist
 
 | | SDLop | SDL3 3.2.10 |
 |---|---:|---:|
-| shared library (unstripped, with `-g`) | 0.78 MB | 2.87 MB |
-| shared library (stripped) | 0.23 MB | 2.87 MB |
-| exported `SDL_*` symbols | 398 | 1208 |
+| shared library (unstripped, with `-g`) | 1.00 MB | 2.87 MB |
+| shared library (stripped) | 0.29 MB | 2.87 MB |
+| exported `SDL_*` symbols | 400 | 1208 |
 
-The stripped comparison is the meaningful one: about **12x less code** for the
-same windowing, input, timing, GL and Vulkan surface APIs.
+The stripped comparison is the meaningful one: about **10x less code** for the
+same windowing, input, timing, GL and Vulkan surface APIs — and this now includes
+*both* Linux backends (Wayland and X11), where the earlier 0.23 MB number was
+Wayland and offscreen only. SDL3's own 2.87 MB is one build of the full library
+for the same machine.

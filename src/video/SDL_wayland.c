@@ -146,314 +146,7 @@ static Uint64 sdlop_wl_repeat_deadline;          /* when the next repeat is due 
 static float sdlop_wl_pointer_x, sdlop_wl_pointer_y;
 
 #ifdef SDLOP_HAVE_XKBCOMMON
-static struct xkb_context *sdlop_xkb_context;
-static struct xkb_keymap *sdlop_xkb_keymap;
-static struct xkb_state *sdlop_xkb_state;
-static int sdlop_xkb_keymap_fd = -1;
 #endif
-
-/* ------------------------------------------------------------------------- */
-/* Keysym -> SDL_Keycode                                                     */
-/* ------------------------------------------------------------------------- */
-
-typedef struct SDLOP_KeysymMapping
-{
-    Uint32 keysym;
-    SDL_Keycode keycode;
-} SDLOP_KeysymMapping;
-
-/* Only the non-ASCII keysyms need a table; ASCII keysyms are their own keycode,
-   which is exactly how SDL3 stores them. */
-static const SDLOP_KeysymMapping sdlop_keysym_map[] = {
-    { 0xFF08, SDLK_BACKSPACE }, { 0xFF09, SDLK_TAB },        { 0xFF0D, SDLK_RETURN },
-    { 0xFF1B, SDLK_ESCAPE },    { 0xFF50, SDLK_HOME },       { 0xFF51, SDLK_LEFT },
-    { 0xFF52, SDLK_UP },        { 0xFF53, SDLK_RIGHT },      { 0xFF54, SDLK_DOWN },
-    { 0xFF55, SDLK_PAGEUP },    { 0xFF56, SDLK_PAGEDOWN },   { 0xFF57, SDLK_END },
-    { 0xFF61, SDLK_PRINTSCREEN }, { 0xFF63, SDLK_INSERT },   { 0xFF67, SDLK_MENU },
-    { 0xFF6A, SDLK_HELP },      { 0xFF7F, SDLK_NUMLOCKCLEAR }, { 0xFF8D, SDLK_KP_ENTER },
-    { 0xFFAA, SDLK_KP_MULTIPLY }, { 0xFFAB, SDLK_KP_PLUS },  { 0xFFAD, SDLK_KP_MINUS },
-    { 0xFFAE, SDLK_KP_PERIOD }, { 0xFFAF, SDLK_KP_DIVIDE },  { 0xFFB0, SDLK_KP_0 },
-    { 0xFFB1, SDLK_KP_1 },      { 0xFFB2, SDLK_KP_2 },       { 0xFFB3, SDLK_KP_3 },
-    { 0xFFB4, SDLK_KP_4 },      { 0xFFB5, SDLK_KP_5 },       { 0xFFB6, SDLK_KP_6 },
-    { 0xFFB7, SDLK_KP_7 },      { 0xFFB8, SDLK_KP_8 },       { 0xFFB9, SDLK_KP_9 },
-    { 0xFFBD, SDLK_KP_EQUALS }, { 0xFFE1, SDLK_LSHIFT },     { 0xFFE2, SDLK_RSHIFT },
-    { 0xFFE3, SDLK_LCTRL },     { 0xFFE4, SDLK_RCTRL },      { 0xFFE5, SDLK_CAPSLOCK },
-    { 0xFFE7, SDLK_LGUI },      { 0xFFE8, SDLK_RGUI },       { 0xFFE9, SDLK_LALT },
-    { 0xFFEA, SDLK_RALT },      { 0xFFEB, SDLK_LGUI },       { 0xFFEC, SDLK_RGUI },
-    { 0xFF13, SDLK_PAUSE },     { 0xFF14, SDLK_SCROLLLOCK },
-};
-
-#define SDLOP_F1_KEYCODE 0xFFBE
-
-static SDL_Keycode sdlop_keycode_from_keysym(Uint32 keysym)
-{
-    size_t i;
-
-    if (keysym == 0) {
-        return SDLK_UNKNOWN;
-    }
-    if (keysym <= 0x7F) {
-        /* ASCII maps to itself. Note the case is *not* normalized here: the
-           keysym already carries the modifier state ("A" while shift is held,
-           "a" otherwise), and SDL wants the same thing in SDL_EVENT_KEY_DOWN:
-           event.key.key is "A" with shift and "a" without. Lowercasing would
-           throw that away. */
-        return (SDL_Keycode)keysym;
-    }
-    if (keysym < 0x100) {
-        return (SDL_Keycode)keysym;                /* Latin-1 control range */
-    }
-    /* "Unicode keysyms" carry their code point in the low 21 bits (0x11000000 is
-       the vendor spelling of the same idea). */
-    if (keysym >= 0x1000000) {
-        return (SDL_Keycode)(keysym & 0x1FFFFF);
-    }
-    if (keysym >= SDLOP_F1_KEYCODE && keysym < SDLOP_F1_KEYCODE + 35) {
-        return (SDL_Keycode)(SDLK_F1 + (keysym - SDLOP_F1_KEYCODE));
-    }
-    /* The table has to be consulted before the arithmetic ranges below: the named
-       keys (arrows, keypad, modifiers) live at 0xE000 and up, and the modifiers
-       must come out as SDLK_LSHIFT & co. - values that carry SDLK_SCANCODE_MASK
-       so that nothing treats them as text. */
-    for (i = 0; i < sizeof(sdlop_keysym_map) / sizeof(sdlop_keysym_map[0]); i++) {
-        if (sdlop_keysym_map[i].keysym == keysym) {
-            return sdlop_keysym_map[i].keycode;
-        }
-    }
-    /* The old Latin-2..4 keysym block: the character is 0x100 below the keysym. */
-    if (keysym >= 0x100 && keysym < 0xE000) {
-        return (SDL_Keycode)(keysym - 0x100);
-    }
-    return SDLK_UNKNOWN;
-}
-
-#ifdef SDLOP_HAVE_XKBCOMMON
-/* Where the keymap comes from, in order of preference:
-
-     1. SDLOP_WAYLAND_KEYMAP=<file>: an explicit XKB keymap file, for debugging
-        and for compositors that never send one;
-     2. the keymap the compositor sends over wl_keyboard;
-     3. the local XKB configuration (XKB_DEFAULT_LAYOUT and friends), which is
-        what a headless or KMS setup has to fall back to;
-     4. no layout at all - the keyboard layer then uses its built-in tables.
-
-   xkbcommon keycodes are evdev keycodes offset by 8. */
-
-static void sdlop_xkb_update_key(Uint32 evdev_code, bool down);
-static SDL_Keycode sdlop_xkb_keycode(Uint32 evdev_code);
-static int sdlop_xkb_text(Uint32 evdev_code, char *buffer, size_t size);
-
-static const SDLOP_KeyLayout sdlop_wl_key_layout = {
-    sdlop_xkb_update_key,
-    sdlop_xkb_keycode,
-    sdlop_xkb_text,
-};
-
-static bool sdlop_xkb_compile(const char *text, size_t size)
-{
-    struct xkb_keymap *keymap;
-
-    if (!sdlop_xkb_context) {
-        sdlop_xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    }
-    if (!sdlop_xkb_context) {
-        return false;
-    }
-    /* xkb_keymap_new_from_string() wants a NUL-terminated string and a keymap fd
-       is not one, so the text is copied. */
-    {
-        char *copy = (char *)SDLOP_Alloc(size + 1);
-        if (!copy) {
-            return false;
-        }
-        memcpy(copy, text, size);
-        copy[size] = '\0';
-        keymap = xkb_keymap_new_from_string(sdlop_xkb_context, copy,
-                                            XKB_KEYMAP_FORMAT_TEXT_V1,
-                                            XKB_KEYMAP_COMPILE_NO_FLAGS);
-        SDLOP_Free(copy);
-    }
-    if (!keymap) {
-        return false;
-    }
-    if (sdlop_xkb_state) {
-        xkb_state_unref(sdlop_xkb_state);
-    }
-    if (sdlop_xkb_keymap) {
-        xkb_keymap_unref(sdlop_xkb_keymap);
-    }
-    sdlop_xkb_keymap = keymap;
-    sdlop_xkb_state = xkb_state_new(keymap);
-    if (!sdlop_xkb_state) {
-        xkb_keymap_unref(keymap);
-        sdlop_xkb_keymap = NULL;
-        return false;
-    }
-    /* From here on, keycodes and text come from this layout instead of the
-       built-in "us" tables. */
-    SDLOP_SetKeyLayout(&sdlop_wl_key_layout);
-    SDLOP_SendKeymapChanged(SDL_GetTicksNS());
-    return true;
-}
-
-/* The layout the machine is configured for. A compositor without a keyboard
-   (headless, KMS, tests) never sends a keymap at all, and the local XKB
-   configuration is a far better guess than the built-in us tables. */
-static void sdlop_xkb_compile_defaults(void)
-{
-    struct xkb_rule_names names = { 0 };   /* NULL fields: xkbcommon applies the
-                                              XKB_DEFAULT_* environment first and
-                                              then its own evdev/pc105/us defaults */
-    struct xkb_keymap *keymap;
-
-    if (!sdlop_xkb_context) {
-        sdlop_xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    }
-    if (!sdlop_xkb_context) {
-        return;
-    }
-    keymap = xkb_keymap_new_from_names(sdlop_xkb_context, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    if (!keymap) {
-        return;
-    }
-    if (sdlop_xkb_keymap) {
-        xkb_keymap_unref(sdlop_xkb_keymap);
-    }
-    sdlop_xkb_keymap = keymap;
-    if (sdlop_xkb_state) {
-        xkb_state_unref(sdlop_xkb_state);
-    }
-    sdlop_xkb_state = xkb_state_new(keymap);
-    if (sdlop_xkb_state) {
-        SDLOP_SetKeyLayout(&sdlop_wl_key_layout);
-    }
-}
-
-static bool sdlop_xkb_override_active(void)
-{
-    const char *path = SDL_getenv("SDLOP_WAYLAND_KEYMAP");
-    return path && path[0];
-}
-
-static void sdlop_xkb_load_override(void)
-{
-    const char *path = SDL_getenv("SDLOP_WAYLAND_KEYMAP");
-    FILE *file;
-    char *buffer;
-    long size;
-
-    if (!path || !path[0]) {
-        return;
-    }
-    file = fopen(path, "rb");
-    if (!file) {
-        SDLOP_LogWarn("sdlop: cannot read the keymap '%s'", path);
-        return;
-    }
-    fseek(file, 0, SEEK_END);
-    size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    buffer = (size > 0) ? (char *)SDLOP_Alloc((size_t)size) : NULL;
-    if (buffer && fread(buffer, 1, (size_t)size, file) == (size_t)size) {
-        if (sdlop_xkb_compile(buffer, (size_t)size)) {
-            SDLOP_LogInfo("sdlop: using the keymap from %s", path);
-        }
-    } else {
-        SDLOP_LogWarn("sdlop: could not read the keymap '%s'", path);
-    }
-    SDLOP_Free(buffer);
-    fclose(file);
-}
-
-static SDL_Keycode sdlop_xkb_keycode(Uint32 evdev_code)
-{
-    xkb_keysym_t keysym;
-
-    if (!sdlop_xkb_state) {
-        return SDLK_UNKNOWN;
-    }
-    keysym = xkb_state_key_get_one_sym(sdlop_xkb_state, evdev_code + 8);
-    return sdlop_keycode_from_keysym(keysym);
-}
-
-static int sdlop_xkb_text(Uint32 evdev_code, char *buffer, size_t size)
-{
-    int len;
-
-    if (!sdlop_xkb_state || !buffer || size < 2) {
-        return 0;
-    }
-    /* xkb_state_key_get_utf8() applies the current modifier state (and handles
-       dead keys, which resolve to nothing until composed), which is exactly the
-       text the key types. It returns 0 when the key produces nothing. */
-    len = xkb_state_key_get_utf8(sdlop_xkb_state, evdev_code + 8, buffer, size);
-    if (len <= 0 || (size_t)len >= size) {
-        buffer[0] = '\0';
-        return 0;
-    }
-    return len;
-}
-
-/* Keys reach us from the evdev worker rather than from the compositor, so the
-   layout state has to follow the keys we actually see. Without this, holding
-   shift would have no effect on keycodes or text on the async path. */
-static void sdlop_xkb_update_key(Uint32 evdev_code, bool down)
-{
-    if (!sdlop_xkb_state) {
-        return;
-    }
-    xkb_state_update_key(sdlop_xkb_state, evdev_code + 8, down ? XKB_KEY_DOWN : XKB_KEY_UP);
-}
-
-static void sdlop_xkb_init(void)
-{
-    if (sdlop_xkb_override_active()) {
-        sdlop_xkb_load_override();
-        return;
-    }
-    sdlop_xkb_compile_defaults();
-}
-
-static void sdlop_xkb_keymap_handle(void)
-{
-    char *map;
-    size_t size;
-
-    if (sdlop_xkb_keymap_fd < 0) {
-        return;
-    }
-    size = (size_t)lseek(sdlop_xkb_keymap_fd, 0, SEEK_END);
-    lseek(sdlop_xkb_keymap_fd, 0, SEEK_SET);
-    map = (char *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, sdlop_xkb_keymap_fd, 0);
-    if (map == MAP_FAILED) {
-        close(sdlop_xkb_keymap_fd);
-        sdlop_xkb_keymap_fd = -1;
-        return;
-    }
-    /* Layout problems are miserable to debug without seeing what the compositor
-       actually sent: SDLOP_WAYLAND_DUMP_KEYMAP=<path> writes it out. */
-    {
-        const char *dump_path = SDL_getenv("SDLOP_WAYLAND_DUMP_KEYMAP");
-        if (dump_path && dump_path[0]) {
-            FILE *out = fopen(dump_path, "wb");
-            if (out) {
-                fwrite(map, 1, size, out);
-                fclose(out);
-                SDLOP_LogInfo("sdlop: wrote the compositor keymap to %s", dump_path);
-            }
-        }
-    }
-    if (sdlop_xkb_override_active()) {
-        SDLOP_LogInfo("sdlop: ignoring the compositor keymap, SDLOP_WAYLAND_KEYMAP is set");
-    } else if (!sdlop_xkb_compile(map, size)) {
-        SDLOP_LogWarn("sdlop: could not compile the compositor keymap");
-    }
-    munmap(map, size);
-    close(sdlop_xkb_keymap_fd);
-    sdlop_xkb_keymap_fd = -1;
-}
-#endif
-
 
 /* ------------------------------------------------------------------------- */
 /* Displays                                                                  */
@@ -948,11 +641,14 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
         close(fd);
         return;
     }
-    if (sdlop_xkb_keymap_fd >= 0) {
-        close(sdlop_xkb_keymap_fd);
+    if (SDLOP_XKBOverrideActive()) {
+        SDLOP_LogInfo("sdlop: ignoring the compositor keymap, SDLOP_XKB_KEYMAP is set");
+        close(fd);
+        return;
     }
-    sdlop_xkb_keymap_fd = fd;
-    sdlop_xkb_keymap_handle();
+    if (!SDLOP_XKBLoadKeymapFD(fd)) {
+        SDLOP_LogWarn("sdlop: could not compile the compositor keymap");
+    }
 #else
     close(fd);
 #endif
@@ -1030,8 +726,8 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_
 {
     (void)data; (void)keyboard; (void)serial; (void)latched; (void)locked; (void)group;
 #ifdef SDLOP_HAVE_XKBCOMMON
-    if (sdlop_xkb_state) {
-        xkb_state_update_mask(sdlop_xkb_state, depressed, latched, locked, 0, 0, group);
+    if (SDLOP_XKBState()) {
+        xkb_state_update_mask(SDLOP_XKBState(), depressed, latched, locked, 0, 0, group);
     } else
 #endif
     {
@@ -1068,8 +764,8 @@ static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32
 static bool sdlop_wl_key_repeats(Uint32 key, SDL_Scancode scancode)
 {
 #ifdef SDLOP_HAVE_XKBCOMMON
-    if (sdlop_xkb_keymap) {
-        return xkb_keymap_key_repeats(sdlop_xkb_keymap, key + 8);
+    if (SDLOP_XKBKeymap()) {
+        return SDLOP_XKBKeyRepeats(key);
     }
 #endif
     (void)key;
@@ -2358,7 +2054,7 @@ static bool sdlop_wayland_init(void)
 #ifdef SDLOP_HAVE_XKBCOMMON
     /* Have a layout ready before the first key can arrive; the compositor's own
        keymap replaces it if and when it is sent. */
-    sdlop_xkb_init();
+    SDLOP_XKBInit();
 #endif
     return true;
 }
@@ -2431,18 +2127,7 @@ static void sdlop_wayland_quit(void)
     sdlop_wl_display = NULL;
 #ifdef SDLOP_HAVE_XKBCOMMON
     SDLOP_SetKeyLayout(NULL);
-    if (sdlop_xkb_state) {
-        xkb_state_unref(sdlop_xkb_state);
-        sdlop_xkb_state = NULL;
-    }
-    if (sdlop_xkb_keymap) {
-        xkb_keymap_unref(sdlop_xkb_keymap);
-        sdlop_xkb_keymap = NULL;
-    }
-    if (sdlop_xkb_context) {
-        xkb_context_unref(sdlop_xkb_context);
-        sdlop_xkb_context = NULL;
-    }
+    SDLOP_XKBQuit();
 #endif
 }
 
@@ -2521,21 +2206,72 @@ static void sdlop_wayland_pump_events(void)
     wl_display_flush(sdlop_wl_display);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Vulkan: the Wayland WSI (VK_KHR_wayland_surface)                          */
+/*                                                                           */
+/* The ABI is declared here, like the Vulkan module's, so no Vulkan headers  */
+/* are needed to build against a runtime-only system.                        */
+/* ------------------------------------------------------------------------- */
+
+#define SDLOP_VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR 1000008000
+
+typedef int (*SDLOP_PFN_vkCreateWaylandSurfaceKHR)(VkInstance instance, const void *create_info,
+                                                   const struct VkAllocationCallbacks *allocator,
+                                                   VkSurfaceKHR *surface);
+typedef bool (*SDLOP_PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR)(
+    VkPhysicalDevice physical_device, Uint32 queue_family_index, struct wl_display *display);
+
+typedef struct SDLOP_VkWaylandSurfaceCreateInfoKHR
+{
+    Uint32 sType;
+    const void *pNext;
+    Uint32 flags;
+    struct wl_display *display;
+    struct wl_surface *surface;
+} SDLOP_VkWaylandSurfaceCreateInfoKHR;
+
 static bool sdlop_wayland_create_vulkan_surface(SDL_Window *window, VkInstance instance,
                                                 const struct VkAllocationCallbacks *allocator,
                                                 VkSurfaceKHR *surface)
 {
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-    VkWaylandSurfaceCreateInfoKHR info;
+    SDLOP_PFN_vkCreateWaylandSurfaceKHR create_surface;
+    SDLOP_VkWaylandSurfaceCreateInfoKHR info;
+    int result;
+
+    if (!sdlop_wl_display || !WL_SURFACE(window)) {
+        return SDL_SetError("The window has no Wayland surface");
+    }
+    create_surface = (SDLOP_PFN_vkCreateWaylandSurfaceKHR)SDLOP_VulkanGetInstanceProc(
+        instance, "vkCreateWaylandSurfaceKHR");
+    if (!create_surface) {
+        return SDL_SetError("VK_KHR_wayland_surface extension is not enabled in the Vulkan instance");
+    }
     memset(&info, 0, sizeof(info));
-    info.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+    info.sType = SDLOP_VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
     info.display = sdlop_wl_display;
     info.surface = WL_SURFACE(window);
-    return vkCreateWaylandSurfaceKHR(instance, &info, allocator, surface) == VK_SUCCESS;
-#else
-    (void)window; (void)instance; (void)allocator; (void)surface;
-    return SDL_SetError("Wayland Vulkan support was not compiled in");
-#endif
+    result = create_surface(instance, &info, allocator, surface);
+    if (result != 0) {
+        return SDL_SetError("vkCreateWaylandSurfaceKHR failed: %s", SDLOP_VulkanResultString(result));
+    }
+    return true;
+}
+
+static bool sdlop_wayland_vulkan_presentation_support(VkInstance instance,
+                                                      VkPhysicalDevice physical_device,
+                                                      Uint32 queue_family_index)
+{
+    SDLOP_PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR get_support =
+        (SDLOP_PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR)SDLOP_VulkanGetInstanceProc(
+            instance, "vkGetPhysicalDeviceWaylandPresentationSupportKHR");
+
+    if (!get_support) {
+        return SDL_SetError("VK_KHR_wayland_surface extension is not enabled in the Vulkan instance");
+    }
+    if (!sdlop_wl_display) {
+        return SDL_SetError("The Wayland display is not open");
+    }
+    return get_support(physical_device, queue_family_index, sdlop_wl_display) ? true : false;
 }
 
 static const char *const *sdlop_wayland_vulkan_extensions(Uint32 *count)
@@ -2586,6 +2322,7 @@ const SDLOP_VideoDriver SDLOP_WaylandVideoDriver = {
 
     .create_vulkan_surface = sdlop_wayland_create_vulkan_surface,
     .get_vulkan_instance_extensions = sdlop_wayland_vulkan_extensions,
+    .vulkan_presentation_support = sdlop_wayland_vulkan_presentation_support,
 
     .gl = &SDLOP_EGLDriver,
 };

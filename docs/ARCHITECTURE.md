@@ -57,12 +57,47 @@ SDLOP_RunTimerCallbacks();
 The order matters: an input record may reference a window, so the window state a
 compositor sent (resize, focus, scale) is applied before the record is translated.
 
-Backends currently: **wayland** (xdg-shell + `wl_shm` XRGB8888 buffers with
-viewporter scaling, `wl_surface_frame` pacing, cursor-shape-v1, pointer
-constraints and the relative pointer; EGL window for GL; Vulkan surface
-creation) and **offscreen** (a window that is a pixel buffer — used by the tests
-and by headless CI). The backend list is compiled per availability; a build with
-`WAYLAND=0` still produces a complete library with `offscreen` alone.
+Backends currently: **wayland**, **x11** and **offscreen** (a window that is a
+pixel buffer — used by the tests and by headless CI). The list is compiled per
+availability, and the core picks at runtime: `WAYLAND_DISPLAY` first, then
+`DISPLAY`, then offscreen, and an auto-detected driver that fails to connect
+hands over to the next one (a stale `WAYLAND_DISPLAY` in an SSH session should
+not stop an application from coming up on X11). An explicit `SDL_VIDEODRIVER` is
+never retried — the application asked for *that* driver.
+
+#### Wayland
+
+xdg-shell + `wl_shm` XRGB8888 buffers with viewporter scaling,
+`wl_surface_frame` pacing, cursor-shape-v1, pointer constraints and the relative
+pointer; a `wl_egl_window` for GL; `vkCreateWaylandSurfaceKHR` for Vulkan. See
+the display and pointer notes below.
+
+#### X11
+
+`src/video/SDL_x11.c` is a plain Xlib client (no XCB except the one bridge
+`xkbcommon-x11` needs) and the fallback for every session where `/dev/input` is
+not readable — XWayland, Flatpak, a sandbox, a remote session. What it owns:
+
+* **Window state through EWMH**, with `_MOTIF_WM_HINTS` for the borderless case
+  (EWMH's decoration hints are not universally implemented) and
+  `_NET_WM_STATE_*` for fullscreen/maximized/above/hidden/demands-attention;
+  display names come from RandR, and a screen without RandR still enumerates one
+  display (refresh rate 0 when the server does not report a dot clock).
+* **Presenting through MIT-SHM** (`XShmCreateImage` + `XShmPutImage`) with a
+  plain `XPutImage` fallback, and the shared memory segment reclaimed on resize.
+  The window's format is XRGB8888 unless the visual says otherwise.
+* **Input translation** (see the input chapter): core events plus XInput2 raw
+  motion when the extension is there.
+* **GL through EGL**, not GLX: the window has to be created with the visual the
+  EGL config can present to, so `sdlop_egl_x11_visual()` is asked *before*
+  `XCreateWindow` and the answer goes into the window attributes (with a
+  `Colormap` of its own when the visual is not the screen default). GLX needs a
+  different config-selection path for the same result.
+* **Vulkan through `vkCreateXlibSurfaceKHR`** — the WSI is declared in the
+  backend, like the Wayland one, so `src/video/SDL_vulkan.c` has no platform code
+  at all: it owns the loader and dispatches to the driver's
+  `create_vulkan_surface` / `get_vulkan_instance_extensions` /
+  `vulkan_presentation_support`.
 
 ### Displays: a burst of events, closed by `wl_output.done`
 
@@ -199,8 +234,20 @@ Design points:
 * **Testability without hardware.** `SDLOP_TEST_INPUT=<fifo>` starts a reader
   thread that accepts `EV_KEY|EV_REL|EV_ABS <code> <value> [device] [ts]` lines
   and pushes them through the *same* ring, so the whole translation path is
-  covered by `tests/test_input.c` on a machine with no `/dev/input` at all. The
-  planned X11 backend slots into the same place as a second producer.
+  covered by `tests/test_input.c` on a machine with no `/dev/input` at all.
+* **The X11 reader is the fallback producer.** When `/dev/input` cannot be
+  opened — XWayland, Flatpak, a sandbox, a remote session — the X11 backend feeds
+  the same translation layer from X events instead: key press/release with the
+  scancode derived from the server's keycode (XKB `evdev+8`, so the two sources
+  agree), the layout's own state fed from every key
+  (`layout->update_key()`, exactly like the evdev worker does), buttons and the
+  wheel (button 4–7, press only — X sends a release for them too), and motion
+  from core events plus XInput2 raw motion so a grabbed pointer reports the
+  unaccelerated deltas. Key repeat stays where the X server puts it (the server
+  sends press events, `XkbSetDetectableAutoRepeat` tells them apart from real
+  presses), text comes from the layout, and an active FIFO producer takes
+  precedence over both sources so a test never fights a real device.
+  `tests/x11_input.sh` drives it with `xdotool` (`make x11-check`).
 
 Translation (`src/input/SDL_input.c`) is table-driven: `sdlop_scancode_from_evdev`
 maps Linux keycodes to SDL scancodes (generated from upstream's
@@ -229,13 +276,25 @@ feeding it the modifier state — it has to follow the keys the application
 actually sees. The Wayland backend registers an xkbcommon layout, compiled from,
 in order of preference:
 
-1. `SDLOP_WAYLAND_KEYMAP=<file>` — an explicit XKB keymap file (debugging, or a
+1. `SDLOP_XKB_KEYMAP=<file>` — an explicit XKB keymap file (debugging, or a
    compositor that sends the wrong one);
 2. the compositor's `wl_keyboard.keymap`;
 3. the local XKB configuration (`XKB_DEFAULT_LAYOUT` and friends) — what a
    headless or KMS compositor that never sends a keymap gets
    (`xkb_keymap_new_from_names`);
 4. nothing: SDL's built-in tables derive text and keycodes from scancodes.
+
+On X11 the same module gets the keymap from the *server* through
+`xkbcommon-x11` (the core keyboard's device id and the Xlib connection handed to
+XCB), so layouts, dead keys and group switching follow the X configuration
+instead of the local one — XKB is how X11 has always described a keyboard.
+
+SDL keycodes are **unshifted**: shift+a reports the same keycode as a, with
+`SDL_KMOD_LSHIFT` in `event.key.mod` and the capital as the text (verified
+against stock SDL3 3.2.10 on both backends). The layout module therefore reads
+level 0 of the keymap (`xkb_keymap_key_get_syms_by_level`) and applies no shift
+state of its own, plus SDL's default `SDL_HINT_KEYCODE_OPTIONS` rules
+(`french_numbers`, `latin_letters`).
 
 A layout that is registered also has the final say on text: if it says a key
 types nothing (a modifier, a dead key), no text is invented from the keycode.
@@ -254,7 +313,18 @@ wakeup eventfd:
 
 * `SDL_PushEvent` takes the lock, appends, and — **only if a thread is parked** —
   broadcasts and writes the eventfd. When nobody is waiting, it touches neither.
-* `SDL_PollEvent` pumps, then pops one event under the lock.
+* `SDL_PollEvent` pops an event that is already queued *without pumping first*,
+  and only pumps when the queue is empty. Pumping costs a `poll(2)` on the
+  backends' descriptors (and the input ring, and the due timers), so this is the
+  difference between a tight poll loop that pays for a pump per event and one
+  that pays for none; SDL3 has the same fast path and the benchmark measures it
+  (see [PERFORMANCE.md](PERFORMANCE.md)).
+* `SIGINT`/`SIGTERM` are installed once (SDL_HINT_NO_SIGNAL_HANDLERS turns that
+  off, and an application's own handler is never replaced) and set a flag in the
+  handler; the handler also writes the wakeup fd, which is async-signal-safe. The
+  next pump turns the flag into `SDL_EVENT_QUIT`, so Ctrl+C in a windowed program
+  is a request to shut down rather than a kill, and a thread blocked in
+  `SDL_WaitEvent()` finds it immediately.
 * `SDL_WaitEvent[_Timeout]` pumps, pops, and otherwise parks in `poll()` over
   {platform event fd, wakeup fd} (or on the condition variable when a backend has
   no descriptor), with the next timer deadline as the timeout. Because input
@@ -292,16 +362,23 @@ The library creates surfaces but never draws into them:
 * `SDL_GetWindowSurface` gives a software surface the app can fill and blit
   (`SDL_UpdateWindowSurface` marks it dirty and the backend presents it — a
   Wayland `wl_shm` buffer attach/commit, a no-op on `offscreen`).
-* `SDL_GL_*` goes through `src/gl/SDL_egl.c`: all fourteen EGL entry points are
+* `SDL_GL_*` goes through `src/gl/SDL_egl.c`: all fifteen EGL entry points are
   resolved with `dlsym` from a `dlopen`ed `libEGL.so.1` (the library itself links
-  no EGL at all, so the `DT_NEEDED` set stays `libc libm libwayland-client
-  libwayland-egl libxkbcommon` + the loader), and the platform display is Wayland.
-  The window's `wl_egl_window` is created on demand and kept on the window.
+  no EGL at all, so the `DT_NEEDED` set stays the platform libraries and the C
+  library), and the platform display is the driver's — `EGL_PLATFORM_WAYLAND_EXT`
+  or `EGL_PLATFORM_X11_EXT` — with the native window being a `wl_egl_window` on
+  Wayland and the X window number on X11. On X11 the EGL config also decides the
+  X visual (`sdlop_egl_x11_visual()`), which is why the backend asks for it
+  before it creates the window.
 * `SDL_Vulkan_*` goes through `src/video/SDL_vulkan.c`, which `dlopen`s the
-  Vulkan loader (`libvulkan.so.1` or `SDL_HINT_VULKAN_LIBRARY`), exposes
-  `{VK_KHR_surface, VK_KHR_wayland_surface}` and calls `vkCreateWaylandSurfaceKHR`
-  on the window's `wl_surface`. No Vulkan headers are needed to build: the three
-  types come from `SDL_vulkan.h` and the entry points are looked up by name.
+  Vulkan loader (`libvulkan.so.1` or `SDL_HINT_VULKAN_LIBRARY`) and then asks the
+  driver for everything platform-specific: `{VK_KHR_surface,
+  VK_KHR_wayland_surface}` + `vkCreateWaylandSurfaceKHR` +
+  `vkGetPhysicalDeviceWaylandPresentationSupportKHR` on Wayland,
+  `{VK_KHR_surface, VK_KHR_xlib_surface}` + `vkCreateXlibSurfaceKHR` +
+  `vkGetPhysicalDeviceXlibPresentationSupportKHR` on X11. No Vulkan headers are
+  needed to build: the types come from `SDL_vulkan.h` and the entry points are
+  looked up by name.
 
 ## 6. Conventions
 

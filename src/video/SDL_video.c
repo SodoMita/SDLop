@@ -503,7 +503,10 @@ bool SDLOP_VideoInit(const char *driver_name)
         requested = SDL_GetHint("SDL_VIDEODRIVER");
     }
     if (!requested || !requested[0]) {
-        /* auto-detect: Wayland first, then X11 */
+        /* Auto-detect: whatever the session points at first, and nothing more
+           than that - if it turns out not to work (a stale WAYLAND_DISPLAY in an
+           SSH session, say) the next driver gets its turn, which is how an
+           application ends up on X11 without having asked for it. */
         env = SDL_getenv("WAYLAND_DISPLAY");
         if (env && env[0]) {
             requested = "wayland";
@@ -527,9 +530,12 @@ bool SDLOP_VideoInit(const char *driver_name)
             SDLOP_MarkDisplayEnumerationDone();
             return true;
         }
-        if (requested && requested[0]) {
+        if (driver_name || (SDL_GetHint("SDL_VIDEODRIVER") &&
+                            SDL_GetHint("SDL_VIDEODRIVER")[0])) {
             break;                     /* an explicit request is not retried */
         }
+        /* Auto-detected: remember the failure, but try the next driver. */
+        requested = NULL;
     }
 
     if (!SDL_GetError()[0]) {

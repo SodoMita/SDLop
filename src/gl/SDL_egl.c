@@ -20,6 +20,11 @@
 
 #include <string.h>
 #include <dlfcn.h>
+/* Without X11 in the build, eglplatform.h must not pull in Xlib: EGL_NO_X11
+   makes the native types plain integers, which is all this file needs. */
+#ifndef SDLOP_HAVE_X11
+#define EGL_NO_X11
+#endif
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <wayland-egl.h>
@@ -29,7 +34,7 @@
    never asks for GL runs on a machine that has no EGL at all. This is what SDL
    does with its own loader; the trick that keeps this file readable is that the
    EGL names below become pointers, so the rest of the code looks unchanged. */
-#define SDLOP_EGL_FUNCS     X(eglBindAPI) X(eglChooseConfig) X(eglCreateContext) X(eglCreateWindowSurface)     X(eglDestroyContext) X(eglDestroySurface) X(eglGetDisplay) X(eglGetProcAddress)     X(eglInitialize) X(eglMakeCurrent) X(eglQueryString) X(eglSwapBuffers)     X(eglSwapInterval) X(eglTerminate)
+#define SDLOP_EGL_FUNCS     X(eglBindAPI) X(eglChooseConfig) X(eglCreateContext) X(eglCreateWindowSurface)     X(eglDestroyContext) X(eglDestroySurface) X(eglGetConfigAttrib) X(eglGetDisplay)     X(eglGetProcAddress) X(eglInitialize) X(eglMakeCurrent) X(eglQueryString)     X(eglSwapBuffers) X(eglSwapInterval) X(eglTerminate)
 
 #define X(name) static __typeof__(&name) sdlop_##name;
 SDLOP_EGL_FUNCS
@@ -45,6 +50,7 @@ static const char *const sdlop_egl_names[] = { SDLOP_EGL_FUNCS };
 #define eglCreateWindowSurface (*sdlop_eglCreateWindowSurface)
 #define eglDestroyContext     (*sdlop_eglDestroyContext)
 #define eglDestroySurface     (*sdlop_eglDestroySurface)
+#define eglGetConfigAttrib    (*sdlop_eglGetConfigAttrib)
 #define eglGetDisplay         (*sdlop_eglGetDisplay)
 #define eglGetProcAddress     (*sdlop_eglGetProcAddress)
 #define eglInitialize         (*sdlop_eglInitialize)
@@ -231,13 +237,21 @@ static bool sdlop_egl_init_display(void)
         return false;
     }
 
-    if (driver && SDL_strcmp(driver->name, "wayland") == 0) {
-        p_eglGetPlatformDisplayEXT = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-        if (p_eglGetPlatformDisplayEXT) {
-            sdlop_egl.display = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_EXT,
-                                                           sdlop_wl_display_handle(), NULL);
-        }
+    p_eglGetPlatformDisplayEXT = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (driver && SDL_strcmp(driver->name, "wayland") == 0 && p_eglGetPlatformDisplayEXT) {
+        /* The display of the Wayland connection this process already has: no
+           second connection, and no guess at which one to use. */
+        sdlop_egl.display = p_eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_EXT,
+                                                       sdlop_wl_display_handle(), NULL);
     }
+#ifdef SDLOP_HAVE_X11
+    if (driver && SDL_strcmp(driver->name, "x11") == 0 && p_eglGetPlatformDisplayEXT) {
+        /* Same idea on X11: EGL_PLATFORM_X11_EXT pins the platform, so
+           eglGetDisplay() never has to guess between X11 and a headless device. */
+        sdlop_egl.display = p_eglGetPlatformDisplayEXT(
+            EGL_PLATFORM_X11_EXT, (void *)(uintptr_t)sdlop_x11_display_handle(), NULL);
+    }
+#endif
     if (sdlop_egl.display == EGL_NO_DISPLAY || sdlop_egl.display == NULL) {
         sdlop_egl.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     }
@@ -313,7 +327,20 @@ static SDL_GLContext sdlop_egl_create_context(SDL_Window *window, SDL_GLContext 
             }
         }
         native_window = (EGLNativeWindowType)window->driver.wayland.egl_window;
-    } else {
+    }
+#ifdef SDLOP_HAVE_X11
+    else if (driver && SDL_strcmp(driver->name, "x11") == 0) {
+        /* On X11 the EGL native window is the X window itself. It has to have
+           been created with the visual of the chosen EGL config, which is what
+           SDLOP_X11_GLVisual() is for. */
+        native_window = (EGLNativeWindowType)sdlop_x11_window_handle(window);
+        if (!native_window) {
+            SDL_SetError("The X11 window has not been created yet");
+            return NULL;
+        }
+    }
+#endif
+    else {
         SDL_SetError("The %s driver cannot create GL contexts", driver ? driver->name : "current");
         return NULL;
     }
@@ -393,6 +420,11 @@ static bool sdlop_egl_make_current(SDL_Window *window, SDL_GLContext context)
         if (driver && SDL_strcmp(driver->name, "wayland") == 0) {
             native_window = (EGLNativeWindowType)window->driver.wayland.egl_window;
         }
+#ifdef SDLOP_HAVE_X11
+        else if (driver && SDL_strcmp(driver->name, "x11") == 0) {
+            native_window = (EGLNativeWindowType)sdlop_x11_window_handle(window);
+        }
+#endif
         if (sdlop_egl.surface != EGL_NO_SURFACE) {
             eglDestroySurface(sdlop_egl.display, sdlop_egl.surface);
         }
@@ -445,6 +477,36 @@ static void sdlop_egl_destroy_context(SDL_GLContext context)
     }
     eglDestroyContext(sdlop_egl.display, (EGLContext)context);
 }
+
+#ifdef SDLOP_HAVE_X11
+/* The X11 visual an SDL_WINDOW_OPENGL window has to be created with, so that the
+   X window matches the EGL config eglCreateWindowSurface() will be given. This is
+   SDL3's "get the visual before creating the window" step, done through EGL
+   instead of GLX. */
+bool sdlop_egl_x11_visual(unsigned long *visual_id, int *depth)
+{
+    EGLint native_visual = 0;
+
+    if (visual_id) {
+        *visual_id = 0;
+    }
+    if (depth) {
+        *depth = 0;
+    }
+    if (!sdlop_egl_init_display() || !sdlop_egl_choose_config()) {
+        return false;
+    }
+    /* EGL reports the X visual the config maps to; the X server owns the depth. */
+    if (!eglGetConfigAttrib(sdlop_egl.display, sdlop_egl.config, EGL_NATIVE_VISUAL_ID,
+                            &native_visual) || !native_visual) {
+        return false;
+    }
+    if (visual_id) {
+        *visual_id = (unsigned long)native_visual;
+    }
+    return true;
+}
+#endif /* SDLOP_HAVE_X11 */
 
 const SDLOP_GLDriver SDLOP_EGLDriver = {
     .name = "egl",

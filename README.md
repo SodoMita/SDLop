@@ -35,6 +35,8 @@ make -j4            # build/libSDLop.a and build/libSDLop.so
 make tests          # build the test programs
 make check          # build and run them
 make bench          # build the SDL3-vs-SDLop benchmark (needs real SDL3)
+make x11-check      # drive the X11 backend with xdotool (needs an X server)
+make wayland-check  # drive the Wayland backend through wl_inject (needs sway)
 make install        # headers + libraries + sdl3-sdlop.pc
 ```
 
@@ -43,9 +45,18 @@ so a machine without Wayland, EGL or xkbcommon still builds everything else:
 
 ```sh
 make WAYLAND=0 EGL=0       # offscreen-only build
+make X11=0                 # without libX11
 make DEBUG=1               # -O0 -DSDLOP_DEBUG
 make CC=clang OPT=-O3
 ```
+
+Both Linux backends are on by default when their libraries are installed:
+Wayland uses `wayland-client`, `wayland-egl` and `xkbcommon`; X11 adds `x11`,
+`xext`, `xi`, `xrandr`, `xkbcommon-x11` and `x11-xcb`. X11's optional pieces are
+probed separately — `XSHM=1|0`, and XInput2/RandR/XShape as well as the
+`xkbcommon-x11` keymap source compile in only when their headers are found
+(`make X11XCB=0` drops the server keymap and falls back to the local XKB
+configuration).
 
 Runnable example:
 
@@ -60,8 +71,9 @@ Environment variables that exist for testing and for stubborn machines:
 | Variable | Effect |
 |---|---|
 | `SDLOP_TEST_INPUT=<fifo>` | Feed input records (`EV_KEY 30 1`) through the async ring without `/dev/input`; what the input tests use. |
-| `SDLOP_WAYLAND_KEYMAP=<file>` | Use this XKB keymap file instead of the compositor's. Also the way to get a non-US layout from a compositor that sends the wrong one. |
-| `SDLOP_WAYLAND_DUMP_KEYMAP=<path>` | Write out the keymap the compositor sent, so layout bugs are debuggable. |
+| `SDLOP_XKB_KEYMAP=<file>` | Use this XKB keymap file instead of the compositor's / the X server's. Also the way to get a non-US layout from a compositor that sends the wrong one. |
+| `SDLOP_XKB_DUMP=<path>` | Write out the keymap that was loaded (whichever source won), so layout bugs are debuggable. |
+| `SDL_HINT_NO_SIGNAL_HANDLERS=1` | The stock SDL3 hint, honoured: do not turn SIGINT/SIGTERM into `SDL_EVENT_QUIT`, leave the default handlers alone. |
 | `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY=1` | The stock SDL3 hint, honoured: displays, window surfaces and content scale switch to physical pixels instead of letting the compositor upscale a 1x surface. |
 
 ## What is implemented
@@ -71,11 +83,11 @@ Environment variables that exist for testing and for stubborn machines:
 | Core | `SDL_Init`/`SDL_Quit`, errors, logging, asserts, properties (with cleanup callbacks), hints, version, `SDL_stdinc` subset, rects |
 | Timing | monotonic ticks and performance counter, `SDL_Delay`, `SDL_AddTimer`/`SDL_RemoveTimer` |
 | Events | 512-event queue, filters and watches, `SDL_PollEvent`/`SDL_WaitEvent`/`SDL_PeepEvents`, user events, main-thread callbacks |
-| Input | keyboard (scancodes, keycodes, mods, text input), mouse (buttons, motion, wheel, relative mode via `zwp_relative_pointer_v1`, grab/mouse-rect via `zwp_pointer_constraints_v1`, capture), focus handling, async evdev worker |
+| Input | keyboard (scancodes, keycodes, mods, text input), mouse (buttons, motion, wheel, relative mode, grab/mouse-rect, capture), focus handling, async evdev worker, and the X11 fallback reader (XInput2 raw motion + core events, server-side auto-repeat, the server's XKB keymap) for a session where `/dev/input` is not readable |
 | Video | window create/destroy/state, displays and modes from `zxdg_output_v1` (logical geometry, HiDPI scale, hotplug), window surfaces that follow the window size (`SDL_GetWindowSurface`, `SDL_UpdateWindowSurface`), cursors |
-| GL | `SDL_GL_*` through dlopen'ed EGL (Wayland platform) |
-| Vulkan | `SDL_Vulkan_*` through the dlopen'ed Vulkan loader and `vkCreateWaylandSurfaceKHR` |
-| Backends | `wayland`, `offscreen` |
+| GL | `SDL_GL_*` through dlopen'ed EGL (Wayland and X11 platform displays) |
+| Vulkan | `SDL_Vulkan_*` through the dlopen'ed Vulkan loader, `vkCreateWaylandSurfaceKHR` and `vkCreateXlibSurfaceKHR` |
+| Backends | `wayland`, `x11`, `offscreen` |
 
 Deliberately **not** implemented (link errors are the intended outcome):
 audio, renderer, camera, joystick/gamepad, HIDAPI, sensors, dialogs, message
@@ -85,17 +97,20 @@ every dropped declaration (112 of them were not kept on purpose).
 
 ## Status
 
-Verified on this machine (gcc 14.2.0, Linux; weston 14.0.2 X11 backend and sway
-1.10.1 headless with two outputs, one of them at scale 2; lavapipe/llvmpipe):
+Verified on this machine (gcc 14.2.0, Linux; Xvfb, weston 14.0.2 X11 backend and
+sway 1.10.1 headless with two outputs, one of them at scale 2;
+lavapipe/llvmpipe):
 
 | Check | Result |
 |-------|--------|
 | `python3 tools/check_api.py --lib build/libSDLop.so` | 21/21 headers identical to SDL3 3.2.10, every declared function exported |
-| `test_core` (offscreen) | 115 checks, 0 failures |
-| `test_input` (offscreen **and** wayland; FIFO record feed) | 93 checks, 0 failures — passes on both a US and a French keyboard layout |
-| `test_video` (offscreen **and** wayland) | 91 checks, 0 failures (102 under sway's two outputs) |
-| `test_gl` (weston) | 28 checks, 0 failures — EGL context *and* Vulkan surface created and destroyed |
-| `examples/hello` (weston) | frames rendered and presented, exit 0 |
+| `test_core` (offscreen, wayland **and** x11) | 118 checks, 0 failures |
+| `test_input` (offscreen **and** wayland **and** x11; FIFO record feed) | 93 checks, 0 failures — passes on both a US and a French keyboard layout |
+| `test_video` (offscreen **and** wayland **and** x11) | 91 checks, 0 failures (102 under sway's two outputs) |
+| `test_gl` (weston, x11) | 28 checks, 0 failures — EGL context *and* Vulkan surface created and destroyed |
+| `examples/hello` (weston, sway, Xvfb) | frames rendered and presented, exit 0 |
+| `tests/x11_input.sh` (`make x11-check`, Xvfb + `xdotool`) | 25 checks, 0 failures — enter/motion/button/wheel/leave, scancodes, keycodes, modifiers, `SDL_EVENT_TEXT_INPUT`, shift-a, Ctrl suppression, held-key repeat (and the same with the server's auto-repeat switched off), resize/move from the X server, the platform properties, display bounds against `xrandr` |
+| Key and pointer stream vs stock SDL3 on X11 (`xdotool`-driven, same script) | identical scancodes, keycodes, modifiers, text, buttons, wheel and focus events; the only differences are the order of the first four lifecycle events and one extra motion event stock sends on a button press |
 | Real key events (`xdotool` into weston's X11 backend) | correct scancodes, keycodes (shift uppercases), `SDL_EVENT_TEXT_INPUT`, Ctrl-suppression, and client-side key repeat |
 | Display geometry vs stock SDL3 (sway, outputs `800x600@1` at 0,0 and `1024x768@2` at 800,0) | identical: bounds, current mode, `pixel_density`, content scale — `512x384` logical for the scale-2 output, content scale 1.0 unless `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY` |
 | `tests/wayland_input.sh` (`make wayland-check`, sway) | 9 checks, 0 failures — enter/motion/button/wheel/leave plus relative-mode deltas, injected with `tools/wl_inject` |
@@ -146,6 +161,17 @@ printf 'sleep 200\ncursor 300 260\nmove 12 7\nbutton left down\n' > /tmp/in.s
 WAYLAND_DISPLAY=wayland-1 ./build/tools/wl_inject /tmp/in.s  # sleep/cursor/move/button/click/wheel/flush
 ```
 
+`make x11-check` drives the X11 backend from the outside: `tests/x11_input.c`
+reports where its window is (and what the backend told it about the display),
+`tests/x11_input.sh` moves the pointer and types at it with `xdotool`, and the
+client's event log is asserted line by line (25 checks). Nothing is assumed about
+the X server — not even that a window manager is running:
+
+```sh
+Xvfb :99 -screen 0 1280x800x24 &
+DISPLAY=:99 make x11-check
+```
+
 `make wayland-check` runs both scripted rigs: `tests/wayland_input.sh` (absolute
 and relative pointer, 9 checks) and `tests/wayland_display.sh` (two outputs,
 HiDPI, hotplug, 12 checks). Both are self-contained — they rebuild the sway
@@ -170,19 +196,23 @@ driver). SDL 3.2.10 vs SDLop, ns per operation:
 
 | operation | SDL3 | SDLop | speedup |
 |---|---:|---:|---:|
-| `SDL_Init` + `SDL_Quit` | 20159 | 4034 | **5.0x** |
-| `SDL_CreateWindow` + `SDL_DestroyWindow` | 16727 | 776 | **21.5x** |
-| `SDL_PumpEvents` (nothing pending) | 34.0 | 9.6 | **3.5x** |
-| `SDL_PushEvent` + `SDL_PollEvent` | 37.5 | 14.0 | **2.7x** |
-| `SDL_GetTicks` | 34.3 | 28.7 | 1.2x |
-| `SDL_GetPerformanceCounter` | 27.3 | 27.1 | 1.0x |
-| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` | 2132637 | 55662 | **38.3x** |
-| `SDL_GetKeyboardState` | 1.9 | 1.5 | 1.3x |
-| `SDL_GetModState` | 1.8 | 1.2 | 1.5x |
+| `SDL_Init` + `SDL_Quit` | 24033 | 5986 | **4.0x** |
+| `SDL_CreateWindow` + `SDL_DestroyWindow` | 29953 | 906 | **33.1x** |
+| `SDL_PumpEvents` (nothing pending) | 40.2 | 11.1 | **3.6x** |
+| `SDL_PushEvent` + `SDL_PollEvent` | 43.3 | 10.2 | **4.3x** |
+| `SDL_GetTicks` | 32.8 | 27.4 | 1.2x |
+| `SDL_GetPerformanceCounter` | 24.7 | 24.2 | 1.0x |
+| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` | 2518572 | 59450 | **42.4x** |
+| `SDL_GetKeyboardState` | 2.7 | 2.3 | 1.2x |
+| `SDL_GetModState` | 2.4 | 1.8 | 1.3x |
 
-The two hot paths that used to be *slower* than SDL3 (a `write()` to the wakeup
-eventfd on every pushed event, and a mutex taken by every `SDL_PumpEvents`) were
-removed after this benchmark measured them — see
+Run on X11 (Xvfb, one real `X11` window and a real `XPutImage`/MIT-SHM present)
+the same benchmark gives 1.4x for init, 8.4x for window create/destroy, 3.5x for
+`SDL_PumpEvents`, 3.2x for push+poll and 11.5x for fill+present — the smaller
+numbers are the X server round trips that both libraries share. The hot paths
+that used to be *slower* than SDL3 (a `write()` to the wakeup eventfd on every
+pushed event, a mutex taken by every `SDL_PumpEvents`, and a pump per polled
+event) were found and removed this way — see
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Layout
@@ -193,16 +223,16 @@ src/core/           stdinc, errors, logging, asserts, properties, hints, init, v
 src/timer/          ticks, performance counter, timers
 src/events/         event queue, filters/watches, waiting (poll + wakeup fd)
 src/input/          async evdev worker, record -> SDL_Event translation, keyboard, mouse
-src/video/          video core, window surfaces, Wayland backend, offscreen backend,
-                    Vulkan surface creation
+src/video/          video core, window surfaces, Wayland and X11 backends, offscreen
+                    backend, Vulkan surface creation
 src/gl/             EGL driver behind SDL_GL_*
 src/main/           SDL_RunApp / SDL_EnterAppMainCallbacks
 src/generated/      generated tables (key names, pixel formats, evdev map, Wayland protocols)
 tools/              header generator, API checker, table generators, wl_inject
                     (dev-only virtual-pointer client), upstream reference data
-tests/              test_core, test_video, test_input, test_gl, and the two
-                    compositor-driven rigs wayland_input / wayland_display
-                    (shared session helpers in wayland_setup.sh)
+tests/              test_core, test_video, test_input, test_gl, and the
+                    display-driven rigs: wayland_input / wayland_display (shared
+                    session helpers in wayland_setup.sh) and x11_input
 examples/           hello
 bench/              SDL3-vs-SDLop benchmark
 docs/               ARCHITECTURE.md, PERFORMANCE.md, ROADMAP.md

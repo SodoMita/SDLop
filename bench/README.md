@@ -43,8 +43,10 @@ The `FillSurfaceRect + UpdateWindowSurface` line compares "push a frame to an
 offscreen window", not present cost on a real compositor: SDL3's offscreen driver
 sends the frame through its renderer-side path while SDLop presents the
 surface buffer directly. Treat it as a measure of how much machinery sits between
-the application and the pixels, not as Wayland present performance.
+the application and the pixels, not as Wayland present performance — run it with
+`SDL_VIDEODRIVER=x11 DISPLAY=:99` (or on a real Wayland session) to see the
+present cost both libraries actually pay.
 
 See [../docs/PERFORMANCE.md](../docs/PERFORMANCE.md) for the current results, the
-method, and the two hot paths that this benchmark found were slower than SDL3
+method, and the three hot paths that this benchmark found were slower than SDL3
 before they were fixed.

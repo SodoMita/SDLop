@@ -22,8 +22,8 @@ so nothing SDL3 supports is missing from the plan.
 
 | Backend | Status | Notes |
 |---|---|---|
-| **Wayland** | **done** | xdg-shell, `wl_shm` XRGB8888 + viewporter for HiDPI, cursor-shape-v1, wl_egl_window for GL, `vkCreateWaylandSurfaceKHR` for Vulkan, xkbcommon keymaps (compositor / local XKB / `SDLOP_WAYLAND_KEYMAP` override), client-side key repeat, `wl_surface_frame` pacing, wl_output v4, `zxdg_output_v1` display geometry + hotplug, `zwp_pointer_constraints_v1` + `zwp_relative_pointer_v1` for relative mouse mode / mouse grab / mouse rect. Verified under weston (X11 backend) and sway (headless, two outputs, one of them scale 2) — display geometry, content scale and window scale match stock SDL3 exactly on both, and against `xdotool`-driven real key and pointer events. |
-| **X11** | **WIP** | Window creation/present plus the **input fallback**: when `/dev/input` is unreadable (XWayland, Flatpak, sandbox, remote session) keys and buttons must keep working through Xlib/XInput2. `src/video/SDL_x11.c` is the missing piece; the X11 branches of `src/gl/SDL_egl.c` were removed until then and must be restored together with it. |
+| **Wayland** | **done** | xdg-shell, `wl_shm` XRGB8888 + viewporter for HiDPI, cursor-shape-v1, wl_egl_window for GL, `vkCreateWaylandSurfaceKHR` for Vulkan, xkbcommon keymaps (compositor / local XKB / `SDLOP_XKB_KEYMAP` override, shared with the X11 backend in `src/input/SDL_xkb.c`), client-side key repeat, `wl_surface_frame` pacing, wl_output v4, `zxdg_output_v1` display geometry + hotplug, `zwp_pointer_constraints_v1` + `zwp_relative_pointer_v1` for relative mouse mode / mouse grab / mouse rect. Verified under weston (X11 backend) and sway (headless, two outputs, one of them scale 2) — display geometry, content scale and window scale match stock SDL3 exactly on both, and against `xdotool`-driven real key and pointer events. |
+| **X11** | **done** | Window creation/present plus the **input fallback** for when `/dev/input` is unreadable (XWayland, Flatpak, sandbox, remote session): `src/video/SDL_x11.c` owns the X connection, EWMH/`_MOTIF_WM_HINTS` window state, MIT-SHM present (with `XPutImage` when the extension is missing), RandR displays (with the screen as fallback), XShape hit tests, 1-bit cursors, grabs/relative mode/capture, and the input translation (core + XInput2 events, the server's XKB keymap through `xkbcommon-x11`, detectable auto-repeat). The X11 branches of `src/gl/SDL_egl.c` and the Xlib Vulkan WSI came back with it. Verified with `make x11-check` (25 checks, Xvfb + `xdotool`) and against stock SDL3 on the same X server, event line for event line. |
 | **KMSDRM** (console, no compositor) | planned | Owns the master plane and the input devices; a good fit for the SDLop design because it removes both a compositor and a window manager from the loop — one place where SDL3's session-management code is a lot of machinery. |
 | **SteamOS** | planned | Gamescope presents Wayland; a SteamOS port is "Wayland with a session script", so it is really a packaging + testing task once the Wayland backend handles the gamescope quirks (`wp_presentation`, tearing control, fractional scaling). |
 | **Raspberry Pi / VideoCore** | planned | X11/Wayland on the Pi needs `rpi`-specific window sizing and the legacy dispmanx path only for very old images; the plan is KMSDRM first. |
@@ -76,9 +76,23 @@ keyboard/mouse layers or any of the `src/generated/` tables.
 - [x] `SDL_GL_*` (EGL) and `SDL_Vulkan_*` (loader + Wayland surface) — verified
       under weston with lavapipe/llvmpipe.
 - [x] `bench/` versus real SDL3, and the two hot-path fixes it found.
-- [ ] **X11 backend** (`src/video/SDL_x11.c`): window, present, and the input
-      fallback for when `/dev/input` is not readable. Restore the X11 branches in
-      `src/gl/SDL_egl.c` in the same change.
+- [x] **X11 backend** (`src/video/SDL_x11.c`): window, present, and the input
+      fallback for when `/dev/input` is not readable; the X11 branches of
+      `src/gl/SDL_egl.c` and the Xlib Vulkan WSI restored in the same change.
+      Sourcing is per session, not per build: the evdev worker is the input
+      producer when `/dev/input` is readable, otherwise the X11 reader takes over
+      (and `SDLOP_TEST_INPUT` overrides both for tests).
+- [x] SIGINT/SIGTERM become `SDL_EVENT_QUIT` in the pump instead of killing the
+      process, and the signal wakes a blocked `SDL_WaitEvent()` through the
+      wakeup fd; `SDL_HINT_NO_SIGNAL_HANDLERS` is honoured, and a handler the
+      application installed itself is left alone.
+- [x] `SDL_PollEvent()` pumps only when the queue is empty (SDL3's own fast
+      path): a poll loop no longer pays for a poll(2) per event.
+- [x] X11 rig (`tests/x11_input.c` + `tests/x11_input.sh`, `make x11-check`):
+      `xdotool`-driven, no window manager needed, 25 checks over enter/motion/
+      button/wheel/leave, scancodes/keycodes/mods/text, held-key repeat (with the
+      server's auto-repeat both on and off), server-side resize/move and the
+      platform properties.
 - [ ] **Input latency harness**: measure record-arrival → `SDL_PollEvent` return
       through the real evdev path (needs a machine with `/dev/input`, or a
       `uinput` device created by the test itself).
@@ -86,12 +100,12 @@ keyboard/mouse layers or any of the `src/generated/` tables.
       the evdev → SDL event path without hardware.
 - [x] XKB keymap loading with xkbcommon: the compositor's `wl_keyboard.keymap`
       is compiled and registered as the keyboard layout (`SDLOP_KeyLayout`), with
-      three fallbacks — an explicit `SDLOP_WAYLAND_KEYMAP=<file>` override, the
+      three fallbacks — an explicit `SDLOP_XKB_KEYMAP=<file>` override, the
       local XKB configuration (`XKB_DEFAULT_LAYOUT`, for headless/KMS
       compositors that never send a keymap), and finally SDL's built-in tables.
       Because keys arrive from the evdev worker rather than from the compositor,
       the layout is told about every key event so its own modifier state follows.
-      `SDLOP_WAYLAND_DUMP_KEYMAP=<path>` writes out what the compositor sent.
+      `SDLOP_XKB_DUMP=<path>` writes out what was loaded, whichever source won.
 - [x] Client-side key repeat (`wl_keyboard.repeat_info` + `xkb_keymap_key_repeats`),
       including waking a blocked `SDL_WaitEvent()` in time for the next repeat.
 - [x] `wl_surface_frame` present pacing, so a buffer is never attached while the
@@ -151,10 +165,9 @@ keyboard/mouse layers or any of the `src/generated/` tables.
 - [ ] `zwp_input_timestamps_v1`: ask the compositor for the real event timestamps
       (the backend currently stamps events with the local clock when they are
       read, like the rest of the pump).
-- [ ] A second GL driver (EGL via GLX/`eglGetPlatformDisplay(EGL_PLATFORM_X11)`)
-      as part of the X11 work. The EGL entry points are already resolved at
-      runtime from a `dlopen`ed `libEGL.so.1`, so the X11 driver only has to
-      pick a different platform display.
+- GLX is deliberately not planned (not a TODO): EGL through
+      `eglGetPlatformDisplay(EGL_PLATFORM_X11_EXT)` covers the same machines with
+      less code, and that is what `src/gl/SDL_egl.c` does on X11 as well.
 - [ ] Headless input rig for non-wlroots compositors: `zwlr_virtual_pointer_v1`
       covers sway/wlroots (`tests/wayland_input.sh`); weston's `weston-test`
       protocol or a `uinput` device would cover the rest, and would also let the

@@ -129,6 +129,46 @@ typedef struct SDLOP_KeyLayout
 void SDLOP_SetKeyLayout(const SDLOP_KeyLayout *layout);
 const SDLOP_KeyLayout *SDLOP_GetKeyLayout(void);
 
+/* ------------------------------------------------------------------------- */
+/* XKB layout (src/input/SDL_xkb.c)                                          */
+/*                                                                            */
+/* Shared by the backends that can ask the platform what layout is in effect   */
+/* (Wayland: the compositor's wl_keyboard keymap; X11: the server's keymap,    */
+/* read through libxkbcommon-x11). All of it is compiled out when the build has */
+/* no xkbcommon, in which case the keyboard layer uses its generated tables.   */
+/* ------------------------------------------------------------------------- */
+
+#ifdef SDLOP_HAVE_XKBCOMMON
+/* The layout state keycode/text questions are answered from; NULL when no
+   keymap has been installed. */
+struct xkb_keymap *SDLOP_XKBKeymap(void);
+struct xkb_state *SDLOP_XKBState(void);
+SDL_Keycode SDLOP_KeycodeFromKeysym(Uint32 keysym);
+/* Does this key repeat while it is held? (xkbcommon knows: it is a property of
+   the key in the current layout.) */
+bool SDLOP_XKBKeyRepeats(Uint32 evdev_code);
+
+bool SDLOP_XKBCompileFromString(const char *text, size_t size);
+/* Compile a keymap from XKB rule names; NULL fields fall back to the
+   XKB_DEFAULT_* environment and then to xkbcommon's own defaults. */
+bool SDLOP_XKBCompileFromRules(const char *rules, const char *model, const char *layout,
+                               const char *variant, const char *options);
+/* mmap a keymap file descriptor (wl_keyboard.keymap() gives one), compile it and
+   close it. */
+bool SDLOP_XKBLoadKeymapFD(int fd);
+/* SDLOP_XKB_KEYMAP=<file> was set: the platform's own keymap must be ignored. */
+bool SDLOP_XKBOverrideActive(void);
+/* Install the best layout available before the first key arrives: the override
+   file if there is one, else the local XKB configuration. */
+void SDLOP_XKBInit(void);
+void SDLOP_XKBQuit(void);
+#ifdef SDLOP_HAVE_XKBCOMMON_X11
+/* Read the X server's core keyboard keymap. `xdisplay` is a Display*. */
+bool SDLOP_XKBLoadFromX11(void *xdisplay, int device_id);
+int SDLOP_XKBX11DeviceID(void *xdisplay);
+#endif
+#endif /* SDLOP_HAVE_XKBCOMMON */
+
 /* Deliver a key press/release. `timestamp` is in nanoseconds of SDL_GetTicksNS()
    time. Produces SDL_EVENT_KEY_DOWN/KEY_UP and, when text input is active, the
    matching SDL_EVENT_TEXT_INPUT/TEXT_EDITING events.
@@ -325,6 +365,10 @@ typedef struct SDLOP_VideoDriver
                                   VkSurfaceKHR *surface);
     const char *const *(*get_vulkan_instance_extensions)(Uint32 *count);
 
+    /* Can this queue family present to the platform's display? (Wayland: the
+       wl_display the connection is on; X11: the X display and its visual.) */
+    bool (*vulkan_presentation_support)(VkInstance instance, VkPhysicalDevice physical_device,
+                                        Uint32 queue_family_index);
     const struct SDLOP_GLDriver *gl;
 } SDLOP_VideoDriver;
 
@@ -437,6 +481,10 @@ void SDLOP_ResizeWindowSurface(SDL_Window *window, int w, int h);
 bool SDLOP_VulkanLoad(const char *path);
 void SDLOP_VulkanUnload(void);
 void SDLOP_VulkanCleanup(void);
+/* vkGetInstanceProcAddr of the loaded loader, and the loader's result codes as
+   text (used by the backends, which own their platform's entry points). */
+SDL_FunctionPointer SDLOP_VulkanGetInstanceProc(VkInstance instance, const char *name);
+const char *SDLOP_VulkanResultString(int result);
 
 /* Native handles the GL driver needs (implemented by the video backends). */
 void *sdlop_wl_display_handle(void);
@@ -444,11 +492,23 @@ void *sdlop_wl_egl_window_create(SDL_Window *window);
 unsigned long sdlop_x11_display_handle(void);
 unsigned long sdlop_x11_window_handle(SDL_Window *window);
 
+#ifdef SDLOP_HAVE_EGL
+#ifdef SDLOP_HAVE_X11
+/* The X visual an SDL_WINDOW_OPENGL window must be created with, so the X window
+   matches the EGL config (implemented in src/gl/SDL_egl.c). */
+bool sdlop_egl_x11_visual(unsigned long *visual_id, int *depth);
+#endif
+#endif
+
 /* Wakeup descriptor: the async input worker rings this so a thread blocked in
    SDL_WaitEvent() notices new input immediately instead of on a timer. */
 bool SDLOP_InitWakeup(void);
 void SDLOP_QuitWakeup(void);
 int SDLOP_GetWakeupFD(void);
+/* SIGINT/SIGTERM -> SDL_EVENT_QUIT (SDL_HINT_NO_SIGNAL_HANDLERS turns it off). */
+void SDLOP_InstallSignalHandlers(void);
+void SDLOP_QuitSignalHandlers(void);
+void SDLOP_QueueSignalQuit(void);
 void SDLOP_SignalWakeup(void);
 
 /* Block until the platform has events, the wakeup fd is rung, or timeoutNS
@@ -539,11 +599,10 @@ struct SDL_Window
         struct
         {
             unsigned long window;      /* X11 Window */
-            void *ic;                  /* XIC, for IME */
-            void *glx;                 /* GLXContext wrapper */
-            void *egl_window;          /* unused on X11 */
+            unsigned long colormap;    /* Colormap we created for a GL visual */
             void *gc;                  /* Xlib GC used for presenting */
-            void *image;               /* XImage for shared-memory-free presenting */
+            void *image;               /* XImage the window is presented from */
+            void *shm;                 /* XShmSegmentInfo when MIT-SHM is used */
             void *buffer;              /* our own pixel buffer */
             int buffer_pitch;
             bool is_popup;

@@ -70,8 +70,43 @@ CFLAGS += -DSDLOP_HAVE_EGL
 LIBS   += $(shell $(PKG_CONFIG) --libs wayland-egl)
 endif
 ifeq ($(X11),1)
-CFLAGS += -DSDLOP_HAVE_X11
-LIBS   += $(shell $(PKG_CONFIG) --libs x11)
+# X11 needs libXext as well: XShape (window hit test) and XShm (shared-memory
+# presentation, one copy less per frame than XPutImage) both live there.
+CFLAGS += -DSDLOP_HAVE_X11 -DSDLOP_HAVE_XSHAPE $(shell $(PKG_CONFIG) --cflags x11 xext 2>/dev/null)
+LIBS   += $(shell $(PKG_CONFIG) --libs x11 xext 2>/dev/null || echo -lX11 -lXext)
+# Each optional piece is detected on its own, so a machine with only libX11
+# still gets a window, a keyboard and a mouse:
+#   XShm          every X server (it is an X extension, checked at runtime too)
+#   XInput2       unaccelerated relative motion for relative mouse mode
+#   XRandR        one SDL display per output, hotplug, mode changes
+#   xkbcommon-x11 the server's keymap, compiled by the same code Wayland uses
+XSHM     ?= 1
+XINPUT2  ?= $(shell $(PKG_CONFIG) --exists xi && echo 1 || echo 0)
+XRANDR   ?= $(shell $(PKG_CONFIG) --exists xrandr && echo 1 || echo 0)
+X11XKB   ?= $(shell $(PKG_CONFIG) --exists xkbcommon-x11 && echo 1 || echo 0)
+ifeq ($(XSHM),1)
+CFLAGS += -DSDLOP_HAVE_XSHM
+endif
+ifeq ($(XINPUT2),1)
+CFLAGS += -DSDLOP_HAVE_XINPUT2 $(shell $(PKG_CONFIG) --cflags xi)
+LIBS   += $(shell $(PKG_CONFIG) --libs xi)
+endif
+ifeq ($(XRANDR),1)
+CFLAGS += -DSDLOP_HAVE_XRANDR $(shell $(PKG_CONFIG) --cflags xrandr)
+LIBS   += $(shell $(PKG_CONFIG) --libs xrandr)
+endif
+ifeq ($(X11XKB),1)
+# xkbcommon-x11 reads the keymap over XCB, so it needs the XCB connection Xlib
+# is already using (libX11-xcb). Without it the X11 driver falls back to the
+# local XKB configuration, which is the same fallback a headless session uses.
+X11XCB ?= $(shell $(PKG_CONFIG) --exists x11-xcb && echo 1 || echo 0)
+CFLAGS += -DSDLOP_HAVE_XKBCOMMON_X11
+LIBS   += $(shell $(PKG_CONFIG) --libs xkbcommon-x11)
+ifeq ($(X11XCB),1)
+CFLAGS += -DSDLOP_HAVE_X11_XCB $(shell $(PKG_CONFIG) --cflags x11-xcb)
+LIBS   += $(shell $(PKG_CONFIG) --libs x11-xcb)
+endif
+endif
 endif
 
 # ---------------------------------------------------------------- sources
@@ -83,7 +118,7 @@ SRCS := $(wildcard src/core/*.c) $(wildcard src/timer/*.c) $(wildcard src/events
 # on, so installing a dependency (or setting WAYLAND=0) and re-running make
 # rebuilds instead of silently keeping objects from the previous configuration.
 FEATURE_STAMP := $(BUILD)/features
-FEATURES := $(CFLAGS_BASE)$(if $(WAYLAND),wayland)$(if $(XKB),xkb)$(if $(EGL),egl)$(if $(X11),x11)$(if $(DEBUG),debug)
+FEATURES := $(CFLAGS_BASE)$(if $(WAYLAND),wayland)$(if $(XKB),xkb)$(if $(EGL),egl)$(if $(X11),x11)$(if $(XSHM),shm)$(if $(XINPUT2),xi2)$(if $(XRANDR),xrandr)$(if $(X11XKB),x11xkb)$(if $(DEBUG),debug)
 
 ifeq ($(WAYLAND),1)
 # cursor-shape-v1 refers to the tablet-v2 interfaces, so tablet-v2 is generated too
@@ -106,7 +141,7 @@ OBJS := $(patsubst src/%,$(BUILD)/obj/%,$(SRCS:.c=.o))
 # headers generated from the SDL3 headers and from the data tables
 GEN_HEADERS := $(GEN)/sdlop_keynames.h $(GEN)/sdlop_pixelformats.h $(GEN)/sdlop_evdev.h
 
-.PHONY: all clean install examples check wayland-check bench bench-run tools inject regen FORCE
+.PHONY: all clean install examples check wayland-check x11-check bench bench-run tools inject regen FORCE
 all: $(BUILD)/libSDLop.a $(BUILD)/libSDLop.so
 
 $(FEATURE_STAMP): FORCE
@@ -191,7 +226,9 @@ EXAMPLES := $(patsubst examples/%.c,$(BUILD)/examples/%,$(wildcard examples/*.c)
 # `make check` runs these; wayland_input is a *client* for a real compositor, so
 # it is built on demand and driven by tests/wayland_input.sh instead.
 WAYLAND_CLIENTS := $(BUILD)/tests/wayland_input $(BUILD)/tests/wayland_display
-TESTS    := $(filter-out $(WAYLAND_CLIENTS),$(patsubst tests/%.c,$(BUILD)/tests/%,$(wildcard tests/*.c)))
+# Driven against a running X server (tests/x11_input.sh): an X client, not a suite.
+X11_CLIENTS := $(BUILD)/tests/x11_input
+TESTS    := $(filter-out $(WAYLAND_CLIENTS) $(X11_CLIENTS),$(patsubst tests/%.c,$(BUILD)/tests/%,$(wildcard tests/*.c)))
 BENCHES  := $(patsubst bench/%.c,$(BUILD)/bench/%_compare,$(wildcard bench/*.c))
 
 examples: $(EXAMPLES)
@@ -225,6 +262,10 @@ $(BUILD)/bench/%_compare: bench/%.c
 check: tests
 	@for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done
 
+# Driven against a running X server; see tests/x11_input.sh.
+x11-check: tests $(X11_CLIENTS)
+	@X11_INPUT_CLIENT=$(BUILD)/tests/x11_input sh tests/x11_input.sh
+
 # Driven against a running compositor; see tests/wayland_input.sh.
 wayland-check: tests inject $(WAYLAND_CLIENTS)
 	@WAYLAND_INPUT_CLIENT=$(BUILD)/tests/wayland_input \
@@ -233,7 +274,7 @@ wayland-check: tests inject $(WAYLAND_CLIENTS)
 	@WAYLAND_DISPLAY_CLIENT=$(BUILD)/tests/wayland_display \
 	 sh tests/wayland_display.sh
 
-$(WAYLAND_CLIENTS): $(BUILD)/tests/%: tests/%.c $(BUILD)/libSDLop.a
+$(WAYLAND_CLIENTS) $(X11_CLIENTS): $(BUILD)/tests/%: tests/%.c $(BUILD)/libSDLop.a
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(BUILD)/libSDLop.a $(LIBS) -o $@
 	@echo "  [exe] $@"
