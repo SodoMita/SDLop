@@ -36,6 +36,7 @@ make tests          # build the test programs
 make check          # build and run them
 make bench          # build the SDL3-vs-SDLop benchmark (needs real SDL3)
 make abi-check      # layouts/constants vs stock SDL3 headers (needs libsdl3-dev)
+make link-check     # a program built against stock SDL3 headers, linked against libSDLop.so
 make x11-check      # drive the X11 backend with xdotool (needs an X server)
 make wayland-check  # drive the Wayland backend through wl_inject (needs sway)
 make behaviour-check # diff the event trace against stock SDL3 (needs Xvfb+xdotool)
@@ -115,6 +116,7 @@ lavapipe/llvmpipe):
 | `examples/hello` (weston, sway, Xvfb) | frames rendered and presented, exit 0 |
 | `tests/x11_input.sh` (`make x11-check`, Xvfb + `xdotool`) | 25 checks, 0 failures — enter/motion/button/wheel/leave, scancodes, keycodes, modifiers, `SDL_EVENT_TEXT_INPUT`, shift-a, Ctrl suppression, held-key repeat (and the same with the server's auto-repeat switched off), resize/move from the X server, the platform properties, display bounds against `xrandr` |
 | Key and pointer stream vs stock SDL3 on X11 (`xdotool`-driven, same script) | identical scancodes, keycodes, modifiers, text, buttons, wheel and focus events, and the same window-lifecycle events in the same order |
+| `make link-check` (the hard direction: stock SDL3 headers + `libSDLop.so`) | builds, runs and prints the same thing as the same program built against SDLop's own headers, on offscreen, X11 and Wayland |
 | `make behaviour-check` (one probe program compiled against both libraries, same scripted input **including a live `setxkbmap` switch while both windows are open**, traces diffed; US and German layouts) | every input and window-operation event identical in order (keys, text, modstate incl. Caps Lock, buttons, wheel, motion with deltas), the window-lifecycle events identical as a set, key/scancode name tables identical, and both probes announce the live layout switch (how many `KEYMAP_CHANGED` events one switch produces is the X server's business, documented in the rig). The one reported difference: `SDL_GetKeyFromName()` for punctuation the layout shifts (German `?` -> 0xdf in stock, 0x2f here) follows the active layout in stock and SDLop's US tables |
 | Real key events (`xdotool` into weston's X11 backend) | correct scancodes, keycodes (shift uppercases), `SDL_EVENT_TEXT_INPUT`, Ctrl-suppression, and client-side key repeat |
 | Display geometry vs stock SDL3 (sway, outputs `800x600@1` at 0,0 and `1024x768@2` at 800,0) | identical: bounds, current mode, `pixel_density`, content scale — `512x384` logical for the scale-2 output, content scale 1.0 unless `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY` |

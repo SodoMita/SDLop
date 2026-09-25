@@ -188,9 +188,16 @@ keyboard/mouse layers or any of the `src/generated/` tables.
       while a member is missing — which is exactly how `SDL_TouchFingerEvent` was
       found to be absent here — and the device events are checked as an ordered
       run, because a wrong position in the enum shifts everything after it.
-- [ ] Link-level ABI check: `tests/` programs compiled against **stock** SDL3
-      headers and linked against `libSDLop.so`, to prove binary compatibility for
-      the subset (the reverse of `check_api.py`).
+- [x] Link-level ABI check: `tools/link_probe.c` is an ordinary SDL3 program (no
+      SDLop-specific calls, no `#ifdef`s) compiled against the **system's** SDL3
+      headers and linked against `libSDLop.so`, then compiled again against
+      SDLop's own headers and linked against `libSDLop.a`; `make link-check` runs
+      both on every driver the session has and diffs their output. It is the one
+      check that catches a function that is declared, laid out correctly, and not
+      *exported* — the reason the library has to keep every symbol the subset
+      promises. Where the numbers are the session's rather than the program's (a
+      tiling compositor choosing the window size) the probe prints a verdict
+      instead of the numbers, so the Wayland leg compares what it can.
 - [x] Behaviour diff against stock SDL3: `tools/behaviour_probe.c` compiled
       against both libraries, driven with the same scripted input, traces diffed
       by `make behaviour-check` (see *Comparing against stock SDL3* in

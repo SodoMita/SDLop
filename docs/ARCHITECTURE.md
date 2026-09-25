@@ -369,7 +369,11 @@ Nothing that is *data* is hand-written; `make regen` rebuilds it:
 `tools/check_api.py` re-derives the declaration set from the SDLop headers with
 clang and diffs it against `/usr/include/SDL3/` — that is the guard that the
 "same API" promise still holds, and (with `--lib`) that every function the
-headers declare is actually exported by the built library.
+headers declare is actually exported by the built library. `tools/link_probe.c`
+is the same promise tested from the other side: a program written against the
+system's SDL3 headers and linked against `libSDLop.so`, which has to build, run
+and print what the same program built against SDLop's headers prints
+(`make link-check`).
 
 ## 5. Rendering surfaces
 

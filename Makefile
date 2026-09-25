@@ -151,7 +151,7 @@ OBJS := $(patsubst src/%,$(BUILD)/obj/%,$(SRCS:.c=.o))
 # headers generated from the SDL3 headers and from the data tables
 GEN_HEADERS := $(GEN)/sdlop_keynames.h $(GEN)/sdlop_pixelformats.h $(GEN)/sdlop_evdev.h
 
-.PHONY: all clean install examples check wayland-check x11-check api-check abi-check bench bench-run tools inject regen FORCE
+.PHONY: all clean install examples check wayland-check x11-check api-check link-check abi-check bench bench-run tools inject regen FORCE
 all: $(BUILD)/libSDLop.a $(BUILD)/libSDLop.so
 
 $(FEATURE_STAMP): FORCE
@@ -301,6 +301,41 @@ $(WAYLAND_CLIENTS) $(X11_CLIENTS): $(BUILD)/tests/%: tests/%.c $(BUILD)/libSDLop
 # be exported by the built library.
 api-check: $(BUILD)/libSDLop.so
 	@python3 tools/check_api.py --lib $(BUILD)/libSDLop.so
+
+# Link-level compatibility check, the hard direction: tools/link_probe.c is an
+# ordinary SDL3 program compiled against the *system's* SDL3 headers and linked
+# against libSDLop.so. It has to build (so every call it makes has to exist in
+# SDLop's headers) and run (so every one of them has to be exported by the
+# library), and its output has to match the same program built against SDLop's
+# own headers. The other direction - SDLop's headers offer nothing stock does not
+# - is check_api.py's job.
+link-check: $(BUILD)/libSDLop.so
+	@mkdir -p $(BUILD)/tools
+	@if ! pkg-config --exists sdl3; then \
+		echo "  (skip) stock SDL3 development files are not installed"; exit 0; \
+	fi
+	$(CC) -std=gnu11 -O1 -Wall $$(pkg-config --cflags sdl3) tools/link_probe.c \
+		-o $(BUILD)/tools/link_probe_stockheaders \
+		-L$(BUILD) -lSDLop -Wl,-rpath,$(abspath $(BUILD))
+	@echo "  [link] $(BUILD)/tools/link_probe_stockheaders (stock SDL3 headers, libSDLop.so)"
+	$(CC) $(CFLAGS) tools/link_probe.c $(BUILD)/libSDLop.a $(LIBS) \
+		-o $(BUILD)/tools/link_probe_sdlopheaders
+	@echo "  [link] $(BUILD)/tools/link_probe_sdlopheaders (SDLop headers, libSDLop.a)"
+	@drivers="offscreen"; \
+	if [ -n "$$DISPLAY" ]; then drivers="$$drivers x11"; fi; \
+	if [ -n "$$WAYLAND_DISPLAY" ]; then drivers="$$drivers wayland"; fi; \
+	fail=0; \
+	for drv in $$drivers; do \
+		SDL_VIDEODRIVER=$$drv $(BUILD)/tools/link_probe_sdlopheaders > $(BUILD)/tools/link_sdlop_$$drv.txt 2>/dev/null || fail=1; \
+		SDL_VIDEODRIVER=$$drv $(BUILD)/tools/link_probe_stockheaders > $(BUILD)/tools/link_stock_$$drv.txt 2>/dev/null || fail=1; \
+		if diff -u $(BUILD)/tools/link_stock_$$drv.txt $(BUILD)/tools/link_sdlop_$$drv.txt > $(BUILD)/tools/link_diff_$$drv.txt; then \
+			echo "  link: stock headers + libSDLop.so behaves like SDLop's own ($(notdir $$drv))"; \
+		else \
+			echo "  link: difference on $$drv ($(BUILD)/tools/link_diff_$$drv.txt):"; \
+			cat $(BUILD)/tools/link_diff_$$drv.txt; fail=1; \
+		fi; \
+	done; \
+	exit $$fail
 
 # Header-level ABI check: the probe is compiled against SDLop's headers and
 # against the system SDL3's, and the two outputs must be identical.
