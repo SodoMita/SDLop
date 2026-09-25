@@ -9,6 +9,7 @@
 #   make examples        build the example programs
 #   make check           build and run the test suite
 #   make bench           build the benchmark (needs real SDL3, see bench/README.md)
+#   make behaviour-check diff the event trace against stock SDL3 (needs Xvfb+xdotool)
 #   make install         install to $(PREFIX)
 #   make clean
 #
@@ -274,6 +275,12 @@ check: tests
 # Driven against a running X server; see tests/x11_input.sh.
 x11-check: tests $(X11_CLIENTS)
 	@X11_INPUT_CLIENT=$(BUILD)/tests/x11_input sh tests/x11_input.sh
+
+# The behaviour probe: one program compiled against both SDLop and the system
+# SDL3, driven with the same script, and the two event traces diffed. Needs an X
+# server (Xvfb), xdotool and setxkbmap; see tests/behaviour_check.sh.
+behaviour-check: $(LIB_STATIC)
+	@sh tests/behaviour_check.sh
 
 # Driven against a running compositor; see tests/wayland_input.sh.
 wayland-check: tests inject $(WAYLAND_CLIENTS)

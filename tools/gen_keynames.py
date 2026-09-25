@@ -61,6 +61,18 @@ WORDS = {
 }
 
 
+# SDL3's SDL_extended_key_names[] - the keys whose keycode is
+# SDLK_EXTENDED_MASK | index. Copied from src/events/SDL_keymap.c in 3.2.10.
+EXTENDED_NAMES = [
+    "LeftTab",          # 0x01 SDLK_LEFT_TAB
+    "Level5Shift",      # 0x02 SDLK_LEVEL5_SHIFT
+    "MultiKeyCompose",  # 0x03 SDLK_MULTI_KEY_COMPOSE
+    "Left Meta",        # 0x04 SDLK_LMETA
+    "Right Meta",       # 0x05 SDLK_RMETA
+    "Left Hyper",       # 0x06 SDLK_LHYPER
+    "Right Hyper",      # 0x07 SDLK_RHYPER
+]
+
 SHIFT_PAIRS = {
     "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&",
     "8": "*", "9": "(", "0": ")", "-": "_", "=": "+", "[": "{", "]": "}",
@@ -140,9 +152,12 @@ def parse_keycodes(scan):
             # derived from the scancode enum, so resolve them through the
             # scancode table instead of skipping the key.
             derived = re.match(r"SDL_SCANCODE_TO_KEYCODE\(\s*SDL_SCANCODE_([A-Z0-9_]+)\s*\)", value)
+            extended = re.match(r"SDL_EXTENDED_MASK\s*\|\s*(0x[0-9a-fA-F]+|\d+)", value)
             if derived:
                 wanted = derived.group(1)
                 code = next((sc | (1 << 30) for sc, n in scan.items() if n == wanted), 0)
+            elif extended:
+                code = (1 << 29) | int(extended.group(1), 0)
             else:
                 continue
         if code == 0 and name != "UNKNOWN":
@@ -208,16 +223,42 @@ def main():
     out.append("#define SDLOP_TABLE")
     out.append("#endif")
     out.append("")
+    # A keycode built from a scancode is named like the scancode, so the names
+    # SDL3 uses there come from the scancode table ("MediaPlay", "Keypad ("),
+    # not from the SDLK_ identifier ("MEDIA_PLAY"). SDL_GetKeyFromName() has to
+    # accept those names, which is why they are added here.
+    by_name = list(keyitems)
+    seen_names = {n.lower() for n, _ in by_name}
+    for index, name in enumerate(EXTENDED_NAMES, start=1):
+        by_name.append((name, (1 << 29) | index))
+        seen_names.add(name.lower())
+    for code, name in sorted((UPSTREAM_NAMES or {}).items()):
+        if not name or name.lower() in seen_names:
+            continue
+        by_name.append((name, code | (1 << 30)))
+        seen_names.add(name.lower())
+    keyitems = sorted(by_name, key=lambda kv: kv[0].lower())
     out.append("SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {")
     for name, code in keyitems:
         esc = name.replace("\\", "\\\\").replace('"', '\\"')
         out.append('    { %s, "%s" },' % (hex(code), esc))
     out.append("};")
     out.append("")
+    out.append("/* SDLK_EXTENDED_MASK | index: SDL3 keeps these names in their own table,")
+    out.append("   and SDL_GetKeyName() looks them up there, in this order. */")
+    out.append("SDLOP_TABLE static const char *sdlop_extended_key_names[] = {")
+    for name in EXTENDED_NAMES:
+        out.append('    "%s",' % name)
+    out.append("};")
+    out.append("")
     out.append("SDLOP_TABLE static const char *sdlop_scancode_names[SDLOP_NUM_SCANCODES] = {")
     for i in range(max_scancode):
         if i in scan:
-            name = (UPSTREAM_NAMES or {}).get(i) or pretty(scan[i])
+            # Only names SDL3 itself has (tools/reference/scancode_names.txt): a
+            # scancode without one is unnamed, and stock prints "" for it rather
+            # than the identifier from the header. UNKNOWN and RESERVED are in
+            # that group.
+            name = (UPSTREAM_NAMES or {}).get(i, "")
             out.append('    "%s", ' % name.replace("\\", "\\\\").replace('"', '\\"'))
         else:
             out.append("    NULL,")
@@ -249,6 +290,27 @@ def main():
                 if sp:
                     shifted = name_to_code.get(sp.lower(), 0)
         out.append("    %s," % ("0x%08Xu" % shifted if shifted else "0"))
+    out.append("};")
+    out.append("")
+    out.append("/* Names SDL_GetKeyFromName() accepts for keys a US layout only produces")
+    out.append("   with Shift held: stock SDL3 resolves them to the unshifted key, so")
+    out.append("   SDL_GetKeyFromName(\"!\") is SDLK_1 (0x31) and not SDLK_EXCLAIM.")
+    out.append("   '#' is the one exception in stock, where its own keycode (SDLK_HASH)")
+    out.append("   wins, and the space character is accepted for SDLK_SPACE. Checked")
+    out.append("   character by character against stock 3.2.10, 0x20..0x7e. */")
+    aliases = []
+    for base, shifted in SHIFT_PAIRS.items():
+        code = name_to_code.get(base.lower())
+        if not code:
+            continue
+        if shifted == "#":
+            code = name_to_code.get("#", code)      # stock keeps SDLK_HASH for '#'
+        aliases.append((shifted, code, base))
+    aliases.append((" ", name_to_code.get("space", 0x20), "space"))
+    out.append("SDLOP_TABLE static const SDLOP_KeyName sdlop_keyname_aliases[] = {")
+    for shifted, code, base in sorted(aliases, key=lambda a: a[0].lower()):
+        esc = shifted.replace("\\", "\\\\").replace('"', '\\"').replace("\t", "\\t")
+        out.append('    { 0x%08Xu, "%s" }, /* %s */' % (code, esc, base))
     out.append("};")
     out.append("")
     out.append("/* scancodes that share a name with another key need explicit lookups */")

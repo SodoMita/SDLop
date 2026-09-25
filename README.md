@@ -38,6 +38,7 @@ make bench          # build the SDL3-vs-SDLop benchmark (needs real SDL3)
 make abi-check      # layouts/constants vs stock SDL3 headers (needs libsdl3-dev)
 make x11-check      # drive the X11 backend with xdotool (needs an X server)
 make wayland-check  # drive the Wayland backend through wl_inject (needs sway)
+make behaviour-check # diff the event trace against stock SDL3 (needs Xvfb+xdotool)
 make install        # headers + libraries + sdl3-sdlop.pc
 ```
 
@@ -75,6 +76,7 @@ Environment variables that exist for testing and for stubborn machines:
 | `SDLOP_TEST_INPUT=<fifo>` | Feed input records (`EV_KEY 30 1`) through the async ring without `/dev/input`; what the input tests use. |
 | `SDLOP_XKB_KEYMAP=<file>` | Use this XKB keymap file instead of the compositor's / the X server's. Also the way to get a non-US layout from a compositor that sends the wrong one. |
 | `SDLOP_XKB_DUMP=<path>` | Write out the keymap that was loaded (whichever source won), so layout bugs are debuggable. |
+| `SDLOP_X11_DEBUG_EVENTS=1` | Log every X event the backend dispatches (type, geometry, crossing coordinates) - the only way to tell a driver bug from something the server did. |
 | `SDL_HINT_NO_SIGNAL_HANDLERS=1` | The stock SDL3 hint, honoured: do not turn SIGINT/SIGTERM into `SDL_EVENT_QUIT`, leave the default handlers alone. |
 | `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY=1` | The stock SDL3 hint, honoured: displays, window surfaces and content scale switch to physical pixels instead of letting the compositor upscale a 1x surface. |
 
@@ -112,7 +114,8 @@ lavapipe/llvmpipe):
 | `test_gl` (weston, x11) | 28 checks, 0 failures — EGL context *and* Vulkan surface created and destroyed |
 | `examples/hello` (weston, sway, Xvfb) | frames rendered and presented, exit 0 |
 | `tests/x11_input.sh` (`make x11-check`, Xvfb + `xdotool`) | 25 checks, 0 failures — enter/motion/button/wheel/leave, scancodes, keycodes, modifiers, `SDL_EVENT_TEXT_INPUT`, shift-a, Ctrl suppression, held-key repeat (and the same with the server's auto-repeat switched off), resize/move from the X server, the platform properties, display bounds against `xrandr` |
-| Key and pointer stream vs stock SDL3 on X11 (`xdotool`-driven, same script) | identical scancodes, keycodes, modifiers, text, buttons, wheel and focus events; the only differences are the order of the first four lifecycle events and one extra motion event stock sends on a button press |
+| Key and pointer stream vs stock SDL3 on X11 (`xdotool`-driven, same script) | identical scancodes, keycodes, modifiers, text, buttons, wheel and focus events, and the same window-lifecycle events in the same order |
+| `make behaviour-check` (one probe program compiled against both libraries, same scripted input, traces diffed; US and German layouts) | 33 input events identical in order (keys, text, modstate incl. Caps Lock, buttons, wheel, motion with deltas), the 15 window-lifecycle events identical as a set, key/scancode name tables identical. The one reported difference: `SDL_GetKeyFromName()` for punctuation the layout shifts (German `?` -> 0xdf in stock, 0x2f here) follows the active layout in stock and SDLop's US tables |
 | Real key events (`xdotool` into weston's X11 backend) | correct scancodes, keycodes (shift uppercases), `SDL_EVENT_TEXT_INPUT`, Ctrl-suppression, and client-side key repeat |
 | Display geometry vs stock SDL3 (sway, outputs `800x600@1` at 0,0 and `1024x768@2` at 800,0) | identical: bounds, current mode, `pixel_density`, content scale — `512x384` logical for the scale-2 output, content scale 1.0 unless `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY` |
 | `tests/wayland_input.sh` (`make wayland-check`, sway) | 9 checks, 0 failures — enter/motion/button/wheel/leave plus relative-mode deltas, injected with `tools/wl_inject` |

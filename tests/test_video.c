@@ -202,8 +202,11 @@ static void test_window_state(void)
 
     CHECK(SDL_SyncWindow(window), "SDL_SyncWindow(): %s", SDL_GetError());
 
-    /* the pixel size follows the window size (scale 1 on every test machine) */
+    /* the pixel size follows the window size (scale 1 on every test machine).
+       The size is read back after SDL_SyncWindow() because the window's size is
+       the server's answer to the request, not the request itself. */
     SDL_SetWindowSize(window, 300, 150);
+    SDL_SyncWindow(window);
     CHECK(SDL_GetWindowSize(window, &w, &h) && w == 300 && h == 150, "size after SDL_SetWindowSize: %dx%d", w, h);
     CHECK(SDL_GetWindowSizeInPixels(window, &w, &h) && w == 300 && h == 150,
           "pixel size after SDL_SetWindowSize: %dx%d", w, h);
@@ -289,6 +292,9 @@ static void test_window_events(void)
     SDL_ShowWindow(window);
     SDL_SetWindowSize(window, 160, 120);
     SDL_SetWindowTitle(window, "events 2");
+    /* The resize event is what the server says about the request, so wait for it
+       (a single pump is a race: the ConfigureNotify may still be in flight). */
+    SDL_SyncWindow(window);
     SDL_PumpEvents();
 
     while (SDL_PollEvent(&event)) {

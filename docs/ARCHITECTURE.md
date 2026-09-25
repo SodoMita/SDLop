@@ -408,3 +408,71 @@ The library creates surfaces but never draws into them:
 * Threads are `pthread`s (the SDLop build assumes a POSIX host for now); the
   Windows/macOS ports will provide their own worker implementations behind the
   same ring interface.
+
+## 7. Comparing against stock SDL3
+
+"The same API" is not enough on its own: a reimplementation that names a key
+differently, or that sends a resize event at a different moment, breaks
+applications in ways the header check cannot see. So there is a second rig, next
+to `make abi-check` (which compares declarations and constants):
+
+* `tools/behaviour_probe.c` is one program, compiled twice - against SDLop and
+  against the system's stock SDL3 - that prints everything an application can
+  observe about a window and its input: the video driver, the displays, window
+  state, every event with its name and payload, the key/scancode name tables, and
+  `SDL_GetKeyName()`/`SDL_GetKeyFromName()` answers for a fixed list.
+* `tests/behaviour_check.sh` (`make behaviour-check`) runs both binaries with the
+  same scripted input on Xvfb - `xdotool` for keys, buttons, the wheel and the
+  pointer, `setxkbmap` for the layout - and diffs the two traces.
+
+The comparison is deliberately not "diff and hope". The input events and the
+window operations the probe performs are compared **in order**, because that is
+what an application reacts to. The window-lifecycle phase is compared as a
+**set** rather than in order: when the server says "mapped, exposed, focused"
+depends on the order the X requests were issued in, and no application can depend
+on it - the rig therefore reports whether the order matches as well (on the
+reference rig it now does, event for event) but does not fail when it does not.
+Getting that far took making SDLop's X11 backend answer the same way stock's does:
+`show_window()` and `create_window()` map, take the focus and then dispatch what
+the server has to say about the map before returning (`XSync()` round trip, then
+one pump - the events a request produces are queued before the reply to a later
+one, so this does not block on anything), and `hide_window()` does the same, which
+is why the focus change is reported before `SDL_EVENT_WINDOW_HIDDEN`. Each
+rule that filters something out is written down with its reason in the script -
+`STATE flags=`, zero-delta motions, and the symbol-name line - so a difference is
+either fixed, documented, or reported; it is never silently swallowed. The script
+calls a difference it only reports a *note*, and that is how the one remaining
+divergence is handled: `SDL_GetKeyFromName("?")` answers with the key that types
+"?" on the active layout in stock SDL3 (0xdf on a German layout) and with the US
+layout's key here.
+
+Window state is compared too, through the flags line the probe prints: the focus
+a window has right after creation is part of this (stock's X11 driver takes the
+input focus when there is no window manager, and SDLop does the same, which is
+what makes typing into a window on a bare X server work), and so is the position
+a geometry request has not answered yet (SDL3 hands the request to the server and
+`SDL_SyncWindow()` is what waits for the answer - on X11 both libraries still
+report the previous position until then).
+
+Getting the two traces to agree is what found, and fixed, the divergences worth
+fixing: Caps Lock reporting the lock on the wrong event, a missing
+`SDL_EVENT_WINDOW_SAFE_AREA_CHANGED`, `SDL_EVENT_KEYMAP_CHANGED` sent for the
+first keymap (a change, not a first setup), the pixel size and safe area never
+announced at creation, an `EXPOSED` (and an `OCCLUDED`) announcement for every
+visibility change on top of the expose events (stock sends `EXPOSED` once per
+Expose event and reads occlusion from `_NET_WM_STATE_HIDDEN` instead), a move
+reported from the request *and* from the server's answer (the answer is the truth,
+and `SDL_SyncWindow()` is what waits for it - which also fixed what the rigs read
+back after a resize), and no motion event on the pointer crossings - X's crossing
+events carry the pointer's position, which is the only way an application that
+draws on motion learns where the pointer is on entry.
+
+Two habits from this work are worth keeping:
+
+* instrument the backend, do not guess what the server sent
+  (`SDLOP_X11_DEBUG_EVENTS=1` logs every dispatched X event, in order);
+* make the rig deterministic before believing a difference - the pointer's
+  position left over from the previous run changed which events a window saw
+  while it was being created, and a filter that was supposed to hide one rule
+  turned out to read the trace from its own stdin instead of from the previous
+  stage of the pipeline (a function body is not a pipeline).

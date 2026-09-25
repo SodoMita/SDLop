@@ -20,6 +20,13 @@ static float sdlop_mouse_x;
    first absolute motion has no delta to report, and a motion that does not change
    the position produces no event at all. */
 static bool sdlop_mouse_has_position;
+/* Where the backend says the pointer is, before the window clamps it. SDL3 keeps
+   both numbers for the same reason (mouse->last_x next to mouse->x): the
+   application sees the clamped position, but the next delta is measured from the
+   real one, so a pointer that left the window still produces the movement that
+   took it out. */
+static float sdlop_mouse_last_x;
+static float sdlop_mouse_last_y;
 static float sdlop_mouse_y;
 static float sdlop_mouse_global_x;
 static float sdlop_mouse_global_y;
@@ -153,23 +160,84 @@ void SDLOP_ClearMouseButtons(void)
 /* Events (called by the input translation and by the video backends)         */
 /* ------------------------------------------------------------------------- */
 
+/* Keep the reported position inside the window. SDL3 does the same in
+   SDL_PrivateSendMouseMotion() (ConstrainMousePosition), including the detail
+   that a pointer beyond the far edge is reported at the last edge position it
+   had rather than snapped back: a backend that reports the pointer outside the
+   window - the X server does that on the crossing event that takes the pointer
+   out - must not hand the application coordinates that are off the window. */
+static void sdlop_constrain_mouse_position(SDL_Window *window, float *x, float *y)
+{
+    int x_min = 0, y_min = 0, x_max, y_max;
+
+    if (!window || (window->flags & SDL_WINDOW_MOUSE_CAPTURE)) {
+        return;
+    }
+    x_max = window->w - 1;
+    y_max = window->h - 1;
+    if (window->mouse_rect_set && window->mouse_rect.w > 0 && window->mouse_rect.h > 0) {
+        const SDL_Rect *confine = &window->mouse_rect;
+        const int ix = SDL_max(confine->x, 0);
+        const int iy = SDL_max(confine->y, 0);
+        const int iw = SDL_min(confine->x + confine->w, x_max + 1) - ix;
+
+        if (iw > 0) {
+            x_min = ix;
+            x_max = ix + iw - 1;
+        }
+        {
+            const int ih = SDL_min(confine->y + confine->h, y_max + 1) - iy;
+
+            if (ih > 0) {
+                y_min = iy;
+                y_max = iy + ih - 1;
+            }
+        }
+    }
+
+    if (*x >= (float)(x_max + 1)) {
+        *x = SDL_max((float)x_max, sdlop_mouse_last_x);
+    }
+    if (*x < (float)x_min) {
+        *x = (float)x_min;
+    }
+    if (*y >= (float)(y_max + 1)) {
+        *y = SDL_max((float)y_max, sdlop_mouse_last_y);
+    }
+    if (*y < (float)y_min) {
+        *y = (float)y_min;
+    }
+}
+
+void SDLOP_ForgetMousePosition(void)
+{
+    /* SDL3 clears this when the mouse focus changes (SDL_SetMouseFocus): the
+       next motion then carries no delta, because the pointer is somewhere new
+       rather than being one step away from where it was. */
+    sdlop_mouse_has_position = false;
+}
+
 void SDLOP_SendMouseMotionAbsolute(SDL_WindowID windowID, float x, float y, Uint64 timestamp)
 {
     SDL_Event event;
     SDL_Window *window = SDLOP_GetWindowFromIDInternal(windowID);
+    const float raw_x = x, raw_y = y;
     float xrel = 0.0f, yrel = 0.0f;
 
+    sdlop_constrain_mouse_position(window, &x, &y);
     if (sdlop_mouse_has_position) {
         /* An absolute move still carries a delta, which is the difference from
            the previous position (SDL3 does the same), so an application may
            integrate xrel/yrel on any backend. */
-        xrel = x - sdlop_mouse_x;
-        yrel = y - sdlop_mouse_y;
+        xrel = x - sdlop_mouse_last_x;
+        yrel = y - sdlop_mouse_last_y;
         if (xrel == 0.0f && yrel == 0.0f) {
             return;   /* nothing changed, and SDL3 sends no event for it */
         }
     }
 
+    sdlop_mouse_last_x = raw_x;
+    sdlop_mouse_last_y = raw_y;
     sdlop_mouse_x = x;
     sdlop_mouse_y = y;
     sdlop_mouse_has_position = true;

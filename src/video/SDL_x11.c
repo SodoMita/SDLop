@@ -540,6 +540,7 @@ static void sdlop_x11_quit(void)
 /* ------------------------------------------------------------------------- */
 
 static void sdlop_x11_request_focus(SDL_Window *window);
+static void sdlop_x11_pump_events(void);
 
 static unsigned long sdlop_x11_event_mask(void)
 {
@@ -676,6 +677,20 @@ static bool sdlop_x11_create_window(SDL_Window *window)
            application that never calls SDL_ShowWindow() (the window was created
            visible) still has to be able to type into it. */
         sdlop_x11_request_focus(window);
+        /* ...and let the server answer before this returns. The XSync() round
+           trip means the server has processed the map by the time it returns and
+           X delivers the events a request produces before the reply to a later
+           one, so the Expose, the FocusIn and the first ConfigureNotify are in
+           the queue already - pumping once dispatches them, without blocking on
+           anything. Stock SDL3 ends up in the same state a harder way (it waits
+           for MapNotify inside ShowWindow); either way SDL_EVENT_WINDOW_SHOWN,
+           which the core sends after the driver is done, arrives after the expose
+           and the focus, and SDL_GetWindowFlags() already reports
+           SDL_WINDOW_INPUT_FOCUS for a window that was created visible. Without
+           this the same events would only arrive at the application's first
+           pump. */
+        XSync(sdlop_x11_display, False);
+        sdlop_x11_pump_events();
     }
     XFlush(sdlop_x11_display);
     return true;
@@ -740,9 +755,15 @@ static bool sdlop_x11_set_window_position(SDL_Window *window, int x, int y)
     }
     XMoveWindow(sdlop_x11_display, (Window)window->driver.x11.window, x, y);
     XFlush(sdlop_x11_display);
-    /* Update the state now: the ConfigureNotify that answers this request is
-       pumped whenever the application next pumps events, which may be later. */
-    SDLOP_OnWindowMoved(window, x, y);
+    /* No event and no state update here: the ConfigureNotify this request
+       answers with is the only thing that reports a new position, exactly as in
+       stock SDL3 - which is why SDL_SetWindowPosition() is documented to need a
+       pump (or SDL_SyncWindow()) before SDL_GetWindowPosition() reflects it.
+       Reporting the position eagerly as well was wrong twice over: it doubled
+       the MOVED event and let the notifications X had already queued for the
+       window's previous position arrive after it as a stale move back (the
+       trace showed MOVED 480,280 - the position the window was created at -
+       after the move to 120,96). */
     return true;
 }
 
@@ -751,11 +772,12 @@ static bool sdlop_x11_set_window_size(SDL_Window *window, int w, int h)
     sdlop_x11_set_size_hints(window);
     XResizeWindow(sdlop_x11_display, (Window)window->driver.x11.window, (unsigned)w, (unsigned)h);
     XFlush(sdlop_x11_display);
-    /* The window manager may adjust this, and ConfigureNotify says so; until then
-       the requested size is the window's size, pixels included (X11 has no scale
-       factor of its own). */
-    SDLOP_OnWindowResized(window, w, h);
-    SDLOP_OnWindowPixelSizeChanged(window, w, h);
+    /* The window manager may adjust the size, and ConfigureNotify answers this
+       request with what the window actually got - stock SDL3 reports the size
+       from there and not from here, and until it arrives SDL_GetWindowSize()
+       keeps saying what the window's size still is (SDL_SyncWindow() waits for
+       the change). X11 has no scale factor of its own, so the pixel size follows
+       the same event. */
     return true;
 }
 
@@ -845,6 +867,13 @@ static bool sdlop_x11_show_window(SDL_Window *window)
     XMapWindow(sdlop_x11_display, w);
     XRaiseWindow(sdlop_x11_display, w);
     sdlop_x11_request_focus(window);
+    /* Dispatch what the server had to say about the map before returning (the
+       XSync() round trip above guarantees the events are queued), so that
+       SDL_ShowWindow() returns with the window's state settled: SDLop sends
+       SDL_EVENT_WINDOW_SHOWN from the core after this returns, and stock SDL3's
+       SHOWN likewise comes after the EXPOSED and FOCUS_GAINED the server sent. */
+    XSync(sdlop_x11_display, False);
+    sdlop_x11_pump_events();
     XFlush(sdlop_x11_display);
     return true;
 }
@@ -852,6 +881,12 @@ static bool sdlop_x11_show_window(SDL_Window *window)
 static bool sdlop_x11_hide_window(SDL_Window *window)
 {
     XUnmapWindow(sdlop_x11_display, (Window)window->driver.x11.window);
+    /* As in show: unmap, then let the server answer before returning. The
+       FocusOut that goes with the unmap is dispatched here, so the core's
+       SDL_EVENT_WINDOW_HIDDEN (sent after this returns) lands after the focus
+       change - which is the order stock SDL3 reports them in. */
+    XSync(sdlop_x11_display, False);
+    sdlop_x11_pump_events();
     XFlush(sdlop_x11_display);
     return true;
 }
@@ -1064,6 +1099,13 @@ static bool sdlop_x11_set_window_hit_test(SDL_Window *window, SDL_HitTest callba
 static bool sdlop_x11_sync_window(SDL_Window *window)
 {
     (void)window;
+    /* Not just a flush: the events the server has already sent are dispatched
+       here, so a position or size that was just requested has arrived by the time
+       this returns. That is what SDL_SyncWindow() is for in SDL3 (an application
+       that does not call it sees the change whenever it next pumps), and stock's
+       X11 driver drains the queue in the same place. */
+    XSync(sdlop_x11_display, False);
+    sdlop_x11_pump_events();
     XSync(sdlop_x11_display, False);
     return true;
 }
@@ -1401,7 +1443,7 @@ static void sdlop_x11_handle_property(SDL_Window *window, XPropertyEvent *event)
                                XA_ATOM, &actual, &format, &count, &remaining,
                                &data) == Success && data) {
             Atom *states = (Atom *)data;
-            bool fullscreen = false, maximized = false;
+            bool fullscreen = false, maximized = false, hidden = false;
             unsigned long i;
 
             for (i = 0; i < count; i++) {
@@ -1412,6 +1454,16 @@ static void sdlop_x11_handle_property(SDL_Window *window, XPropertyEvent *event)
                     states[i] == atom_net_wm_state_maximized_horz) {
                     maximized = true;
                 }
+                if (states[i] == atom_net_wm_state_hidden) {
+                    /* The window manager's own "this window is not visible"
+                       state, which is where stock SDL3 takes SDL_WINDOW_OCCLUDED
+                       from on this backend. */
+                    SDLOP_SetWindowOccludedFlag(window, true);
+                    hidden = true;
+                }
+            }
+            if (!hidden) {
+                SDLOP_SetWindowOccludedFlag(window, false);
             }
             SDLOP_OnWindowFullscreenChanged(window, fullscreen);
             SDLOP_OnWindowMaximized(window, maximized);
@@ -1456,11 +1508,10 @@ static void sdlop_x11_handle_button(SDL_Window *window, XButtonEvent *button, bo
                           SDL_GetTicksNS());
 }
 
-static void sdlop_x11_handle_motion(SDL_Window *window, XMotionEvent *motion)
+/* One place for "the pointer is here now": the MotionNotify path and the
+   crossing events (which carry a position of their own) both end up here. */
+static void sdlop_x11_send_motion(SDL_Window *window, float x, float y)
 {
-    float x = (float)motion->x;
-    float y = (float)motion->y;
-
     if (SDLOP_AsyncInputActive() || !window) {
         return;
     }
@@ -1495,9 +1546,50 @@ static void sdlop_x11_handle_motion(SDL_Window *window, XMotionEvent *motion)
     }
 }
 
+static void sdlop_x11_handle_motion(SDL_Window *window, XMotionEvent *motion)
+{
+    sdlop_x11_send_motion(window, (float)motion->x, (float)motion->y);
+}
+
 static void sdlop_x11_handle_event(XEvent *event)
 {
     SDL_Window *window = sdlop_x11_window_from_xid(event->xany.window);
+    static int trace = -1;
+
+    if (trace < 0) {
+        const char *env = SDL_getenv("SDLOP_X11_DEBUG_EVENTS");
+        trace = (env && *env && *env != '0') ? 1 : 0;
+        if (trace) {
+            /* The events are logged at debug level, which nothing prints by
+               default: asking for the trace is also asking for that level. */
+            SDL_SetLogPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_DEBUG);
+        }
+    }
+    if (trace) {
+        /* What the X server actually sent, in order: the only way to tell a
+           driver problem from a server-side one. Same idea as SDLOP_XKB_DUMP -
+           set the variable, read stderr. */
+        if (event->type == Expose) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
+                         "sdlop: x11 Expose window=0x%lx count=%d x=%d y=%d w=%d h=%d",
+                         event->xany.window, event->xexpose.count, event->xexpose.x,
+                         event->xexpose.y, event->xexpose.width, event->xexpose.height);
+        } else if (event->type == ConfigureNotify) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
+                         "sdlop: x11 ConfigureNotify window=0x%lx x=%d y=%d w=%d h=%d",
+                         event->xany.window, event->xconfigure.x, event->xconfigure.y,
+                         event->xconfigure.width, event->xconfigure.height);
+        } else if (event->type == EnterNotify || event->type == LeaveNotify) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
+                         "sdlop: x11 %s window=0x%lx x=%d y=%d mode=%d detail=%d",
+                         event->type == EnterNotify ? "EnterNotify" : "LeaveNotify",
+                         event->xany.window, event->xcrossing.x, event->xcrossing.y,
+                         event->xcrossing.mode, event->xcrossing.detail);
+        } else {
+            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION, "sdlop: x11 event type=%d window=0x%lx",
+                         event->type, event->xany.window);
+        }
+    }
 
     switch (event->type) {
         case KeyPress:
@@ -1522,16 +1614,25 @@ static void sdlop_x11_handle_event(XEvent *event)
         case EnterNotify:
             if (window) {
                 SDLOP_OnWindowMouseEnter(window);
-                /* The pointer is now inside the window: remember where, so a
-                   button press reports the right coordinates, but do not report a
-                   move - the pointer did not move, and SDL3 sends motion events
-                   only for actual motion. */
-                sdlop_x11_mouse_x = (float)event->xcrossing.x;
-                sdlop_x11_mouse_y = (float)event->xcrossing.y;
+                /* The pointer is inside the window now and the crossing event
+                   says where: report that as a motion, because an application
+                   that tracks the pointer through motion events has no other way
+                   to learn where it is until it moves again. Stock SDL3 does the
+                   same on EnterNotify and LeaveNotify - not doing it was one of
+                   the differences the behaviour probe found (two MOTION events
+                   in stock's phase-1 trace, none in SDLop's). */
+                sdlop_x11_send_motion(window, (float)event->xcrossing.x,
+                                      (float)event->xcrossing.y);
             }
             break;
         case LeaveNotify:
             if (window) {
+                /* The same on the way out: the event carries where the pointer
+                   was, and the core clamps it into the window, so a pointer that
+                   left through the edge is reported at that edge instead of
+                   vanishing without a trace. */
+                sdlop_x11_send_motion(window, (float)event->xcrossing.x,
+                                      (float)event->xcrossing.y);
                 SDLOP_OnWindowMouseLeave(window);
             }
             break;
@@ -1571,7 +1672,12 @@ static void sdlop_x11_handle_event(XEvent *event)
             }
             break;
         case Expose:
-            if (window) {
+            /* X splits an expose into one event per rectangle and numbers how
+               many are still queued behind this one, so a single redraw reports
+               itself once - in the last event of the run. Pushing every event
+               made SDLop announce two or three times per show where stock SDL3
+               announces once (the behaviour probe counted 6 against 3). */
+            if (window && event->xexpose.count == 0) {
                 SDLOP_OnWindowExposed(window);
             }
             break;
@@ -1590,10 +1696,12 @@ static void sdlop_x11_handle_event(XEvent *event)
             }
             break;
         case VisibilityNotify:
-            if (window) {
-                SDLOP_OnWindowOccluded(window,
-                                       event->xvisibility.state == VisibilityFullyObscured);
-            }
+            /* Deliberately not handled: the X server's visibility states are not
+               the window manager's occlusion, and stock SDL3's X11 driver ignores
+               this event entirely (it takes SDL_WINDOW_OCCLUDED from
+               _NET_WM_STATE_HIDDEN, which SDLop reads in the property handler).
+               Sending EXPOSED for every VisibilityUnobscured is what made SDLop
+               announce twice as many exposes as stock. */
             break;
         case PropertyNotify:
             if (window) {

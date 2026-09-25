@@ -30,7 +30,6 @@ SDL_events.h	decl	struct SDL_PenProximityEvent
 SDL_events.h	decl	struct SDL_PenTouchEvent
 SDL_events.h	decl	struct SDL_RenderEvent
 SDL_events.h	decl	struct SDL_SensorEvent
-SDL_events.h	decl	struct SDL_TouchFingerEvent
 SDL_keyboard.h	decl	SDL_GetKeyboardNameForID
 SDL_keyboard.h	decl	SDL_GetKeyboards
 SDL_keyboard.h	decl	SDL_HasKeyboard

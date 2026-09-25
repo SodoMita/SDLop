@@ -201,13 +201,22 @@ static bool sdlop_xkb_install(struct xkb_keymap *keymap)
     if (sdlop_xkb_keymap) {
         xkb_keymap_unref(sdlop_xkb_keymap);
     }
-    sdlop_xkb_keymap = keymap;
-    sdlop_xkb_state = state;
-    sdlop_xkb_fallback_pending = false;      /* the platform's own keymap wins */
-    /* From here on, keycodes and text come from this layout instead of the
-       built-in "us" tables. */
-    SDLOP_SetKeyLayout(&sdlop_xkb_layout);
-    SDLOP_SendKeymapChanged(SDL_GetTicksNS());
+    /* A keymap replacing another one is a change an application hears about;
+       the first one is just this session's layout, and stock SDL3 does not send
+       the event for it either (found by the behaviour probe, which showed SDLop
+       emitting SDL_EVENT_KEYMAP_CHANGED at startup and stock not). */
+    {
+        const bool replacing = (sdlop_xkb_keymap != NULL);
+        sdlop_xkb_keymap = keymap;
+        sdlop_xkb_state = state;
+        sdlop_xkb_fallback_pending = false;  /* the platform's own keymap wins */
+        /* From here on, keycodes and text come from this layout instead of the
+           built-in "us" tables. */
+        SDLOP_SetKeyLayout(&sdlop_xkb_layout);
+        if (replacing) {
+            SDLOP_SendKeymapChanged(SDL_GetTicksNS());
+        }
+    }
     return true;
 }
 

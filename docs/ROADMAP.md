@@ -189,6 +189,26 @@ keyboard/mouse layers or any of the `src/generated/` tables.
 - [ ] Link-level ABI check: `tests/` programs compiled against **stock** SDL3
       headers and linked against `libSDLop.so`, to prove binary compatibility for
       the subset (the reverse of `check_api.py`).
+- [x] Behaviour diff against stock SDL3: `tools/behaviour_probe.c` compiled
+      against both libraries, driven with the same scripted input, traces diffed
+      by `make behaviour-check` (see *Comparing against stock SDL3* in
+      ARCHITECTURE.md). Input events and window operations match in order on a US
+      and a German layout, and on the reference rig the window-lifecycle events do
+      too - they are compared as a set, because their order is up to the server.
+      What it
+      caught has been fixed, and the one remaining difference is reported as a
+      note: `SDL_GetKeyFromName()` for punctuation the layout shifts (stock
+      answers with the key that types it - German `?` is 0xdf - SDLop answers
+      with its US table). SDLop's name tables are layout-independent by
+      construction; stock's answer needs a keycode -> scancode lookup in the
+      active keymap (`SDL_GetKeymapScancode`), which the key layout interface
+      here does not have yet.
+- [ ] `SDL_GetKeyFromName()` for layout-shifted punctuation: the lookup stock
+      does in its keymap (`keycode -> scancode + modstate`, then the key's
+      unshifted keycode). It needs a reverse lookup in `SDLOP_KeyLayout`
+      (`SDL_xkb.c` has the level tables to answer it) - worth doing when an
+      application needs it, because the current answer is wrong on any layout
+      that is not US.
 
 ### Later
 

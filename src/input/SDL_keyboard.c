@@ -61,13 +61,45 @@ static const SDLOP_KeyName *sdlop_find_name(const SDLOP_KeyName *table, int coun
     return NULL;
 }
 
+/* A code point, UTF-8 encoded - SDL3 names a keycode that has no key of its own
+   by the code point itself (SDL_GetKeyName(0x80) is the two bytes for U+0080).
+   Out-of-range code points become U+FFFD, as in SDL3's SDL_UCS4ToUTF8. */
+static char *sdlop_ucs4_to_utf8(Uint32 ch, char *dst)
+{
+    Uint8 *p = (Uint8 *)dst;
+    if (ch > 0x10FFFF) {
+        ch = 0xFFFD;
+    }
+    if (ch <= 0x7F) {
+        *p++ = (Uint8)ch;
+    } else if (ch <= 0x7FF) {
+        *p++ = (Uint8)(0xC0 | (ch >> 6));
+        *p++ = (Uint8)(0x80 | (ch & 0x3F));
+    } else if (ch <= 0xFFFF) {
+        *p++ = (Uint8)(0xE0 | (ch >> 12));
+        *p++ = (Uint8)(0x80 | ((ch >> 6) & 0x3F));
+        *p++ = (Uint8)(0x80 | (ch & 0x3F));
+    } else {
+        *p++ = (Uint8)(0xF0 | (ch >> 18));
+        *p++ = (Uint8)(0x80 | ((ch >> 12) & 0x3F));
+        *p++ = (Uint8)(0x80 | ((ch >> 6) & 0x3F));
+        *p++ = (Uint8)(0x80 | (ch & 0x3F));
+    }
+    *p = '\0';
+    return (char *)p;
+}
+
 const char *SDL_GetScancodeName(SDL_Scancode scancode)
 {
-    if (scancode < 0 || scancode >= SDLOP_NUM_SCANCODES || !sdlop_scancode_names[scancode]) {
+    const char *name;
+    /* Unnamed scancodes have the empty name, an out-of-range scancode is an
+       error - both as in SDL3, which returns "" and not a placeholder here. */
+    if ((int)scancode < SDL_SCANCODE_UNKNOWN || (int)scancode >= SDLOP_NUM_SCANCODES) {
         SDL_InvalidParamError("scancode");
-        return NULL;
+        return "";
     }
-    return sdlop_scancode_names[scancode];
+    name = sdlop_scancode_names[scancode];
+    return name ? name : "";
 }
 
 SDL_Scancode SDL_GetScancodeFromName(const char *name)
@@ -85,26 +117,52 @@ SDL_Scancode SDL_GetScancodeFromName(const char *name)
 
 const char *SDL_GetKeyName(SDL_Keycode key)
 {
-    const SDLOP_KeyName *found;
-    int count = (int)(sizeof(sdlop_keynames) / sizeof(sdlop_keynames[0]));
+    static char sdlop_utf8_name[8];
 
-    /* printable ASCII is its own name, like SDL3 */
-    if (key == SDLK_UNKNOWN) {
-        return "Unknown";
+    /* Both of these are SDL3's paths, in SDL3's order. A keycode built from a
+       scancode is named like the scancode (SDLK_LEFT_TAB is "LeftTab"), and the
+       same six control keys are named after their scancode rather than by code
+       point. */
+    if (key & SDLK_SCANCODE_MASK) {
+        return SDL_GetScancodeName((SDL_Scancode)(key & ~SDLK_SCANCODE_MASK));
     }
-    if (key > 0x20 && key < 0x7F) {
-        static char sdlop_ascii_name[2];
-        sdlop_ascii_name[0] = (char)key;
-        sdlop_ascii_name[1] = '\0';
-        return sdlop_ascii_name;
+    if (key & SDLK_EXTENDED_MASK) {
+        SDL_Keycode idx = (key & ~SDLK_EXTENDED_MASK);
+        if (idx > 0 && (idx - 1) < (SDL_Keycode)(sizeof(sdlop_extended_key_names) /
+                                                 sizeof(sdlop_extended_key_names[0]))) {
+            return sdlop_extended_key_names[idx - 1];
+        }
+        SDL_InvalidParamError("key");
+        return "";
     }
-    for (int i = 0; i < count; i++) {
-        if (sdlop_keynames[i].code == (SDL_Keycode)key) {
-            found = &sdlop_keynames[i];
-            return found->name;
+    switch (key) {
+    case SDLK_RETURN: return SDL_GetScancodeName(SDL_SCANCODE_RETURN);
+    case SDLK_ESCAPE: return SDL_GetScancodeName(SDL_SCANCODE_ESCAPE);
+    case SDLK_BACKSPACE: return SDL_GetScancodeName(SDL_SCANCODE_BACKSPACE);
+    case SDLK_TAB: return SDL_GetScancodeName(SDL_SCANCODE_TAB);
+    case SDLK_SPACE: return SDL_GetScancodeName(SDL_SCANCODE_SPACE);
+    case SDLK_DELETE: return SDL_GetScancodeName(SDL_SCANCODE_DELETE);
+    default: break;
+    }
+
+    /* SDLK_A is the unshifted key ('a'), but its name is the character printed
+       on the key, so ask the layout for the shifted keycode - the same thing
+       SDL3 does, and the reason a letter is "A" and not "a". */
+    if (key > 0x7F || (key >= 'a' && key <= 'z')) {
+        SDL_Keymod modstate = SDL_KMOD_NONE;
+        SDL_Scancode scancode = SDL_GetScancodeFromKey(key, &modstate);
+        if (scancode != SDL_SCANCODE_UNKNOWN && !(modstate & SDL_KMOD_SHIFT)) {
+            SDL_Keycode capital = SDL_GetKeyFromScancode(scancode, SDL_KMOD_SHIFT, false);
+            if (capital > 0x7F || (capital >= 'A' && capital <= 'Z')) {
+                key = capital;
+            }
         }
     }
-    return "Unknown";
+
+    /* Anything left is a code point and names itself; SDL_GetKeyName(0) is ""
+       because that is the code point U+0000, not because it is unknown. */
+    sdlop_ucs4_to_utf8((Uint32)key, sdlop_utf8_name);
+    return sdlop_utf8_name;
 }
 
 SDL_Keycode SDL_GetKeyFromName(const char *name)
@@ -116,14 +174,26 @@ SDL_Keycode SDL_GetKeyFromName(const char *name)
         SDL_InvalidParamError("name");
         return SDLK_UNKNOWN;
     }
-    if (name[1] == '\0' && (unsigned char)name[0] > 0x20 && (unsigned char)name[0] < 0x7F) {
-        /* a single printable character is <-> its own keycode, except that
-           letters are stored lowercase in SDLK_* */
+    if (name[1] == '\0') {
+        /* A single character is <-> its own keycode, except that the letters are
+           stored lowercase in SDLK_*, and that the characters a US layout only
+           reaches with Shift map to the key they sit on ("!" is SDLK_1). SDL3's
+           SDL_GetKeyFromName() does the same; sdlop_keyname_aliases is that
+           table, checked against stock for every character from 0x20 to 0x7e -
+           including the space character, which is why this runs before the
+           printable-only case below. */
+        const SDLOP_KeyName *alias = sdlop_find_name(sdlop_keyname_aliases,
+                (int)(sizeof(sdlop_keyname_aliases) / sizeof(sdlop_keyname_aliases[0])), name);
         char c = name[0];
-        if (c >= 'A' && c <= 'Z') {
-            return (SDL_Keycode)(c - 'A' + 'a');
+        if (alias) {
+            return (SDL_Keycode)alias->code;
         }
-        return (SDL_Keycode)(unsigned char)c;
+        if ((unsigned char)c > 0x20 && (unsigned char)c < 0x7F) {
+            if (c >= 'A' && c <= 'Z') {
+                return (SDL_Keycode)(c - 'A' + 'a');
+            }
+            return (SDL_Keycode)(unsigned char)c;
+        }
     }
     for (int i = 0; i < count; i++) {
         if (SDL_strcasecmp(sdlop_keynames[i].name, name) == 0) {
@@ -273,6 +343,14 @@ void SDLOP_SetKeyboardFocus(SDL_Window *window)
     }
 }
 
+/* Caps/num/scroll are locks, and XKB's lock behaviour is not "held down": stock
+   SDL3 on X11 shows a lock key's press when the modifier was clear *locking* it
+   immediately, and a press that starts from the locked state *unlocking* it when
+   the key is released. So CapsLock down/up/down/up ends with the modifier clear
+   again - the state never sticks. Measured on stock 3.2.10 (X11/Xvfb +
+   xdotool) event by event; the same sequence is in the behaviour probe. */
+static bool sdlop_lock_armed[3];      /* caps, num, scroll: was the lock clear at press? */
+
 static SDL_Keymod sdlop_modstate_for_scancode(SDL_Scancode scancode, bool down)
 {
     SDL_Keymod bit = SDL_KMOD_NONE;
@@ -291,14 +369,22 @@ static SDL_Keymod sdlop_modstate_for_scancode(SDL_Scancode scancode, bool down)
         case SDL_SCANCODE_SCROLLLOCK: bit = SDL_KMOD_SCROLL; break;
         default: return SDL_KMOD_NONE;
     }
-    if (down) {
+    if (bit == SDL_KMOD_CAPS || bit == SDL_KMOD_NUM || bit == SDL_KMOD_SCROLL) {
+        int which = (bit == SDL_KMOD_CAPS) ? 0 : (bit == SDL_KMOD_NUM) ? 1 : 2;
+        if (down) {
+            if (sdlop_modstate & bit) {
+                sdlop_lock_armed[which] = false;      /* started locked: release unlocks */
+            } else {
+                sdlop_modstate |= bit;                /* locked at the press */
+                sdlop_lock_armed[which] = true;
+            }
+        } else if (!sdlop_lock_armed[which]) {
+            sdlop_modstate &= (SDL_Keymod)~bit;       /* the release that turns it off */
+        }
+    } else if (down) {
         sdlop_modstate |= bit;
     } else {
-        /* num/caps/scroll are toggles: the caller decides by passing the state
-           it wants, so only clear the plain modifiers here */
-        if (bit != SDL_KMOD_CAPS && bit != SDL_KMOD_NUM && bit != SDL_KMOD_SCROLL) {
-            sdlop_modstate &= (SDL_Keymod)~bit;
-        }
+        sdlop_modstate &= (SDL_Keymod)~bit;
     }
     return bit;
 }
@@ -345,7 +431,11 @@ void SDLOP_SendKeyEvent(SDL_Scancode scancode, SDL_Keycode keycode, SDL_Keymod m
     }
 
     sdlop_modstate_for_scancode(scancode, down);
-    if (modstate != SDL_KMOD_NONE && !(scancode == SDL_SCANCODE_CAPSLOCK)) {
+    if (modstate != SDL_KMOD_NONE) {
+        /* A layout that reports a state wins, caps lock included: it is the only
+           thing that knows when a lock actually flipped, and the old exclusion
+           here is why a second Caps Lock press used to leave SDL_KMOD_CAPS set
+           forever. (Without a layout the bit set above is all there is.) */
         sdlop_modstate = modstate;
     }
 

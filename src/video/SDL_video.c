@@ -974,6 +974,13 @@ SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
 
     /* SDL3 tells the app the window exists before it is shown. */
     sdlop_push_window_event(window, SDL_EVENT_WINDOW_SHOWN, 0, 0);
+    /* ...and then the size it can draw at, and the area it may draw in. Both
+       events are sent even though they agree with what was asked for - stock
+       SDL3 sends them here, and an application that only listens to events has
+       no other way to learn its drawable size (the behaviour probe is what found
+       SDLop not sending either). */
+    sdlop_push_window_event(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
+    sdlop_push_window_event(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);
     return window;
 }
 
@@ -2030,6 +2037,12 @@ void SDLOP_OnWindowPixelSizeChanged(SDL_Window *window, int w, int h)
        changes - applications keep drawing into the surface they already have. */
     SDLOP_ResizeWindowSurface(window, w, h);
     sdlop_push_window_event(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, w, h);
+    /* The safe area of these windows is the whole window (SDL_GetWindowSafeArea()
+       returns the window rectangle: there are no display cutouts on the platforms
+       this backend runs on), so it changes exactly when the pixel size does.
+       Stock SDL3 sends this event in the same place - found by the behaviour
+       probe, which is the only thing that would have noticed it was missing. */
+    sdlop_push_window_event(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);
 }
 
 void SDLOP_OnWindowShown(SDL_Window *window, bool shown)
@@ -2083,6 +2096,7 @@ void SDLOP_OnWindowMouseEnter(SDL_Window *window)
     }
     sdlop_mouse_focus = window;
     sdlop_set_window_flag(window, SDL_WINDOW_MOUSE_FOCUS, true);
+    SDLOP_ForgetMousePosition();
     sdlop_push_window_event(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
 }
 
@@ -2094,6 +2108,7 @@ void SDLOP_OnWindowMouseLeave(SDL_Window *window)
     if (sdlop_mouse_focus == window) {
         sdlop_mouse_focus = NULL;
         sdlop_set_window_flag(window, SDL_WINDOW_MOUSE_FOCUS, false);
+        SDLOP_ForgetMousePosition();
     }
     sdlop_push_window_event(window, SDL_EVENT_WINDOW_MOUSE_LEAVE, 0, 0);
 }
@@ -2107,6 +2122,16 @@ void SDLOP_OnWindowDisplayScaleChanged(SDL_Window *window, float scale)
     /* SDL3 carries no payload for this event: applications call
        SDL_GetWindowDisplayScale() to read the new value. */
     sdlop_push_window_event(window, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
+}
+
+void SDLOP_SetWindowOccludedFlag(SDL_Window *window, bool occluded)
+{
+    /* The flag without the event: stock SDL3 sets SDL_WINDOW_OCCLUDED when the
+       window manager reports _NET_WM_STATE_HIDDEN and leaves it to the minimized
+       event to tell the application (see the X11 property handler). */
+    if (window) {
+        sdlop_set_window_flag(window, SDL_WINDOW_OCCLUDED, occluded);
+    }
 }
 
 void SDLOP_OnWindowOccluded(SDL_Window *window, bool occluded)

@@ -323,12 +323,19 @@ static void test_focus_and_windows(void)
     CHECK(SDL_strcmp(SDL_GetWindowTitle(window), "renamed") == 0, "title after SDL_SetWindowTitle()");
 
     SDL_SetWindowPosition(window, 10, 20);
+    /* SDL3 hands a geometry request to the server and reports the window's own
+       position until the server confirms the change, so the request is waited for
+       with SDL_SyncWindow() - the documented way - before it is read back. Stock
+       SDL3 needs this on X11 too (measured: it also still reports the old
+       position here). */
+    SDL_SyncWindow(window);
 {
         int x = -1, y = -1;
         CHECK(SDL_GetWindowPosition(window, &x, &y) && x == 10 && y == 20,
               "window position %d,%d", x, y);
     }
     SDL_SetWindowSize(window, 200, 150);
+    SDL_SyncWindow(window);
     {
         int w = 0, h = 0;
         CHECK(SDL_GetWindowSize(window, &w, &h) && w == 200 && h == 150, "size %dx%d", w, h);

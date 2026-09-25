@@ -73,9 +73,16 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x61, "A" },
     { 0x4000011a, "AC Back" },
     { 0x4000011e, "AC Bookmarks" },
+    { 0x40000113, "AC Close" },
+    { 0x40000114, "AC Exit" },
     { 0x4000011b, "AC Forward" },
     { 0x40000119, "AC Home" },
+    { 0x40000111, "AC New" },
+    { 0x40000112, "AC Open" },
+    { 0x40000116, "AC Print" },
+    { 0x40000117, "AC Properties" },
     { 0x4000011d, "AC Refresh" },
+    { 0x40000115, "AC Save" },
     { 0x40000118, "AC Search" },
     { 0x4000011c, "AC Stop" },
     { 0x40000113, "AC_CLOSE" },
@@ -97,7 +104,10 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x40000039, "CapsLock" },
     { 0x40000105, "CHANNEL_DECREMENT" },
     { 0x40000104, "CHANNEL_INCREMENT" },
+    { 0x40000105, "ChannelDown" },
+    { 0x40000104, "ChannelUp" },
     { 0x4000009c, "Clear" },
+    { 0x400000a2, "Clear / Again" },
     { 0x400000a2, "CLEARAGAIN" },
     { 0x4000007c, "Copy" },
     { 0x400000a3, "CrSel" },
@@ -109,6 +119,7 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x7f, "Delete" },
     { 0x40000051, "Down" },
     { 0x65, "E" },
+    { 0x4000010e, "Eject" },
     { 0x4000004d, "End" },
     { 0x40000122, "EndCall" },
     { 0x1b, "Escape" },
@@ -146,6 +157,15 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x4000004a, "Home" },
     { 0x69, "I" },
     { 0x40000049, "Insert" },
+    { 0x40000087, "International 1" },
+    { 0x40000088, "International 2" },
+    { 0x40000089, "International 3" },
+    { 0x4000008a, "International 4" },
+    { 0x4000008b, "International 5" },
+    { 0x4000008c, "International 6" },
+    { 0x4000008d, "International 7" },
+    { 0x4000008e, "International 8" },
+    { 0x4000008f, "International 9" },
     { 0x6a, "J" },
     { 0x6b, "K" },
     { 0x400000cf, "Keypad !" },
@@ -153,8 +173,11 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x400000c4, "Keypad %" },
     { 0x400000c7, "Keypad &" },
     { 0x400000c8, "Keypad &&" },
+    { 0x400000b6, "Keypad (" },
+    { 0x400000b7, "Keypad )" },
     { 0x40000055, "Keypad *" },
     { 0x40000057, "Keypad +" },
+    { 0x400000d7, "Keypad +/-" },
     { 0x40000085, "Keypad ," },
     { 0x40000056, "Keypad -" },
     { 0x40000063, "Keypad ." },
@@ -173,21 +196,40 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x40000060, "Keypad 8" },
     { 0x40000061, "Keypad 9" },
     { 0x400000cb, "Keypad :" },
+    { 0x400000c5, "Keypad <" },
     { 0x40000067, "Keypad =" },
+    { 0x40000086, "Keypad = (AS400)" },
+    { 0x400000c6, "Keypad >" },
     { 0x400000ce, "Keypad @" },
     { 0x400000c3, "Keypad ^" },
     { 0x400000bc, "Keypad A" },
+    { 0x400000bd, "Keypad B" },
     { 0x400000bb, "Keypad Backspace" },
     { 0x400000da, "Keypad Binary" },
+    { 0x400000be, "Keypad C" },
     { 0x400000d8, "Keypad Clear" },
     { 0x400000d9, "Keypad ClearEntry" },
+    { 0x400000bf, "Keypad D" },
+    { 0x400000dc, "Keypad Decimal" },
+    { 0x400000c0, "Keypad E" },
     { 0x40000058, "Keypad Enter" },
+    { 0x400000c1, "Keypad F" },
+    { 0x400000dd, "Keypad Hexadecimal" },
+    { 0x400000d3, "Keypad MemAdd" },
+    { 0x400000d2, "Keypad MemClear" },
+    { 0x400000d6, "Keypad MemDivide" },
+    { 0x400000d5, "Keypad MemMultiply" },
+    { 0x400000d1, "Keypad MemRecall" },
+    { 0x400000d0, "Keypad MemStore" },
+    { 0x400000d4, "Keypad MemSubtract" },
     { 0x400000db, "Keypad Octal" },
     { 0x400000cd, "Keypad Space" },
     { 0x400000ba, "Keypad Tab" },
     { 0x400000c2, "Keypad XOR" },
+    { 0x400000b8, "Keypad {" },
     { 0x400000c9, "Keypad |" },
     { 0x400000ca, "Keypad ||" },
+    { 0x400000b9, "Keypad }" },
     { 0x400000bd, "KP_B" },
     { 0x400000be, "KP_C" },
     { 0x400000bf, "KP_D" },
@@ -210,14 +252,27 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x400000b9, "KP_RIGHTBRACE" },
     { 0x400000b7, "KP_RIGHTPAREN" },
     { 0x6c, "L" },
+    { 0x40000090, "Language 1" },
+    { 0x40000091, "Language 2" },
+    { 0x40000092, "Language 3" },
+    { 0x40000093, "Language 4" },
+    { 0x40000094, "Language 5" },
+    { 0x40000095, "Language 6" },
+    { 0x40000096, "Language 7" },
+    { 0x40000097, "Language 8" },
+    { 0x40000098, "Language 9" },
     { 0x40000050, "Left" },
     { 0x400000e2, "Left Alt" },
     { 0x400000e0, "Left Ctrl" },
     { 0x400000e3, "Left GUI" },
+    { 0x20000006, "Left Hyper" },
+    { 0x20000004, "Left Meta" },
     { 0x400000e1, "Left Shift" },
     { 0x20000001, "LEFT_TAB" },
     { 0x7b, "LEFTBRACE" },
+    { 0x20000001, "LeftTab" },
     { 0x20000002, "LEVEL5_SHIFT" },
+    { 0x20000002, "Level5Shift" },
     { 0x20000006, "LHYPER" },
     { 0x20000004, "LMETA" },
     { 0x6d, "M" },
@@ -232,10 +287,24 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x4000010a, "MEDIA_REWIND" },
     { 0x40000110, "MEDIA_SELECT" },
     { 0x4000010d, "MEDIA_STOP" },
+    { 0x40000109, "MediaFastForward" },
+    { 0x40000107, "MediaPause" },
+    { 0x40000106, "MediaPlay" },
+    { 0x4000010f, "MediaPlayPause" },
+    { 0x40000108, "MediaRecord" },
+    { 0x4000010a, "MediaRewind" },
+    { 0x40000110, "MediaSelect" },
+    { 0x4000010d, "MediaStop" },
+    { 0x4000010b, "MediaTrackNext" },
+    { 0x4000010c, "MediaTrackPrevious" },
     { 0x40000076, "Menu" },
+    { 0x40000101, "ModeSwitch" },
     { 0x20000003, "MULTI_KEY_COMPOSE" },
+    { 0x20000003, "MultiKeyCompose" },
     { 0x4000007f, "Mute" },
     { 0x6e, "N" },
+    { 0x40000064, "NonUSBackslash" },
+    { 0x40000053, "Numlock" },
     { 0x40000053, "Numlock/Clear" },
     { 0x6f, "O" },
     { 0x400000a1, "Oper" },
@@ -259,6 +328,8 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x400000e6, "Right Alt" },
     { 0x400000e4, "Right Ctrl" },
     { 0x400000e7, "Right GUI" },
+    { 0x20000007, "Right Hyper" },
+    { 0x20000005, "Right Meta" },
     { 0x400000e5, "Right Shift" },
     { 0x7d, "RIGHTBRACE" },
     { 0x20000005, "RMETA" },
@@ -290,8 +361,20 @@ SDLOP_TABLE static const SDLOP_KeyName sdlop_keynames[] = {
     { 0x7a, "Z" },
 };
 
+/* SDLK_EXTENDED_MASK | index: SDL3 keeps these names in their own table,
+   and SDL_GetKeyName() looks them up there, in this order. */
+SDLOP_TABLE static const char *sdlop_extended_key_names[] = {
+    "LeftTab",
+    "Level5Shift",
+    "MultiKeyCompose",
+    "Left Meta",
+    "Right Meta",
+    "Left Hyper",
+    "Right Hyper",
+};
+
 SDLOP_TABLE static const char *sdlop_scancode_names[SDLOP_NUM_SCANCODES] = {
-    "UNKNOWN", 
+    "", 
     NULL,
     NULL,
     NULL,
@@ -340,7 +423,7 @@ SDLOP_TABLE static const char *sdlop_scancode_names[SDLOP_NUM_SCANCODES] = {
     "=", 
     "[", 
     "]", 
-    "\\\\", 
+    "\\", 
     "#", 
     ";", 
     "'", 
@@ -691,7 +774,7 @@ SDLOP_TABLE static const char *sdlop_scancode_names[SDLOP_NUM_SCANCODES] = {
     NULL,
     NULL,
     NULL,
-    "RESERVED", 
+    "", 
 };
 
 /* scancode -> keycode: the SDLK_* value when the key has a name for it,
@@ -1504,6 +1587,37 @@ SDLOP_TABLE static const SDL_Keycode sdlop_shifted_keycode_for_scancode[SDLOP_NU
     0,
     0,
     0,
+};
+
+/* Names SDL_GetKeyFromName() accepts for keys a US layout only produces
+   with Shift held: stock SDL3 resolves them to the unshifted key, so
+   SDL_GetKeyFromName("!") is SDLK_1 (0x31) and not SDLK_EXCLAIM.
+   '#' is the one exception in stock, where its own keycode (SDLK_HASH)
+   wins, and the space character is accepted for SDLK_SPACE. Checked
+   character by character against stock 3.2.10, 0x20..0x7e. */
+SDLOP_TABLE static const SDLOP_KeyName sdlop_keyname_aliases[] = {
+    { 0x00000020u, " " }, /* space */
+    { 0x00000031u, "!" }, /* 1 */
+    { 0x00000027u, "\"" }, /* ' */
+    { 0x00000023u, "#" }, /* 3 */
+    { 0x00000034u, "$" }, /* 4 */
+    { 0x00000035u, "%" }, /* 5 */
+    { 0x00000037u, "&" }, /* 7 */
+    { 0x00000039u, "(" }, /* 9 */
+    { 0x00000030u, ")" }, /* 0 */
+    { 0x00000038u, "*" }, /* 8 */
+    { 0x0000003Du, "+" }, /* = */
+    { 0x0000003Bu, ":" }, /* ; */
+    { 0x0000002Cu, "<" }, /* , */
+    { 0x0000002Eu, ">" }, /* . */
+    { 0x0000002Fu, "?" }, /* / */
+    { 0x00000032u, "@" }, /* 2 */
+    { 0x00000036u, "^" }, /* 6 */
+    { 0x0000002Du, "_" }, /* - */
+    { 0x0000005Bu, "{" }, /* [ */
+    { 0x0000005Cu, "|" }, /* \ */
+    { 0x0000005Du, "}" }, /* ] */
+    { 0x00000060u, "~" }, /* ` */
 };
 
 /* scancodes that share a name with another key need explicit lookups */

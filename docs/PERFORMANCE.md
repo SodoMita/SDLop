@@ -80,21 +80,34 @@ stock's `XPutImage` path, which is where the 13.8x comes from.
 
 Readings of the individual benchmarks:
 
-* **Init/teardown (4.0x).** SDLop has no HIDAPI scan, no udev enumeration of
+* **Init/teardown (4.3x).** SDLop has no HIDAPI scan, no udev enumeration of
   every subsystem, no joystick/audio/haptic probing when only `SDL_INIT_VIDEO`
   was asked for, and it starts exactly one input thread.
-* **Window create/destroy (33.1x offscreen, 8.4x on X11).** An SDLop window is a
+* **Window create/destroy (26.5x offscreen, 6.2x on X11).** An SDLop window is a
   struct, a surface and (on Wayland) a `wl_surface`, or on X11 an `XCreateWindow`
   and a GC; there is no renderer, no per-window properties bag, no display-mode
-  list to rebuild, and no `SDL_PumpEvents` in between. On X11 the 8.4x is what is
-  left after the X server round trips that both libraries pay.
-* **`SDL_PumpEvents` (3.5x).** The backends pump with a descriptor and a ring;
-  callbacks and timers return via an atomic fast path before taking any lock or
-  reading the clock. Measured **on the Wayland path** (offscreen is not
-  comparable, it has no socket): the SDLop pump was **299 ns/call** against stock
-  SDL3's **1329 ns/call** — 4.4x — *including* the non-blocking `poll()` that
-  keeps a polling application reading its compositor socket. On X11 the pump is
-  421 ns against stock's 1463 ns.
+  list to rebuild, and no `SDL_PumpEvents` in between. On X11 the 6.2x is what is
+  left after the X server round trips that both libraries pay: SDLop now waits
+  for the map (an `XSync()` round trip and one pump, 400 us per create+destroy)
+  because that is what makes the events an application sees after
+  `SDL_CreateWindow()` - the expose, the focus, and `SDL_WINDOW_INPUT_FOCUS` - the
+  same as stock's, which pays even more for the same thing (2.48 ms). The ratio
+  is a little lower than it was without the wait; the events are worth it, and
+  the absolute cost is still 6x lower.
+* **`SDL_PumpEvents` (1.2x on Wayland, 1.7x on X11).** The backends pump with a
+  descriptor and a ring; callbacks and timers return via an atomic fast path
+  before taking any lock or reading the clock. Measured **on the Wayland path**
+  (offscreen is not comparable, it has no socket): the SDLop pump is
+  **270 ns/call** against stock SDL3's **330 ns/call**, *including* the
+  non-blocking `poll()` that keeps a polling application reading its compositor
+  socket. On X11 the pump is **1036 ns** against stock's **1716 ns** - both are
+  now paying for a server round trip on an empty queue, which is the honest
+  measurement: SDLop's create/show paths dispatch the events the server sends
+  about a map, so by the time the benchmark pumps there is nothing left in the
+  queue, where before those events were still sitting there and `XPending()`
+  answered from the local buffer (421 ns). An application that pumps while events
+  are already queued still sees the fast path; the empty-queue case is what a
+  frame loop actually pays, and there stock is the slower one.
 * **`SDL_PushEvent` + `SDL_PollEvent` (4.3x offscreen, 3.2x on X11).** A single
   mutex and a ring copy in each direction, *no syscall when no thread is
   waiting*, and no pump when an event is already queued (see below).

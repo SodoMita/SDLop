@@ -97,6 +97,15 @@ FILES = {
         "banner": "Events: window, keyboard, text input and mouse. The SDL_Event union keeps\n"
                   " * upstream's `Uint8 padding[128]` member, so size/ABI still match SDL3 even\n"
                   " * though the dropped event kinds are no longer members of the union.",
+        # SDL_TouchFingerEvent is upstream's own struct (kept above); the two ID
+        # typedefs it is built from live in SDL_touch.h upstream, and touch is not
+        # part of SDLop's surface, so they are declared here instead of pulling in
+        # that header. The union member has to exist for both whatever the event
+        # kinds an application can actually receive.
+        "extra_before": '''
+typedef Uint64 SDL_TouchID;
+typedef Uint64 SDL_FingerID;
+''',
         "keep": [r"^SDL_(CommonEvent|DisplayEvent|WindowEvent|KeyboardDeviceEvent|KeyboardEvent|"
                  r"TextEditingEvent|TextEditingCandidatesEvent|TextInputEvent|MouseDeviceEvent|"
                  r"MouseMotionEvent|MouseButtonEvent|MouseWheelEvent)$",
@@ -109,11 +118,11 @@ FILES = {
                  r"^SDL_RemoveEventWatch$", r"^SDL_FilterEvents$", r"^SDL_SetEventEnabled$",
                  r"^SDL_EventEnabled$", r"^SDL_RegisterEvents$", r"^SDL_GetEventDescription$", r"^SDL_COMPILE_TIME_ASSERT$",
                  r"^SDL_UserEvent$", r"^SDL_QuitEvent$", r"^struct SDL_UserEvent$",
-                 r"^struct SDL_QuitEvent$"],
+                 r"^struct SDL_QuitEvent$", r"^SDL_TouchFingerEvent$"],
         "drop_members": {
             "union SDL_Event": ("SDL_AudioDeviceEvent", "SDL_CameraDeviceEvent", "SDL_ClipboardEvent",
                                 "SDL_DropEvent", "SDL_Gamepad", "SDL_Joy", "SDL_Pen",
-                                "SDL_RenderEvent", "SDL_SensorEvent", "SDL_TouchFingerEvent"),
+                                "SDL_RenderEvent", "SDL_SensorEvent"),
         },
     },
     "SDL_keycode.h": {
@@ -639,6 +648,9 @@ def emit(fname, spec, items, dropped):
     incs = "".join("#include <SDL3/%s>\n" % i for i in spec.get("includes", []))
     out = [HEADER.format(src=fname, ver=SDL_VERSION, banner=spec.get("banner", ""),
                          guard=guard, includes=incs)]
+    if spec.get("extra_before"):
+        out.append(spec["extra_before"].strip("\n"))
+        out.append("")
     kept = 0
     kept_items = close_over(spec, items)
     kept_ids = set(id(it) for it in kept_items)

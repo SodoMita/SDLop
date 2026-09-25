@@ -59,6 +59,12 @@ int main(int argc, char **argv)
     }
     SDL_SetWindowPosition(window, 120, 90);
     SDL_ShowWindow(window);
+    /* SDL3 reports a requested position once the server has confirmed it, so the
+       window has to be synchronised before it can be read back (this is what
+       SDL_SyncWindow() is for; without it the application sees the change at its
+       next pump). SDLop behaves the same way as stock here - it used to update the
+       position when asked, which is what made this rig pass before. */
+    SDL_SyncWindow(window);
     SDL_StartTextInput(window);
 
     /* Where the window is and how big it is: the driver computes the pointer
