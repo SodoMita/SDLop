@@ -313,9 +313,11 @@ int main(void)
     expect rel = { .type = SDL_EVENT_MOUSE_MOTION, .check_rel = true, .rx = 5.5f, .ry = -2.25f };
     CHECK(pump_until(pred_generic, &rel, 3000),
           "no relative MOTION (5.5,-2.25) via locked pointer");
+    /* stock accumulates relative motion into the absolute position:
+     * enter (64,64) + (5.5,-2.25) */
     SDL_GetMouseState(&mx, &my);
-    CHECK(fabsf(mx - (64.0f - win_x)) < 1.0f && fabsf(my - (64.0f - win_y)) < 1.0f,
-          "locked pointer drifted to (%.1f,%.1f)", mx, my);
+    CHECK(fabsf(mx - (69.5f - win_x)) < 1.0f && fabsf(my - (61.75f - win_y)) < 1.0f,
+          "position after relative motion (%.1f,%.1f) != (69.5,61.75)", mx, my);
 
     /* unlock; absolute motion must work again. The unlock travels on
      * SDLop's connection while the motion is injected on the controller

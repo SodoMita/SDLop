@@ -620,9 +620,14 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     d->pointer_focus = window;
     sdlop.mouse_focus = window;
     window->flags |= SDL_WINDOW_MOUSE_FOCUS;
-    sdlop.mouse_x = (float)wl_fixed_to_double(surface_x);
-    sdlop.mouse_y = (float)wl_fixed_to_double(surface_y);
+    sdlop.mouse_has_position = false; /* stock: the enter's own motion carries no delta */
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
+    /* stock delivers the enter position through the motion path (a movement
+       event with zero delta); a confine warp may arrive with no following
+       motion, so the enter coordinates are the position. */
+    SDLOP_SendMouseMotion((float)wl_fixed_to_double(surface_x),
+                          (float)wl_fixed_to_double(surface_y), 0.0f, 0.0f,
+                          SDLOP_MonotonicNS());
 
     if (sdlop.relative_mode_window == window) {
         if (!wl_data.locked_pointer) {
@@ -643,6 +648,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     (void)surface;
     SDL_Window *window = d->pointer_focus;
     d->pointer_focus = NULL;
+    sdlop.mouse_has_position = false;
     if (sdlop.mouse_focus == window) {
         sdlop.mouse_focus = NULL;
     }
@@ -674,7 +680,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
         sdlop.mouse_y = y;
         return;
     }
-    SDLOP_SendMouseMotion(x, y, x - sdlop.mouse_x, y - sdlop.mouse_y, SDLOP_MonotonicNS());
+    SDLOP_SendMouseMotion(x, y, 0.0f, 0.0f, SDLOP_MonotonicNS()); /* core derives deltas from clamped positions (stock) */
 }
 
 static Uint8 wl_button_to_sdl(uint32_t button)

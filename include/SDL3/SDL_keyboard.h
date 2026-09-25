@@ -73,4 +73,14 @@ extern const char *SDL_GetScancodeName(SDL_Scancode scancode);
  */
 extern const char *SDL_GetKeyName(SDL_Keycode key);
 
+/**
+ * Get a key code from a human-readable name.
+ *
+ * \\param name the human-readable key name.
+ * \\returns key code, or `SDLK_UNKNOWN` if the name wasn't recognized.
+ *
+ * \\since This function is available since SDL 3.2.0.
+ */
+extern SDL_Keycode SDL_GetKeyFromName(const char *name);
+
 #endif /* SDL_keyboard_h_ */

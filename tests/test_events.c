@@ -7,6 +7,7 @@
 */
 
 #include <SDL3/SDL.h>
+#include "internal/sdlop_internal.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +155,48 @@ int main(void)
     SDL_GetRelativeMouseState(&rx, &ry);
     assert(rx == 0.0f && ry == 0.0f);
 
+    /* --- stock parity: clamping, deltas from clamped positions, drop rule --- */
+    sdlop.mouse_focus = w;
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(w, &win_w, &win_h);
+    sdlop.mouse_has_position = false;
+    SDLOP_SendMouseMotion(10.0f, 10.0f, 0.0f, 0.0f, 0); /* first after focus change: no delta (stock) */
+    {
+        SDL_Event ev;
+        bool saw = false;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                saw = true;
+                assert(ev.motion.xrel == 0.0f && ev.motion.yrel == 0.0f);
+            }
+        }
+        assert(saw);
+    }
+    SDLOP_SendMouseMotion(10.0f, 10.0f, 0.0f, 0.0f, 0); /* no state change: dropped (stock) */
+    {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            assert(ev.type != SDL_EVENT_MOUSE_MOTION);
+        }
+    }
+    SDLOP_SendMouseMotion(5000.0f, -30.0f, 0.0f, 0.0f, 0); /* clamped into the window (stock) */
+    {
+        SDL_Event ev;
+        bool saw = false;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                saw = true;
+                assert(ev.motion.x == (float)(win_w - 1));
+                assert(ev.motion.y == 0.0f);
+                assert(ev.motion.xrel == (float)(win_w - 1) - 10.0f);
+                assert(ev.motion.yrel == -10.0f);
+            }
+        }
+        assert(saw);
+    }
+    sdlop.mouse_focus = NULL;
+    SDL_GetRelativeMouseState(&rx, &ry); /* drain accumulators for the checks below */
+
     SDLOP_SendMouseButton(true, SDL_BUTTON_LEFT, 0, 0, 0);
     {
         SDL_Event ev;
@@ -202,6 +245,64 @@ int main(void)
     assert(SDL_GetWindowFlags(w) & SDL_WINDOW_HIDDEN);
     assert(SDL_ShowWindow(w));
     assert(!(SDL_GetWindowFlags(w) & SDL_WINDOW_HIDDEN));
+
+    /* --- stock parity: key names --- */
+    assert(strcmp(SDL_GetKeyName(SDLK_SPACE), "Space") == 0);
+    assert(strcmp(SDL_GetKeyName(SDLK_RETURN), "Return") == 0);
+    assert(strcmp(SDL_GetKeyName('a'), "A") == 0); /* name is the printed (capital) letter */
+    assert(strcmp(SDL_GetKeyName('B'), "B") == 0);
+    /* non-ASCII: stock capitalizes via the active keymap; a US keymap has no
+       e-acute, so stock returns it unchanged too (same note as arena's rig) */
+    assert(strcmp(SDL_GetKeyName((SDL_Keycode)0x00E9), "\xc3\xa9") == 0);
+    assert(strcmp(SDL_GetKeyName((SDL_Keycode)(SDLK_EXTENDED_MASK | 1)), "LeftTab") == 0);
+    assert(strcmp(SDL_GetKeyName((SDL_Keycode)(SDLK_EXTENDED_MASK | 4)), "Left Meta") == 0);
+    assert(strcmp(SDL_GetScancodeName(SDL_SCANCODE_UNKNOWN), "") == 0);
+    assert(SDL_GetKeyFromName("LeftTab") == (SDL_Keycode)(SDLK_EXTENDED_MASK | 1));
+    assert(SDL_GetKeyFromName("lefttab") == (SDL_Keycode)(SDLK_EXTENDED_MASK | 1));
+    assert(SDL_GetKeyFromName("Left Ctrl") == (SDL_Keycode)(SDLK_SCANCODE_MASK | SDL_SCANCODE_LCTRL));
+    assert(SDL_GetKeyFromName("a") == 'a');
+    assert(SDL_GetKeyFromName("\xc3\xa9") == 0x00E9); /* UTF-8 char is the keycode itself */
+    assert(SDL_GetKeyFromName(NULL) == SDLK_UNKNOWN);
+    assert(SDL_GetKeyFromName("DefinitelyNotAKey") == SDLK_UNKNOWN);
+    for (SDL_Keycode k = 'a'; k <= 'z'; k++) {
+        assert(SDL_GetKeyFromName(SDL_GetKeyName(k)) == (k - 'a' + 'A'));
+    }
+
+    /* --- stock parity: KEYMAP_CHANGED fires for a replaced keymap --- */
+    static const char minimal_keymap[] =
+        "xkb_keymap {\n"
+        "xkb_keycodes \"min\" { minimum = 8; maximum = 255;\n"
+        "  <ESC> = 9; <AE01> = 10; <AD01> = 24; <AD02> = 25;\n"
+        "  <LFSH> = 50; <RTSH> = 62; <LCTL> = 37; <CAPS> = 66; };\n"
+        "xkb_types \"min\" {\n"
+        "  type \"ONE_LEVEL\" { modifiers= none; map[none]= Level1; level_name[Level1]= \"Any\"; };\n"
+        "  type \"TWO_LEVEL\" { modifiers= Shift; map[none]= Level1; map[Shift]= Level2;\n"
+        "    level_name[Level1]= \"Base\"; level_name[Level2]= \"Shift\"; };\n"
+        "  type \"ALPHABETIC\" { modifiers= Shift+Lock; map[none]= Level1; map[Shift]= Level2;\n"
+        "    map[Lock]= Level2; level_name[Level1]= \"Base\"; level_name[Level2]= \"Caps\"; }; };\n"
+        "xkb_compatibility \"min\" {\n"
+        "  interpret Caps_Lock { action= LockMods(modifiers=Lock); };\n"
+        "  interpret Shift_L { action= SetMods(modifiers=Shift); }; };\n"
+        "xkb_symbols \"min\" {\n"
+        "  key <ESC> { [ Escape ] };\n"
+        "  key <AE01> { type= \"TWO_LEVEL\", symbols[Group1]= [ 1, exclam ] };\n"
+        "  key <AD01> { type= \"ALPHABETIC\", symbols[Group1]= [ q, Q ] };\n"
+        "  key <AD02> { type= \"ALPHABETIC\", symbols[Group1]= [ w, W ] };\n"
+        "  key <LFSH> { [ Shift_L ] }; key <RTSH> { [ Shift_R ] };\n"
+        "  key <LCTL> { [ Control_L ] }; key <CAPS> { [ Caps_Lock ] }; }; };\n";
+    assert(SDLOP_KeyboardSetDefaultKeymap()); /* ensure one exists: first keymap sends no event */
+    SDL_FlushEvent(SDL_EVENT_KEYMAP_CHANGED);
+    assert(SDLOP_KeyboardSetKeymapString(minimal_keymap, sizeof(minimal_keymap) - 1));
+    {
+        SDL_Event ev;
+        bool saw = false;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_EVENT_KEYMAP_CHANGED) {
+                saw = true;
+            }
+        }
+        assert(saw);
+    }
 
     /* --- destroy --- */
     SDL_WindowID saved_id = SDL_GetWindowID(w);

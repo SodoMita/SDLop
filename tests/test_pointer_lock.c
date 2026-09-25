@@ -162,10 +162,11 @@ int main(int argc, char *argv[])
         CHECK(SDL_SetWindowRelativeMouseMode(w, true),
               "relative mode on: %s", SDL_GetError());
 
-        /* the mini compositor answers with locked + relative_motion(10.5,-3.25) */
-        motion_expect rel = { 10.5f, -3.25f, 100.0f, 100.0f, true, true, false };
+        /* the mini compositor answers with locked + relative_motion(10.5,-3.25);
+         * stock SDL3 accumulates relative motion into the reported position */
+        motion_expect rel = { 10.5f, -3.25f, 110.5f, 96.75f, true, true, false };
         CHECK(pump_until(pred_motion, &rel, 3000),
-              "no relative MOUSE_MOTION (xrel=10.5, yrel=-3.25, pos held at 100,100)");
+              "no relative MOUSE_MOTION (xrel=10.5, yrel=-3.25, pos 110.5,96.75)");
 
         /* relative state reflects the accumulated deltas */
         float rx = 0, ry = 0;
@@ -173,17 +174,19 @@ int main(int argc, char *argv[])
         CHECK(fabsf(rx - 10.5f) < 0.01f && fabsf(ry + 3.25f) < 0.01f,
               "relative state (%f,%f) != (10.5,-3.25)", rx, ry);
 
-        /* absolute position must not have changed */
+        /* stock accumulates relative motion into the absolute position too */
         SDL_GetMouseState(&mx, &my);
-        CHECK(fabsf(mx - 100.0f) < 0.01f && fabsf(my - 100.0f) < 0.01f,
-              "locked position drifted to (%f,%f)", mx, my);
+        CHECK(fabsf(mx - 110.5f) < 0.01f && fabsf(my - 96.75f) < 0.01f,
+              "position after relative motion (%f,%f) != (110.5,96.75)", mx, my);
 
         /* step 3: unlock; the compositor then sends absolute motion */
         CHECK(SDL_SetWindowRelativeMouseMode(w, false),
               "relative mode off: %s", SDL_GetError());
-        motion_expect abs_ = { 0.0f, 0.0f, 600.0f, 450.0f, false, true, false };
+        /* the rig injects (600,450), far outside the 320x240 window: stock
+         * clamps the reported position into the window (w-1, h-1) */
+        motion_expect abs_ = { 0.0f, 0.0f, 319.0f, 239.0f, false, true, false };
         CHECK(pump_until(pred_motion, &abs_, 3000),
-              "no absolute MOUSE_MOTION to (600,450) after unlock");
+              "no absolute MOUSE_MOTION clamped to (319,239) after unlock");
 
         SDL_DestroyWindowSurface(w);
         SDL_DestroyWindow(w);

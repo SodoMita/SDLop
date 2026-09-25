@@ -18,18 +18,72 @@ static SDL_WindowID mouse_window_id(void)
     return sdlop.windows ? sdlop.windows->id : 0;
 }
 
+/* Mirrors stock SDL3's ConstrainMousePosition: the reported position lives
+   inside the window (no mouse-rect API in this subset, so the window rect is
+   the only confine), and going past the far edge keeps the larger of the
+   edge and the previous position so deltas stay continuous. */
+static void constrain_mouse_pos(float *x, float *y)
+{
+    SDL_Window *w = sdlop.mouse_focus;
+    if (!w || (w->flags & SDL_WINDOW_MOUSE_CAPTURE)) {
+        return;
+    }
+    int x_max = w->w - 1;
+    int y_max = w->h - 1;
+    if (*x >= (float)(x_max + 1)) {
+        *x = SDL_max((float)x_max, sdlop.mouse_last_x);
+    }
+    if (*x < 0.0f) {
+        *x = 0.0f;
+    }
+    if (*y >= (float)(y_max + 1)) {
+        *y = SDL_max((float)y_max, sdlop.mouse_last_y);
+    }
+    if (*y < 0.0f) {
+        *y = 0.0f;
+    }
+}
+
 void SDLOP_SendMouseMotion(float x, float y, float xrel, float yrel, Uint64 timestamp_ns)
 {
-    if (x != SDLOP_NO_POS) {
-        sdlop.mouse_x = x;
-        sdlop.mouse_y = y;
+    if (x == SDLOP_NO_POS) {
+        /* relative-only motion (relative-pointer / evdev / locked pointer) */
+        if (xrel == 0.0f && yrel == 0.0f) {
+            return;
+        }
+        if (sdlop.mouse_has_position) {
+            float fx = sdlop.mouse_x + xrel;
+            float fy = sdlop.mouse_y + yrel;
+            constrain_mouse_pos(&fx, &fy);
+            sdlop.mouse_x = fx;
+            sdlop.mouse_y = fy;
+            sdlop.mouse_last_x = fx;
+            sdlop.mouse_last_y = fy;
+        }
+    } else {
+        /* absolute motion: clamp first, then derive deltas (stock order);
+           explicit xrel/yrel from injection paths are honored as-is */
+        float fx = x;
+        float fy = y;
+        constrain_mouse_pos(&fx, &fy);
+        if (xrel == 0.0f && yrel == 0.0f) {
+            if (sdlop.mouse_has_position) {
+                xrel = fx - sdlop.mouse_last_x;
+                yrel = fy - sdlop.mouse_last_y;
+            }
+            if (sdlop.mouse_has_position && xrel == 0.0f && yrel == 0.0f) {
+                return; /* drop events that don't change state (stock) */
+            }
+        }
+        sdlop.mouse_x = fx;
+        sdlop.mouse_y = fy;
+        sdlop.mouse_last_x = fx;
+        sdlop.mouse_last_y = fy;
+        sdlop.mouse_has_position = true;
     }
     if (xrel != 0.0f || yrel != 0.0f) {
         sdlop.mouse_xrel_acc += xrel;
         sdlop.mouse_yrel_acc += yrel;
-    }
-    if (x == SDLOP_NO_POS && xrel == 0.0f && yrel == 0.0f) {
-        return;
     }
 
     SDL_Event event;
@@ -52,8 +106,14 @@ void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 tim
         return;
     }
     if (x != SDLOP_NO_POS) {
-        sdlop.mouse_x = x;
-        sdlop.mouse_y = y;
+        float fx = x;
+        float fy = y;
+        constrain_mouse_pos(&fx, &fy);
+        sdlop.mouse_x = fx;
+        sdlop.mouse_y = fy;
+        sdlop.mouse_last_x = fx;
+        sdlop.mouse_last_y = fy;
+        sdlop.mouse_has_position = true;
     }
 
     SDL_MouseButtonFlags mask = SDL_BUTTON_MASK(button);
