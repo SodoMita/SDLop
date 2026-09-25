@@ -1,12 +1,78 @@
+# -----------------------------------------------------------------------------
+# C/C++ compiler and linker outputs
+# -----------------------------------------------------------------------------
 *.o
+*.obj
+*.lo
 *.a
+*.la
+*.lib
 *.so
 *.so.*
-build/
+*.dylib
+*.dll
+*.exe
+*.out
+*.d
+
+# -----------------------------------------------------------------------------
+# CMake, Ninja, and out-of-source build trees
+# -----------------------------------------------------------------------------
+# Keep all build variants out of the source tree, including build-san,
+# build-asan, build-web, and user-named variants such as build-debug.
 build*/
-build-asan/
-build-ubsan/
-build-tsan/
-build-wextra/
-build-san/
-build-web/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+rules.ninja
+CMakeUserPresets.json
+
+# -----------------------------------------------------------------------------
+# Coverage, profiling, sanitizers, and test logs
+# -----------------------------------------------------------------------------
+*.gcno
+*.gcda
+*.gcov
+coverage/
+.lcov/
+lcov.info
+*.profraw
+*.profdata
+*.log
+asan.log*
+lsan.log*
+ubsan.log*
+
+# -----------------------------------------------------------------------------
+# Python tooling used by the source generators
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# -----------------------------------------------------------------------------
+# Editors and operating-system metadata
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# -----------------------------------------------------------------------------
+# Local-only configuration
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
