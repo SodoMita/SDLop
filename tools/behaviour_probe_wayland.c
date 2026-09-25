@@ -249,6 +249,24 @@ static void pump_for(Uint32 milliseconds)
     }
 }
 
+/* Get + fill + update in one step. SDL3's SDL_UpdateWindowSurface() refuses
+   to run without a current SDL_GetWindowSurface() (and invalidates the
+   surface on resize), while SDLop maps during the configure handshake; doing
+   all three here is what makes stock SDL3 actually commit a buffer and map
+   the window, so both implementations reach the input phase comparable. */
+static void draw_window(SDL_Window *window)
+{
+    SDL_Surface *surface = SDL_GetWindowSurface(window);
+    if (!surface) {
+        fprintf(stderr, "draw: GetWindowSurface: %s\n", SDL_GetError());
+        return;
+    }
+    SDL_FillSurfaceRect(surface, NULL, 0xFF006E);
+    if (!SDL_UpdateWindowSurface(window)) {
+        fprintf(stderr, "draw: UpdateWindowSurface: %s\n", SDL_GetError());
+    }
+}
+
 static int parse_args(int argc, char **argv)
 {
     for (int i = 1; i < argc; ++i) {
@@ -321,12 +339,20 @@ int main(int argc, char **argv)
        events before the external injector starts. */
     SDL_ShowWindow(window);
     pump_for(250);
+    /* Draw once so the surface actually maps: stock SDL3 only commits a
+       buffer from the render/update path, so an undrawn window never maps
+       on Wayland (no view, no focus, no input - the stock trace comes back
+       with device-added events only). SDLop maps in its configure handler;
+       this call is what makes the two implementations comparable. */
+    draw_window(window);
+    pump_for(120);
 
     /* A resize is supported by both SDLop's and stock SDL3's Wayland driver;
        positioning is intentionally omitted because Wayland has no global
        window-position API. */
     if (SDL_SetWindowSize(window, probe_width + 80, probe_height + 60)) {
         pump_for(180);
+        draw_window(window);
     }
 
     /* Hide/show gives the lifecycle trace a deterministic operation without
@@ -335,6 +361,8 @@ int main(int argc, char **argv)
     pump_for(120);
     SDL_ShowWindow(window);
     pump_for(180);
+    draw_window(window);
+    pump_for(120);
 
     if (relative_mode) {
         if (!SDL_SetWindowRelativeMouseMode(window, true)) {
