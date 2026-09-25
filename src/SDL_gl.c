@@ -223,7 +223,12 @@ bool SDL_GL_SwapWindow(SDL_Window *window)
     if (!sdlop.video || !sdlop.video->GL_SwapBuffers) {
         return SDL_SetError("Video driver does not support OpenGL");
     }
-    return sdlop.video->GL_SwapBuffers(sdlop.video, window);
+    if (!sdlop.video->GL_SwapBuffers(sdlop.video, window)) {
+        return false;
+    }
+    /* stock SDL3 announces presented content with an expose event */
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+    return true;
 }
 
 void SDL_GL_DestroyContext(SDL_GLContext context)

@@ -152,6 +152,11 @@ static void test_browser_driver(void)
         &cw, &ch);
     CHECK(cw == 320 && ch == 240, "canvas sized to window (%dx%d)", cw, ch);
 
+    /* stock SDL3: TEXT_INPUT only flows after an explicit opt-in */
+    CHECK(!SDL_TextInputActive(w), "text input inactive by default");
+    CHECK(SDL_StartTextInput(w), "StartTextInput: %s", SDL_GetError());
+    CHECK(SDL_TextInputActive(w), "text input active after StartTextInput");
+
     /* keyboard: synthetic KeyboardEvent on window */
     dispatch_js("window.dispatchEvent(new KeyboardEvent('keydown', {code:'KeyW', key:'w', bubbles:true, cancelable:true}))");
     SDL_PumpEvents();

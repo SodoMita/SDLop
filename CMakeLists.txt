@@ -35,6 +35,7 @@ if(EMSCRIPTEN)
     src/SDL_timer.c
     src/SDL_events.c
     src/SDL_keyboard_web.c
+    src/SDL_keynames.c
     src/SDL_mouse.c
     src/SDL_video.c
     src/SDL_surface.c
@@ -195,6 +196,7 @@ set(SDLop_SOURCES
   src/SDL_timer.c
   src/SDL_events.c
   src/SDL_keyboard.c
+  src/SDL_keynames.c
   src/SDL_mouse.c
   src/SDL_video.c
   src/SDL_surface.c
@@ -415,6 +417,15 @@ endif()
 # diffs every size/offset/enum value. Skipped when no reference is provided.
 if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
   add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
+endif()
+
+# Wayland behaviour injector (virtual pointer + keyboard script driver);
+# pairs with the shared behaviour_probe_wayland on the agent branch and
+# tests/run_behaviour_wayland.sh
+if (NOT EMSCRIPTEN)
+  add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
+  target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR})
+  target_link_libraries(wl_injector PRIVATE wayland-client xkbcommon)
 endif()
 
 # API subset gate: every SDL_* symbol exported by SDLop must also be exported

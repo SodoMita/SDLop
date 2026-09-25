@@ -71,6 +71,41 @@ extern const char *SDL_GetScancodeName(SDL_Scancode scancode);
 /**
  * Get a human-readable name for a key.
  */
+/**
+ * Start receiving Unicode text input events in a window.
+ *
+ * Text input events are not received by default: like stock SDL3,
+ * SDL_EVENT_TEXT_INPUT is only delivered after this call.
+ *
+ * \\param window the window to enable text input.
+ * \\returns true on success or false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \\since This function is available since SDL 3.2.0.
+ */
+extern bool SDL_StartTextInput(SDL_Window *window);
+
+/**
+ * Stop receiving any text input events in a window.
+ *
+ * \\param window the window to stop text input.
+ * \\returns true on success or false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \\since This function is available since SDL 3.2.0.
+ */
+extern bool SDL_StopTextInput(SDL_Window *window);
+
+/**
+ * Check whether or not Unicode text input events are enabled for a window.
+ *
+ * \\param window the window to check.
+ * \\returns true if text input events are enabled else false.
+ *
+ * \\since This function is available since SDL 3.2.0.
+ */
+extern bool SDL_TextInputActive(SDL_Window *window);
+
 extern const char *SDL_GetKeyName(SDL_Keycode key);
 
 /**

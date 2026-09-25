@@ -253,20 +253,6 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     }
 }
 
-void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
-{
-    if (!utf8 || !utf8[0]) {
-        return;
-    }
-    SDL_Event event;
-    SDL_zero(event);
-    event.text.type = SDL_EVENT_TEXT_INPUT;
-    event.text.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
-    event.text.windowID = SDLOP_FocusWindowID();
-    event.text.text = utf8;
-    SDLOP_PushEventInternal(&event);
-}
-
 void SDLOP_KeyboardProcessRepeats(void)
 {
     if (!sdlop.repeat_active) {
@@ -350,44 +336,6 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
         }
     }
     return SDL_SCANCODE_UNKNOWN;
-}
-
-/* ------------------------------------------------------------------ */
-/* Scancode / key names (shared with the native build)                 */
-/* ------------------------------------------------------------------ */
-
-#include "scancode_names.h"
-
-const char *SDL_GetScancodeName(SDL_Scancode scancode)
-{
-    if (scancode > SDL_SCANCODE_UNKNOWN && scancode < SDL_SCANCODE_COUNT) {
-        const char *name = sdlop_scancode_names[scancode];
-        if (name) {
-            return name;
-        }
-    }
-    return "";
-}
-
-const char *SDL_GetKeyName(SDL_Keycode key)
-{
-    if (key & SDLK_SCANCODE_MASK) {
-        return SDL_GetScancodeName((SDL_Scancode)(key & ~SDLK_SCANCODE_MASK));
-    }
-    switch (key) {
-    case SDLK_RETURN:    return "Return";
-    case SDLK_ESCAPE:    return "Escape";
-    case SDLK_BACKSPACE: return "Backspace";
-    case SDLK_TAB:       return "Tab";
-    case SDLK_DELETE:    return "Delete";
-    default: break;
-    }
-    if (key >= 0x20 && key < 0x7f) {
-        static _Thread_local char namebuf[2] = { 0, 0 };
-        namebuf[0] = (char)key;
-        return namebuf;
-    }
-    return "";
 }
 
 void SDLOP_KeyboardQuit(void)
