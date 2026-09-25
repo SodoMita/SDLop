@@ -478,10 +478,12 @@ and the new keymap is already readable when that event arrives, so that is what
 the X11 backend answers now (`XKLAVIER_STATE` is watched as well, because it is
 the property stock SDL3 reads for exactly this reason). Both libraries then
 announce the switch; they do not agree on *how many* times (this server posts
-three `MappingNotify` events for one switch, stock sends one event each, SDLop has
-one property change), which is a count no application can depend on - the rig
-collapses the run of `KEYMAP_CHANGED` events so the switch is compared rather than
-the server's chattiness.
+three `MappingNotify` events for one switch, stock sends one event each - plus a
+stray one deferred to the next key press, on some runs - and SDLop has one
+property change), which is a count no application can depend on. The rig
+therefore removes `KEYMAP_CHANGED` from the ordered diff and asserts separately
+that both probes announced the switch, so a library that ignores one fails while
+the server's delivery rules are not compared.
 
 Two habits from this work are worth keeping:
 

@@ -194,23 +194,30 @@ run_one()
 #                              change state") and SDLop never sends them, but the
 #                              two disagree about when the pointer counts as
 #                              having a position.
-#   KEYMAP_CHANGED, repeated    the *number* of these events a single layout
-#                              switch produces belongs to the server, not to the
-#                              library. This X server posts three core
-#                              MappingNotify events for one `setxkbmap` while
-#                              the probe runs (measured: three
-#                              XRefreshKeyboardMapping calls, all with
-#                              request=MappingKeyboard), stock SDL3 answers every
-#                              one of them with an event, and SDLop answers the
-#                              root property change this server makes instead -
-#                              it has to, because this server only sends core
-#                              MappingNotify to clients that never spoke XKB to
-#                              it at all, and SDLop's connection must speak XKB
-#                              (its keymap comes from xkbcommon-x11). On Wayland
-#                              both see one keymap per switch and emit one event.
-#                              Consecutive KEYMAP_CHANGED lines are collapsed, so
-#                              the switch itself is compared and the server's
-#                              chattiness is not.
+#   KEYMAP_CHANGED             how many of these events a layout switch produces,
+#                              and when they arrive, belongs to the X server's
+#                              idea of this client, not to the library.
+#                              Measured on this server: one `setxkbmap` sends
+#                              stock SDL3 three core MappingNotify events at the
+#                              switch (three XRefreshKeyboardMapping calls, all
+#                              request=MappingKeyboard), and a stray fourth one
+#                              only after the *next* key press, so whether one of
+#                              them lands before or after READY-INPUT depends on
+#                              the run. SDLop receives none of them: this server
+#                              sends core MappingNotify only to clients that never
+#                              spoke XKB to it, and SDLop's connection must speak
+#                              XKB (its keymap comes from xkbcommon-x11), so it
+#                              answers the root property the server rewrites
+#                              instead - one announcement per switch (see
+#                              src/video/SDL_x11.c, PropertyNotify). The count and
+#                              the position of these lines are therefore not
+#                              compared; that both probes announce the switch *at
+#                              all* is, and it is asserted separately in
+#                              compare().
+#
+#                              The lines are removed here rather than collapsed so
+#                              that the stray event, which arrives on its own, is
+#                              covered by the same rule.
 documented_patterns()
 {
     # Chained with pipes, not listed as separate commands: separate commands in a
@@ -220,7 +227,7 @@ documented_patterns()
     grep -vE '^STATE flags=' |
         grep -vE '^FROMNAMES-SYMBOLS ' |
         grep -vE '^EVENT input MOTION .*xrel=0\.0 yrel=0\.0$' |
-        awk '{ if ($0 == prev && $0 == "EVENT input KEYMAP_CHANGED") next; print; prev = $0 }'
+        grep -vE '^EVENT input KEYMAP_CHANGED$'
 }
 
 # The window-lifecycle phase is compared as a *set* rather than in sequence: when
@@ -234,12 +241,16 @@ normalize() { sed -e 's/[[:space:]]*$//' -e '/^$/d' "$1" | documented_patterns |
 
 segment()        { sed -n "/^EVENT $1/p" "$2"; }                     # one phase of a trace
 segment_sorted() { sed -n "/^EVENT $1/p" "$2" | sort; }
+# The lifecycle phase is compared raw, but the same documented rule about
+# KEYMAP_CHANGED applies to it: a stray server-deferred event can land before
+# READY-INPUT as easily as after it.
+phase_events()   { sed -n "/^EVENT $1/p" "$2" | grep -vE '^EVENT .* KEYMAP_CHANGED$'; }
 
 phase_report()
 {
     phase=$1; sdlop=$2; stock=$3
-    segment "$phase" "$stock" > "$TMP/p_stock.txt"
-    segment "$phase" "$sdlop" > "$TMP/p_sdlop.txt"
+    phase_events "$phase" "$stock" > "$TMP/p_stock.txt"
+    phase_events "$phase" "$sdlop" > "$TMP/p_sdlop.txt"
     sort "$TMP/p_stock.txt" > "$TMP/p_stock.sorted"
     sort "$TMP/p_sdlop.txt" > "$TMP/p_sdlop.sorted"
     n_sdlop=$(grep -c . "$TMP/p_sdlop.txt")
@@ -281,7 +292,20 @@ compare()
         return
     fi
 
-    # 1. the input events and the window operations, in order, once the
+    # 1. both probes must have announced the live layout switch the drive()
+    #    sequence makes. The number and position of those events are the
+    #    server's business (documented above), but *having* them is not: a
+    #    library that ignores a layout switch fails here.
+    switch_events=1
+    for trace in "$sdlop" "$stock"; do
+        if ! grep -q '^EVENT input KEYMAP_CHANGED$' "$trace"; then
+            bad "$(basename "$trace"): the layout was switched mid-run and no SDL_EVENT_KEYMAP_CHANGED came out"
+            switch_events=0
+        fi
+    done
+    [ "$switch_events" = 1 ] && ok "both probes announced the live layout switch"
+
+    # 2. the input events and the window operations, in order, once the
     #    documented rules are applied: this is the part an application sees
     normalize "$sdlop" > "$sdlop.n"; normalize "$stock" > "$stock.n"
     if diff -u "$stock.n" "$sdlop.n" > "$TMP/diff$tag.txt"; then
@@ -301,7 +325,7 @@ compare()
         sed -n '1,30p' "$TMP/diff$tag.txt" | sed 's/^/      /'
     fi
 
-    # 2. the lifecycle phase, as a set: this is where the two drivers place
+    # 3. the lifecycle phase, as a set: this is where the two drivers place
     #    SHOWN/EXPOSED/FOCUS_* differently, which is why it is reported apart
     if phase_report phase1 "$sdlop" "$stock"; then
         ok "the window lifecycle events match as a set"

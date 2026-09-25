@@ -555,14 +555,14 @@ static void sdlop_x11_pump_events(void);
 
 static unsigned long sdlop_x11_event_mask(void)
 {
-    /* KeymapStateMask is what makes the server send this client KeymapNotify;
-       stock SDL3 selects it too, because its own KeymapNotify handler is how it
-       notices a *group* switch (the XKB group changed while the keys it saw did
-       not say so). SDLop asks for the same mask so the server's view of this
-       client is the same one stock has, but it answers KeymapNotify in the
-       property/MappingNotify paths instead: its layout state follows the keys the
-       input path delivers, which is what makes a group switch the evdev worker
-       sees work as well. */
+    /* KeymapStateMask is what makes the server send this client KeymapNotify.
+       Stock SDL3 selects it for its KeymapNotify handler, which is how it notices
+       an XKB *group* switch (the group changed without the keys it saw saying
+       so); SDLop asks for the same mask, so the server's view of this client is
+       the one stock has, but its layout state follows the keys the input path
+       delivers - which is what makes a group switch that arrives through the
+       evdev worker work as well - and a live layout switch is caught through the
+       root property and MappingNotify paths below. */
     return StructureNotifyMask | ExposureMask | FocusChangeMask | EnterWindowMask |
            LeaveWindowMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
            ButtonReleaseMask | PointerMotionMask | PropertyChangeMask |
