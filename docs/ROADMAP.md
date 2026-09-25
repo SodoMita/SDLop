@@ -105,7 +105,11 @@ keyboard/mouse layers or any of the `src/generated/` tables.
       compositors that never send a keymap), and finally SDL's built-in tables.
       Because keys arrive from the evdev worker rather than from the compositor,
       the layout is told about every key event so its own modifier state follows.
-      `SDLOP_XKB_DUMP=<path>` writes out what was loaded, whichever source won.
+      `SDLOP_XKB_DUMP=<path>` writes out what was loaded, whichever source won
+      (compositor keymap, X server keymap, override file or the local rules).
+      The local fallback is compiled on the first key that needs it rather than
+      at init — it costs ~2 ms and is usually superseded, which the benchmark
+      caught as a 0.13x `SDL_Init` (see PERFORMANCE.md).
 - [x] Client-side key repeat (`wl_keyboard.repeat_info` + `xkb_keymap_key_repeats`),
       including waking a blocked `SDL_WaitEvent()` in time for the next repeat.
 - [x] `wl_surface_frame` present pacing, so a buffer is never attached while the

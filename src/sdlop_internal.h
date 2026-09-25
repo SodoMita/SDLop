@@ -161,6 +161,11 @@ bool SDLOP_XKBOverrideActive(void);
 /* Install the best layout available before the first key arrives: the override
    file if there is one, else the local XKB configuration. */
 void SDLOP_XKBInit(void);
+/* Compile the deferred local keymap if no platform keymap has arrived yet:
+   called by the input translation before the first translated key, so a session
+   that is never told its layout (a headless compositor, an offscreen run) gets
+   the local XKB configuration instead of the built-in us tables. */
+void SDLOP_XKBEnsure(void);
 void SDLOP_XKBQuit(void);
 #ifdef SDLOP_HAVE_XKBCOMMON_X11
 /* Read the X server's core keyboard keymap. `xdisplay` is a Display*. */

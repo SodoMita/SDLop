@@ -59,10 +59,13 @@ void *XGetXCBConnection(void *display);
 static struct xkb_context *sdlop_xkb_context;
 static struct xkb_keymap *sdlop_xkb_keymap;
 static struct xkb_state *sdlop_xkb_state;
+/* No keymap yet, and one can still be built locally: see SDLOP_XKBEnsure(). */
+static bool sdlop_xkb_fallback_pending;
 
 static void sdlop_xkb_update_key(Uint32 evdev_code, bool down);
 static SDL_Keycode sdlop_xkb_keycode(Uint32 evdev_code);
 static int sdlop_xkb_text(Uint32 evdev_code, char *buffer, size_t size);
+void SDLOP_XKBEnsure(void);
 
 static const SDLOP_KeyLayout sdlop_xkb_layout = {
     sdlop_xkb_update_key,
@@ -159,11 +162,16 @@ struct xkb_state *SDLOP_XKBState(void)
 
 bool SDLOP_XKBKeyRepeats(Uint32 evdev_code)
 {
+    SDLOP_XKBEnsure();
     if (!sdlop_xkb_keymap) {
         return false;
     }
     return xkb_keymap_key_repeats(sdlop_xkb_keymap, evdev_code + SDLOP_XKB_KEYCODE_OFFSET);
 }
+
+static void sdlop_xkb_write_dump(const char *text, size_t size);
+static void sdlop_xkb_dump_keymap(struct xkb_keymap *keymap);
+void SDLOP_XKBSetDumpPath(const char *path);
 
 static bool sdlop_xkb_context_ensure(void)
 {
@@ -195,6 +203,7 @@ static bool sdlop_xkb_install(struct xkb_keymap *keymap)
     }
     sdlop_xkb_keymap = keymap;
     sdlop_xkb_state = state;
+    sdlop_xkb_fallback_pending = false;      /* the platform's own keymap wins */
     /* From here on, keycodes and text come from this layout instead of the
        built-in "us" tables. */
     SDLOP_SetKeyLayout(&sdlop_xkb_layout);
@@ -240,8 +249,14 @@ bool SDLOP_XKBCompileFromRules(const char *rules, const char *model, const char 
     names.layout = layout;
     names.variant = variant;
     names.options = options;
-    return sdlop_xkb_install(xkb_keymap_new_from_names(sdlop_xkb_context, &names,
-                                                       XKB_KEYMAP_COMPILE_NO_FLAGS));
+    {
+        struct xkb_keymap *keymap = xkb_keymap_new_from_names(sdlop_xkb_context, &names,
+                                                             XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if (keymap) {
+            sdlop_xkb_dump_keymap(keymap);
+        }
+        return sdlop_xkb_install(keymap);
+    }
 }
 
 /* Where the keymap being installed came from, for debug logging. */
@@ -252,7 +267,7 @@ void SDLOP_XKBSetDumpPath(const char *path)
     sdlop_xkb_dump_path = (path && path[0]) ? path : NULL;
 }
 
-static void sdlop_xkb_dump(const char *text, size_t size)
+static void sdlop_xkb_write_dump(const char *text, size_t size)
 {
     FILE *out;
 
@@ -267,6 +282,17 @@ static void sdlop_xkb_dump(const char *text, size_t size)
     fwrite(text, 1, size, out);
     fclose(out);
     SDLOP_LogInfo("sdlop: wrote the keymap to %s", sdlop_xkb_dump_path);
+}
+
+/* The same dump, for a keymap object (the compositor's or the server's). */
+static void sdlop_xkb_dump_keymap(struct xkb_keymap *keymap)
+{
+    char *text = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
+
+    if (text) {
+        sdlop_xkb_write_dump(text, SDL_strlen(text));
+        free(text);
+    }
 }
 
 bool SDLOP_XKBLoadKeymapFD(int fd)
@@ -285,7 +311,7 @@ bool SDLOP_XKBLoadKeymapFD(int fd)
         close(fd);
         return false;
     }
-    sdlop_xkb_dump(map, size);
+    sdlop_xkb_write_dump(map, size);
     ok = SDLOP_XKBCompileFromString(map, size);
     munmap(map, size);
     close(fd);
@@ -319,13 +345,7 @@ bool SDLOP_XKBLoadFromX11(void *xdisplay, int device_id)
     if (!keymap) {
         return false;
     }
-    if (sdlop_xkb_dump_path) {
-        char *text = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
-        if (text) {
-            sdlop_xkb_dump(text, strlen(text));
-            free(text);
-        }
-    }
+    sdlop_xkb_dump_keymap(keymap);
     /* The state is *not* device-synced (xkb_x11_state_new_from_device would track
        the server's own modifier state): this layout has to follow the keys the
        input path actually delivers, which may come from the evdev worker rather
@@ -391,6 +411,7 @@ static SDL_Keycode sdlop_xkb_keycode(Uint32 evdev_code)
     SDL_Keycode keycode;
     size_t i;
 
+    SDLOP_XKBEnsure();
     if (!sdlop_xkb_state || !sdlop_xkb_keymap) {
         return SDLK_UNKNOWN;
     }
@@ -425,6 +446,7 @@ static int sdlop_xkb_text(Uint32 evdev_code, char *buffer, size_t size)
 {
     int len;
 
+    SDLOP_XKBEnsure();
     if (!sdlop_xkb_state || !buffer || size < 2) {
         return 0;
     }
@@ -485,17 +507,36 @@ bool SDLOP_XKBOverrideActive(void)
     return sdlop_xkb_override_active();
 }
 
+/* A local keymap is compiled on the first key that needs one, not when the
+   library starts: compiling the XKB configuration costs ~2 ms, which is more
+   than everything else SDL_Init(SDL_INIT_VIDEO) does on Wayland put together,
+   and a session that has a keyboard is told its layout by the compositor (or by
+   the X server) anyway. A session that is never told - a headless compositor, a
+   test harness - pays the 2 ms once, when a key arrives.
+
+   Order of preference, unchanged: an explicit SDLOP_XKB_KEYMAP file, then the
+   local XKB configuration (XKB_DEFAULT_LAYOUT and friends), which is a far
+   better guess than the built-in us tables. */
+void SDLOP_XKBEnsure(void)
+{
+    if (sdlop_xkb_keymap || !sdlop_xkb_fallback_pending) {
+        return;
+    }
+    sdlop_xkb_fallback_pending = false;
+    if (sdlop_xkb_override_active()) {
+        sdlop_xkb_load_override();
+        if (sdlop_xkb_keymap) {
+            return;
+        }
+    }
+    SDLOP_XKBCompileFromRules(NULL, NULL, NULL, NULL, NULL);
+}
+
 void SDLOP_XKBInit(void)
 {
     SDLOP_XKBSetDumpPath(SDL_getenv("SDLOP_XKB_DUMP"));
-    if (sdlop_xkb_override_active()) {
-        sdlop_xkb_load_override();
-        return;
-    }
-    /* The local XKB configuration (XKB_DEFAULT_LAYOUT and friends) is a far
-       better guess than the built-in us tables for a session that never tells us
-       about its keyboard (a headless compositor, a test harness). */
-    SDLOP_XKBCompileFromRules(NULL, NULL, NULL, NULL, NULL);
+    /* The keymap itself is compiled by sdlop_xkb_ensure() when it is needed. */
+    sdlop_xkb_fallback_pending = true;
 }
 
 void SDLOP_XKBQuit(void)

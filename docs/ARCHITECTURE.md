@@ -281,7 +281,12 @@ in order of preference:
 2. the compositor's `wl_keyboard.keymap`;
 3. the local XKB configuration (`XKB_DEFAULT_LAYOUT` and friends) — what a
    headless or KMS compositor that never sends a keymap gets
-   (`xkb_keymap_new_from_names`);
+   (`xkb_keymap_new_from_names`). This one is compiled **lazily**, on the first
+   key that needs it: it costs ~2 ms, more than everything else
+   `SDL_Init(SDL_INIT_VIDEO)` does, and a session with a keyboard is told its
+   layout by the compositor or the X server anyway. `SDLOP_XKBEnsure()` is called
+   by the input translation (and by the layout's own queries), and a keymap that
+   arrives from the platform cancels the pending fallback;
 4. nothing: SDL's built-in tables derive text and keycodes from scancodes.
 
 On X11 the same module gets the keymap from the *server* through

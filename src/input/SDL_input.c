@@ -316,7 +316,15 @@ static void sdlop_translate_record(const SDLOP_RawInputRecord *record)
             }
             {
                 SDL_Scancode scancode = SDLOP_ScancodeFromEvdevKeycode(record->code);
-                const SDLOP_KeyLayout *layout = SDLOP_GetKeyLayout();
+                const SDLOP_KeyLayout *layout;
+
+                /* A key is here: if no layout has been registered yet, this is the
+                   moment to build the fallback one (the platform may never send
+                   one - see SDLOP_XKBEnsure()). */
+#if defined(SDLOP_HAVE_XKBCOMMON)
+                SDLOP_XKBEnsure();
+#endif
+                layout = SDLOP_GetKeyLayout();
                 if (scancode == SDL_SCANCODE_UNKNOWN) {
                     return;
                 }

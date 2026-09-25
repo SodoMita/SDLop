@@ -197,23 +197,24 @@ driver). SDL 3.2.10 vs SDLop, ns per operation:
 
 | operation | SDL3 | SDLop | speedup |
 |---|---:|---:|---:|
-| `SDL_Init` + `SDL_Quit` | 24033 | 5986 | **4.0x** |
-| `SDL_CreateWindow` + `SDL_DestroyWindow` | 29953 | 906 | **33.1x** |
-| `SDL_PumpEvents` (nothing pending) | 40.2 | 11.1 | **3.6x** |
-| `SDL_PushEvent` + `SDL_PollEvent` | 43.3 | 10.2 | **4.3x** |
-| `SDL_GetTicks` | 32.8 | 27.4 | 1.2x |
-| `SDL_GetPerformanceCounter` | 24.7 | 24.2 | 1.0x |
-| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` | 2518572 | 59450 | **42.4x** |
-| `SDL_GetKeyboardState` | 2.7 | 2.3 | 1.2x |
+| `SDL_Init` + `SDL_Quit` | 24766 | 6210 | **4.0x** |
+| `SDL_CreateWindow` + `SDL_DestroyWindow` | 30890 | 1023 | **30.2x** |
+| `SDL_PumpEvents` (nothing pending) | 40.7 | 10.8 | **3.8x** |
+| `SDL_PushEvent` + `SDL_PollEvent` | 44.2 | 10.5 | **4.2x** |
+| `SDL_GetTicks` | 32.9 | 27.3 | 1.2x |
+| `SDL_GetPerformanceCounter` | 25.5 | 24.1 | 1.0x |
+| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` | 2335787 | 59712 | **39.1x** |
+| `SDL_GetKeyboardState` | 2.6 | 2.3 | 1.1x |
 | `SDL_GetModState` | 2.4 | 1.8 | 1.3x |
 
-Run on X11 (Xvfb, one real `X11` window and a real `XPutImage`/MIT-SHM present)
-the same benchmark gives 1.4x for init, 8.4x for window create/destroy, 3.5x for
-`SDL_PumpEvents`, 3.2x for push+poll and 11.5x for fill+present — the smaller
-numbers are the X server round trips that both libraries share. The hot paths
-that used to be *slower* than SDL3 (a `write()` to the wakeup eventfd on every
-pushed event, a mutex taken by every `SDL_PumpEvents`, and a pump per polled
-event) were found and removed this way — see
+The same benchmark on a real display, where both libraries pay for the same
+server round trips: on X11 (Xvfb, MIT-SHM present) 2.1x for init, 7.3x for window
+create/destroy, 3.6x for `SDL_PumpEvents`, 3.2x for push+poll and 13.8x for
+fill+present; on Wayland (headless sway) 1.5x init, 3.0x window, 1.2x pump, 4.1x
+push+poll, 1.9x fill+present. Four hot paths that used to be *slower* than SDL3
+(a `write()` to the wakeup eventfd on every pushed event, a mutex taken by every
+`SDL_PumpEvents`, a pump per polled event, and a keymap compiled eagerly at init)
+were found and removed this way — see
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Layout

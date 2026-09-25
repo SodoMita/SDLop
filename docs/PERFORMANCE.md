@@ -31,14 +31,14 @@ compositor in the way:
 
 | operation | SDL3 | SDLop | ratio |
 |---|---:|---:|---:|
-| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 24033 ns | 5986 ns | **4.0x faster** |
-| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 29953 ns | 906 ns | **33.1x faster** |
-| `SDL_PumpEvents` (nothing pending) | 40.2 ns | 11.1 ns | **3.6x faster** |
-| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 43.3 ns | 10.2 ns | **4.3x faster** |
-| `SDL_GetTicks` | 32.8 ns | 27.4 ns | 1.2x faster |
-| `SDL_GetPerformanceCounter` | 24.7 ns | 24.2 ns | tie |
-| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 2518572 ns | 59450 ns | 42.4x faster |
-| `SDL_GetKeyboardState` | 2.7 ns | 2.3 ns | 1.2x faster |
+| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 24766 ns | 6210 ns | **4.0x faster** |
+| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 30890 ns | 1023 ns | **30.2x faster** |
+| `SDL_PumpEvents` (nothing pending) | 40.7 ns | 10.8 ns | **3.8x faster** |
+| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 44.2 ns | 10.5 ns | **4.2x faster** |
+| `SDL_GetTicks` | 32.9 ns | 27.3 ns | 1.2x faster |
+| `SDL_GetPerformanceCounter` | 25.5 ns | 24.1 ns | tie |
+| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 2335787 ns | 59712 ns | 39.1x faster |
+| `SDL_GetKeyboardState` | 2.6 ns | 2.3 ns | 1.1x faster |
 | `SDL_GetModState` | 2.4 ns | 1.8 ns | 1.3x faster |
 
 And on X11 (Xvfb, a real X window, `XShmPutImage` presentation), where the same
@@ -46,12 +46,29 @@ X server round trips are paid by both libraries:
 
 | operation | SDL3 | SDLop | ratio |
 |---|---:|---:|---:|
-| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 6888884 ns | 4954875 ns | 1.4x faster |
-| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 2064126 ns | 246281 ns | **8.4x faster** |
-| `SDL_PumpEvents` (nothing pending) | 1462.9 ns | 420.8 ns | **3.5x faster** |
-| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 52.3 ns | 16.3 ns | **3.2x faster** |
-| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 3022949 ns | 262164 ns | **11.5x faster** |
-| `SDL_GetTicks` / `SDL_GetPerformanceCounter` | 33.1 / 25.7 ns | 27.6 / 25.3 ns | 1.2x / tie |
+| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 6836328 ns | 3296747 ns | **2.1x faster** |
+| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 1680684 ns | 229278 ns | **7.3x faster** |
+| `SDL_PumpEvents` (nothing pending) | 1474.8 ns | 410.2 ns | **3.6x faster** |
+| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 52.4 ns | 16.6 ns | **3.2x faster** |
+| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 2780572 ns | 202042 ns | **13.8x faster** |
+| `SDL_GetTicks` / `SDL_GetPerformanceCounter` | 32.3 / 25.8 ns | 27.1 / 25.4 ns | 1.2x / tie |
+
+And on Wayland (headless sway, two outputs), where every call has to talk to a
+compositor:
+
+| operation | SDL3 | SDLop | ratio |
+|---|---:|---:|---:|
+| `SDL_Init(SDL_INIT_VIDEO)` + `SDL_Quit` | 273990 ns | 184449 ns | **1.5x faster** |
+| `SDL_CreateWindow` + `SDL_DestroyWindow` (640x480) | 356906 ns | 118005 ns | **3.0x faster** |
+| `SDL_PumpEvents` (nothing pending) | 303.3 ns | 258.3 ns | 1.2x faster |
+| `SDL_PushEvent` + `SDL_PollEvent` (round trip) | 50.3 ns | 12.2 ns | **4.1x faster** |
+| `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 2880690 ns | 1483737 ns | 1.9x faster |
+| `SDL_GetTicks` / `SDL_GetPerformanceCounter` | 31.9 / 25.5 ns | 27.5 / 24.8 ns | 1.2x / tie |
+
+`SDL_UpdateWindowSurface` on Wayland is the one number that is close to a tie,
+and it should be: both libraries attach one `wl_shm` buffer and commit, so the
+cost is the compositor's, not the library's. On X11 it is `XShmPutImage` against
+stock's `XPutImage` path, which is where the 13.8x comes from.
 
 Readings of the individual benchmarks:
 
@@ -84,8 +101,8 @@ Readings of the individual benchmarks:
 
 ## What the benchmark found (and what was fixed)
 
-The first run had two hot paths **slower** than SDL3, which is why the benchmark
-is worth keeping:
+Four hot paths were **slower** than SDL3 at some point, and each one was found
+by this benchmark — which is why it is worth keeping:
 
 1. **A `write()` to the wakeup eventfd on every pushed event** (0.34x on the
    push/poll round trip). The eventfd exists so that a thread parked in
@@ -99,8 +116,18 @@ is worth keeping:
    and `SDLOP_RunTimerCallbacks` now check an atomic mirror of their queue
    depth first and return immediately when there is nothing to do — no lock, and
    for timers not even a clock read. Pump went 36 ns → 9.6 ns.
-
-3. **A pump per polled event** (0.13x on X11 — the first X11 bench run is how
+3. **An eagerly compiled XKB keymap on Wayland init** (0.13x — found by running
+   the benchmark against this tree's Wayland backend, where `SDL_Init` was
+   2681 µs against stock's 342 µs). Compiling the local XKB configuration
+   (`xkb_keymap_new_from_names`) costs ~2.1–3.2 ms, and init was doing it "just
+   in case" — while a session that has a keyboard is told its layout by the
+   compositor (or by the X server) anyway. The fallback keymap is now compiled on
+   the first key that needs one (`SDLOP_XKBEnsure()`), and a keymap that arrives
+   from the platform cancels the deferred one. `SDL_Init` went 2681 µs → 184 µs
+   (stock: 274 µs) with the same layout behaviour: composing the local rules on
+   the first key still works where nothing sends a keymap, and a compositor's
+   keymap still wins.
+4. **A pump per polled event** (0.13x on X11 — the first X11 bench run is how
    this was found: `SDL_PollEvent` pumped on *every* call, so a frame that
    drained 64 events paid for 64 `poll(2)`s on the X connection). `SDL_PollEvent`
    now hands out an event that is already queued and only pumps when the queue is
@@ -108,9 +135,10 @@ is worth keeping:
    same X server (26 ns/event there while its own empty-queue poll is 1582 ns).
    Push/poll went 383 ns → 16 ns per event on X11.
 
-All three fixes are pure fast paths: the slow paths (an actual waiter, an actual
-queued callback, an actual timer, an empty queue) are unchanged, and the whole
-test suite plus the Wayland and X11 end-to-end rigs were re-run after them.
+All four fixes are pure fast paths: the slow paths (an actual waiter, an actual
+queued callback, an actual timer, an empty queue, a session that does need the
+fallback keymap) are unchanged, and the whole test suite plus the Wayland and X11
+end-to-end rigs were re-run after them.
 
 A later round of Wayland work added things a benchmark would only catch
 indirectly, so they are noted here instead: every pump now reads the compositor
