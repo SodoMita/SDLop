@@ -26,6 +26,25 @@ typedef enum SDL_EventType
     SDL_EVENT_FIRST     = 0,
     SDL_EVENT_QUIT           = 0x100,
     SDL_EVENT_TERMINATING,
+    SDL_EVENT_LOW_MEMORY,
+    SDL_EVENT_WILL_ENTER_BACKGROUND,
+    SDL_EVENT_DID_ENTER_BACKGROUND,
+    SDL_EVENT_WILL_ENTER_FOREGROUND,
+    SDL_EVENT_DID_ENTER_FOREGROUND,
+    SDL_EVENT_LOCALE_CHANGED,
+    SDL_EVENT_SYSTEM_THEME_CHANGED,
+
+    /* Display events */
+    /* 0x150 was SDL_DISPLAYEVENT, reserve the number for sdl2-compat */
+    SDL_EVENT_DISPLAY_ORIENTATION = 0x151,   /**< Display orientation has changed to data1 */
+    SDL_EVENT_DISPLAY_ADDED,                 /**< Display has been added to the system */
+    SDL_EVENT_DISPLAY_REMOVED,               /**< Display has been removed from the system */
+    SDL_EVENT_DISPLAY_MOVED,                 /**< Display has changed position */
+    SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED,  /**< Display has changed desktop mode */
+    SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED,  /**< Display has changed current mode */
+    SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED, /**< Display has changed content scale */
+    SDL_EVENT_DISPLAY_FIRST = SDL_EVENT_DISPLAY_ORIENTATION,
+    SDL_EVENT_DISPLAY_LAST = SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED,
 
     /* Window events */
     SDL_EVENT_WINDOW_SHOWN = 0x202,
@@ -98,6 +117,16 @@ typedef struct SDL_CommonEvent
 } SDL_CommonEvent;
 
 /** Window state change event data (event.window.*). */
+typedef struct SDL_DisplayEvent
+{
+    SDL_EventType type; /**< SDL_DISPLAYEVENT_* */
+    Uint32 reserved;
+    Uint64 timestamp;   /**< In nanoseconds, populated using SDL_GetTicksNS() */
+    SDL_DisplayID displayID;/**< The associated display */
+    Sint32 data1;       /**< event dependent data */
+    Sint32 data2;       /**< event dependent data */
+} SDL_DisplayEvent;
+
 typedef struct SDL_WindowEvent
 {
     SDL_EventType type; /**< SDL_EVENT_WINDOW_* */
@@ -109,6 +138,14 @@ typedef struct SDL_WindowEvent
 } SDL_WindowEvent;
 
 /** Keyboard button event data (event.key.*). */
+typedef struct SDL_KeyboardDeviceEvent
+{
+    SDL_EventType type; /**< SDL_EVENT_KEYBOARD_ADDED or SDL_EVENT_KEYBOARD_REMOVED */
+    Uint32 reserved;
+    Uint64 timestamp;   /**< In nanoseconds, populated using SDL_GetTicksNS() */
+    SDL_KeyboardID which;   /**< The keyboard instance id */
+} SDL_KeyboardDeviceEvent;
+
 typedef struct SDL_KeyboardEvent
 {
     SDL_EventType type;     /**< SDL_EVENT_KEY_DOWN or SDL_EVENT_KEY_UP */
@@ -125,6 +162,32 @@ typedef struct SDL_KeyboardEvent
 } SDL_KeyboardEvent;
 
 /** Keyboard text input event data (event.text.*). */
+typedef struct SDL_TextEditingEvent
+{
+    SDL_EventType type;         /**< SDL_EVENT_TEXT_EDITING */
+    Uint32 reserved;
+    Uint64 timestamp;           /**< In nanoseconds, populated using SDL_GetTicksNS() */
+    SDL_WindowID windowID;      /**< The window with keyboard focus, if any */
+    const char *text;           /**< The editing text */
+    Sint32 start;               /**< The start cursor of selected editing text, or -1 if not set */
+    Sint32 length;              /**< The length of selected editing text, or -1 if not set */
+} SDL_TextEditingEvent;
+
+typedef struct SDL_TextEditingCandidatesEvent
+{
+    SDL_EventType type;         /**< SDL_EVENT_TEXT_EDITING_CANDIDATES */
+    Uint32 reserved;
+    Uint64 timestamp;           /**< In nanoseconds, populated using SDL_GetTicksNS() */
+    SDL_WindowID windowID;      /**< The window with keyboard focus, if any */
+    const char * const *candidates;    /**< The list of candidates, or NULL if there are no candidates available */
+    Sint32 num_candidates;      /**< The number of strings in `candidates` */
+    Sint32 selected_candidate;  /**< The index of the selected candidate, or -1 if no candidate is selected */
+    bool horizontal;          /**< true if the list is horizontal, false if it's vertical */
+    Uint8 padding1;
+    Uint8 padding2;
+    Uint8 padding3;
+} SDL_TextEditingCandidatesEvent;
+
 typedef struct SDL_TextInputEvent
 {
     SDL_EventType type; /**< SDL_EVENT_TEXT_INPUT */
@@ -135,6 +198,14 @@ typedef struct SDL_TextInputEvent
 } SDL_TextInputEvent;
 
 /** Mouse motion event data (event.motion.*). */
+typedef struct SDL_MouseDeviceEvent
+{
+    SDL_EventType type; /**< SDL_EVENT_MOUSE_ADDED or SDL_EVENT_MOUSE_REMOVED */
+    Uint32 reserved;
+    Uint64 timestamp;   /**< In nanoseconds, populated using SDL_GetTicksNS() */
+    SDL_MouseID which;  /**< The mouse instance id */
+} SDL_MouseDeviceEvent;
+
 typedef struct SDL_MouseMotionEvent
 {
     SDL_EventType type; /**< SDL_EVENT_MOUSE_MOTION */
@@ -225,15 +296,20 @@ typedef union SDL_Event
 {
     Uint32 type;                    /**< Event type, shared with all events */
     SDL_CommonEvent common;         /**< Common event data */
+    SDL_DisplayEvent display;       /**< Display state change event data */
     SDL_WindowEvent window;         /**< Window event data */
+    SDL_KeyboardDeviceEvent kdevice; /**< Keyboard device change event data */
     SDL_KeyboardEvent key;          /**< Keyboard event data */
+    SDL_TextEditingEvent edit;      /**< Text editing event data */
+    SDL_TextEditingCandidatesEvent edit_candidates; /**< Text editing candidates event data */
     SDL_TextInputEvent text;        /**< Text input event data */
+    SDL_MouseDeviceEvent mdevice;   /**< Mouse device change event data */
     SDL_MouseMotionEvent motion;    /**< Mouse motion event data */
     SDL_MouseButtonEvent button;    /**< Mouse button event data */
     SDL_MouseWheelEvent wheel;      /**< Mouse wheel event data */
-    SDL_TouchFingerEvent tfinger;   /**< Touch finger event data */
     SDL_QuitEvent quit;             /**< Quit request event data */
     SDL_UserEvent user;             /**< Custom event data */
+    SDL_TouchFingerEvent tfinger;   /**< Touch finger event data */
 
     /* Pad to the same size as SDL3 (128 bytes) */
     Uint8 padding[128];
@@ -309,7 +385,6 @@ extern Uint32 SDL_RegisterEvents(int numevents);
 /**
  * Pump the event loop and return whether an SDL_EVENT_QUIT event is queued.
  */
-extern bool SDL_QuitRequested(void);
 
 /**
  * Get the window associated with an event.

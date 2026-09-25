@@ -227,12 +227,6 @@ Uint32 SDL_RegisterEvents(int numevents)
     return base;
 }
 
-bool SDL_QuitRequested(void)
-{
-    SDL_PumpEvents();
-    return SDL_HasEvent(SDL_EVENT_QUIT);
-}
-
 SDL_Window *SDL_GetWindowFromEvent(const SDL_Event *event)
 {
     if (!event) {

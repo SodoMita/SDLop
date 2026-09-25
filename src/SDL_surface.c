@@ -10,6 +10,8 @@
 
 #include "internal/sdlop_internal.h"
 
+#include <stdint.h>
+
 int SDLOP_BytesPerPixel(SDL_PixelFormat format)
 {
     switch (format) {
@@ -45,6 +47,14 @@ SDL_Surface *SDL_CreateSurface(int width, int height, SDL_PixelFormat format)
         SDL_SetError("Unsupported pixel format: 0x%08x", (unsigned)format);
         return NULL;
     }
+    /* 64-bit pitch math: width*bpp can overflow int (UB) for huge widths */
+    int64_t pitch64 = (int64_t)width * (int64_t)bpp;
+    /* and the byte total can overflow size_t on 32-bit targets (wasm32) */
+    uint64_t total64 = (uint64_t)pitch64 * (uint64_t)height;
+    if (pitch64 > INT32_MAX || total64 > (uint64_t)SIZE_MAX) {
+        SDL_SetError("Surface is too large");
+        return NULL;
+    }
     SDL_Surface *surface = (SDL_Surface *)calloc(1, sizeof(*surface));
     if (!surface) {
         SDL_OutOfMemory();
@@ -53,8 +63,8 @@ SDL_Surface *SDL_CreateSurface(int width, int height, SDL_PixelFormat format)
     surface->format = format;
     surface->w = width;
     surface->h = height;
-    surface->pitch = width * bpp;
-    surface->pixels = calloc(1, (size_t)surface->pitch * (size_t)height);
+    surface->pitch = (int)pitch64;
+    surface->pixels = calloc(1, (size_t)total64);
     if (!surface->pixels) {
         free(surface);
         SDL_OutOfMemory();
@@ -70,8 +80,16 @@ SDL_Surface *SDL_CreateSurfaceFrom(int width, int height, SDL_PixelFormat format
         SDL_SetError("Invalid surface dimensions");
         return NULL;
     }
-    if (!SDLOP_BytesPerPixel(format)) {
+    int bpp = SDLOP_BytesPerPixel(format);
+    if (!bpp) {
         SDL_SetError("Unsupported pixel format: 0x%08x", (unsigned)format);
+        return NULL;
+    }
+    /* a row must fit in the given pitch or every row-strided write would
+     * overrun the caller's buffer (64-bit math: width*bpp can overflow int) */
+    if (pitch < 0 || (int64_t)pitch < (int64_t)width * (int64_t)bpp) {
+        SDL_SetError("Pitch %d is too small for %dx%d format 0x%08x",
+                     pitch, width, height, (unsigned)format);
         return NULL;
     }
     SDL_Surface *surface = (SDL_Surface *)calloc(1, sizeof(*surface));

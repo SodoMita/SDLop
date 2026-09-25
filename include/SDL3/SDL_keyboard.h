@@ -31,7 +31,6 @@ extern const bool *SDL_GetKeyboardState(int *numkeys);
 /**
  * Get the current state of a key on the keyboard.
  */
-extern bool SDL_GetKeyState(SDL_Scancode scancode);
 
 /**
  * Release all keys (useful when losing/regaining focus).

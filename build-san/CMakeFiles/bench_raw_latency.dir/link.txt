@@ -1,0 +1,1 @@
+/usr/bin/cc  -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g  -fsanitize=address,undefined -Wl,--dependency-file=CMakeFiles/bench_raw_latency.dir/link.d CMakeFiles/bench_raw_latency.dir/bench/bench_raw_latency.c.o CMakeFiles/bench_raw_latency.dir/tests/uinput_synth.c.o -o bench_raw_latency  libsdlop.a -lpthread -ldl -lm

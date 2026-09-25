@@ -1,0 +1,11 @@
+# Hashes of file build rules.
+486f505e5abf28ba8e970ee02a84077e CMakeFiles/sdlop_wayland_protocols
+719dee7d1070f4a7d7fdce08b4de95a0 wayland-gen/pointer-constraints-client-protocol.h
+fd2573face278aba18b3da728f809d0b wayland-gen/pointer-constraints-server-protocol.h
+2917a0443f1a6c9e7a8d3ef4180e86c0 wayland-gen/relative-pointer-client-protocol.h
+01d667f361f35fef8e14d7448aed1234 wayland-gen/relative-pointer-server-protocol.h
+3899d344af9f763c388ec4f27c9011e6 wayland-gen/virtual-keyboard-client-protocol.h
+b87e0cf0da79dc9d9673879d81ea14dc wayland-gen/wayland-client-protocol.h
+3d5e0c4cf234a8f2963a6863a54d1cb8 wayland-gen/wlr-virtual-pointer-client-protocol.h
+2714aebf067f96c31b75b9f1a564af06 wayland-gen/xdg-shell-client-protocol.h
+65ef84312f6bac7f0def022e46a386b5 wayland-gen/xdg-shell-server-protocol.h

@@ -108,7 +108,7 @@ int main(void)
         }
         assert(saw_down);
     }
-    assert(SDL_GetKeyState(SDL_SCANCODE_W));
+    assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_W]);
     {
         int n = 0;
         const bool *ks = SDL_GetKeyboardState(&n);
@@ -117,7 +117,7 @@ int main(void)
     }
     SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_W, 17, 0);
     SDL_FlushEvent(SDL_EVENT_KEY_UP);
-    assert(!SDL_GetKeyState(SDL_SCANCODE_W));
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_W]);
 
     /* modifier state tracking */
     SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_LSHIFT, 42, 0);
@@ -180,7 +180,7 @@ int main(void)
     SDL_zero(quit);
     quit.type = SDL_EVENT_QUIT;
     assert(SDL_PushEvent(&quit));
-    assert(SDL_QuitRequested());
+    assert(SDL_HasEvent(SDL_EVENT_QUIT));
     SDL_FlushEvent(SDL_EVENT_QUIT);
 
     /* --- WaitEventTimeout with nothing pending times out --- */

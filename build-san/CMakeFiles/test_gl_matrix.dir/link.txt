@@ -1,0 +1,1 @@
+/usr/bin/cc  -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g  -fsanitize=address,undefined -Wl,--dependency-file=CMakeFiles/test_gl_matrix.dir/link.d CMakeFiles/test_gl_matrix.dir/tests/test_gl_matrix.c.o -o test_gl_matrix  libsdlop.a -lGLESv2 -lpthread -ldl -lm

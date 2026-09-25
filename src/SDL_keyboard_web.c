@@ -291,15 +291,6 @@ const bool *SDL_GetKeyboardState(int *numkeys)
     return sdlop.keystate;
 }
 
-bool SDL_GetKeyState(SDL_Scancode scancode)
-{
-    if (scancode >= 0 && scancode < SDL_SCANCODE_COUNT) {
-        return sdlop.keystate[scancode];
-    }
-    SDL_SetError("Invalid scancode: %d", (int)scancode);
-    return false;
-}
-
 void SDL_ResetKeyboard(void)
 {
     for (int i = 0; i < SDL_SCANCODE_COUNT; i++) {

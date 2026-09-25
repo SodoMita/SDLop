@@ -174,7 +174,7 @@ static void test_browser_driver(void)
     dispatch_js("window.dispatchEvent(new KeyboardEvent('keyup', {code:'ShiftLeft', key:'Shift', location:2, bubbles:true}))");
     SDL_PumpEvents();
     CHECK(poll_key(SDL_SCANCODE_W, false, NULL), "KEY_UP W");
-    CHECK(!SDL_GetKeyState(SDL_SCANCODE_LSHIFT), "shift released in keystate");
+    CHECK(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_LSHIFT], "shift released in keystate");
 
     /* mouse: synthetic events on #canvas */
     dispatch_js("const c = document.getElementById('canvas');"

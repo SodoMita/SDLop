@@ -1,0 +1,1 @@
+/usr/bin/cc  -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g  -fsanitize=address,undefined -Wl,--dependency-file=CMakeFiles/smoke_relative_mode.dir/link.d CMakeFiles/smoke_relative_mode.dir/tests/smoke_relative_mode.c.o -o smoke_relative_mode  libsdlop.a -lpthread -ldl -lm

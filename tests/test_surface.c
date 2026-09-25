@@ -8,6 +8,7 @@
 #include <SDL3/SDL.h>
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 int main(void)
@@ -79,6 +80,28 @@ int main(void)
     assert(SDL_ReadSurfacePixel(mem, 4, 4, &r, &g, &b, &a));
     assert(a == 0x80 && r == 0x11 && g == 0x22 && b == 0x33);
     SDL_DestroySurface(mem);
+
+    /* --- memory-safety regressions (audit round 2026-09) --- */
+    /* width*bpp must not overflow int; huge surfaces are rejected cleanly */
+    assert(!SDL_CreateSurface(0x40000001, 1, SDL_PIXELFORMAT_RGBA8888)); /* 4 GiB row */
+    assert(!SDL_CreateSurface(1, 0x40000001, SDL_PIXELFORMAT_RGBA8888)); /* 16 GiB total */
+    /* CreateSurfaceFrom must reject rows that don't fit in the pitch */
+    {
+        Uint32 small[32];
+        assert(!SDL_CreateSurfaceFrom(8, 4, SDL_PIXELFORMAT_RGBA8888, small, 16));
+    }
+    /* an over-large pitch is legal and fills must honor the row stride */
+    {
+        Uint8 padded[2 * 64];
+        memset(padded, 0, sizeof(padded));
+        SDL_Surface *str = SDL_CreateSurfaceFrom(4, 2, SDL_PIXELFORMAT_RGBA8888, padded, 64);
+        assert(str);
+        assert(SDL_FillSurfaceRect(str, NULL, 0xFFFFFFFF));
+        assert(((Uint32 *)padded)[3] == 0xFFFFFFFFu);  /* last px of row 0 */
+        assert(((Uint32 *)padded)[4] == 0);            /* padding untouched */
+        assert(((Uint32 *)padded)[16] == 0xFFFFFFFFu); /* row 1 starts at byte 64 */
+        SDL_DestroySurface(str);
+    }
 
     /* destroy window surface then recreate */
     assert(SDL_DestroyWindowSurface(w));

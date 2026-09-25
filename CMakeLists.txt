@@ -1,7 +1,13 @@
 cmake_minimum_required(VERSION 3.13)
-option(SDLOP_SANITIZERS "Built with sanitizers (tweak leak checks for GPU tests)" OFF)
+option(SDLOP_SANITIZERS "Build with ASan+UBSan and tune leak checks for GPU tests" OFF)
 
 project(SDLop VERSION 0.1.0 LANGUAGES C)
+
+if (SDLOP_SANITIZERS)
+  string(APPEND CMAKE_C_FLAGS " -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=address,undefined")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=address,undefined")
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -404,10 +410,21 @@ if(SDLop_BUILD_BENCHMARKS)
   target_include_directories(bench_raw_latency PRIVATE src tests)
 endif()
 
+# ABI parity gate: builds tools/abi_probe.c against these headers and against
+# stock SDL3 headers (-DSDL3_REFERENCE_INCLUDE=/path/to/SDL3/include) and
+# diffs every size/offset/enum value. Skipped when no reference is provided.
+if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
+  add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
+endif()
+
 if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
   # only - every other test keeps full leak checking
   set_tests_properties(test_gl test_gl_matrix test_vulkan_compute
     PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+  # test_surface asserts the alloc-failure contract (CreateSurface must
+  # return NULL); ASan's allocator aborts on OOM unless allowed to return null
+  set_tests_properties(test_surface
+    PROPERTIES ENVIRONMENT "ASAN_OPTIONS=allocator_may_return_null=1")
 endif()

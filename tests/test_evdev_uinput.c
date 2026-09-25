@@ -168,7 +168,7 @@ int main(void)
     CHECK(saw_button_up, "SDL_EVENT_MOUSE_BUTTON_UP from BTN_LEFT");
 
     /* W should be released now */
-    CHECK(!SDL_GetKeyState(SDL_SCANCODE_W), "W released in keystate");
+    CHECK(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_W], "W released in keystate");
 
     /* press again and check state sticks until release */
     uinput_synth_key(synth, KEY_D, 1);
@@ -176,13 +176,13 @@ int main(void)
     SDL_Delay(50);
     SDL_PumpEvents();
     SDL_FlushEvents(0, 0xFFFFFFFFu);
-    CHECK(SDL_GetKeyState(SDL_SCANCODE_D), "D held in keystate");
+    CHECK(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_D], "D held in keystate");
     uinput_synth_key(synth, KEY_D, 0);
     uinput_synth_syn(synth);
     SDL_Delay(50);
     SDL_PumpEvents();
     SDL_FlushEvents(0, 0xFFFFFFFFu);
-    CHECK(!SDL_GetKeyState(SDL_SCANCODE_D), "D released in keystate");
+    CHECK(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_D], "D released in keystate");
 
     SDL_DestroyWindow(w);
     SDL_Quit();
