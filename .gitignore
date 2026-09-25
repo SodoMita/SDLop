@@ -8,4 +8,5 @@ build-asan/
 build-ubsan/
 build-tsan/
 build-wextra/
+build-san/
 build-web/
