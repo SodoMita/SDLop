@@ -80,10 +80,12 @@ typedef enum SDL_EventType
     SDL_EVENT_KEY_UP,
     SDL_EVENT_TEXT_EDITING,
     SDL_EVENT_TEXT_INPUT,
-    SDL_EVENT_TEXT_EDITING_CANDIDATES,
+    /* stock order: CANDIDATES was added upstream after the device events,
+       so it sorts last in this block - do not reorder */
     SDL_EVENT_KEYMAP_CHANGED,
     SDL_EVENT_KEYBOARD_ADDED,
     SDL_EVENT_KEYBOARD_REMOVED,
+    SDL_EVENT_TEXT_EDITING_CANDIDATES,
 
     /* Mouse events */
     SDL_EVENT_MOUSE_MOTION    = 0x400,

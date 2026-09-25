@@ -268,6 +268,7 @@ int main(void)
         assert(SDL_GetKeyFromName(SDL_GetKeyName(k)) == (k - 'a' + 'A'));
     }
 
+#ifndef __EMSCRIPTEN__ /* the web backend has no xkb keymaps */
     /* --- stock parity: KEYMAP_CHANGED fires for a replaced keymap --- */
     static const char minimal_keymap[] =
         "xkb_keymap {\n"
@@ -303,6 +304,8 @@ int main(void)
         }
         assert(saw);
     }
+
+#endif /* !__EMSCRIPTEN__ */
 
     /* --- destroy --- */
     SDL_WindowID saved_id = SDL_GetWindowID(w);

@@ -63,6 +63,8 @@ typedef struct WaylandDeviceData
     struct wl_compositor *compositor;
     struct wl_shm *shm;
     struct wl_seat *seat;
+    SDL_KeyboardID keyboard_id;
+    SDL_MouseID pointer_id;
     struct wl_keyboard *keyboard;
     struct wl_pointer *pointer;
     struct wl_touch *touch;
@@ -322,6 +324,12 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
         window_create_buffer(window, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
+        if (first) {
+            /* stock SDL3 reports the (origin-relative) position and the
+             * safe area when a window first maps on Wayland */
+            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, 0, 0);
+            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);
+        }
     }
     if (!wd->buffer) {
         window_create_buffer(window, window->w, window->h);
@@ -1058,6 +1066,33 @@ static const struct wl_surface_listener surface_listener = {
 /* wl_seat                                                             */
 /* ------------------------------------------------------------------ */
 
+/* stock SDL3 reports seat device hotplug as KEYBOARD/MOUSE_ADDED|REMOVED */
+static Uint32 sdlop_device_next_id(void)
+{
+    static Uint32 next_id = 0;
+    return ++next_id;
+}
+
+static void send_keyboard_device_event(bool added, SDL_KeyboardID which)
+{
+    SDL_Event event;
+    SDL_zero(event);
+    event.kdevice.type = added ? SDL_EVENT_KEYBOARD_ADDED : SDL_EVENT_KEYBOARD_REMOVED;
+    event.kdevice.timestamp = SDL_GetTicksNS();
+    event.kdevice.which = which;
+    SDLOP_PushEventInternal(&event);
+}
+
+static void send_mouse_device_event(bool added, SDL_MouseID which)
+{
+    SDL_Event event;
+    SDL_zero(event);
+    event.mdevice.type = added ? SDL_EVENT_MOUSE_ADDED : SDL_EVENT_MOUSE_REMOVED;
+    event.mdevice.timestamp = SDL_GetTicksNS();
+    event.mdevice.which = which;
+    SDLOP_PushEventInternal(&event);
+}
+
 static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
@@ -1065,16 +1100,24 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !d->keyboard) {
         d->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(d->keyboard, &keyboard_listener, d);
+        d->keyboard_id = sdlop_device_next_id();
+        send_keyboard_device_event(true, d->keyboard_id);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && d->keyboard) {
         wl_keyboard_destroy(d->keyboard);
         d->keyboard = NULL;
+        send_keyboard_device_event(false, d->keyboard_id);
+        d->keyboard_id = 0;
     }
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !d->pointer) {
         d->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+        d->pointer_id = sdlop_device_next_id();
+        send_mouse_device_event(true, d->pointer_id);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
+        send_mouse_device_event(false, d->pointer_id);
+        d->pointer_id = 0;
     }
     if ((caps & WL_SEAT_CAPABILITY_TOUCH) && !d->touch) {
         d->touch = wl_seat_get_touch(seat);
@@ -1253,6 +1296,41 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     SDLOP_Wayland_UnloadSymbols();
 }
 
+/* (Re)create the xdg role objects and start the configure handshake. Used at
+ * creation and on every remap: hiding destroys the role objects (as stock
+ * SDL3's Wayland driver does), so showing is a fresh handshake instead of a
+ * re-commit of an unmapped surface - compositors require a new configure
+ * before any buffer may be attached again ("xdg_surface has never been
+ * configured" otherwise). */
+static bool wayland_create_role_objects(SDL_Window *window)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    wd->xsurface = xdg_wm_base_get_xdg_surface(wl_data.wm_base, wd->surface);
+    if (!wd->xsurface) {
+        return SDL_SetError("xdg_wm_base_get_xdg_surface failed");
+    }
+    xdg_surface_add_listener(wd->xsurface, &xsurface_listener, window);
+    wd->toplevel = xdg_surface_get_toplevel(wd->xsurface);
+    if (!wd->toplevel) {
+        xdg_surface_destroy(wd->xsurface);
+        wd->xsurface = NULL;
+        return SDL_SetError("xdg_surface_get_toplevel failed");
+    }
+    xdg_toplevel_add_listener(wd->toplevel, &toplevel_listener, window);
+    xdg_toplevel_set_title(wd->toplevel, window->title ? window->title : "SDLop");
+    xdg_toplevel_set_app_id(wd->toplevel, "SDLop");
+    if (window->flags & SDL_WINDOW_FULLSCREEN) {
+        xdg_toplevel_set_fullscreen(wd->toplevel, NULL);
+    }
+    if (window->flags & SDL_WINDOW_MAXIMIZED) {
+        xdg_toplevel_set_maximized(wd->toplevel);
+    }
+    /* kick off the configure sequence (buffer is attached by
+     * xsurface_configure once the compositor answers) */
+    wl_surface_commit(wd->surface);
+    return true;
+}
+
 static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -1267,35 +1345,15 @@ static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         free(wd);
         return SDL_SetError("wl_compositor_create_surface failed");
     }
-    wd->xsurface = xdg_wm_base_get_xdg_surface(wl_data.wm_base, wd->surface);
-    if (!wd->xsurface) {
-        wl_surface_destroy(wd->surface);
-        free(wd);
-        return SDL_SetError("xdg_wm_base_get_xdg_surface failed");
-    }
-    xdg_surface_add_listener(wd->xsurface, &xsurface_listener, window);
     wl_surface_add_listener(wd->surface, &surface_listener, window);
-    wd->toplevel = xdg_surface_get_toplevel(wd->xsurface);
-    if (!wd->toplevel) {
-        xdg_surface_destroy(wd->xsurface);
-        wl_surface_destroy(wd->surface);
-        free(wd);
-        return SDL_SetError("xdg_surface_get_toplevel failed");
-    }
-    xdg_toplevel_add_listener(wd->toplevel, &toplevel_listener, window);
-    xdg_toplevel_set_title(wd->toplevel, window->title ? window->title : "SDLop");
-    xdg_toplevel_set_app_id(wd->toplevel, "SDLop");
-    if (window->flags & SDL_WINDOW_FULLSCREEN) {
-        xdg_toplevel_set_fullscreen(wd->toplevel, NULL);
-    }
-    if (window->flags & SDL_WINDOW_MAXIMIZED) {
-        xdg_toplevel_set_maximized(wd->toplevel);
-    }
-
     window->driverdata = wd;
 
-    /* kick off the configure sequence */
-    wl_surface_commit(wd->surface);
+    if (!wayland_create_role_objects(window)) {
+        wl_surface_destroy(wd->surface);
+        window->driverdata = NULL;
+        free(wd);
+        return false;
+    }
     wl_display_roundtrip(wl_data.display);
     return true;
 }
@@ -1340,39 +1398,12 @@ static void wayland_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!wd) {
         return;
     }
-    if (!wd->xsurface) {
-        /* Remap after HideWindow: the xdg role objects were destroyed with
-         * the unmap, so recreate them and run the same initial-commit ->
-         * configure handshake as window creation (SDL3's Wayland_ShowWindow
-         * does the same). Attaching a buffer before the new xdg_surface has
-         * been configured is a protocol error ("xdg_surface has never been
-         * configured") that kills the connection on wlroots compositors; the
-         * configure handler maps the window once the compositor answers. */
-        wd->xsurface = xdg_wm_base_get_xdg_surface(wl_data.wm_base, wd->surface);
-        if (!wd->xsurface) {
-            SDL_SetError("xdg_wm_base_get_xdg_surface failed");
-            return;
+    if (!wd->toplevel) {
+        /* remap after hide: fresh role objects + configure handshake;
+         * xsurface_configure attaches the buffer */
+        if (wayland_create_role_objects(window)) {
+            wl_display_flush(wl_data.display);
         }
-        xdg_surface_add_listener(wd->xsurface, &xsurface_listener, window);
-        wd->toplevel = xdg_surface_get_toplevel(wd->xsurface);
-        if (!wd->toplevel) {
-            xdg_surface_destroy(wd->xsurface);
-            wd->xsurface = NULL;
-            SDL_SetError("xdg_surface_get_toplevel failed");
-            return;
-        }
-        xdg_toplevel_add_listener(wd->toplevel, &toplevel_listener, window);
-        xdg_toplevel_set_title(wd->toplevel, window->title ? window->title : "SDLop");
-        xdg_toplevel_set_app_id(wd->toplevel, "SDLop");
-        if (window->flags & SDL_WINDOW_FULLSCREEN) {
-            xdg_toplevel_set_fullscreen(wd->toplevel, NULL);
-        }
-        if (window->flags & SDL_WINDOW_MAXIMIZED) {
-            xdg_toplevel_set_maximized(wd->toplevel);
-        }
-        wd->configured = false;
-        wl_surface_commit(wd->surface);
-        wl_display_flush(wl_data.display);
         return;
     }
     window_commit(window);
@@ -1386,12 +1417,10 @@ static void wayland_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!wd) {
         return;
     }
-    /* unmap by detaching the buffer */
-    wl_surface_attach(wd->surface, NULL, 0, 0);
-    wl_surface_commit(wd->surface);
-    /* Destroy the xdg role objects with the unmap: an unmapped xdg_surface
-     * loses its configured state, and remapping on the same objects would
-     * require a configure that never comes. Recreated on next ShowWindow. */
+    /* Unmap the stock way: destroy the role objects first - leaving them on
+     * a buffer-less surface strands the xdg_surface in a state where the
+     * next buffer attach is a protocol error, and a bare commit alone will
+     * not restart the configure handshake. */
     if (wd->toplevel) {
         xdg_toplevel_destroy(wd->toplevel);
         wd->toplevel = NULL;
@@ -1400,8 +1429,12 @@ static void wayland_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
         xdg_surface_destroy(wd->xsurface);
         wd->xsurface = NULL;
     }
+    wl_surface_attach(wd->surface, NULL, 0, 0);
+    wl_surface_commit(wd->surface);
     wd->configured = false;
     wd->mapped = false;
+    wd->pending_w = 0;
+    wd->pending_h = 0;
     wl_display_flush(wl_data.display);
 }
 

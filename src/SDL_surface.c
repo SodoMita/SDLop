@@ -330,7 +330,12 @@ bool SDL_UpdateWindowSurfaceRects(SDL_Window *window, const SDL_Rect *rects, int
     if (!sdlop.video || !sdlop.video->UpdateWindowFramebuffer) {
         return SDL_SetError("Video driver does not support window surfaces");
     }
-    return sdlop.video->UpdateWindowFramebuffer(sdlop.video, window, rects, numrects);
+    if (!sdlop.video->UpdateWindowFramebuffer(sdlop.video, window, rects, numrects)) {
+        return false;
+    }
+    /* stock SDL3 announces presented content with an expose event */
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+    return true;
 }
 
 bool SDL_UpdateWindowSurface(SDL_Window *window)
