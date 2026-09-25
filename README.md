@@ -167,6 +167,21 @@ cmake --build build-abi -j
 ctest --test-dir build-abi -R abi_check --output-on-failure
 ```
 
+The manually driven Wayland behavior trace is built with the test targets but
+is not registered with CTest because it waits for an external input script:
+
+```sh
+cmake --build build --target behaviour_probe_wayland
+SDLOP_DISABLE_RAW_INPUT=1 WAYLAND_DISPLAY=wayland-0 \
+  ./build/behaviour_probe_wayland --seconds 8 > wayland-trace.txt
+```
+
+The program prints `READY-INPUT` after the window is configured. At that point,
+use the same compositor-side key/pointer script for SDLop and stock SDL3, then
+compare the traces. Use `--relative` when comparing relative-pointer behavior.
+`SDLOP_DISABLE_RAW_INPUT=1` is important: it forces SDLop to use Wayland seat
+input rather than `/dev/input`.
+
 Build deps: `wayland-protocols` + `wayland-scanner` (for the generated
 protocol code) and the `wayland-client`/`xkbcommon`/`EGL` **headers** — all
 standard on Wayland distros. Static `libsdlop.a` and shared `libSDLop.so`

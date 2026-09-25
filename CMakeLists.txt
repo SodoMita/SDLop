@@ -290,6 +290,12 @@ if(SDLop_BUILD_TESTS)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
 
+  # Manual, externally driven trace tool. It is intentionally not registered
+  # with CTest: it waits for a compositor-side input script after READY-INPUT.
+  add_executable(behaviour_probe_wayland tools/behaviour_probe_wayland.c)
+  target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
+  target_include_directories(behaviour_probe_wayland PRIVATE src)
+
   # integration tests that need real subsystems (auto-skip when unavailable)
   add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
   target_link_libraries(test_evdev_uinput PRIVATE sdlop)
