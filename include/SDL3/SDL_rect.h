@@ -26,6 +26,12 @@ typedef struct SDL_Rect
 } SDL_Rect;
 
 /** A rectangle, with the origin at the upper left (floating point). */
+typedef struct SDL_FPoint
+{
+    float x;
+    float y;
+} SDL_FPoint;
+
 typedef struct SDL_FRect
 {
     float x, y;

@@ -344,4 +344,57 @@ extern void SDL_GL_DestroyContext(SDL_GLContext context);
  */
 extern SDL_DECLSPEC float SDLCALL SDL_GetWindowDisplayScale(SDL_Window *window);
 
+
+/* ---- API-surface parity types (SDL3 3.2.10 layouts; declarations only,
+ * the lean core does not implement display enumeration) ---- */
+
+typedef Uint32 SDL_DisplayID;
+
+typedef enum SDL_SystemTheme
+{
+    SDL_SYSTEM_THEME_UNKNOWN,   /**< Unknown system theme */
+    SDL_SYSTEM_THEME_LIGHT,     /**< Light colored system theme */
+    SDL_SYSTEM_THEME_DARK       /**< Dark colored system theme */
+} SDL_SystemTheme;
+
+typedef enum SDL_DisplayOrientation
+{
+    SDL_ORIENTATION_UNKNOWN,            /**< The display orientation can't be determined */
+    SDL_ORIENTATION_LANDSCAPE,          /**< The display is in landscape mode, with the right side up, relative to portrait mode */
+    SDL_ORIENTATION_LANDSCAPE_FLIPPED,  /**< The display is in landscape mode, with the left side up, relative to portrait mode */
+    SDL_ORIENTATION_PORTRAIT,           /**< The display is in portrait mode */
+    SDL_ORIENTATION_PORTRAIT_FLIPPED    /**< The display is in portrait mode, upside down */
+} SDL_DisplayOrientation;
+
+typedef enum SDL_HitTestResult
+{
+    SDL_HITTEST_NORMAL,             /**< Region is normal. No special properties. */
+    SDL_HITTEST_DRAGGABLE,          /**< Region can drag entire window. */
+    SDL_HITTEST_RESIZE_TOPLEFT,     /**< Region is the resizable top-left corner border. */
+    SDL_HITTEST_RESIZE_TOP,         /**< Region is the resizable top border. */
+    SDL_HITTEST_RESIZE_TOPRIGHT,    /**< Region is the resizable top-right corner border. */
+    SDL_HITTEST_RESIZE_RIGHT,       /**< Region is the resizable right border. */
+    SDL_HITTEST_RESIZE_BOTTOMRIGHT, /**< Region is the resizable bottom-right corner border. */
+    SDL_HITTEST_RESIZE_BOTTOM,      /**< Region is the resizable bottom border. */
+    SDL_HITTEST_RESIZE_BOTTOMLEFT,  /**< Region is the resizable bottom-left corner border. */
+    SDL_HITTEST_RESIZE_LEFT         /**< Region is the resizable left border. */
+} SDL_HitTestResult;
+
+typedef struct SDL_DisplayModeData SDL_DisplayModeData;
+
+typedef struct SDL_DisplayMode
+{
+    SDL_DisplayID displayID;        /**< the display this mode is associated with */
+    SDL_PixelFormat format;         /**< pixel format */
+    int w;                          /**< width */
+    int h;                          /**< height */
+    float pixel_density;            /**< scale converting size to pixels */
+    float refresh_rate;             /**< refresh rate (or 0.0f for unspecified) */
+    int refresh_rate_numerator;     /**< precise refresh rate numerator (or 0 for unspecified) */
+    int refresh_rate_denominator;   /**< precise refresh rate denominator */
+
+    SDL_DisplayModeData *internal;  /**< Private */
+
+} SDL_DisplayMode;
+
 #endif /* SDL_video_h_ */
