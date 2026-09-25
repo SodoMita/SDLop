@@ -46,6 +46,7 @@ typedef struct WaylandWindowData
 
     bool configured;
     bool mapped;
+    bool moved_reported; /* stock emits exactly one MOVED(0,0) per window */
     struct wl_output *output; /* output the surface currently intersects */
     uint32_t toplevel_states;
     int pending_w, pending_h;
@@ -313,8 +314,6 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
     SDL_Window *window = (SDL_Window *)data;
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     xdg_surface_ack_configure(xsurface, serial);
-
-    bool first = !wd->configured;
     wd->configured = true;
 
     if (wd->pending_w > 0 && wd->pending_h > 0 &&
@@ -324,11 +323,16 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
         window_create_buffer(window, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
-        if (first) {
-            /* stock SDL3 reports the (origin-relative) position and the
-             * safe area when a window first maps on Wayland */
+        /* Stock 3.2.10 sends SAFE_AREA_CHANGED with every size change on
+         * Wayland (measured: 4 SAFE for 4 resizes) and exactly one
+         * MOVED(0,0) per window once a size is applied. The previous guard
+         * additionally required this to be the FIRST configure, but
+         * sway/wlroots send toplevel configure(0,0) first, so the block
+         * only ever ran when first was already false - never fired. */
+        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);
+        if (!wd->moved_reported) {
+            wd->moved_reported = true;
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, 0, 0);
-            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);
         }
     }
     if (!wd->buffer) {
@@ -337,7 +341,6 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
     if (!(window->flags & SDL_WINDOW_HIDDEN)) {
         window_commit(window);
     }
-    (void)first;
 }
 
 static const struct xdg_surface_listener xsurface_listener = {
@@ -1459,6 +1462,9 @@ static bool wayland_SetWindowSize(SDLop_VideoDevice *device, SDL_Window *window)
     wl_display_flush(wl_data.display);
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
+    /* stock pairs SAFE_AREA_CHANGED with every size change, including this
+     * client-initiated one (measured on 3.2.10 with the behaviour probe) */
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);
     return true;
 }
 
