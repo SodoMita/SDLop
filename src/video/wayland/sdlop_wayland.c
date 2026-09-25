@@ -1331,7 +1331,42 @@ static void wayland_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
-    if (!wd || !wd->configured) {
+    if (!wd) {
+        return;
+    }
+    if (!wd->xsurface) {
+        /* Remap after HideWindow: the xdg role objects were destroyed with
+         * the unmap, so recreate them and run the same initial-commit ->
+         * configure handshake as window creation (SDL3's Wayland_ShowWindow
+         * does the same). Attaching a buffer before the new xdg_surface has
+         * been configured is a protocol error ("xdg_surface has never been
+         * configured") that kills the connection on wlroots compositors; the
+         * configure handler maps the window once the compositor answers. */
+        wd->xsurface = xdg_wm_base_get_xdg_surface(wl_data.wm_base, wd->surface);
+        if (!wd->xsurface) {
+            SDL_SetError("xdg_wm_base_get_xdg_surface failed");
+            return;
+        }
+        xdg_surface_add_listener(wd->xsurface, &xsurface_listener, window);
+        wd->toplevel = xdg_surface_get_toplevel(wd->xsurface);
+        if (!wd->toplevel) {
+            xdg_surface_destroy(wd->xsurface);
+            wd->xsurface = NULL;
+            SDL_SetError("xdg_surface_get_toplevel failed");
+            return;
+        }
+        xdg_toplevel_add_listener(wd->toplevel, &toplevel_listener, window);
+        xdg_toplevel_set_title(wd->toplevel, window->title ? window->title : "SDLop");
+        xdg_toplevel_set_app_id(wd->toplevel, "SDLop");
+        if (window->flags & SDL_WINDOW_FULLSCREEN) {
+            xdg_toplevel_set_fullscreen(wd->toplevel, NULL);
+        }
+        if (window->flags & SDL_WINDOW_MAXIMIZED) {
+            xdg_toplevel_set_maximized(wd->toplevel);
+        }
+        wd->configured = false;
+        wl_surface_commit(wd->surface);
+        wl_display_flush(wl_data.display);
         return;
     }
     window_commit(window);
@@ -1348,8 +1383,20 @@ static void wayland_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
     /* unmap by detaching the buffer */
     wl_surface_attach(wd->surface, NULL, 0, 0);
     wl_surface_commit(wd->surface);
-    wl_display_flush(wl_data.display);
+    /* Destroy the xdg role objects with the unmap: an unmapped xdg_surface
+     * loses its configured state, and remapping on the same objects would
+     * require a configure that never comes. Recreated on next ShowWindow. */
+    if (wd->toplevel) {
+        xdg_toplevel_destroy(wd->toplevel);
+        wd->toplevel = NULL;
+    }
+    if (wd->xsurface) {
+        xdg_surface_destroy(wd->xsurface);
+        wd->xsurface = NULL;
+    }
+    wd->configured = false;
     wd->mapped = false;
+    wl_display_flush(wl_data.display);
 }
 
 static bool wayland_SetWindowTitle(SDLop_VideoDevice *device, SDL_Window *window)

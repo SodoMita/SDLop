@@ -296,6 +296,17 @@ if(SDLop_BUILD_TESTS)
   target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
   target_include_directories(behaviour_probe_wayland PRIVATE src)
 
+  # Reference compositor-side driver for the probe: injects the scripted
+  # pointer/key sequence once READY-INPUT appears. Also not a CTest.
+  add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c
+    ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
+  add_dependencies(behaviour_probe_inject sdlop_wayland_protocols)
+  target_include_directories(behaviour_probe_inject PRIVATE
+    ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+  target_link_libraries(behaviour_probe_inject PRIVATE
+    ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+
   # integration tests that need real subsystems (auto-skip when unavailable)
   add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
   target_link_libraries(test_evdev_uinput PRIVATE sdlop)

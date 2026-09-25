@@ -179,6 +179,10 @@ SDLOP_DISABLE_RAW_INPUT=1 WAYLAND_DISPLAY=wayland-0 \
 The program prints `READY-INPUT` after the window is configured. At that point,
 use the same compositor-side key/pointer script for SDLop and stock SDL3, then
 compare the traces. Use `--relative` when comparing relative-pointer behavior.
+A reference driver ships with the repo: once `READY-INPUT` appears, run
+`./build/behaviour_probe_inject` (target `behaviour_probe_inject`) to replay
+the scripted enter/motion/click/key/wheel sequence on sway or any compositor
+implementing the wlr virtual-pointer + virtual-keyboard protocols.
 `SDLOP_DISABLE_RAW_INPUT=1` is important: it forces SDLop to use Wayland seat
 input rather than `/dev/input`.
 
