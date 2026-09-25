@@ -181,11 +181,13 @@ keyboard/mouse layers or any of the `src/generated/` tables.
 - [x] Header-level ABI check: `tools/abi_probe.c` is compiled twice — against
       SDLop's headers and against stock SDL3's — and prints sizes, member offsets,
       event/scancode/keycode values, flags and hint strings; `make abi-check`
-      diffs the two. 186 values, currently identical: struct sizes and member
-      offsets (including every `SDL_Event` union member), event/scancode/keycode
-      values, flags, and hint strings. The union members are checked because a
-      size check passes while a member is missing — which is exactly how
-      `SDL_TouchFingerEvent` was found to be absent here.
+      diffs the two. 208 values, currently identical: struct sizes and member
+      offsets (including every `SDL_Event` union member, and the keyboard/mouse
+      device and text-editing event structs), event/scancode/keycode values, flags,
+      and hint strings. The union members are checked because a size check passes
+      while a member is missing — which is exactly how `SDL_TouchFingerEvent` was
+      found to be absent here — and the device events are checked as an ordered
+      run, because a wrong position in the enum shifts everything after it.
 - [ ] Link-level ABI check: `tests/` programs compiled against **stock** SDL3
       headers and linked against `libSDLop.so`, to prove binary compatibility for
       the subset (the reverse of `check_api.py`).

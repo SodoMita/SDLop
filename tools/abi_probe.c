@@ -25,6 +25,11 @@ int main(void)
     S(SDL_KeyboardEvent); S(SDL_MouseMotionEvent); S(SDL_MouseButtonEvent);
     S(SDL_MouseWheelEvent); S(SDL_TextInputEvent); S(SDL_WindowEvent);
     S(SDL_UserEvent); S(SDL_DisplayMode); S(SDL_TouchFingerEvent);
+    /* The device and text-editing events: an application that tracks keyboards
+       and mice being plugged in reaches through these, and their layouts are as
+       much part of the ABI as the more common ones. */
+    S(SDL_KeyboardDeviceEvent); S(SDL_MouseDeviceEvent);
+    S(SDL_TextEditingEvent); S(SDL_TextEditingCandidatesEvent);
 
     O(SDL_Event, type); O(SDL_Event, common.timestamp);
     /* The union members an application reaches through event.<member>. Their
@@ -52,6 +57,11 @@ int main(void)
     O(SDL_MouseWheelEvent, x); O(SDL_MouseWheelEvent, y);
     O(SDL_MouseWheelEvent, direction);
     O(SDL_WindowEvent, data1); O(SDL_WindowEvent, data2);
+    O(SDL_KeyboardDeviceEvent, timestamp); O(SDL_KeyboardDeviceEvent, which);
+    O(SDL_MouseDeviceEvent, timestamp); O(SDL_MouseDeviceEvent, which);
+    O(SDL_TextEditingEvent, windowID); O(SDL_TextEditingEvent, text);
+    O(SDL_TextEditingEvent, start); O(SDL_TextEditingEvent, length);
+    O(SDL_TextEditingCandidatesEvent, windowID); O(SDL_TextEditingCandidatesEvent, num_candidates);
     O(SDL_DisplayMode, displayID); O(SDL_DisplayMode, format);
     O(SDL_DisplayMode, w); O(SDL_DisplayMode, h); O(SDL_DisplayMode, refresh_rate);
 
@@ -63,6 +73,13 @@ int main(void)
     V(SDL_EVENT_WINDOW_CLOSE_REQUESTED); V(SDL_EVENT_WINDOW_MOUSE_ENTER);
     V(SDL_EVENT_WINDOW_MOUSE_LEAVE); V(SDL_EVENT_WINDOW_DISPLAY_CHANGED);
     V(SDL_EVENT_CLIPBOARD_UPDATE); V(SDL_EVENT_USER); V(SDL_EVENT_LAST);
+    /* The keyboard and mouse device events, in the order SDL3 declares them:
+       a wrong position here shifts every event after it, which is exactly the
+       kind of break a probe that only checks a handful of names misses. */
+    V(SDL_EVENT_KEYMAP_CHANGED); V(SDL_EVENT_KEYBOARD_ADDED);
+    V(SDL_EVENT_KEYBOARD_REMOVED); V(SDL_EVENT_TEXT_EDITING_CANDIDATES);
+    V(SDL_EVENT_TEXT_EDITING); V(SDL_EVENT_TEXT_EDITING_CANDIDATES);
+    V(SDL_EVENT_MOUSE_ADDED); V(SDL_EVENT_MOUSE_REMOVED);
     /* the finger events and the display/scale+orientation family */
     V(SDL_EVENT_FINGER_DOWN); V(SDL_EVENT_FINGER_UP); V(SDL_EVENT_FINGER_MOTION);
     V(SDL_EVENT_FINGER_CANCELED);
