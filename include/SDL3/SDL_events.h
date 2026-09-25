@@ -332,6 +332,28 @@ typedef struct SDL_UserEvent
  void *data2;
 } SDL_UserEvent;
 
+/* Finger IDs: stock SDL3 declares these two in SDL_touch.h, next to the touch
+   subsystem's functions. Touch is not part of SDLop's core-only surface, but the
+   SDL_EVENT_FINGER_* events this header declares are, so the typedefs and the
+   event struct live here - an SDL_Event union member has to exist for both. */
+typedef Uint64 SDL_TouchID;
+typedef Uint64 SDL_FingerID;
+
+typedef struct SDL_TouchFingerEvent
+{
+    SDL_EventType type; /**< SDL_EVENT_FINGER_DOWN, SDL_EVENT_FINGER_UP, SDL_EVENT_FINGER_MOTION, or SDL_EVENT_FINGER_CANCELED */
+    Uint32 reserved;
+    Uint64 timestamp;   /**< In nanoseconds, populated using SDL_GetTicksNS() */
+    SDL_TouchID touchID;
+    SDL_FingerID fingerID;
+    float x;            /**< Normalized in the range 0...1 */
+    float y;
+    float dx;
+    float dy;
+    float pressure;
+    SDL_WindowID windowID; /**< The window underneath the finger, if any */
+} SDL_TouchFingerEvent;
+
 typedef union SDL_Event
 {
  Uint32 type;
@@ -349,6 +371,7 @@ typedef union SDL_Event
  SDL_MouseWheelEvent wheel;
  SDL_QuitEvent quit;
  SDL_UserEvent user;
+ SDL_TouchFingerEvent tfinger;
 
  Uint8 padding[128];
 } SDL_Event;

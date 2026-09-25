@@ -37,6 +37,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # delta is reported as information rather than as a failure.
 OWN_HEADERS = {"SDL_stdinc.h", "SDL_begin_code.h", "SDL_close_code.h",
                "SDL.h", "SDL_main.h"}
+# Names SDLop declares in one header that upstream declares in a different one.
+# SDL_touch.h is not part of the core-only surface (touch is not implemented),
+# but the SDL_EVENT_FINGER_* events are, so the two ID typedefs the touch event
+# struct needs live next to it in SDL_events.h. Their layout is verified by
+# tools/abi_probe.c.
+RELOCATED = {
+    "SDL_events.h": {"SDL_TouchID", "SDL_FingerID"},
+}
+
 EXTENSION_NAMES = {"SDL_GetSDLopVersion", "SDL_SDLOP", "SDL_SDLOP_MAJOR_VERSION",
                    "SDL_SDLOP_MINOR_VERSION", "SDL_SDLOP_MICRO_VERSION",
                    "SDL_SDLopVersion", "SDL_SDLOP_IMPLEMENTED_SUBSYSTEMS",
@@ -195,8 +204,9 @@ def main():
                 pass
             else:
                 missing.append("%s %s" % (kind, name))
+        relocated = RELOCATED.get(h, ())
         extra = [n for (k, n) in decls if (k, n) not in up and
-                 n not in EXTENSION_NAMES and not own]
+                 n not in EXTENSION_NAMES and n not in relocated and not own]
 
         missing_macros = []
         for name in up_macros:

@@ -24,9 +24,23 @@ int main(void)
     S(SDL_Event); S(SDL_Rect); S(SDL_FRect); S(SDL_Point); S(SDL_FPoint);
     S(SDL_KeyboardEvent); S(SDL_MouseMotionEvent); S(SDL_MouseButtonEvent);
     S(SDL_MouseWheelEvent); S(SDL_TextInputEvent); S(SDL_WindowEvent);
-    S(SDL_UserEvent); S(SDL_DisplayMode);
+    S(SDL_UserEvent); S(SDL_DisplayMode); S(SDL_TouchFingerEvent);
 
     O(SDL_Event, type); O(SDL_Event, common.timestamp);
+    /* The union members an application reaches through event.<member>. Their
+       offsets are as much a part of the ABI as the struct sizes, and a missing
+       member (SDL_TouchFingerEvent was one here) only shows up in an
+       application's compile, not in a size check. */
+    O(SDL_Event, common); O(SDL_Event, display); O(SDL_Event, window);
+    O(SDL_Event, kdevice); O(SDL_Event, key); O(SDL_Event, edit);
+    O(SDL_Event, edit_candidates); O(SDL_Event, text); O(SDL_Event, mdevice);
+    O(SDL_Event, motion); O(SDL_Event, button); O(SDL_Event, wheel);
+    O(SDL_Event, quit); O(SDL_Event, user); O(SDL_Event, tfinger);
+    O(SDL_TouchFingerEvent, type); O(SDL_TouchFingerEvent, timestamp);
+    O(SDL_TouchFingerEvent, touchID); O(SDL_TouchFingerEvent, fingerID);
+    O(SDL_TouchFingerEvent, x); O(SDL_TouchFingerEvent, y);
+    O(SDL_TouchFingerEvent, dx); O(SDL_TouchFingerEvent, dy);
+    O(SDL_TouchFingerEvent, pressure); O(SDL_TouchFingerEvent, windowID);
     O(SDL_KeyboardEvent, timestamp); O(SDL_KeyboardEvent, windowID);
     O(SDL_KeyboardEvent, scancode); O(SDL_KeyboardEvent, key);
     O(SDL_KeyboardEvent, mod); O(SDL_KeyboardEvent, raw); O(SDL_KeyboardEvent, down);
@@ -49,6 +63,16 @@ int main(void)
     V(SDL_EVENT_WINDOW_CLOSE_REQUESTED); V(SDL_EVENT_WINDOW_MOUSE_ENTER);
     V(SDL_EVENT_WINDOW_MOUSE_LEAVE); V(SDL_EVENT_WINDOW_DISPLAY_CHANGED);
     V(SDL_EVENT_CLIPBOARD_UPDATE); V(SDL_EVENT_USER); V(SDL_EVENT_LAST);
+    /* the finger events and the display/scale+orientation family */
+    V(SDL_EVENT_FINGER_DOWN); V(SDL_EVENT_FINGER_UP); V(SDL_EVENT_FINGER_MOTION);
+    V(SDL_EVENT_FINGER_CANCELED);
+    V(SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED); V(SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED);
+    V(SDL_EVENT_WINDOW_SAFE_AREA_CHANGED); V(SDL_EVENT_WINDOW_OCCLUDED);
+    V(SDL_EVENT_WINDOW_ENTER_FULLSCREEN); V(SDL_EVENT_WINDOW_LEAVE_FULLSCREEN);
+    V(SDL_EVENT_WINDOW_DESTROYED); V(SDL_EVENT_DISPLAY_ADDED);
+    V(SDL_EVENT_DISPLAY_REMOVED); V(SDL_EVENT_DISPLAY_ORIENTATION);
+    V(SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED); V(SDL_EVENT_WINDOW_DISPLAY_CHANGED);
+    V(SDL_EVENT_LOCALE_CHANGED); V(SDL_EVENT_SYSTEM_THEME_CHANGED);
 
     V(SDL_SCANCODE_A); V(SDL_SCANCODE_Z); V(SDL_SCANCODE_1); V(SDL_SCANCODE_RETURN);
     V(SDL_SCANCODE_ESCAPE); V(SDL_SCANCODE_UP); V(SDL_SCANCODE_F12);
@@ -75,6 +99,8 @@ int main(void)
     V(SDL_PIXELFORMAT_XRGB8888); V(SDL_PIXELFORMAT_ARGB8888);
     V(SDL_WINDOWPOS_CENTERED); V(SDL_WINDOWPOS_UNDEFINED);
     V(SDL_ORIENTATION_UNKNOWN); V(SDL_ORIENTATION_LANDSCAPE);
+    V(SDL_ORIENTATION_PORTRAIT); V(SDL_ORIENTATION_LANDSCAPE_FLIPPED);
+    V(SDL_ORIENTATION_PORTRAIT_FLIPPED);
     V(SDL_SYSTEM_THEME_UNKNOWN); V(SDL_GL_CONTEXT_MAJOR_VERSION);
     V(SDL_GL_DOUBLEBUFFER); V(SDL_GL_CONTEXT_PROFILE_CORE);
     /* Hints are strings: the pointer differs per build, the text must not. */
