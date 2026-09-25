@@ -64,6 +64,7 @@ fi
 drive()
 {
     probe=$1
+    switch_to=$2
     wid=$(xdotool search --name "$TITLE" | head -1)
     [ -n "$wid" ] || { echo "no window found for $TITLE" >&2; return 1; }
 
@@ -93,6 +94,13 @@ drive()
     sleep 0.15
     xdotool key Caps_Lock
     sleep 0.15
+    # A live layout switch, with the window already open and focused: this is
+    # what an application sees when the user picks another layout while it runs.
+    # Both probes see the same switch at the same point of the sequence, and
+    # everything that follows it (Return, Escape, the mouse block) uses keys and
+    # buttons whose keycodes do not depend on the layout.
+    setxkbmap "$switch_to"
+    sleep 0.4
     xdotool click 1
     sleep 0.15
     xdotool mousemove --sync $((cx + 25)) $((cy + 15))
@@ -140,7 +148,9 @@ run_one()
         fail=1
         return 1
     fi
-    drive "$bin"
+    # the live switch inside the run goes to the *other* layout, so both runs
+    # start from the layout they were given and then really change it
+    if [ "$layout" = "de" ]; then drive "$bin" us; else drive "$bin" de; fi
     for i in $(seq 1 200); do
         grep -q '^DONE' "$out" 2>/dev/null && break
         sleep 0.1
@@ -184,6 +194,23 @@ run_one()
 #                              change state") and SDLop never sends them, but the
 #                              two disagree about when the pointer counts as
 #                              having a position.
+#   KEYMAP_CHANGED, repeated    the *number* of these events a single layout
+#                              switch produces belongs to the server, not to the
+#                              library. This X server posts three core
+#                              MappingNotify events for one `setxkbmap` while
+#                              the probe runs (measured: three
+#                              XRefreshKeyboardMapping calls, all with
+#                              request=MappingKeyboard), stock SDL3 answers every
+#                              one of them with an event, and SDLop answers the
+#                              root property change this server makes instead -
+#                              it has to, because this server only sends core
+#                              MappingNotify to clients that never spoke XKB to
+#                              it at all, and SDLop's connection must speak XKB
+#                              (its keymap comes from xkbcommon-x11). On Wayland
+#                              both see one keymap per switch and emit one event.
+#                              Consecutive KEYMAP_CHANGED lines are collapsed, so
+#                              the switch itself is compared and the server's
+#                              chattiness is not.
 documented_patterns()
 {
     # Chained with pipes, not listed as separate commands: separate commands in a
@@ -192,7 +219,8 @@ documented_patterns()
     # nothing through) - which is how a rule here can look right and do nothing.
     grep -vE '^STATE flags=' |
         grep -vE '^FROMNAMES-SYMBOLS ' |
-        grep -vE '^EVENT input MOTION .*xrel=0\.0 yrel=0\.0$'
+        grep -vE '^EVENT input MOTION .*xrel=0\.0 yrel=0\.0$' |
+        awk '{ if ($0 == prev && $0 == "EVENT input KEYMAP_CHANGED") next; print; prev = $0 }'
 }
 
 # The window-lifecycle phase is compared as a *set* rather than in sequence: when

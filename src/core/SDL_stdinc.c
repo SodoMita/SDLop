@@ -380,14 +380,24 @@ long long SDL_strtoll(const char *str, char **endp, int base) { return strtoll(s
 unsigned long long SDL_strtoull(const char *str, char **endp, int base) { return strtoull(str, endp, base); }
 double SDL_strtod(const char *str, char **endp) { return strtod(str, endp); }
 
-static int sdlop_ulltoa(unsigned long long value, char *str, int radix, bool negative)
+/* The integer-to-string family returns the string it was given, not a length:
+   stock SDL3 declares all six as `char *` (SDL_stdinc.h, "char * SDLCALL
+   SDL_itoa(int value, char *str, int radix)") and returns the caller's buffer,
+   so a program that compiled against SDL3 could not link against, or even
+   compile against, an int-returning SDLop. The negation happens in unsigned
+   arithmetic so that the most negative value of each type converts to the right
+   magnitude instead of overflowing. */
+static char *sdlop_ulltoa(unsigned long long value, char *str, int radix, bool negative)
 {
     char temp[70];
     int i = 0, j = 0;
     const char *digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    if (!str) {
+        return NULL;
+    }
     if (radix < 2 || radix > 36) {
-        if (str) *str = '\0';
-        return 0;
+        *str = '\0';
+        return str;
     }
     do {
         temp[i++] = digits[value % (unsigned)radix];
@@ -400,15 +410,27 @@ static int sdlop_ulltoa(unsigned long long value, char *str, int radix, bool neg
         str[j++] = temp[--i];
     }
     str[j] = '\0';
-    return j;
+    return str;
 }
 
-int SDL_itoa(int value, char *str, int radix) { return sdlop_ulltoa((unsigned long long)(value < 0 ? -(long long)value : value), str, radix, value < 0); }
-int SDL_uitoa(unsigned int value, char *str, int radix) { return sdlop_ulltoa(value, str, radix, false); }
-int SDL_ltoa(long value, char *str, int radix) { return sdlop_ulltoa((unsigned long long)(value < 0 ? -value : value), str, radix, value < 0); }
-int SDL_ultoa(unsigned long value, char *str, int radix) { return sdlop_ulltoa(value, str, radix, false); }
-int SDL_lltoa(long long value, char *str, int radix) { return sdlop_ulltoa((unsigned long long)(value < 0 ? -value : value), str, radix, value < 0); }
-int SDL_ulltoa(unsigned long long value, char *str, int radix) { return sdlop_ulltoa(value, str, radix, false); }
+char *SDL_itoa(int value, char *str, int radix)
+{
+    return sdlop_ulltoa(value < 0 ? 0ULL - (unsigned long long)value : (unsigned long long)value,
+                        str, radix, value < 0);
+}
+char *SDL_uitoa(unsigned int value, char *str, int radix) { return sdlop_ulltoa(value, str, radix, false); }
+char *SDL_ltoa(long value, char *str, int radix)
+{
+    return sdlop_ulltoa(value < 0 ? 0ULL - (unsigned long long)value : (unsigned long long)value,
+                        str, radix, value < 0);
+}
+char *SDL_ultoa(unsigned long value, char *str, int radix) { return sdlop_ulltoa(value, str, radix, false); }
+char *SDL_lltoa(long long value, char *str, int radix)
+{
+    return sdlop_ulltoa(value < 0 ? 0ULL - (unsigned long long)value : (unsigned long long)value,
+                        str, radix, value < 0);
+}
+char *SDL_ulltoa(unsigned long long value, char *str, int radix) { return sdlop_ulltoa(value, str, radix, false); }
 
 /* ------------------------------------------------------------------------- */
 /* ctype / math: direct libc delegation                                      */
@@ -578,7 +600,10 @@ float SDL_randf(void)
     return (float)((double)SDL_rand_bits() / 4294967296.0);
 }
 
-int SDL_rand(int n)
+/* Sint32, not int: same type here, but the declaration has to say what SDL3's
+   header says - check_api.py compares the declaration, and the whole point of
+   these headers is that SDL3 source compiles against them unchanged. */
+Sint32 SDL_rand(Sint32 n)
 {
     Uint32 r;
     Uint32 bound;
@@ -589,7 +614,7 @@ int SDL_rand(int n)
     do {
         r = SDL_rand_bits();
     } while (r >= bound);
-    return (int)(r % (Uint32)n);
+    return (Sint32)(r % (Uint32)n);
 }
 
 /* Environment: SDL3 wraps the process environment in SDL_Environment objects;

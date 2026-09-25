@@ -151,7 +151,7 @@ OBJS := $(patsubst src/%,$(BUILD)/obj/%,$(SRCS:.c=.o))
 # headers generated from the SDL3 headers and from the data tables
 GEN_HEADERS := $(GEN)/sdlop_keynames.h $(GEN)/sdlop_pixelformats.h $(GEN)/sdlop_evdev.h
 
-.PHONY: all clean install examples check wayland-check x11-check abi-check bench bench-run tools inject regen FORCE
+.PHONY: all clean install examples check wayland-check x11-check api-check abi-check bench bench-run tools inject regen FORCE
 all: $(BUILD)/libSDLop.a $(BUILD)/libSDLop.so
 
 $(FEATURE_STAMP): FORCE
@@ -294,6 +294,13 @@ $(WAYLAND_CLIENTS) $(X11_CLIENTS): $(BUILD)/tests/%: tests/%.c $(BUILD)/libSDLop
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(BUILD)/libSDLop.a $(LIBS) -o $@
 	@echo "  [exe] $@"
+
+# Header-level API check: every declaration SDLop's headers make has to exist in
+# upstream SDL3 with the same signature (tools/check_api.py; a changed signature
+# is a failure in SDLop's own headers too), and every function they declare has to
+# be exported by the built library.
+api-check: $(BUILD)/libSDLop.so
+	@python3 tools/check_api.py --lib $(BUILD)/libSDLop.so
 
 # Header-level ABI check: the probe is compiled against SDLop's headers and
 # against the system SDL3's, and the two outputs must be identical.

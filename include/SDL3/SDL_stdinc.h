@@ -479,12 +479,12 @@ extern SDL_DECLSPEC unsigned long SDLCALL SDL_strtoul(const char *str, char **en
 extern SDL_DECLSPEC long long SDLCALL SDL_strtoll(const char *str, char **endp, int base);
 extern SDL_DECLSPEC unsigned long long SDLCALL SDL_strtoull(const char *str, char **endp, int base);
 extern SDL_DECLSPEC double SDLCALL SDL_strtod(const char *str, char **endp);
-extern SDL_DECLSPEC int SDLCALL SDL_itoa(int value, char *str, int radix);
-extern SDL_DECLSPEC int SDLCALL SDL_uitoa(unsigned int value, char *str, int radix);
-extern SDL_DECLSPEC int SDLCALL SDL_ltoa(long value, char *str, int radix);
-extern SDL_DECLSPEC int SDLCALL SDL_ultoa(unsigned long value, char *str, int radix);
-extern SDL_DECLSPEC int SDLCALL SDL_lltoa(long long value, char *str, int radix);
-extern SDL_DECLSPEC int SDLCALL SDL_ulltoa(unsigned long long value, char *str, int radix);
+extern SDL_DECLSPEC char *SDLCALL SDL_itoa(int value, char *str, int radix);
+extern SDL_DECLSPEC char *SDLCALL SDL_uitoa(unsigned int value, char *str, int radix);
+extern SDL_DECLSPEC char *SDLCALL SDL_ltoa(long value, char *str, int radix);
+extern SDL_DECLSPEC char *SDLCALL SDL_ultoa(unsigned long value, char *str, int radix);
+extern SDL_DECLSPEC char *SDLCALL SDL_lltoa(long long value, char *str, int radix);
+extern SDL_DECLSPEC char *SDLCALL SDL_ulltoa(unsigned long long value, char *str, int radix);
 
 /* Environment. SDL3 wraps these in SDL_Environment objects (3.2); SDLop
    exposes the process environment directly. */
@@ -516,7 +516,7 @@ extern SDL_DECLSPEC int SDLCALL SDL_toupper(int x);
 extern SDL_DECLSPEC int SDLCALL SDL_tolower(int x);
 /* Stdlib: PRNG. SDL3 exposes a thread-safe global PRNG plus an explicit-state
    variant; SDLop implements both with xoshiro256**. */
-extern SDL_DECLSPEC int SDLCALL SDL_rand(int n);
+extern SDL_DECLSPEC Sint32 SDLCALL SDL_rand(Sint32 n);
 extern SDL_DECLSPEC float SDLCALL SDL_randf(void);
 extern SDL_DECLSPEC void SDLCALL SDL_srand(Uint64 seed);
 extern SDL_DECLSPEC Sint32 SDLCALL SDL_rand_r(Uint64 *state, Sint32 n);

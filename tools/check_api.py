@@ -186,7 +186,12 @@ def main():
         if not os.path.exists(os.path.join(up_inc, "SDL3", h)):
             print("%-22s (SDLop-only header, not compared)" % h)
             continue
-        decls = dump_decls((inc, h), inc) if not own else {}
+        # SDLop's own headers are parsed too: their *surface* is a documented
+        # subset (a missing declaration is reported as a note), but a declaration
+        # they do carry has to have upstream's signature. Skipping them here is
+        # how six SDL_itoa/uitoa/ltoa/ultoa/lltoa/ulltoa functions could return
+        # `int` while upstream returns `char *` without this check noticing.
+        decls = dump_decls((inc, h), inc)
         up = dump_decls((up_inc, h), up_inc)
         macros = dump_macros((inc, h), inc) if own else {}
         up_macros = dump_macros((up_inc, h), up_inc) if own else {}
@@ -236,8 +241,13 @@ def main():
             print("    CHANGED  %s\n      upstream: %s\n      sdlop: %s" % (name, want, got))
         for m in sorted(missing_macros):
             print("    %s  %s" % ("NOTE    " if info else "MACRO   ", m))
+        # A different signature is a bug whether or not the header is SDLop's
+        # own: the whole point of the headers is that a program written against
+        # SDL3 compiles and links against SDLop unchanged. Only the *absences*
+        # are allowed in SDLop's own headers, and those stay notes.
+        problems += len(changed)
         if not info:
-            problems += len(missing) + len(extra) + len(changed) + len(missing_macros)
+            problems += len(missing) + len(extra) + len(missing_macros)
 
     if args.lib:
         # every function the SDLop headers declare must be *defined* by the library,

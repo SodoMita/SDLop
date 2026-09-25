@@ -351,6 +351,24 @@ static void test_strings(void)
     CHECK(SDL_atoi("  -42xyz") == -42, "SDL_atoi()");
     CHECK(SDL_strtol("0x10", NULL, 16) == 16, "SDL_strtol()");
     {
+        /* The integer-to-string family hands back the buffer it was given
+           (SDL3's signature is `char *`, not the length), and the most negative
+           value of each type has to come out right rather than overflow. */
+        char digits[32];
+        CHECK(SDL_itoa(-42, digits, 10) == digits, "SDL_itoa() returns its buffer");
+        CHECK(SDL_strcmp(digits, "-42") == 0, "SDL_itoa(-42) = '%s'", digits);
+        CHECK(SDL_uitoa(0, digits, 2) == digits && SDL_strcmp(digits, "0") == 0,
+              "SDL_uitoa(0, 2) = '%s'", digits);
+        CHECK(SDL_ulltoa(255, digits, 16) == digits && SDL_strcmp(digits, "ff") == 0,
+              "SDL_ulltoa(255, 16) = '%s'", digits);
+        CHECK(SDL_lltoa(-9223372036854775807LL - 1, digits, 10) == digits &&
+                  SDL_strcmp(digits, "-9223372036854775808") == 0,
+              "SDL_lltoa(LLONG_MIN, 10) = '%s'", digits);
+        CHECK(SDL_ultoa(4294967295UL, digits, 36) == digits &&
+                  SDL_strcmp(digits, "1z141z3") == 0,
+              "SDL_ultoa(ULONG_MAX, 36) = '%s'", digits);
+    }
+    {
         Uint64 state = 0;
         Uint32 first, second;
         SDL_srand(1234);

@@ -107,15 +107,15 @@ lavapipe/llvmpipe):
 
 | Check | Result |
 |-------|--------|
-| `python3 tools/check_api.py --lib build/libSDLop.so` | 21/21 headers identical to SDL3 3.2.10, every declared function exported |
-| `test_core` (offscreen, wayland **and** x11) | 118 checks, 0 failures |
+| `python3 tools/check_api.py --lib build/libSDLop.so` (or `make api-check`) | 21/21 headers identical to SDL3 3.2.10, every declared function exported. A declaration that differs from upstream in *signature* is a failure in SDLop's own headers too, not only in the generated ones (that gap let six of them return the wrong type) |
+| `test_core` (offscreen, wayland **and** x11) | 124 checks, 0 failures |
 | `test_input` (offscreen **and** wayland **and** x11; FIFO record feed) | 93 checks, 0 failures — passes on both a US and a French keyboard layout |
 | `test_video` (offscreen **and** wayland **and** x11) | 91 checks, 0 failures (102 under sway's two outputs) |
 | `test_gl` (weston, x11) | 28 checks, 0 failures — EGL context *and* Vulkan surface created and destroyed |
 | `examples/hello` (weston, sway, Xvfb) | frames rendered and presented, exit 0 |
 | `tests/x11_input.sh` (`make x11-check`, Xvfb + `xdotool`) | 25 checks, 0 failures — enter/motion/button/wheel/leave, scancodes, keycodes, modifiers, `SDL_EVENT_TEXT_INPUT`, shift-a, Ctrl suppression, held-key repeat (and the same with the server's auto-repeat switched off), resize/move from the X server, the platform properties, display bounds against `xrandr` |
 | Key and pointer stream vs stock SDL3 on X11 (`xdotool`-driven, same script) | identical scancodes, keycodes, modifiers, text, buttons, wheel and focus events, and the same window-lifecycle events in the same order |
-| `make behaviour-check` (one probe program compiled against both libraries, same scripted input, traces diffed; US and German layouts) | 33 input events identical in order (keys, text, modstate incl. Caps Lock, buttons, wheel, motion with deltas), the 15 window-lifecycle events identical as a set, key/scancode name tables identical. The one reported difference: `SDL_GetKeyFromName()` for punctuation the layout shifts (German `?` -> 0xdf in stock, 0x2f here) follows the active layout in stock and SDLop's US tables |
+| `make behaviour-check` (one probe program compiled against both libraries, same scripted input **including a live `setxkbmap` switch while both windows are open**, traces diffed; US and German layouts) | 36 input events identical in order (keys, text, modstate incl. Caps Lock, buttons, wheel, motion with deltas), the 15 window-lifecycle events identical as a set, key/scancode name tables identical. The one reported difference: `SDL_GetKeyFromName()` for punctuation the layout shifts (German `?` -> 0xdf in stock, 0x2f here) follows the active layout in stock and SDLop's US tables |
 | Real key events (`xdotool` into weston's X11 backend) | correct scancodes, keycodes (shift uppercases), `SDL_EVENT_TEXT_INPUT`, Ctrl-suppression, and client-side key repeat |
 | Display geometry vs stock SDL3 (sway, outputs `800x600@1` at 0,0 and `1024x768@2` at 800,0) | identical: bounds, current mode, `pixel_density`, content scale — `512x384` logical for the scale-2 output, content scale 1.0 unless `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY` |
 | `tests/wayland_input.sh` (`make wayland-check`, sway) | 9 checks, 0 failures — enter/motion/button/wheel/leave plus relative-mode deltas, injected with `tools/wl_inject` |

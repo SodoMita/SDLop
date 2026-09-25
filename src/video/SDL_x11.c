@@ -68,6 +68,9 @@ static Atom atom_net_wm_state_maximized_vert, atom_net_wm_state_maximized_horz;
 static Atom atom_net_wm_state_hidden, atom_net_wm_state_above;
 static Atom atom_net_wm_state_demands_attention, atom_net_wm_window_opacity;
 static Atom atom_net_wm_icon, atom_net_active_window, atom_motif_wm_hints, atom_utf8_string;
+/* Root window properties the X server (or the desktop's layout tool) rewrites
+   when the keyboard layout changes; see the PropertyNotify case below. */
+static Atom atom_xkb_rules_names, atom_xklavier_state;
 
 static bool sdlop_x11_xrandr;
 static bool sdlop_x11_xinput2;
@@ -379,6 +382,10 @@ static void sdlop_x11_setup_screen_display(void)
 
 static void sdlop_x11_select_global_events(void)
 {
+    /* Layout switches on a server that does not send this client the core
+       MappingNotify show up as a change of these root properties, so the root
+       window's property changes are wanted as well as the per-window ones. */
+    XSelectInput(sdlop_x11_display, sdlop_x11_root, PropertyChangeMask);
 #ifdef SDLOP_HAVE_XRANDR
     if (sdlop_x11_xrandr) {
         XRRSelectInput(sdlop_x11_display, sdlop_x11_root,
@@ -442,6 +449,10 @@ static bool sdlop_x11_init(void)
     atom_net_active_window = XInternAtom(sdlop_x11_display, "_NET_ACTIVE_WINDOW", False);
     atom_motif_wm_hints = XInternAtom(sdlop_x11_display, "_MOTIF_WM_HINTS", False);
     atom_utf8_string = XInternAtom(sdlop_x11_display, "UTF8_STRING", False);
+    atom_xkb_rules_names = XInternAtom(sdlop_x11_display, "_XKB_RULES_NAMES", False);
+    /* The property stock SDL3 watches as its "this server does not send
+       MappingNotify" fallback (SDL_x11events.c, the XKLAVIER_STATE hack). */
+    atom_xklavier_state = XInternAtom(sdlop_x11_display, "XKLAVIER_STATE", False);
 
     XkbSetDetectableAutoRepeat(sdlop_x11_display, True, &sdlop_x11_detectable_repeat);
 
@@ -505,7 +516,7 @@ static bool sdlop_x11_init(void)
 #ifdef SDLOP_HAVE_XKBCOMMON_X11
     if (!SDLOP_XKBOverrideActive()) {
         int device_id = SDLOP_XKBX11DeviceID(sdlop_x11_display);
-        if (device_id < 0 || !SDLOP_XKBLoadFromX11(sdlop_x11_display, device_id)) {
+        if (device_id < 0 || !SDLOP_XKBLoadFromX11(sdlop_x11_display, device_id, false)) {
             SDLOP_LogWarn("sdlop: could not read the X server keymap; using the local layout");
         }
     }
@@ -544,10 +555,18 @@ static void sdlop_x11_pump_events(void);
 
 static unsigned long sdlop_x11_event_mask(void)
 {
+    /* KeymapStateMask is what makes the server send this client KeymapNotify;
+       stock SDL3 selects it too, because its own KeymapNotify handler is how it
+       notices a *group* switch (the XKB group changed while the keys it saw did
+       not say so). SDLop asks for the same mask so the server's view of this
+       client is the same one stock has, but it answers KeymapNotify in the
+       property/MappingNotify paths instead: its layout state follows the keys the
+       input path delivers, which is what makes a group switch the evdev worker
+       sees work as well. */
     return StructureNotifyMask | ExposureMask | FocusChangeMask | EnterWindowMask |
            LeaveWindowMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
            ButtonReleaseMask | PointerMotionMask | PropertyChangeMask |
-           VisibilityChangeMask;
+           VisibilityChangeMask | KeymapStateMask;
 }
 
 static void sdlop_x11_set_motif_hints(SDL_Window *window, bool decorated)
@@ -1551,6 +1570,21 @@ static void sdlop_x11_handle_motion(SDL_Window *window, XMotionEvent *motion)
     sdlop_x11_send_motion(window, (float)motion->x, (float)motion->y);
 }
 
+/* Re-read the server's keymap after the server said it changed. The rebuild is
+   asked not to announce anything: the callers send exactly one
+   SDL_EVENT_KEYMAP_CHANGED per notification, the way stock SDL3 does. */
+static void sdlop_x11_refresh_keymap(void)
+{
+#if defined(SDLOP_HAVE_XKBCOMMON) && defined(SDLOP_HAVE_XKBCOMMON_X11)
+    if (!SDLOP_XKBOverrideActive()) {
+        int device_id = SDLOP_XKBX11DeviceID(sdlop_x11_display);
+        if (device_id >= 0 && !SDLOP_XKBLoadFromX11(sdlop_x11_display, device_id, false)) {
+            SDLOP_LogWarn("sdlop: could not refresh the X server keymap");
+        }
+    }
+#endif
+}
+
 static void sdlop_x11_handle_event(XEvent *event)
 {
     SDL_Window *window = sdlop_x11_window_from_xid(event->xany.window);
@@ -1649,19 +1683,21 @@ static void sdlop_x11_handle_event(XEvent *event)
             }
             break;
         case MappingNotify:
+            /* The server's keyboard mapping changed: this is the event a live
+               layout switch turns into, and it is answered the way stock SDL3
+               answers it - rebuild the keymap and send SDL_EVENT_KEYMAP_CHANGED,
+               for every MappingNotify, whether or not the rebuild differs from
+               what was there (stock's X11 driver does exactly this; the only
+               keymap that is announced to nobody is a session's first one).
+               The rebuild itself is asked not to announce, so that one event
+               goes out per MappingNotify instead of one per keymap file that
+               changed. */
             if (event->xmapping.request == MappingKeyboard ||
                 event->xmapping.request == MappingModifier) {
                 XRefreshKeyboardMapping(&event->xmapping);
-#if defined(SDLOP_HAVE_XKBCOMMON) && defined(SDLOP_HAVE_XKBCOMMON_X11)
-                if (!SDLOP_XKBOverrideActive()) {
-                    int device_id = SDLOP_XKBX11DeviceID(sdlop_x11_display);
-                    if (device_id >= 0 &&
-                        !SDLOP_XKBLoadFromX11(sdlop_x11_display, device_id)) {
-                        SDLOP_LogWarn("sdlop: could not refresh the X server keymap");
-                    }
-                }
-#endif
+                sdlop_x11_refresh_keymap();
             }
+            SDLOP_SendKeymapChanged(SDL_GetTicksNS());
             break;
         case ConfigureNotify:
             if (window) {
@@ -1704,6 +1740,28 @@ static void sdlop_x11_handle_event(XEvent *event)
                announce twice as many exposes as stock. */
             break;
         case PropertyNotify:
+            /* A live layout switch, seen from the root window. X servers do not
+               agree on how they tell clients about one: some post the core
+               MappingNotify handled above, and the ones that do send it only to
+               clients that never spoke XKB to them at all (measured on Xorg
+               21.1.16: a client that has sent XkbUseExtension receives nothing
+               when setxkbmap reloads a layout). SDLop's connection does speak
+               XKB - its keymap comes from xkbcommon-x11 - so on those servers
+               the switch would be invisible without this. What every server that
+               reloads a layout does rewrite is these root properties, and the new
+               keymap is already readable when the property event arrives
+               (measured, not assumed: a fetch at the event returns the layout
+               that was just switched to). XKLAVIER_STATE is the property stock
+               SDL3 watches for exactly this reason (SDL_x11events.c, "Hack for
+               Ubuntu 12.04 (etc) that doesn't send MappingNotify events"); the
+               rules property is what this X server actually writes. */
+            if (event->xproperty.window == sdlop_x11_root &&
+                (event->xproperty.atom == atom_xkb_rules_names ||
+                 event->xproperty.atom == atom_xklavier_state)) {
+                sdlop_x11_refresh_keymap();
+                SDLOP_SendKeymapChanged(SDL_GetTicksNS());
+                break;
+            }
             if (window) {
                 sdlop_x11_handle_property(window, &event->xproperty);
             }

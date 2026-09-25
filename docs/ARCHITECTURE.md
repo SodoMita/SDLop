@@ -467,6 +467,22 @@ back after a resize), and no motion event on the pointer crossings - X's crossin
 events carry the pointer's position, which is the only way an application that
 draws on motion learns where the pointer is on entry.
 
+The last of those divergences took the longest to pin down, because the reason was
+on the server's side: for a layout switched while the application runs, this X
+server sends the core `MappingNotify` only to clients that never spoke XKB to it
+at all (measured: a client that has sent `XkbUseExtension` receives nothing when
+`setxkbmap` reloads a layout, while one that has not receives the pair), and
+SDLop's connection has to speak XKB - its keymap comes from xkbcommon-x11. What
+such a server does write on every reload is the root property `_XKB_RULES_NAMES`,
+and the new keymap is already readable when that event arrives, so that is what
+the X11 backend answers now (`XKLAVIER_STATE` is watched as well, because it is
+the property stock SDL3 reads for exactly this reason). Both libraries then
+announce the switch; they do not agree on *how many* times (this server posts
+three `MappingNotify` events for one switch, stock sends one event each, SDLop has
+one property change), which is a count no application can depend on - the rig
+collapses the run of `KEYMAP_CHANGED` events so the switch is compared rather than
+the server's chattiness.
+
 Two habits from this work are worth keeping:
 
 * instrument the backend, do not guess what the server sent

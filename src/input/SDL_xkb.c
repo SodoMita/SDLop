@@ -182,8 +182,12 @@ static bool sdlop_xkb_context_ensure(void)
 }
 
 /* Take ownership of a freshly compiled keymap and start answering keycode and
-   text questions from it. */
-static bool sdlop_xkb_install(struct xkb_keymap *keymap)
+   text questions from it. `announce` is the caller's answer to "is this keymap a
+   change the application should hear about?": the platform paths pass true and
+   the replacement rule below decides, the X11 event dispatcher passes false and
+   sends the event itself, because stock SDL3 sends one per MappingNotify whether
+   or not the keymap it rebuilt differs from the last one. */
+static bool sdlop_xkb_install(struct xkb_keymap *keymap, bool announce)
 {
     struct xkb_state *state;
 
@@ -213,7 +217,7 @@ static bool sdlop_xkb_install(struct xkb_keymap *keymap)
         /* From here on, keycodes and text come from this layout instead of the
            built-in "us" tables. */
         SDLOP_SetKeyLayout(&sdlop_xkb_layout);
-        if (replacing) {
+        if (announce && replacing) {
             SDLOP_SendKeymapChanged(SDL_GetTicksNS());
         }
     }
@@ -240,7 +244,7 @@ bool SDLOP_XKBCompileFromString(const char *text, size_t size)
                                         XKB_KEYMAP_FORMAT_TEXT_V1,
                                         XKB_KEYMAP_COMPILE_NO_FLAGS);
     SDLOP_Free(copy);
-    return sdlop_xkb_install(keymap);
+    return sdlop_xkb_install(keymap, true);
 }
 
 bool SDLOP_XKBCompileFromRules(const char *rules, const char *model, const char *layout,
@@ -264,7 +268,7 @@ bool SDLOP_XKBCompileFromRules(const char *rules, const char *model, const char 
         if (keymap) {
             sdlop_xkb_dump_keymap(keymap);
         }
-        return sdlop_xkb_install(keymap);
+        return sdlop_xkb_install(keymap, true);
     }
 }
 
@@ -328,7 +332,7 @@ bool SDLOP_XKBLoadKeymapFD(int fd)
 }
 
 #ifdef SDLOP_HAVE_XKBCOMMON_X11
-bool SDLOP_XKBLoadFromX11(void *xdisplay, int device_id)
+bool SDLOP_XKBLoadFromX11(void *xdisplay, int device_id, bool announce)
 {
     struct xkb_keymap *keymap;
     xcb_connection_t *connection;
@@ -359,7 +363,7 @@ bool SDLOP_XKBLoadFromX11(void *xdisplay, int device_id)
        the server's own modifier state): this layout has to follow the keys the
        input path actually delivers, which may come from the evdev worker rather
        than from the X event stream. */
-    return sdlop_xkb_install(keymap);
+    return sdlop_xkb_install(keymap, announce);
 }
 
 int SDLOP_XKBX11DeviceID(void *xdisplay)

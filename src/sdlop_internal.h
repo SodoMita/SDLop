@@ -169,7 +169,11 @@ void SDLOP_XKBEnsure(void);
 void SDLOP_XKBQuit(void);
 #ifdef SDLOP_HAVE_XKBCOMMON_X11
 /* Read the X server's core keyboard keymap. `xdisplay` is a Display*. */
-bool SDLOP_XKBLoadFromX11(void *xdisplay, int device_id);
+/* Load the X server's keymap through libxkbcommon-x11. `announce` is false when
+   the caller sends SDL_EVENT_KEYMAP_CHANGED itself (the X11 event dispatcher
+   does, once per MappingNotify, the way stock SDL3 does); the platform paths
+   pass true and the "a keymap replaced another one" rule decides. */
+bool SDLOP_XKBLoadFromX11(void *xdisplay, int device_id, bool announce);
 int SDLOP_XKBX11DeviceID(void *xdisplay);
 #endif
 #endif /* SDLOP_HAVE_XKBCOMMON */
