@@ -174,9 +174,13 @@ keyboard/mouse layers or any of the `src/generated/` tables.
       pointer path be tested with more than one pointer or an absolute device.
 - [ ] CI: build matrix (`WAYLAND=0 EGL=0`, `DEBUG=1`, clang), `make check` under
       weston headless, `check_api.py`, and a bench run that fails on regression.
-- [ ] ABI check: `tests/` programs compiled against **stock** SDL3 headers and
-      linked against `libSDLop.so`, to prove binary compatibility for the
-      subset (the reverse of `check_api.py`).
+- [x] Header-level ABI check: `tools/abi_probe.c` is compiled twice — against
+      SDLop's headers and against stock SDL3's — and prints sizes, member offsets,
+      event/scancode/keycode values, flags and hint strings; `make abi-check`
+      diffs the two. 139 values, currently identical.
+- [ ] Link-level ABI check: `tests/` programs compiled against **stock** SDL3
+      headers and linked against `libSDLop.so`, to prove binary compatibility for
+      the subset (the reverse of `check_api.py`).
 
 ### Later
 

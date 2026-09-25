@@ -35,6 +35,7 @@ make -j4            # build/libSDLop.a and build/libSDLop.so
 make tests          # build the test programs
 make check          # build and run them
 make bench          # build the SDL3-vs-SDLop benchmark (needs real SDL3)
+make abi-check      # layouts/constants vs stock SDL3 headers (needs libsdl3-dev)
 make x11-check      # drive the X11 backend with xdotool (needs an X server)
 make wayland-check  # drive the Wayland backend through wl_inject (needs sway)
 make install        # headers + libraries + sdl3-sdlop.pc

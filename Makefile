@@ -141,7 +141,7 @@ OBJS := $(patsubst src/%,$(BUILD)/obj/%,$(SRCS:.c=.o))
 # headers generated from the SDL3 headers and from the data tables
 GEN_HEADERS := $(GEN)/sdlop_keynames.h $(GEN)/sdlop_pixelformats.h $(GEN)/sdlop_evdev.h
 
-.PHONY: all clean install examples check wayland-check x11-check bench bench-run tools inject regen FORCE
+.PHONY: all clean install examples check wayland-check x11-check abi-check bench bench-run tools inject regen FORCE
 all: $(BUILD)/libSDLop.a $(BUILD)/libSDLop.so
 
 $(FEATURE_STAMP): FORCE
@@ -278,6 +278,24 @@ $(WAYLAND_CLIENTS) $(X11_CLIENTS): $(BUILD)/tests/%: tests/%.c $(BUILD)/libSDLop
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(BUILD)/libSDLop.a $(LIBS) -o $@
 	@echo "  [exe] $@"
+
+# Header-level ABI check: the probe is compiled against SDLop's headers and
+# against the system SDL3's, and the two outputs must be identical.
+abi-check:
+	@mkdir -p $(BUILD)/tools
+	$(CC) -std=gnu11 -O0 -Wall -Iinclude tools/abi_probe.c -o $(BUILD)/tools/abi_probe_sdlop
+	@if ! pkg-config --exists sdl3; then \
+		echo "  (skip) stock SDL3 development files are not installed"; exit 0; \
+	fi
+	$(CC) -std=gnu11 -O0 -Wall $$(pkg-config --cflags sdl3) tools/abi_probe.c -o $(BUILD)/tools/abi_probe_stock
+	@$(BUILD)/tools/abi_probe_sdlop > $(BUILD)/tools/abi_sdlop.txt
+	@$(BUILD)/tools/abi_probe_stock > $(BUILD)/tools/abi_stock.txt
+	@if diff -u $(BUILD)/tools/abi_stock.txt $(BUILD)/tools/abi_sdlop.txt > $(BUILD)/tools/abi_diff.txt; then \
+		echo "  ABI: $$(wc -l < $(BUILD)/tools/abi_sdlop.txt) values identical to stock SDL3"; \
+	else \
+		echo "  ABI: differences from stock SDL3 ($(BUILD)/tools/abi_diff.txt):"; \
+		cat $(BUILD)/tools/abi_diff.txt; exit 1; \
+	fi
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/include/SDL3 $(DESTDIR)$(PREFIX)/lib/pkgconfig
