@@ -87,25 +87,12 @@ static bool sdlop_x11_last_key_down;
    absolute move and the first delta after a warp are derived from it. */
 static float sdlop_x11_mouse_x, sdlop_x11_mouse_y;
 
-/* The backend state a window keeps lives in the anonymous struct the internal
-   header declares, so this is its layout: the fields are used through it, and
-   the compiler checks that the two definitions agree. */
-typedef struct SDLOP_X11WindowState
-{
-    unsigned long window;          /* X11 Window */
-    unsigned long colormap;        /* Colormap, when the GL visual needs one */
-    void *ic;                      /* XIC (no IME support: unused) */
-    void *glx;                     /* GLXContext wrapper (unused: EGL only) */
-    void *egl_window;              /* unused on X11 */
-    void *gc;                      /* Xlib GC used for presenting */
-    void *image;                   /* XImage the window is presented from */
-    void *shm;                     /* XShmSegmentInfo when MIT-SHM is used */
-    void *buffer;                  /* the pixel buffer the XImage points at */
-    int buffer_pitch;
-    bool is_popup;
-} SDLOP_X11WindowState;
-
-#define SDLOP_X11_STATE(window) ((SDLOP_X11WindowState *)&(window)->driver.x11)
+/* The backend state a window keeps: SDLOP_X11WindowState, declared in
+   sdlop_internal.h as the type of the x11 member of the driver union. It used to
+   be re-declared here, and the copy drifted from the union (it kept three fields
+   the union had dropped), so fields past the drift were read and written at the
+   wrong offsets. Never redeclare it. */
+#define SDLOP_X11_STATE(window) (&(window)->driver.x11)
 
 /* ------------------------------------------------------------------------- */
 /* Windows: lookup, visual selection                                         */

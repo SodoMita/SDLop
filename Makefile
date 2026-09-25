@@ -13,7 +13,7 @@
 #   make clean
 #
 # Options:
-#   CC=clang OPT="-O3 -march=native" DEBUG=1 WAYLAND=0 X11=0 EGL=0 OFFSCREEN=1
+#   CC=clang OPT="-O3 -march=native" DEBUG=1 SANITIZE=1 WAYLAND=0 X11=0 EGL=0 OFFSCREEN=1
 
 CC      ?= cc
 AR      ?= ar
@@ -29,6 +29,15 @@ LDFLAGS ?=
 
 ifdef DEBUG
 CFLAGS += -O0 -DSDLOP_DEBUG
+endif
+
+# SANITIZE=1 builds with the address and undefined-behaviour sanitizers, which is
+# how the input worker, the present path and the teardown order get checked:
+#   make SANITIZE=1 && ./build/examples/hello
+ifdef SANITIZE
+SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
+CFLAGS  += $(SAN_FLAGS)
+LDFLAGS += $(SAN_FLAGS)
 endif
 
 # ---------------------------------------------------------------- dependencies

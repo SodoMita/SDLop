@@ -47,6 +47,23 @@ the application and the pixels, not as Wayland present performance — run it wi
 `SDL_VIDEODRIVER=x11 DISPLAY=:99` (or on a real Wayland session) to see the
 present cost both libraries actually pay.
 
+### Two caveats before you quote a number
+
+* **On weston the comparison is not like for like.** Weston does not implement
+  `zxdg_decoration_manager_v1`, so stock SDL3 falls back to client-side
+  decorations and initialises **libdecor + GTK 3** for every window it creates
+  (`/proc/self/maps` shows `libgtk-3.so` and `libdecor-gtk.so` being loaded).
+  SDLop does not implement client-side decorations at all (a documented
+  omission), so on weston its windows have no titlebar and the init/window rows
+  compare "SDL3 with GTK decorations" against "SDLop without". On sway, which
+  implements server-side decorations, both libraries let the compositor draw the
+  titlebar and the numbers are comparable (the Wayland table in PERFORMANCE.md is
+  sway).
+* **A compositor round trip is not the library's cost.** Where both libraries
+  attach their buffer and commit (Wayland present), the difference between them
+  is small on purpose; on X11 stock uses `XPutImage` while SDLop uses MIT-SHM,
+  which is a real difference and shows up as 13x.
+
 See [../docs/PERFORMANCE.md](../docs/PERFORMANCE.md) for the current results, the
-method, and the three hot paths that this benchmark found were slower than SDL3
+method, and the four hot paths that this benchmark found were slower than SDL3
 before they were fixed.

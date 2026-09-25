@@ -99,6 +99,17 @@ not readable — XWayland, Flatpak, a sandbox, a remote session. What it owns:
   `create_vulkan_surface` / `get_vulkan_instance_extensions` /
   `vulkan_presentation_support`.
 
+The per-backend state a window carries is a named struct in the internal header
+(`SDLOP_X11WindowState`, `SDLOP_WaylandWindowState`) and the `driver` union is
+made of those two types, because a backend reaches its state through a local
+macro (`SDLOP_X11_STATE(window)`) and a second copy of the layout is a trap: the
+X11 copy once kept three fields the union had dropped, so every field from the
+GC on was addressed 24 bytes off. The present path worked — it was self-consistent
+inside the file — while the teardown read the wrong offset and leaked one GC per
+window. The address sanitizer found it (`make SANITIZE=1`, a 50-cycle
+init/window/present/destroy loop); it is documented there so the copy does not
+come back.
+
 ### Displays: a burst of events, closed by `wl_output.done`
 
 A Wayland output is not described by one object: `wl_output` carries the mode,

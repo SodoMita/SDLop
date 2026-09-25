@@ -65,6 +65,14 @@ compositor:
 | `SDL_FillSurfaceRect` + `SDL_UpdateWindowSurface` (640x480) | 2880690 ns | 1483737 ns | 1.9x faster |
 | `SDL_GetTicks` / `SDL_GetPerformanceCounter` | 31.9 / 25.5 ns | 27.5 / 24.8 ns | 1.2x / tie |
 
+Two caveats on the Wayland row. Weston, unlike sway, has no
+`zxdg_decoration_manager_v1`, so stock SDL3 falls back to client-side
+decorations and loads libdecor + GTK 3 per window — on that compositor the
+init/window rows compare SDL3 *with* decorations against SDLop *without* (SDLop
+does not implement client-side decorations; it is a documented omission). The
+table above is sway, where both libraries let the compositor draw the titlebar
+and the comparison is like for like.
+
 `SDL_UpdateWindowSurface` on Wayland is the one number that is close to a tie,
 and it should be: both libraries attach one `wl_shm` buffer and commit, so the
 cost is the compositor's, not the library's. On X11 it is `XShmPutImage` against
@@ -101,8 +109,8 @@ Readings of the individual benchmarks:
 
 ## What the benchmark found (and what was fixed)
 
-Four hot paths were **slower** than SDL3 at some point, and each one was found
-by this benchmark — which is why it is worth keeping:
+Five problems were found this way (four of them *slower* hot paths, one a crash);
+none was found by reading the code, and all are fixed:
 
 1. **A `write()` to the wakeup eventfd on every pushed event** (0.34x on the
    push/poll round trip). The eventfd exists so that a thread parked in
@@ -134,8 +142,19 @@ by this benchmark — which is why it is worth keeping:
    empty — the same fast path stock SDL3 has, confirmed by measuring stock on the
    same X server (26 ns/event there while its own empty-queue poll is 1582 ns).
    Push/poll went 383 ns → 16 ns per event on X11.
+5. **A stale Wayland connection on re-init.** `make bench` on weston exited 139
+   (segfault) while the same binary was clean on sway, and no amount of reading
+   the teardown order explained it. Running the cycle loop under
+   `-fsanitize=address` showed weston rejecting the *second* `SDL_Init` with
+   "invalid arguments for zwp_relative_pointer_manager_v1.get_relative_pointer",
+   after which the quit path dereferenced proxies from the dead connection:
+   `sdlop_wayland_quit()` destroyed the globals but never dropped its pointers,
+   so a re-init handed libwayland objects from a connection that no longer
+   belonged to the compositor. A live connection makes that invisible — the
+   benchmark's init/quit cycle loop is what exposed it, and it is the reason
+   `make SANITIZE=1` now exists.
 
-All four fixes are pure fast paths: the slow paths (an actual waiter, an actual
+All four performance fixes are pure fast paths: the slow paths (an actual waiter, an actual
 queued callback, an actual timer, an empty queue, a session that does need the
 fallback keymap) are unchanged, and the whole test suite plus the Wayland and X11
 end-to-end rigs were re-run after them.

@@ -564,6 +564,40 @@ typedef struct SDLOP_WaylandBufferSlot
     int w, h;
 } SDLOP_WaylandBufferSlot;
 
+/* The per-backend state a window keeps. Both are plain structs with no
+   pointers to SDLop types, so they can be declared before struct SDL_Window. */
+typedef struct SDLOP_X11WindowState
+{
+    unsigned long window;          /* X11 Window */
+    unsigned long colormap;        /* Colormap we created for a GL visual */
+    void *gc;                      /* Xlib GC used for presenting */
+    void *image;                   /* XImage the window is presented from */
+    void *shm;                     /* XShmSegmentInfo when MIT-SHM is used */
+    void *buffer;                  /* our own pixel buffer */
+    int buffer_pitch;
+    bool is_popup;
+} SDLOP_X11WindowState;
+
+typedef struct SDLOP_WaylandWindowState
+{
+    struct wl_surface *wl_surface;
+    struct xdg_surface *xdg_surface;
+    struct xdg_toplevel *xdg_toplevel;
+    struct xdg_popup *xdg_popup;
+    struct wl_egl_window *egl_window;   /* when GL is used */
+    struct wp_viewport *viewport;       /* HiDPI scaling */
+    SDLOP_WaylandBufferSlot buffers[SDLOP_WAYLAND_NUM_BUFFERS];
+    int num_buffers;
+    struct wl_callback *frame_callback;      /* re-armed after every present */
+    struct SDLOP_WaylandOutput *outputs[8];  /* wl_surface.enter(), oldest first */
+    int num_outputs;
+    struct zwp_locked_pointer_v1 *locked_pointer;      /* relative mouse mode */
+    struct zwp_confined_pointer_v1 *confined_pointer;  /* mouse grab / rect */
+    bool configured;
+    bool pending_resize;
+    int pending_w, pending_h;
+} SDLOP_WaylandWindowState;
+
 /* SDLop defines the opaque SDL_Window itself (upstream leaves it opaque to
    applications, which is what makes this possible). */
 struct SDL_Window
@@ -598,39 +632,16 @@ struct SDL_Window
     SDL_HitTest hit_test;
     void *hit_test_data;
 
-    /* backend specific */
+    /* backend specific. The two states are named types, not anonymous structs
+       in the union: a backend has a local alias for its own state and the fields
+       must line up with the union member exactly. (They once did not: the X11
+       alias kept three fields that the union had dropped, so every field from
+       the GC on was read and written 24 bytes off - which is how a present path
+       that worked nevertheless leaked one GC per window.) */
     union
     {
-        struct
-        {
-            unsigned long window;      /* X11 Window */
-            unsigned long colormap;    /* Colormap we created for a GL visual */
-            void *gc;                  /* Xlib GC used for presenting */
-            void *image;               /* XImage the window is presented from */
-            void *shm;                 /* XShmSegmentInfo when MIT-SHM is used */
-            void *buffer;              /* our own pixel buffer */
-            int buffer_pitch;
-            bool is_popup;
-        } x11;
-        struct
-        {
-            struct wl_surface *wl_surface;
-            struct xdg_surface *xdg_surface;
-            struct xdg_toplevel *xdg_toplevel;
-            struct xdg_popup *xdg_popup;
-            struct wl_egl_window *egl_window;   /* when GL is used */
-            struct wp_viewport *viewport;       /* HiDPI scaling */
-            SDLOP_WaylandBufferSlot buffers[SDLOP_WAYLAND_NUM_BUFFERS];
-            int num_buffers;
-            struct wl_callback *frame_callback;   /* re-armed after every present */
-            struct SDLOP_WaylandOutput *outputs[8];  /* wl_surface.enter(), oldest first */
-            int num_outputs;
-            struct zwp_locked_pointer_v1 *locked_pointer;      /* relative mouse mode */
-            struct zwp_confined_pointer_v1 *confined_pointer;  /* mouse grab / rect */
-            bool configured;
-            bool pending_resize;
-            int pending_w, pending_h;
-        } wayland;
+        SDLOP_X11WindowState x11;
+        SDLOP_WaylandWindowState wayland;
     } driver;
 
     struct SDL_Window *next;

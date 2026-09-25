@@ -48,6 +48,7 @@ so a machine without Wayland, EGL or xkbcommon still builds everything else:
 make WAYLAND=0 EGL=0       # offscreen-only build
 make X11=0                 # without libX11
 make DEBUG=1               # -O0 -DSDLOP_DEBUG
+make SANITIZE=1            # address + undefined sanitizers (see PERFORMANCE.md)
 make CC=clang OPT=-O3
 ```
 

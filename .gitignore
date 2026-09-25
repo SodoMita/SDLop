@@ -1,5 +1,5 @@
-# Build output
-build/
+# Build output (build/ plus the sanitizer and debug trees: build-asan/, build-dbg/)
+build*/
 
 # Editor and OS noise
 *.swp

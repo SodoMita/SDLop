@@ -2061,11 +2061,24 @@ static bool sdlop_wayland_init(void)
 
 static void sdlop_wayland_quit(void)
 {
+    /* Every global this connection produced has to be dropped here, not just
+       destroyed: the objects belong to the connection that is about to go away,
+       and a process that calls SDL_Init() again (the benchmark's cycle loop, and
+       any application that re-inits) would otherwise hand libwayland proxies
+       from a dead connection - which the compositor sees as an unknown object.
+       Weston rejects that with a protocol error; the release/destroy calls then
+       dereference freed proxies. */
     if (sdlop_wl_cursor_shape_device) {
         wp_cursor_shape_device_v1_destroy(sdlop_wl_cursor_shape_device);
+        sdlop_wl_cursor_shape_device = NULL;
+    }
+    if (sdlop_wl_cursor_surface) {
+        wl_surface_destroy(sdlop_wl_cursor_surface);
+        sdlop_wl_cursor_surface = NULL;
     }
     if (sdlop_wl_cursor_shape_manager) {
         wp_cursor_shape_manager_v1_destroy(sdlop_wl_cursor_shape_manager);
+        sdlop_wl_cursor_shape_manager = NULL;
     }
     if (sdlop_wl_relative_pointer) {
         zwp_relative_pointer_v1_destroy(sdlop_wl_relative_pointer);
@@ -2081,6 +2094,7 @@ static void sdlop_wayland_quit(void)
     }
     if (sdlop_wl_viewporter) {
         wp_viewporter_destroy(sdlop_wl_viewporter);
+        sdlop_wl_viewporter = NULL;
     }
     for (int i = 0; i < sdlop_wl_num_outputs; i++) {
         if (sdlop_wl_outputs[i].xdg_output) {
@@ -2094,31 +2108,41 @@ static void sdlop_wayland_quit(void)
     }
     if (sdlop_wl_pointer) {
         wl_pointer_release(sdlop_wl_pointer);
+        sdlop_wl_pointer = NULL;
+        sdlop_wl_has_pointer = false;
     }
     if (sdlop_wl_keyboard) {
         wl_keyboard_release(sdlop_wl_keyboard);
+        sdlop_wl_keyboard = NULL;
+        sdlop_wl_has_keyboard = false;
     }
     if (sdlop_wl_seat) {
         wl_seat_release(sdlop_wl_seat);
+        sdlop_wl_seat = NULL;
     }
     for (int i = 0; i < sdlop_wl_num_outputs; i++) {
         if (sdlop_wl_outputs[i].output) {
             wl_output_release(sdlop_wl_outputs[i].output);
+            sdlop_wl_outputs[i].output = NULL;
         }
     }
     sdlop_wl_num_outputs = 0;
     sdlop_wl_next_output_x = 0;
     if (sdlop_wl_wm_base) {
         xdg_wm_base_destroy(sdlop_wl_wm_base);
+        sdlop_wl_wm_base = NULL;
     }
     if (sdlop_wl_shm) {
         wl_shm_destroy(sdlop_wl_shm);
+        sdlop_wl_shm = NULL;
     }
     if (sdlop_wl_compositor) {
         wl_compositor_destroy(sdlop_wl_compositor);
+        sdlop_wl_compositor = NULL;
     }
     if (sdlop_wl_registry) {
         wl_registry_destroy(sdlop_wl_registry);
+        sdlop_wl_registry = NULL;
     }
     if (sdlop_wl_display) {
         wl_display_flush(sdlop_wl_display);
