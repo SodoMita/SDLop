@@ -113,9 +113,9 @@ and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
 Init/quit · `SDL_Init` `SDL_InitSubSystem` `SDL_QuitSubSystem` `SDL_WasInit` `SDL_Quit`
 Error · `SDL_SetError` `SDL_GetError` `SDL_ClearError` `SDL_OutOfMemory`
 Timer · `SDL_GetTicks` `SDL_GetTicksNS` `SDL_GetPerformanceCounter` `SDL_GetPerformanceFrequency` `SDL_Delay` `SDL_DelayNS`
-Video · `SDL_CreateWindow` `SDL_DestroyWindow` `SDL_ShowWindow` `SDL_HideWindow` `SDL_SetWindowTitle` `SDL_GetWindowTitle` `SDL_SetWindowSize` `SDL_GetWindowSize` `SDL_SetWindowPosition` `SDL_GetWindowPosition` `SDL_MinimizeWindow` `SDL_MaximizeWindow` `SDL_RestoreWindow` `SDL_SetWindowFullscreen` `SDL_RaiseWindow` `SDL_GetWindowID` `SDL_GetWindowFromID` `SDL_GetWindowFlags` `SDL_GetCurrentVideoDriver` `SDL_GetNumVideoDrivers` `SDL_GetVideoDriver`
-Events · `SDL_PumpEvents` `SDL_PollEvent` `SDL_WaitEvent` `SDL_WaitEventTimeout` `SDL_PushEvent` `SDL_HasEvent` `SDL_HasEvents` `SDL_FlushEvent` `SDL_FlushEvents` `SDL_RegisterEvents` `SDL_QuitRequested` `SDL_GetWindowFromEvent`
-Keyboard · `SDL_GetKeyboardState` `SDL_GetKeyState` `SDL_ResetKeyboard` `SDL_GetModState` `SDL_SetModState` `SDL_GetKeyboardFocus` `SDL_GetKeyFromScancode` `SDL_GetScancodeFromKey` `SDL_GetScancodeName` `SDL_GetKeyName`
+Video · `SDL_CreateWindow` `SDL_DestroyWindow` `SDL_ShowWindow` `SDL_HideWindow` `SDL_SetWindowTitle` `SDL_GetWindowTitle` `SDL_SetWindowSize` `SDL_GetWindowSize` `SDL_SetWindowPosition` `SDL_GetWindowPosition` `SDL_MinimizeWindow` `SDL_MaximizeWindow` `SDL_RestoreWindow` `SDL_SetWindowFullscreen` `SDL_RaiseWindow` `SDL_GetWindowID` `SDL_GetWindowFromID` `SDL_GetWindowFlags` `SDL_GetCurrentVideoDriver` `SDL_GetNumVideoDrivers` `SDL_GetVideoDriver` `SDL_GetWindowDisplayScale`
+Events · `SDL_PumpEvents` `SDL_PollEvent` `SDL_WaitEvent` `SDL_WaitEventTimeout` `SDL_PushEvent` `SDL_HasEvent` `SDL_HasEvents` `SDL_FlushEvent` `SDL_FlushEvents` `SDL_RegisterEvents` `SDL_GetWindowFromEvent`
+Keyboard · `SDL_GetKeyboardState` `SDL_ResetKeyboard` `SDL_GetModState` `SDL_SetModState` `SDL_GetKeyboardFocus` `SDL_GetKeyFromScancode` `SDL_GetScancodeFromKey` `SDL_GetScancodeName` `SDL_GetKeyName`
 Mouse · `SDL_GetMouseState` `SDL_GetRelativeMouseState` `SDL_GetMouseFocus` `SDL_SetWindowRelativeMouseMode` `SDL_GetWindowRelativeMouseMode`
 Surfaces · `SDL_CreateSurface` `SDL_CreateSurfaceFrom` `SDL_DestroySurface` `SDL_GetWindowSurface` `SDL_UpdateWindowSurface` `SDL_UpdateWindowSurfaceRects` `SDL_DestroyWindowSurface` `SDL_WindowHasSurface` `SDL_FillSurfaceRect` `SDL_FillSurfaceRects` `SDL_ReadSurfacePixel` `SDL_LockSurface` `SDL_UnlockSurface` `SDL_MapSurfaceRGB` `SDL_MapSurfaceRGBA` `SDL_MapRGB` `SDL_MapRGBA`
 OpenGL · `SDL_GL_SetAttribute` `SDL_GL_GetAttribute` `SDL_GL_CreateContext` `SDL_GL_DestroyContext` `SDL_GL_MakeCurrent` `SDL_GL_GetCurrentContext` `SDL_GL_GetCurrentWindow` `SDL_GL_SwapWindow` `SDL_GL_SetSwapInterval` `SDL_GL_GetSwapInterval` `SDL_GL_GetProcAddress` `SDL_GL_ResetAttributes`
@@ -159,6 +159,12 @@ parallel; mix both models freely.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ctest --test-dir build            # headless tests
+
+# Optional: compare public layouts/constants with stock SDL3 3.2.10 headers
+cmake -S . -B build-abi \
+  -DSDL3_REFERENCE_INCLUDE=/path/to/SDL3/include
+cmake --build build-abi -j
+ctest --test-dir build-abi -R abi_check --output-on-failure
 ```
 
 Build deps: `wayland-protocols` + `wayland-scanner` (for the generated

@@ -268,7 +268,9 @@ typedef enum SDL_GLAttr
 #define SDL_GL_CONTEXT_RESET_ISOLATION_FLAG    0x0008
 
 /**
- * Load the OpenGL library (no-op on SDLop; EGL is linked in).
+ * Select the OpenGL library. SDLop loads EGL dynamically when the video
+ * driver creates its first context; path is currently accepted for API
+ * compatibility.
  */
 extern bool SDL_GL_LoadLibrary(const char *path);
 
@@ -278,7 +280,8 @@ extern bool SDL_GL_LoadLibrary(const char *path);
 extern SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc);
 
 /**
- * Unload the OpenGL library (no-op on SDLop).
+ * Unload the OpenGL library. SDLop releases its dynamically loaded EGL
+ * symbols when the video subsystem shuts down.
  */
 extern void SDL_GL_UnloadLibrary(void);
 

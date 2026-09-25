@@ -122,7 +122,8 @@ bool SDL_GL_GetAttribute(SDL_GLAttr attr, int *value)
 bool SDL_GL_LoadLibrary(const char *path)
 {
     (void)path;
-    return true; /* EGL/GLES are linked directly */
+    /* EGL/GLES are loaded by the active video driver on first use. */
+    return true;
 }
 
 void SDL_GL_UnloadLibrary(void)
