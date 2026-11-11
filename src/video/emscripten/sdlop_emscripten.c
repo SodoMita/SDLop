@@ -740,6 +740,7 @@ SDLop_VideoDevice SDLop_emscripten_device = {
     .GL_SetSwapInterval = emscripten_GL_SetSwapInterval,
     .GL_GetSwapInterval = emscripten_GL_GetSwapInterval,
     .Vulkan_CreateSurface = NULL, /* no Vulkan on the web */
+    .Vulkan_GetInstanceExtensions = NULL,
 };
 
 #endif /* SDLop_VIDEO_EMSCRIPTEN */

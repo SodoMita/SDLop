@@ -88,6 +88,10 @@ struct SDLop_VideoDevice
 
     /* Vulkan WSI */
     bool (*Vulkan_CreateSurface)(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface);
+    /* Vulkan instance extensions to advertise to apps (NULL-terminated).
+     * Optional: when NULL, SDL_Vulkan_GetInstanceExtensions() returns the
+     * default (VK_KHR_surface + VK_KHR_wayland_surface). */
+    const char *const *(*Vulkan_GetInstanceExtensions)(SDLop_VideoDevice *device, Uint32 *count);
 };
 
 /* Provided by backends */

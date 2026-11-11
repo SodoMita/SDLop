@@ -1716,4 +1716,5 @@ SDLop_VideoDevice SDLop_wayland_device = {
 
     /* Vulkan (lavapipe) - implemented in sdlop_wayland_vulkan.c */
     SDLOP_Wayland_Vulkan_CreateSurface,
+    NULL, /* Vulkan_GetInstanceExtensions: default (VK_KHR_surface + VK_KHR_wayland_surface) */
 };

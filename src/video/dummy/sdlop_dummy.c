@@ -287,4 +287,5 @@ SDLop_VideoDevice SDLop_dummy_device = {
     dummy_GL_SetSwapInterval,
     dummy_GL_GetSwapInterval,
     dummy_Vulkan_CreateSurface,
+    NULL, /* Vulkan_GetInstanceExtensions: not supported */
 };

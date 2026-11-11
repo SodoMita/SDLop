@@ -55,6 +55,15 @@ typedef struct kmsdrm_gl_context
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
 static bool egl_initialized;
 static int swap_interval = 1; /* vsync by default (SDL3 behavior) */
+
+/* SDL_HINT_VIDEO_DOUBLE_BUFFER equivalent: wait for the flip right after
+ * queueing it (matches sdl's optional immediate wait; the software path is
+ * always synchronous) */
+static bool kmsdrm_double_buffer(void)
+{
+    const char *v = getenv("SDLOP_KMSDRM_DOUBLE_BUFFER");
+    return v && *v && strcmp(v, "0") != 0;
+}
 static uint32_t kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888; /* must match the GBM surface format */
 
 /* the single device instance lives in sdlop_kmsdrm.c; reach it through a
@@ -323,7 +332,6 @@ void KMSDRM_DestroyGLSurfaces(KMSDRM_WindowData *windata)
 
 void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
 {
-    KMSDRM_DeviceData *dev = vid();
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
     if (!windata) {
         SDL_SetError("Invalid window");
@@ -531,6 +539,10 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
                                         flip_flags, &windata->waiting_for_flip);
         if (ret == 0) {
             windata->waiting_for_flip = true;
+            /* immediate wait (SDL_HINT_VIDEO_DOUBLE_BUFFER) */
+            if (kmsdrm_double_buffer()) {
+                KMSDRM_WaitPageflip(dev, windata, 1500);
+            }
         } else {
             int err = errno;
             if (err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {

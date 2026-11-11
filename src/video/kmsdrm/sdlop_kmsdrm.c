@@ -22,10 +22,25 @@
     SDLOP_KMSDRM_CONNECTOR=<substr>         pick the output by name, e.g. VGA, HDMI
     SDLOP_KMSDRM_NOFLIP=1                   never page flip; always drmModeSetCrtc
     SDLOP_KMSDRM_FLIP_TIMEOUT_MS=<n>        page flip wait timeout (default 1500)
+    SDLOP_KMSDRM_REQUIRE_MASTER=0           do not require DRM master at startup
+                                          (default: require it; SDL3 semantics)
+    SDLOP_KMSDRM_DOUBLE_BUFFER=1           wait for the flip immediately after
+                                          queueing it (GL path; SDL_HINT_VIDEO_DOUBLE_BUFFER)
+
+  VRR is enabled automatically when the connector reports VRR_CAPABLE and is
+  restored to its saved state on quit. Panel orientation is logged when set.
+  VT switching (Ctrl+Alt+Fn) is handled with VT_PROCESS mode: scanout is torn
+  down and DRM master dropped on switch-away, re-acquired on switch-back.
+  Vulkan windows (SDL_WINDOW_VULKAN) get a VK_KHR_display surface and own the
+  output; the dumb/GL paths re-acquire master in kmsdrm_CreateWindow().
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
 */
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  /* for SIGRTMIN/SIGRTMAX in VT signal setup */
+#endif
 
 #include "sdlop_kmsdrm.h"
 
@@ -33,9 +48,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
 #include <unistd.h>
 #include <strings.h>
 #include <stdarg.h>
@@ -83,6 +102,366 @@ static int flip_timeout_ms(void)
 static bool is_permission_error(int err)
 {
     return err == EPERM || err == EACCES;
+}
+
+/* SDL3's SDL_HINT_KMSDRM_REQUIRE_DRM_MASTER semantics: default to requiring
+ * DRM master (probing skips cards that cannot be mastered, startup fails
+ * with a clear error otherwise). Set SDLOP_KMSDRM_REQUIRE_MASTER=0 to opt
+ * out and get the historical warn-and-continue behavior. */
+static bool kmsdrm_require_master(void)
+{
+    const char *v = getenv("SDLOP_KMSDRM_REQUIRE_MASTER");
+    return !(v && *v && strcmp(v, "0") == 0);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* DRM master                                                          */
+/* ------------------------------------------------------------------ */
+
+/* Best-effort re-acquisition of DRM master. The device probing code drops
+ * master once at the end of init (so a Vulkan window can grab it); the
+ * dumb/GL scanout paths need it back. Returns false if we still don't hold
+ * it afterwards (modesetting will fail with a lost-master error later). */
+static bool kmsdrm_ensure_master(KMSDRM_DeviceData *vid)
+{
+    if (vid->drm_fd < 0) {
+        vid->drm_fd = open(vid->devpath, O_RDWR | O_CLOEXEC);
+        if (vid->drm_fd < 0) {
+            return false;
+        }
+    }
+    if (SDLOP_DRM_drmSetMaster) {
+        SDLOP_DRM_drmSetMaster(vid->drm_fd);
+    }
+    if (SDLOP_DRM_drmAuthMagic && SDLOP_DRM_drmAuthMagic(vid->drm_fd, 0) == -EACCES) {
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* KMS object properties (VRR / panel orientation), ported from SDL3   */
+/* ------------------------------------------------------------------ */
+
+/* find the prop_id of the property `name` among `props` (frees nothing) */
+static uint32_t kmsdrm_prop_id(int fd, drmModeObjectPropertiesPtr props, const char *name)
+{
+    uint32_t prop_id = 0;
+    if (!SDLOP_DRM_drmModeGetProperty) {
+        return 0;
+    }
+    for (uint32_t i = 0; !prop_id && i < props->count_props; ++i) {
+        drmModePropertyPtr drm_prop = SDLOP_DRM_drmModeGetProperty(fd, props->props[i]);
+        if (!drm_prop) {
+            continue;
+        }
+        if (strcmp(drm_prop->name, name) == 0) {
+            prop_id = drm_prop->prop_id;
+        }
+        SDLOP_DRM_drmModeFreeProperty(drm_prop);
+    }
+    return prop_id;
+}
+
+/* read the raw value of property `name` on `object_id`/`object_type`;
+ * returns false if the property does not exist */
+static bool kmsdrm_prop_get_value(int fd, uint32_t object_id, uint32_t object_type,
+                                  const char *name, uint64_t *value)
+{
+    if (!SDLOP_DRM_drmModeObjectGetProperties || !SDLOP_DRM_drmModeFreeObjectProperties) {
+        return false;
+    }
+    drmModeObjectPropertiesPtr props =
+        SDLOP_DRM_drmModeObjectGetProperties(fd, object_id, object_type);
+    if (!props) {
+        return false;
+    }
+    bool found = false;
+    for (uint32_t i = 0; i < props->count_props; ++i) {
+        drmModePropertyPtr drm_prop = SDLOP_DRM_drmModeGetProperty(fd, props->props[i]);
+        if (!drm_prop) {
+            continue;
+        }
+        if (strcmp(drm_prop->name, name) == 0) {
+            *value = props->prop_values[i];
+            found = true;
+        }
+        SDLOP_DRM_drmModeFreeProperty(drm_prop);
+        if (found) {
+            break;
+        }
+    }
+    SDLOP_DRM_drmModeFreeObjectProperties(props);
+    return found;
+}
+
+/* set a property on an object; best effort (caller holds DRM master) */
+static void kmsdrm_prop_set_value(int fd, uint32_t object_id, uint32_t object_type,
+                                  const char *name, uint64_t value)
+{
+    if (!SDLOP_DRM_drmModeObjectGetProperties || !SDLOP_DRM_drmModeObjectSetProperty) {
+        return;
+    }
+    drmModeObjectPropertiesPtr props =
+        SDLOP_DRM_drmModeObjectGetProperties(fd, object_id, object_type);
+    if (!props) {
+        return;
+    }
+    uint32_t prop_id = kmsdrm_prop_id(fd, props, name);
+    SDLOP_DRM_drmModeFreeObjectProperties(props);
+    if (prop_id) {
+        SDLOP_DRM_drmModeObjectSetProperty(fd, object_id, object_type, prop_id, value);
+    }
+}
+
+static bool kmsdrm_connector_check_vrr_capable(int fd, uint32_t connector_id, const char *name)
+{
+    uint64_t value = 0;
+    if (!kmsdrm_prop_get_value(fd, connector_id, DRM_MODE_OBJECT_CONNECTOR, name, &value)) {
+        return false;
+    }
+    return value != 0;
+}
+
+static bool KMSDRM_CrtcGetVrr(int fd, uint32_t crtc_id)
+{
+    uint64_t value = 0;
+    if (!kmsdrm_prop_get_value(fd, crtc_id, DRM_MODE_OBJECT_CRTC, "VRR_ENABLED", &value)) {
+        return false;
+    }
+    return value != 0;
+}
+
+static void KMSDRM_CrtcSetVrr(int fd, uint32_t crtc_id, bool enabled)
+{
+    kmsdrm_prop_set_value(fd, crtc_id, DRM_MODE_OBJECT_CRTC, "VRR_ENABLED", enabled ? 1 : 0);
+}
+
+/* panel orientation is a *connector* property ("panel orientation"), enum
+ * valued; map it to degrees (0 = unknown/normal). SDLop has no display
+ * properties API, so the value is stored on the display and logged. */
+static int KMSDRM_ConnectorGetOrientation(int fd, uint32_t connector_id)
+{
+    if (!SDLOP_DRM_drmModeObjectGetProperties || !SDLOP_DRM_drmModeGetProperty
+        || !SDLOP_DRM_drmModeFreeProperty || !SDLOP_DRM_drmModeFreeObjectProperties) {
+        return 0;
+    }
+    drmModeObjectPropertiesPtr props =
+        SDLOP_DRM_drmModeObjectGetProperties(fd, connector_id, DRM_MODE_OBJECT_CONNECTOR);
+    if (!props) {
+        return 0;
+    }
+    int orientation = 0;
+    bool done = false;
+    for (uint32_t i = 0; i < props->count_props && !done; ++i) {
+        drmModePropertyPtr drm_prop = SDLOP_DRM_drmModeGetProperty(fd, props->props[i]);
+        if (!drm_prop) {
+            continue;
+        }
+        if (strcmp(drm_prop->name, "panel orientation") == 0
+            && (drm_prop->flags & DRM_MODE_PROP_ENUM)) {
+            /* match the *current* value against the enum list (SDL3 reads
+             * enums[0] which is not necessarily the current one) */
+            for (int j = 0; j < drm_prop->count_enums; ++j) {
+                if (drm_prop->enums[j].value == props->prop_values[i]) {
+                    if (strcmp(drm_prop->enums[j].name, "Upside Down") == 0) {
+                        orientation = 180;
+                    } else if (strcmp(drm_prop->enums[j].name, "Left Side Up") == 0) {
+                        orientation = 90;
+                    } else if (strcmp(drm_prop->enums[j].name, "Right Side Up") == 0) {
+                        orientation = 270;
+                    }
+                    break;
+                }
+            }
+            done = true;
+        }
+        SDLOP_DRM_drmModeFreeProperty(drm_prop);
+    }
+    SDLOP_DRM_drmModeFreeObjectProperties(props);
+    return orientation;
+}
+
+/* ------------------------------------------------------------------ */
+/* VT switch handling (VT_PROCESS mode, ported from SDL3)              */
+/* ------------------------------------------------------------------ */
+
+#define SDLOP_KMSDRM_VT_NONE    0
+#define SDLOP_KMSDRM_VT_RELEASE 1
+#define SDLOP_KMSDRM_VT_ACQUIRE 2
+
+static volatile sig_atomic_t kmsdrm_vt_pending = SDLOP_KMSDRM_VT_NONE;
+static int kmsdrm_vt_console_fd = -1;
+static int kmsdrm_vt_release_sig = 0;
+static int kmsdrm_vt_acquire_sig = 0;
+static struct sigaction kmsdrm_vt_old_release;
+static struct sigaction kmsdrm_vt_old_acquire;
+
+static void kmsdrm_vt_release_action(int signum)
+{
+    (void)signum;
+    kmsdrm_vt_pending = SDLOP_KMSDRM_VT_RELEASE;
+}
+
+static void kmsdrm_vt_acquire_action(int signum)
+{
+    (void)signum;
+    kmsdrm_vt_pending = SDLOP_KMSDRM_VT_ACQUIRE;
+}
+
+static bool kmsdrm_vt_setup_signal(int signum, void (*handler)(int), struct sigaction *old_out)
+{
+    struct sigaction new_action;
+    memset(&new_action, 0, sizeof(new_action));
+    new_action.sa_handler = handler;
+    new_action.sa_flags = SA_RESTART;
+    if (sigaction(signum, &new_action, old_out) < 0) {
+        return false;
+    }
+    if (old_out->sa_handler != SIG_DFL) {
+        /* signal in use: restore and report failure */
+        sigaction(signum, old_out, NULL);
+        return false;
+    }
+    return true;
+}
+
+static int kmsdrm_vt_find_free_signal(void (*handler)(int), struct sigaction *old_out)
+{
+#ifdef SIGRTMIN
+    for (int signum = SIGRTMIN + 2; signum <= SIGRTMAX; ++signum) {
+        if (kmsdrm_vt_setup_signal(signum, handler, old_out)) {
+            return signum;
+        }
+    }
+#endif
+    if (kmsdrm_vt_setup_signal(SIGUSR1, handler, old_out)) {
+        return SIGUSR1;
+    }
+    if (kmsdrm_vt_setup_signal(SIGUSR2, handler, old_out)) {
+        return SIGUSR2;
+    }
+    return 0;
+}
+
+static void kmsdrm_vt_shutdown(void)
+{
+    if (kmsdrm_vt_release_sig) {
+        sigaction(kmsdrm_vt_release_sig, &kmsdrm_vt_old_release, NULL);
+        kmsdrm_vt_release_sig = 0;
+    }
+    if (kmsdrm_vt_acquire_sig) {
+        sigaction(kmsdrm_vt_acquire_sig, &kmsdrm_vt_old_acquire, NULL);
+        kmsdrm_vt_acquire_sig = 0;
+    }
+    if (kmsdrm_vt_console_fd >= 0) {
+        struct vt_mode mode;
+        memset(&mode, 0, sizeof(mode));
+        mode.mode = VT_AUTO;
+        ioctl(kmsdrm_vt_console_fd, VT_SETMODE, &mode);
+        close(kmsdrm_vt_console_fd);
+        kmsdrm_vt_console_fd = -1;
+    }
+    kmsdrm_vt_pending = SDLOP_KMSDRM_VT_NONE;
+}
+
+static void kmsdrm_vt_init(void)
+{
+    /* opening /dev/tty may fail (no controlling console, e.g. service or
+     * ssh) - in that case the kernel keeps VT_AUTO mode and we rely on the
+     * lost-master recovery paths instead */
+    int fd = open("/dev/tty", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        kmsdrm_log("KMSDRM: no controlling tty; VT switching left to the kernel");
+        return;
+    }
+    char kbtype = 0;
+    if (ioctl(fd, KDGKBTYPE, &kbtype) != 0 || (kbtype != KB_101 && kbtype != KB_84)) {
+        close(fd);
+        kmsdrm_log("KMSDRM: /dev/tty is not a keyboard console; VT switching left to the kernel");
+        return;
+    }
+
+    kmsdrm_vt_release_sig = kmsdrm_vt_find_free_signal(kmsdrm_vt_release_action, &kmsdrm_vt_old_release);
+    kmsdrm_vt_acquire_sig = kmsdrm_vt_find_free_signal(kmsdrm_vt_acquire_action, &kmsdrm_vt_old_acquire);
+    if (!kmsdrm_vt_release_sig || !kmsdrm_vt_acquire_sig) {
+        kmsdrm_vt_shutdown();
+        kmsdrm_log("KMSDRM: could not claim signals for VT switching; leaving VT_AUTO");
+        return;
+    }
+
+    struct vt_mode mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.mode = VT_PROCESS;
+    mode.relsig = (short)kmsdrm_vt_release_sig;
+    mode.acqsig = (short)kmsdrm_vt_acquire_sig;
+    mode.frsig = SIGIO;
+    if (ioctl(fd, VT_SETMODE, &mode) < 0) {
+        kmsdrm_vt_shutdown();
+        kmsdrm_log("KMSDRM: VT_SETMODE failed (%s); leaving VT_AUTO", strerror(errno));
+        return;
+    }
+    kmsdrm_vt_console_fd = fd;
+    kmsdrm_log("KMSDRM: VT switching handled (relsig=%d acqsig=%d)",
+               kmsdrm_vt_release_sig, kmsdrm_vt_acquire_sig);
+}
+
+/* release the current VT: free GL scanouts (GBM/EGL does not know we lost
+ * the VT), keep the dumb buffers (they stay valid; the CRTC is simply
+ * reprogrammed on switch-back), drop DRM master */
+static void kmsdrm_vt_release(void)
+{
+    KMSDRM_DeviceData *vid = &kmsdrm;
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        KMSDRM_WindowData *windata = (KMSDRM_WindowData *)w->driverdata;
+        if (!windata) {
+            continue;
+        }
+        if (windata->waiting_for_flip) {
+            KMSDRM_WaitPageflip(vid, windata, 500);
+        }
+        if (windata->gl_active) {
+            KMSDRM_DestroyGLSurfaces(windata);
+        }
+        windata->crtc_programmed = false;
+        windata->sw_front = -1;
+    }
+    if (SDLOP_DRM_drmDropMaster) {
+        SDLOP_DRM_drmDropMaster(vid->drm_fd);
+    }
+    if (kmsdrm_vt_console_fd >= 0) {
+        ioctl(kmsdrm_vt_console_fd, VT_RELDISP, 1);
+    }
+}
+
+/* acquire the VT: take DRM master back; windows reprogram their CRTC on the
+ * next present (software: drmModeSetCrtc; GL: lazily on next swap) */
+static void kmsdrm_vt_acquire(void)
+{
+    KMSDRM_DeviceData *vid = &kmsdrm;
+    kmsdrm_ensure_master(vid);
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        KMSDRM_WindowData *windata = (KMSDRM_WindowData *)w->driverdata;
+        if (windata) {
+            windata->crtc_programmed = false;
+        }
+    }
+    if (kmsdrm_vt_console_fd >= 0) {
+        ioctl(kmsdrm_vt_console_fd, VT_RELDISP, VT_ACKACQ);
+    }
+}
+
+static void kmsdrm_vt_check(void)
+{
+    int pending = kmsdrm_vt_pending;
+    if (pending == SDLOP_KMSDRM_VT_RELEASE) {
+        kmsdrm_vt_pending = SDLOP_KMSDRM_VT_NONE;
+        kmsdrm_vt_release();
+    } else if (pending == SDLOP_KMSDRM_VT_ACQUIRE) {
+        kmsdrm_vt_pending = SDLOP_KMSDRM_VT_NONE;
+        kmsdrm_vt_acquire();
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -174,6 +553,16 @@ static char *kmsdrm_find_device(void)
                     has_connected = true;
                 }
                 SDLOP_DRM_drmModeFreeConnector(conn);
+            }
+            if (usable && has_connected && kmsdrm_require_master()
+                && SDLOP_DRM_drmSetMaster && SDLOP_DRM_drmAuthMagic) {
+                /* SDL3's SDL_HINT_KMSDRM_REQUIRE_DRM_MASTER: do not pick a
+                 * card we cannot become master on. Master is re-acquired in
+                 * kmsdrm_CreateWindow() (and released at the end of init). */
+                SDLOP_DRM_drmSetMaster(fd);
+                if (SDLOP_DRM_drmAuthMagic(fd, 0) == -EACCES) {
+                    has_connected = false;
+                }
             }
             if (usable && has_connected) {
                 best = strdup(path);
@@ -358,6 +747,26 @@ static bool kmsdrm_init_displays(void)
                vid->display.mode.hdisplay, vid->display.mode.vdisplay,
                vid->display.connector->count_modes);
 
+    /* VRR: save the CRTC's current state; enable it if the connector says
+     * it can do variable refresh rate (SDL3 behavior). Restored on quit. */
+    vid->display.saved_vrr = KMSDRM_CrtcGetVrr(vid->drm_fd, vid->display.crtc->crtc_id);
+    vid->display.vrr_enabled = false;
+    if (kmsdrm_connector_check_vrr_capable(vid->drm_fd, vid->display.connector->connector_id,
+                                           "VRR_CAPABLE")) {
+        KMSDRM_CrtcSetVrr(vid->drm_fd, vid->display.crtc->crtc_id, true);
+        vid->display.vrr_enabled = true;
+        kmsdrm_log("KMSDRM: enabling VRR (connector reports VRR_CAPABLE)");
+    }
+
+    /* panel orientation (connector property); SDLop has no display
+     * properties API, so store + log it for diagnostics */
+    vid->display.panel_orientation_degrees =
+        KMSDRM_ConnectorGetOrientation(vid->drm_fd, vid->display.connector->connector_id);
+    if (vid->display.panel_orientation_degrees != 0) {
+        kmsdrm_log("KMSDRM: panel orientation: %d degrees",
+                   vid->display.panel_orientation_degrees);
+    }
+
     result = true;
 
 cleanup:
@@ -379,6 +788,12 @@ cleanup:
 static void kmsdrm_deinit_displays(void)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
+
+    /* restore the CRTC's VRR state to what it was at init (best effort) */
+    if (vid->drm_fd >= 0 && vid->display.crtc) {
+        KMSDRM_CrtcSetVrr(vid->drm_fd, vid->display.crtc->crtc_id, vid->display.saved_vrr);
+        vid->display.vrr_enabled = false;
+    }
 
     /* Restore the CRTC to its original mode, if we know it and had a
      * framebuffer at init time (fbcon's buffer usually survives). */
@@ -433,7 +848,7 @@ static void kmsdrm_deinit_displays(void)
 /* Mode selection                                                      */
 /* ------------------------------------------------------------------ */
 
-static int mode_refresh_mhz(const drmModeModeInfo *m)
+int KMSDRM_ModeRefreshMHz(const drmModeModeInfo *m)
 {
     uint64_t num = (uint64_t)m->clock * 1000;
     uint64_t den = (uint64_t)m->htotal * (uint64_t)m->vtotal;
@@ -462,7 +877,7 @@ static drmModeModeInfo *kmsdrm_closest_mode(KMSDRM_DisplayData *dd, int w, int h
         long side_cost = labs(m->hdisplay - w) + labs(m->vdisplay - h);
         long cost = side_cost * 1000000 + area_cost;
         if (cost < best_cost ||
-            (cost == best_cost && best && mode_refresh_mhz(m) > mode_refresh_mhz(best))) {
+            (cost == best_cost && best && KMSDRM_ModeRefreshMHz(m) > KMSDRM_ModeRefreshMHz(best))) {
             best = m;
             best_cost = cost;
         }
@@ -1143,6 +1558,26 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     windata->egl_surface = EGL_NO_SURFACE;
     windata->clear_color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
 
+    /* Vulkan windows get their scanout from VK_KHR_display instead of the
+     * dumb/GBM paths; leave the CRTC alone and keep the requested size */
+    if (window->flags & SDL_WINDOW_VULKAN) {
+        window->driverdata = windata;
+        sdlop.keyboard_focus = window;
+        sdlop.mouse_focus = window;
+        window->flags |= SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_MOUSE_FOCUS;
+        kmsdrm_log("KMSDRM: Vulkan window (scanout handled by VK_KHR_display)");
+        return true;
+    }
+
+    /* init dropped DRM master (see kmsdrm_Init); take it back for the
+     * dumb/GBM scanout paths. Best effort - modesetting fails cleanly
+     * later with a lost-master error if we cannot get it. */
+    if (!kmsdrm_ensure_master(vid)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                    "KMSDRM: cannot re-acquire DRM master on %s; modesetting will fail",
+                    vid->devpath);
+    }
+
     /* pick the mode (windowed = closest requested, fullscreen = preferred) */
     bool fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
     drmModeModeInfo chosen = kmsdrm_select_mode(dd, window->w, window->h, fullscreen);
@@ -1216,8 +1651,8 @@ static void kmsdrm_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!windata) {
         return;
     }
-    if (windata->gl_active) {
-        return; /* GL owns presentation */
+    if ((window->flags & SDL_WINDOW_VULKAN) || windata->gl_active) {
+        return; /* Vulkan/GL owns presentation */
     }
     if (!windata->crtc_programmed) {
         kmsdrm_present_sw(vid, window);
@@ -1255,6 +1690,12 @@ static bool kmsdrm_mode_change(SDLop_VideoDevice *device, SDL_Window *window)
 {
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
     KMSDRM_DisplayData *dd = windata->display;
+
+    /* Vulkan windows: the display mode is negotiated with the Vulkan driver
+     * when the VK_KHR_display surface is created; don't modeset here */
+    if (window->flags & SDL_WINDOW_VULKAN) {
+        return true;
+    }
 
     bool fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
     drmModeModeInfo chosen = kmsdrm_select_mode(dd, window->w, window->h, fullscreen);
@@ -1369,6 +1810,9 @@ static void kmsdrm_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
     (void)timeout_ms;
     KMSDRM_DeviceData *vid = &kmsdrm;
 
+    /* handle VT switch requests (release: drop master; acquire: re-take) */
+    kmsdrm_vt_check();
+
     /* drain pending DRM events (page flip completions), non-blocking */
     if (vid->drm_fd >= 0) {
         struct pollfd pfd = { vid->drm_fd, POLLIN, 0 };
@@ -1420,6 +1864,9 @@ static bool kmsdrm_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     if (!windata || !dd) {
         return SDL_SetError("Invalid window");
     }
+    if (window->flags & SDL_WINDOW_VULKAN) {
+        return SDL_SetError("Vulkan is active: window surface is not presentable");
+    }
     if (windata->gl_active) {
         return SDL_SetError("OpenGL is active: window surface is not presentable");
     }
@@ -1445,6 +1892,9 @@ static bool kmsdrm_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
     if (!windata) {
         return SDL_SetError("Invalid window");
+    }
+    if (window->flags & SDL_WINDOW_VULKAN) {
+        return SDL_SetError("Vulkan is active: window surface is not presentable");
     }
     if (windata->gl_active) {
         return SDL_SetError("OpenGL is active: window surface is not presentable");
@@ -1498,11 +1948,20 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
         goto failed;
     }
 
-    /* become DRM master if we aren't already (best effort) */
+    /* become DRM master; the modeset path requires it. With
+     * SDLOP_KMSDRM_REQUIRE_MASTER=1 (default) refusal is fatal - clearer
+     * than failing on the first present; set =0 for the historical
+     * warn-and-continue behavior. */
     if (SDLOP_DRM_drmSetMaster) {
         SDLOP_DRM_drmSetMaster(vid->drm_fd);
     }
-    if (SDLOP_DRM_drmAuthMagic(vid->drm_fd, 0) == -EACCES) {
+    if (SDLOP_DRM_drmAuthMagic && SDLOP_DRM_drmAuthMagic(vid->drm_fd, 0) == -EACCES) {
+        if (kmsdrm_require_master()) {
+            SDL_SetError("KMSDRM: cannot become DRM master of %s "
+                         "(set SDLOP_KMSDRM_REQUIRE_MASTER=0 to skip this check)",
+                         vid->devpath);
+            goto failed_close;
+        }
         SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
                     "KMSDRM: no DRM master on %s (another master holds it?); modesetting will fail",
                     vid->devpath);
@@ -1517,10 +1976,21 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
         vid->async_pageflip_support = async_flip != 0;
     }
 
+    kmsdrm_vt_init();
+
+    /* SDL3 drops DRM master after probing so a Vulkan window (VK_KHR_display)
+     * can acquire it; non-Vulkan windows re-acquire master in
+     * kmsdrm_CreateWindow(). Best effort: staying master works for the
+     * dumb/GL paths too. */
+    if (SDLOP_DRM_drmDropMaster) {
+        SDLOP_DRM_drmDropMaster(vid->drm_fd);
+    }
+
     vid->video_init = true;
     return true;
 
 failed_close:
+    kmsdrm_vt_shutdown();
     if (vid->drm_fd >= 0) {
         close(vid->drm_fd);
         vid->drm_fd = -1;
@@ -1537,6 +2007,7 @@ static void kmsdrm_Quit(SDLop_VideoDevice *device)
 
     /* windows are destroyed by the core before this runs */
     kmsdrm_deinit_displays();      /* restores the CRTC, destroys cursor bo */
+    kmsdrm_vt_shutdown();          /* restore VT_AUTO mode on /dev/tty */
     if (vid->gbm_dev) {
         SDLOP_GBM_gbm_device_destroy(vid->gbm_dev);
         vid->gbm_dev = NULL;
@@ -1587,6 +2058,7 @@ SDLop_VideoDevice SDLop_kmsdrm_device = {
     KMSDRM_GL_GetProcAddress,
     KMSDRM_GL_SetSwapInterval,
     KMSDRM_GL_GetSwapInterval,
-    /* Vulkan: not supported on this driver */
-    NULL,
+    /* Vulkan (VK_KHR_surface + VK_KHR_display) - sdlop_kmsdrm_vulkan.c */
+    SDLOP_KMSDRM_Vulkan_CreateSurface,
+    SDLOP_KMSDRM_Vulkan_GetInstanceExtensions,
 };

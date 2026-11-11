@@ -58,6 +58,11 @@ typedef struct KMSDRM_DisplayData
     uint32_t original_fb_id;        /* CRTC buffer at init (0 if none) */
     char name[32];                  /* e.g. "HDMI-A-1" */
 
+    /* variable refresh rate (VRR): saved at init, re-applied on quit */
+    bool saved_vrr;                 /* VRR state at init (restored on quit) */
+    bool vrr_enabled;               /* we enabled it (log/restore bookkeeping) */
+    int panel_orientation_degrees;  /* connector "panel orientation": 0/90/180/270 (SDLop has no display properties API; logged at init) */
+
     /* hardware cursor */
     struct gbm_bo *cursor_bo;
     uint64_t cursor_w, cursor_h;
@@ -138,5 +143,13 @@ void KMSDRM_GL_DeleteContext(SDLop_VideoDevice *device, void *context);
 SDL_FunctionPointer KMSDRM_GL_GetProcAddress(SDLop_VideoDevice *device, const char *proc);
 bool KMSDRM_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval);
 bool KMSDRM_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval);
+
+/* Vulkan WSI (VK_KHR_surface + VK_KHR_display) - sdlop_kmsdrm_vulkan.c */
+bool SDLOP_KMSDRM_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window,
+                                       void *instance, const void *allocator, Uint64 *surface);
+const char *const *SDLOP_KMSDRM_Vulkan_GetInstanceExtensions(SDLop_VideoDevice *device, Uint32 *count);
+
+/* shared bits for the Vulkan module (sdlop_kmsdrm_vulkan.c) */
+int KMSDRM_ModeRefreshMHz(const drmModeModeInfo *m);
 
 #endif /* sdlop_kmsdrm_h_ */

@@ -40,6 +40,15 @@ SDLOP_DRM_SYM(int, drmModeAddFB2WithModifiers, (int fd, uint32_t width, uint32_t
 SDLOP_DRM_SYM(const char *, drmModeGetConnectorTypeName, (uint32_t connector_type))
 SDLOP_DRM_SYM(int, drmModeRmFB, (int fd, uint32_t bufferId))
 SDLOP_DRM_SYM(drmModeFBPtr, drmModeGetFB, (int fd, uint32_t buf))
+/* --- KMS object properties (VRR / panel orientation; required in practice:
+       these are ancient libdrm entry points) --- */
+SDLOP_DRM_SYM(drmModeObjectPropertiesPtr, drmModeObjectGetProperties,
+              (int fd, uint32_t object_id, uint32_t object_type))
+SDLOP_DRM_SYM(void, drmModeFreeObjectProperties, (drmModeObjectPropertiesPtr ptr))
+SDLOP_DRM_SYM(drmModePropertyPtr, drmModeGetProperty, (int fd, uint32_t property_id))
+SDLOP_DRM_SYM(void, drmModeFreeProperty, (drmModePropertyPtr ptr))
+SDLOP_DRM_SYM(int, drmModeObjectSetProperty, (int fd, uint32_t object_id, uint32_t object_type,
+                                              uint32_t property_id, uint64_t value))
 SDLOP_DRM_SYM(drmModeCrtcPtr, drmModeGetCrtc, (int fd, uint32_t crtcId))
 SDLOP_DRM_SYM(int, drmModeSetCrtc, (int fd, uint32_t crtcId, uint32_t bufferId,
                                     uint32_t x, uint32_t y, uint32_t *connectors, int count,
