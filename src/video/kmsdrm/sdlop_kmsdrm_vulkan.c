@@ -478,7 +478,9 @@ bool SDLOP_KMSDRM_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *wi
         if (vkGetDisplayPlaneCapabilitiesKHR(gpu, display_mode, i, &caps) != VK_SUCCESS) {
             continue;
         }
-        if (caps.supportedAlpha == wanted_alpha) {
+        /* supportedAlpha is a bitmask of VK_DISPLAY_PLANE_ALPHA_*_BIT_KHR;
+         * a plane carrying opaque plus other modes must match too */
+        if ((caps.supportedAlpha & wanted_alpha) != 0) {
             plane = i;
             break;
         }

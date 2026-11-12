@@ -1167,13 +1167,14 @@ static void kmsdrm_destroy_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *winda
 
 static bool kmsdrm_create_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windata, uint32_t w, uint32_t h)
 {
-    kmsdrm_destroy_dumb(vid, windata);
-
-    for (int i = 0; i < 2; i++) {
-        windata->sw_handle[i] = 0;
-        windata->sw_fb_id[i] = 0;
-        windata->sw_map[i] = NULL;
-    }
+    /* Build the new scanout in local state first. The old dumb buffers -
+     * and with them the cached window surface - stay valid until every
+     * step has succeeded, so a failure here leaves the window usable
+     * instead of dangling the cached surface at unmapped memory. */
+    uint32_t new_handle[2] = { 0, 0 }, new_fb[2] = { 0, 0 };
+    void *new_map[2] = { NULL, NULL };
+    int new_pitch = 0;
+    uint64_t new_size = 0;
 
     for (int i = 0; i < 2; i++) {
         uint32_t handle = 0, pitch = 0;
@@ -1182,6 +1183,10 @@ static bool kmsdrm_create_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windat
         if (ret != 0) {
             SDL_SetError("drmModeCreateDumbBuffer(%ux%u) failed: %s", w, h, strerror(errno));
             goto failed;
+        }
+        if (i == 0) { /* both buffers are identical in layout */
+            new_pitch = (int)pitch;
+            new_size = size;
         }
         uint64_t map_offset = 0;
         if (SDLOP_DRM_drmModeMapDumbBuffer(vid->drm_fd, handle, &map_offset) != 0) {
@@ -1203,20 +1208,38 @@ static bool kmsdrm_create_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windat
             goto failed;
         }
         memset(p, 0, (size_t)size);
-        windata->sw_handle[i] = handle;
-        windata->sw_map[i] = p;
-        windata->sw_fb_id[i] = fb;
-        windata->sw_pitch = pitch;
-        windata->sw_size = size;
+        new_handle[i] = handle;
+        new_map[i] = p;
+        new_fb[i] = fb;
     }
 
+    /* everything is in place: drop the old scanout and adopt the new one */
+    kmsdrm_destroy_dumb(vid, windata);
+    for (int i = 0; i < 2; i++) {
+        windata->sw_handle[i] = new_handle[i];
+        windata->sw_fb_id[i] = new_fb[i];
+        windata->sw_map[i] = new_map[i];
+    }
+    windata->sw_pitch = new_pitch;
+    windata->sw_size = new_size;
     windata->sw_draw = 0;
     windata->sw_front = -1;
     windata->sw_active = true;
     return true;
 
 failed:
-    kmsdrm_destroy_dumb(vid, windata);
+    /* destroy only the partial new scanout; the old one is untouched */
+    for (int i = 0; i < 2; i++) {
+        if (new_map[i]) {
+            munmap(new_map[i], (size_t)new_size);
+        }
+        if (new_fb[i]) {
+            SDLOP_DRM_drmModeRmFB(vid->drm_fd, new_fb[i]);
+        }
+        if (new_handle[i]) {
+            SDLOP_DRM_drmModeDestroyDumbBuffer(vid->drm_fd, new_handle[i]);
+        }
+    }
     return false;
 }
 
@@ -1466,6 +1489,13 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window)
         if (s) {
             window->surface = s;
             SDL_DestroySurface(old);
+        } else {
+            /* the old surface wraps the old dumb buffers, which are gone
+             * now; drop it instead of leaving a pointer at unmapped memory
+             * (SDL_GetWindowSurface recreates from the current buffers) */
+            SDL_DestroySurface(old);
+            window->surface = NULL;
+            return SDL_SetError("KMSDRM: failed to rebuild the window surface");
         }
     }
     return true;
