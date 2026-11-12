@@ -49,6 +49,10 @@
 #define DRM_FORMAT_XRGB8888 0x34325258u /* 'XR24' */
 #endif
 
+#ifndef DRM_FORMAT_ARGB8888
+#define DRM_FORMAT_ARGB8888 0x34325241u /* 'AR24' */
+#endif
+
 typedef struct KMSDRM_DisplayData
 {
     drmModeConnector *connector;    /* owned */
@@ -62,6 +66,20 @@ typedef struct KMSDRM_DisplayData
     bool saved_vrr;                 /* VRR state at init (restored on quit) */
     bool vrr_enabled;               /* we enabled it (log/restore bookkeeping) */
     int panel_orientation_degrees;  /* connector "panel orientation": 0/90/180/270 (SDLop has no display properties API; logged at init) */
+
+    /* atomic modesetting state (available only after KMSDRM_AtomicTryInit) */
+    struct KMSDRM_AtomicData {
+        bool available;             /* client caps set + primary plane found + syms loaded */
+        uint32_t primary_plane;     /* plane id of the CRTC's primary plane */
+        uint32_t mode_blob;         /* drmModeCreatePropertyBlob for dd->mode (0 = none) */
+        uint32_t plane_prop_fb_id;
+        uint32_t plane_prop_crtc_id;
+        uint32_t plane_prop_src_x, plane_prop_src_y, plane_prop_src_w, plane_prop_src_h;
+        uint32_t plane_prop_crtc_x, plane_prop_crtc_y, plane_prop_crtc_w, plane_prop_crtc_h;
+        uint32_t crtc_prop_active;
+        uint32_t crtc_prop_mode_id;
+        uint32_t conn_prop_crtc_id;
+    } atomic;
 
     /* hardware cursor */
     struct gbm_bo *cursor_bo;
@@ -126,12 +144,26 @@ typedef struct KMSDRM_DeviceData
 /* fb lifetime helper shared by the GL path */
 KMSDRM_FBInfo *KMSDRM_FBFromBO(int drm_fd, struct gbm_bo *bo);
 bool KMSDRM_WaitPageflip(KMSDRM_DeviceData *viddata, KMSDRM_WindowData *windata, int timeout_ms);
-void KMSDRM_FlipHandler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data);
+void KMSDRM_FlipHandler(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
+                        unsigned int crtc_id, void *data);
 void KMSDRM_DestroySurfaces(KMSDRM_DeviceData *viddata, SDL_Window *window);
 bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window);
 
 KMSDRM_DeviceData *KMSDRM_GetDevice(void);
 void KMSDRM_DestroySwScanout(SDL_Window *window);
+/* Atomic modesetting (sdlop_kmsdrm_atomic.c): enter on first present /
+ * mode reprogram; page flip via drmModeAtomicCommit otherwise. Falls back
+ * to the legacy drmModeSetCrtc/drmModePageFlip path internally on failure. */
+void KMSDRM_AtomicTryInit(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd);
+bool KMSDRM_AtomicModeset(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd, uint32_t fb_id);
+int KMSDRM_AtomicFlip(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd, uint32_t fb_id,
+                      void *flip_cookie);   /* 0 queued, -1 error (errno set) */
+bool KMSDRM_AtomicEnabled(void);    /* env knob: SDLOP_KMSDRM_ATOMIC=0 disables */
+/* Union of fourccs advertised by every plane on the device (all CRTCs);
+ * used to pick a GL scanout format the KMS planes actually accept
+ * (virtio-gpu 2D's primary plane is XR24-only). Returns false when the
+ * plane API is unavailable. */
+bool KMSDRM_PlaneFormatsUnion(int fd, uint32_t *xrgb8888, uint32_t *argb8888);
 void KMSDRM_DestroyGLSurfaces(KMSDRM_WindowData *windata);
 void KMSDRM_GL_Deinit(void);
 

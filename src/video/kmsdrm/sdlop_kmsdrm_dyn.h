@@ -26,6 +26,7 @@ void SDLOP_KMSDRM_UnloadSymbols(void);
 bool SDLOP_GBM_LoadSymbols(void);      /* libgbm - optional */
 void SDLOP_GBM_UnloadSymbols(void);
 bool SDLOP_GBM_Available(void);        /* true iff GBM symbols are loaded */
+bool SDLOP_DRM_ATOMIC_Available(void); /* true iff the atomic syms resolved */
 
 #define SDLOP_DRM_SYM(rc, fn, params) \
     typedef rc(*SDLOP_DYNDRM_##fn) params; \
@@ -38,6 +39,14 @@ bool SDLOP_GBM_Available(void);        /* true iff GBM symbols are loaded */
     typedef rc(*SDLOP_DYNGBM_##fn) params; \
     extern SDLOP_DYNGBM_##fn SDLOP_GBM_##fn;
 #include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_GBM_SYM
+#undef SDLOP_DRM_SYM
+
+#define SDLOP_DRM_ATOMIC_SYM(rc, fn, params) \
+    typedef rc(*SDLOP_DYNADRM_##fn) params; \
+    extern SDLOP_DYNADRM_##fn SDLOP_DRM_ATOMIC_##fn;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_ATOMIC_SYM
 #undef SDLOP_GBM_SYM
 #undef SDLOP_DRM_SYM
 

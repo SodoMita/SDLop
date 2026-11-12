@@ -102,5 +102,27 @@ SDLOP_GBM_SYM(uint32_t, gbm_bo_get_offset, (struct gbm_bo *bo, int plane))
 SDLOP_GBM_SYM(uint32_t, gbm_bo_get_stride_for_plane, (struct gbm_bo *bo, int plane))
 SDLOP_GBM_SYM(union gbm_bo_handle, gbm_bo_get_handle_for_plane, (struct gbm_bo *bo, int plane))
 
+
+/* optional: atomic modesetting support. Left out of SDLOP_DRM_SYM so that a
+ * libdrm without the atomic API does not take down the whole driver -
+ * SDLOP_DRM_ATOMIC_Available() reports whether the full set resolved. */
+#ifndef SDLOP_DRM_ATOMIC_SYM
+#define SDLOP_DRM_ATOMIC_SYM(...)
+#endif
+SDLOP_DRM_ATOMIC_SYM(drmModeAtomicReqPtr, drmModeAtomicAlloc, (void))
+SDLOP_DRM_ATOMIC_SYM(int, drmModeAtomicAddProperty, (drmModeAtomicReqPtr req,
+                                                    uint32_t object_id, uint32_t property_id,
+                                                    uint64_t value))
+SDLOP_DRM_ATOMIC_SYM(int, drmModeAtomicCommit, (int fd, drmModeAtomicReqPtr req,
+                                                uint32_t flags, void *user_data))
+SDLOP_DRM_ATOMIC_SYM(void, drmModeAtomicFree, (drmModeAtomicReqPtr req))
+SDLOP_DRM_ATOMIC_SYM(int, drmModeCreatePropertyBlob, (int fd, const void *data,
+                                                      size_t length, uint32_t *id_out))
+SDLOP_DRM_ATOMIC_SYM(int, drmModeDestroyPropertyBlob, (int fd, uint32_t id))
+SDLOP_DRM_ATOMIC_SYM(drmModePlanePtr, drmModeGetPlane, (int fd, uint32_t plane_id))
+SDLOP_DRM_ATOMIC_SYM(void, drmModeFreePlane, (drmModePlanePtr ptr))
+SDLOP_DRM_ATOMIC_SYM(drmModePlaneResPtr, drmModeGetPlaneResources, (int fd))
+SDLOP_DRM_ATOMIC_SYM(void, drmModeFreePlaneResources, (drmModePlaneResPtr ptr))
+#undef SDLOP_DRM_ATOMIC_SYM
 #undef SDLOP_DRM_SYM
 #undef SDLOP_GBM_SYM

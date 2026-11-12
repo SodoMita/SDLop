@@ -82,30 +82,54 @@ static bool is_permission_error(int err)
 
 static bool ensure_gbm(KMSDRM_DeviceData *dev)
 {
-    if (dev->gbm_init && dev->gbm_dev) {
-        return true;
-    }
     if (!SDLOP_GBM_LoadSymbols()) {
         return SDL_SetError("libgbm not available (GL on KMS requires it)");
     }
     if (dev->drm_fd < 0) {
         return SDL_SetError("DRM device not open");
     }
-    if (SDLOP_DRM_drmSetMaster) {
-        SDLOP_DRM_drmSetMaster(dev->drm_fd);
-    }
-    dev->gbm_dev = SDLOP_GBM_gbm_create_device(dev->drm_fd);
+    /* The driver may already have created the shared GBM device for the
+     * cursor path; the GL visual choice below is still ours to make and is
+     * idempotent, so it runs on every call instead of only on creation. */
     if (!dev->gbm_dev) {
-        return SDL_SetError("Couldn't create GBM device");
+        if (SDLOP_DRM_drmSetMaster) {
+            SDLOP_DRM_drmSetMaster(dev->drm_fd);
+        }
+        dev->gbm_dev = SDLOP_GBM_gbm_create_device(dev->drm_fd);
+        if (!dev->gbm_dev) {
+            return SDL_SetError("Couldn't create GBM device");
+        }
+        dev->gbm_init = true;
     }
-    dev->gbm_init = true;
-    uint32_t usage = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
-    if (SDLOP_GBM_gbm_device_is_format_supported(dev->gbm_dev, GBM_FORMAT_ARGB8888, usage)) {
-        kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888;
-    } else if (SDLOP_GBM_gbm_device_is_format_supported(dev->gbm_dev, GBM_FORMAT_XRGB8888, usage)) {
-        kmsdrm_gl_visual_id = GBM_FORMAT_XRGB8888;
-    } else {
-        kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888; /* create may still work; warn there */
+    {
+        uint32_t usage = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
+        /* GBM does not know what the KMS planes can scan out. Plane format
+         * lists are authoritative (e.g. virtio-gpu 2D's primary plane is
+         * XR24-only), so consult them first; without plane info prefer
+         * XRGB8888, which every scanout plane supporting 32-bit formats does. */
+        bool gbm_xrgb = SDLOP_GBM_gbm_device_is_format_supported(dev->gbm_dev, GBM_FORMAT_XRGB8888, usage);
+        bool gbm_argb = SDLOP_GBM_gbm_device_is_format_supported(dev->gbm_dev, GBM_FORMAT_ARGB8888, usage);
+        uint32_t plane_xrgb = 0, plane_argb = 0;
+        bool have_planes = KMSDRM_PlaneFormatsUnion(dev->drm_fd, &plane_xrgb, &plane_argb);
+        static bool format_logged;
+        if (have_planes && plane_xrgb && gbm_xrgb) {
+            kmsdrm_gl_visual_id = GBM_FORMAT_XRGB8888;
+        } else if (have_planes && plane_argb && gbm_argb) {
+            kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888;
+        } else if (gbm_xrgb) {
+            kmsdrm_gl_visual_id = GBM_FORMAT_XRGB8888;
+        } else if (gbm_argb) {
+            kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888;
+        } else {
+            kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888; /* create may still work; warn there */
+        }
+        if (!format_logged) {
+            format_logged = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: GL scanout format 0x%08x (planes: %s)",
+                        kmsdrm_gl_visual_id,
+                        have_planes ? (plane_xrgb ? "XR24" : (plane_argb ? "AR24-only" : "no 32-bit")) : "unknown");
+        }
     }
     return true;
 }
@@ -523,14 +547,68 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
     }
 
     int ret = 0;
-    if (!windata->bo) {
+    const bool use_atomic = dd->atomic.available;
+    if (!windata->bo || !windata->crtc_programmed) {
         /* first swap: the CRTC must be told what to scan out */
-        ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id, 0, 0,
-                                       &dd->connector->connector_id, 1, &dd->mode);
-        if (ret) {
-            return SDL_SetError("Could not set videomode on CRTC");
+        if (use_atomic) {
+            if (!KMSDRM_AtomicModeset(dev, dd, fb_info->fb_id)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                            "KMSDRM: atomic modeset failed (%s); using legacy modeset for GL present",
+                            strerror(errno));
+                ret = -1;
+            }
+        } else {
+            ret = -1; /* go straight to the legacy path below */
         }
-        windata->crtc_programmed = true;
+        if (ret == 0) {
+            windata->crtc_programmed = true;
+        } else {
+            ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id, 0, 0,
+                                           &dd->connector->connector_id, 1, &dd->mode);
+            if (ret) {
+                return SDL_SetError("Could not set videomode on CRTC");
+            }
+            windata->crtc_programmed = true;
+        }
+    } else if (use_atomic) {
+        /* swap_interval 0 async flips are a legacy-path refinement; the
+         * atomic flip below is vsync'd (NONBLOCK without ASYNC), which is
+         * the conservative behavior for the GL path here */
+        (void)flip_flags;
+        ret = KMSDRM_AtomicFlip(dev, dd, fb_info->fb_id, &windata->waiting_for_flip);
+        if (ret == 0) {
+            windata->waiting_for_flip = true;
+            if (kmsdrm_double_buffer()) {
+                KMSDRM_WaitPageflip(dev, windata, 1500);
+            }
+        } else {
+            int err = errno;
+            if (err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {
+                ret = KMSDRM_AtomicFlip(dev, dd, fb_info->fb_id, &windata->waiting_for_flip);
+                if (ret == 0) {
+                    windata->waiting_for_flip = true;
+                }
+            }
+            if (ret != 0) {
+                if (is_permission_error(err)) {
+                    windata->lost_master = true;
+                    SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: atomic flip lost DRM master");
+                } else {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                                "KMSDRM: atomic flip failed (%s); using modeset for GL present",
+                                strerror(err));
+                    ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
+                                                   0, 0, &dd->connector->connector_id, 1, &dd->mode);
+                    if (ret == 0) {
+                        windata->crtc_programmed = true;
+                    } else {
+                        SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
+                                     "KMSDRM: atomic flip failed and modeset fallback failed: %s",
+                                     strerror(errno));
+                    }
+                }
+            }
+        }
     } else {
         if (swap_interval == 0 && dev->async_pageflip_support) {
             flip_flags |= DRM_MODE_PAGE_FLIP_ASYNC;

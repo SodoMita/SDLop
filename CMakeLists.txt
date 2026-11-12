@@ -214,9 +214,11 @@ set(SDLop_SOURCES
   src/video/wayland/sdlop_wayland_vulkan.c
   src/video/wayland/sdlop_wayland_protos.c
   src/video/kmsdrm/sdlop_kmsdrm.c
+  src/video/kmsdrm/sdlop_kmsdrm_atomic.c
   src/video/kmsdrm/sdlop_kmsdrm_dyn.c
   src/video/kmsdrm/sdlop_kmsdrm_gl.c
   src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
+  src/video/kmsdrm/sdlop_xcursor.c
   src/video/dummy/sdlop_dummy.c
 )
 

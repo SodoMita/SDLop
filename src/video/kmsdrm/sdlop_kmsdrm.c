@@ -26,6 +26,9 @@
                                           (default: require it; SDL3 semantics)
     SDLOP_KMSDRM_DOUBLE_BUFFER=1           wait for the flip immediately after
                                           queueing it (GL path; SDL_HINT_VIDEO_DOUBLE_BUFFER)
+    SDLOP_KMSDRM_ATOMIC=0                   never use DRM atomic modesetting; always the
+                                          legacy drmModeSetCrtc/drmModePageFlip path
+                                          (default: try atomic, fall back automatically)
 
   VRR is enabled automatically when the connector reports VRR_CAPABLE and is
   restored to its saved state on quit. Panel orientation is logged when set.
@@ -43,6 +46,7 @@
 #endif
 
 #include "sdlop_kmsdrm.h"
+#include "sdlop_xcursor.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -293,6 +297,7 @@ static int KMSDRM_ConnectorGetOrientation(int fd, uint32_t connector_id)
 
 static volatile sig_atomic_t kmsdrm_vt_pending = SDLOP_KMSDRM_VT_NONE;
 static int kmsdrm_vt_console_fd = -1;
+static int kmsdrm_vt_saved_kbmode = -1;
 static int kmsdrm_vt_release_sig = 0;
 static int kmsdrm_vt_acquire_sig = 0;
 static struct sigaction kmsdrm_vt_old_release;
@@ -356,6 +361,11 @@ static void kmsdrm_vt_shutdown(void)
         kmsdrm_vt_acquire_sig = 0;
     }
     if (kmsdrm_vt_console_fd >= 0) {
+        if (kmsdrm_vt_saved_kbmode >= 0) {
+            ioctl(kmsdrm_vt_console_fd, KDSKBMODE, kmsdrm_vt_saved_kbmode);
+            kmsdrm_vt_saved_kbmode = -1;
+        }
+        ioctl(kmsdrm_vt_console_fd, KDSETMODE, KD_TEXT);
         struct vt_mode mode;
         memset(&mode, 0, sizeof(mode));
         mode.mode = VT_AUTO;
@@ -402,6 +412,26 @@ static void kmsdrm_vt_init(void)
         kmsdrm_log("KMSDRM: VT_SETMODE failed (%s); leaving VT_AUTO", strerror(errno));
         return;
     }
+    /* full graphics takeover (swa behavior): disable the kernel keyboard
+     * handler so Ctrl-C etc. don't kill us, and switch the VT to graphics
+     * mode so fbcon/text does not draw over us. Restored in
+     * kmsdrm_vt_shutdown(). */
+    {
+        int kbmode = 0;
+        if (ioctl(fd, KDGKBMODE, &kbmode) == 0) {
+            kmsdrm_vt_saved_kbmode = kbmode;
+            if (ioctl(fd, KDSKBMODE, K_OFF) != 0) {
+                kmsdrm_log("KMSDRM: KDSKBMODE K_OFF failed: %s", strerror(errno));
+            }
+        } else {
+            kmsdrm_vt_saved_kbmode = -1;
+            kmsdrm_log("KMSDRM: KDGKBMODE failed: %s", strerror(errno));
+        }
+        if (ioctl(fd, KDSETMODE, KD_GRAPHICS) != 0) {
+            kmsdrm_log("KMSDRM: KDSETMODE KD_GRAPHICS failed: %s", strerror(errno));
+        }
+    }
+
     kmsdrm_vt_console_fd = fd;
     kmsdrm_log("KMSDRM: VT switching handled (relsig=%d acqsig=%d)",
                kmsdrm_vt_release_sig, kmsdrm_vt_acquire_sig);
@@ -767,6 +797,11 @@ static bool kmsdrm_init_displays(void)
                    vid->display.panel_orientation_degrees);
     }
 
+    /* atomic modesetting probe: sets the client cap, finds the CRTC's
+     * primary plane and caches the property ids. Never fatal - on any
+     * failure the driver silently keeps the legacy path. */
+    KMSDRM_AtomicTryInit(vid, &vid->display);
+
     result = true;
 
 cleanup:
@@ -788,6 +823,13 @@ cleanup:
 static void kmsdrm_deinit_displays(void)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
+
+    /* drop the cached atomic mode blob before the fd goes away */
+    if (vid->drm_fd >= 0 && vid->display.atomic.mode_blob
+        && SDLOP_DRM_ATOMIC_Available()) {
+        SDLOP_DRM_ATOMIC_drmModeDestroyPropertyBlob(vid->drm_fd, vid->display.atomic.mode_blob);
+    }
+    memset(&vid->display.atomic, 0, sizeof(vid->display.atomic));
 
     /* restore the CRTC's VRR state to what it was at init (best effort) */
     if (vid->drm_fd >= 0 && vid->display.crtc) {
@@ -1040,9 +1082,10 @@ KMSDRM_FBInfo *KMSDRM_FBFromBO(int drm_fd, struct gbm_bo *bo)
     return fb_info;
 }
 
-void KMSDRM_FlipHandler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data)
+void KMSDRM_FlipHandler(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
+                        unsigned int crtc_id, void *data)
 {
-    (void)fd; (void)frame; (void)sec; (void)usec;
+    (void)fd; (void)frame; (void)sec; (void)usec; (void)crtc_id;
     if (data) {
         *((bool *)data) = false;
     }
@@ -1056,7 +1099,7 @@ bool KMSDRM_WaitPageflip(KMSDRM_DeviceData *viddata, KMSDRM_WindowData *windata,
     const int step_ms = 10;
 
     ev.version = DRM_EVENT_CONTEXT_VERSION;
-    ev.page_flip_handler = KMSDRM_FlipHandler;
+    ev.page_flip_handler2 = KMSDRM_FlipHandler;
 
     pfd.fd = viddata->drm_fd;
     pfd.events = POLLIN;
@@ -1212,6 +1255,23 @@ static void kmsdrm_retarget_surface(SDL_Window *window, KMSDRM_WindowData *winda
 static bool kmsdrm_crtc_set(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windata, uint32_t fb_id)
 {
     KMSDRM_DisplayData *dd = windata->display;
+
+    if (dd->atomic.available) {
+        if (KMSDRM_AtomicModeset(vid, dd, fb_id)) {
+            windata->crtc_programmed = true;
+            windata->lost_master = false;
+            return true;
+        }
+        int atomic_err = errno;
+        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                    "KMSDRM: atomic modeset failed (%s); falling back to drmModeSetCrtc",
+                    strerror(atomic_err));
+        if (is_permission_error(atomic_err)) {
+            windata->lost_master = true;
+        }
+        /* fall through to the legacy path */
+    }
+
     int ret = SDLOP_DRM_drmModeSetCrtc(vid->drm_fd, dd->crtc->crtc_id, fb_id, 0, 0,
                                        &dd->connector->connector_id, 1, &dd->mode);
     if (ret != 0) {
@@ -1247,8 +1307,41 @@ static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
     }
 
     bool ok;
+    const bool use_atomic = windata->display->atomic.available;
     if (!windata->crtc_programmed || vid->no_flip) {
         ok = kmsdrm_crtc_set(vid, windata, fb_id);
+    } else if (use_atomic) {
+        int ret = KMSDRM_AtomicFlip(vid, windata->display, fb_id, &windata->waiting_for_flip);
+        if (ret == 0) {
+            windata->waiting_for_flip = true;
+            ok = true;
+        } else {
+            int err = errno;
+            if (err == EBUSY && KMSDRM_WaitPageflip(vid, windata, flip_timeout_ms())) {
+                /* a flip was pending; retry once */
+                ret = KMSDRM_AtomicFlip(vid, windata->display, fb_id, &windata->waiting_for_flip);
+                if (ret == 0) {
+                    windata->waiting_for_flip = true;
+                    ok = true;
+                } else {
+                    ok = kmsdrm_crtc_set(vid, windata, fb_id);
+                }
+            } else if (is_permission_error(err)) {
+                windata->lost_master = true;
+                ok = SDL_SetError("atomic flip: no DRM master (%s)", strerror(err));
+            } else {
+                /* atomic not usable for this CRTC after all: fall back to a
+                 * modeset for this present; latch no_flip on hard errors so
+                 * we stop asking for flips the driver rejected outright */
+                if (err == EINVAL || err == ENOSYS) {
+                    vid->no_flip = true;
+                }
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                            "KMSDRM: atomic flip failed (%s); falling back to modeset",
+                            strerror(err));
+                ok = kmsdrm_crtc_set(vid, windata, fb_id);
+            }
+        }
     } else {
         int ret = SDLOP_DRM_drmModePageFlip(vid->drm_fd, windata->display->crtc->crtc_id,
                                             fb_id, DRM_MODE_PAGE_FLIP_EVENT,
@@ -1418,6 +1511,59 @@ static bool kmsdrm_ensure_gbm(void)
     return true;
 }
 
+/* XCursor theme cache (loaded at most once per driver lifetime).
+ * Returns NULL when no theme is available (e.g. minimal systems); the
+ * built-in arrow below is used as the fallback cursor then. */
+static struct sdlop_xcursor_theme *kmsdrm_cursor_theme_cache = NULL;
+static bool kmsdrm_cursor_theme_tried = false;
+
+static struct sdlop_xcursor_theme *kmsdrm_cursor_theme_load_once(void)
+{
+    if (!kmsdrm_cursor_theme_tried) {
+        kmsdrm_cursor_theme_tried = true;
+        const char *theme_name = getenv("XCURSOR_THEME");
+        int size = 32;
+        const char *ss = getenv("XCURSOR_SIZE");
+        if (ss) {
+            long s = strtol(ss, NULL, 10);
+            if (s >= 8 && s <= 256) {
+                size = (int)s;
+            }
+        }
+        kmsdrm_cursor_theme_cache = sdlop_xcursor_theme_load(theme_name, size);
+        if (!kmsdrm_cursor_theme_cache) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "KMSDRM: no XCursor theme found; using built-in arrow cursor");
+        }
+    }
+    return kmsdrm_cursor_theme_cache;
+}
+
+static struct sdlop_xcursor *kmsdrm_theme_arrow(void)
+{
+    struct sdlop_xcursor_theme *t = kmsdrm_cursor_theme_load_once();
+    if (!t) {
+        return NULL;
+    }
+    static const char *const names[] = { "left_ptr", "default", "arrow", "top_left_arrow", NULL };
+    for (int i = 0; names[i]; i++) {
+        struct sdlop_xcursor *c = sdlop_xcursor_theme_get_cursor(t, names[i]);
+        if (c) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+void KMSDRM_XCursorQuit(void)
+{
+    if (kmsdrm_cursor_theme_cache) {
+        sdlop_xcursor_theme_destroy(kmsdrm_cursor_theme_cache);
+        kmsdrm_cursor_theme_cache = NULL;
+    }
+    kmsdrm_cursor_theme_tried = false;
+}
+
 static bool kmsdrm_ensure_cursor_bo(void)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
@@ -1444,6 +1590,23 @@ static bool kmsdrm_ensure_cursor_bo(void)
         return false;
     }
 
+    /* prefer the system's XCursor theme arrow when it fits the hardware
+     * cursor size (swa behavior); otherwise draw the built-in 16x16 arrow */
+    struct sdlop_xcursor *theme_cursor = kmsdrm_theme_arrow();
+    struct sdlop_xcursor_image *theme_image = NULL;
+    if (theme_cursor && theme_cursor->image_count > 0) {
+        theme_image = theme_cursor->images[0];
+        if (theme_image->width == 0 || theme_image->height == 0
+            || theme_image->width > cw || theme_image->height > ch) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "KMSDRM: XCursor image %ux%u exceeds hardware cursor %llux%llu; "
+                         "using built-in arrow",
+                         theme_image->width, theme_image->height,
+                         (unsigned long long)cw, (unsigned long long)ch);
+            theme_image = NULL;
+        }
+    }
+
     struct gbm_bo *bo = SDLOP_GBM_gbm_bo_create(vid->gbm_dev, (uint32_t)cw, (uint32_t)ch,
                                                 GBM_FORMAT_ARGB8888,
                                                 GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE | GBM_BO_USE_LINEAR);
@@ -1456,16 +1619,31 @@ static bool kmsdrm_ensure_cursor_bo(void)
         SDLOP_GBM_gbm_bo_destroy(bo);
         return false;
     }
-    for (uint64_t y = 0; y < ch; y++) {
-        for (uint64_t x = 0; x < cw; x++) {
-            char c = cursor_arrow[(y * 16) / ch][(x * 16) / cw];
-            uint32_t px = 0;
-            if (c == '1') {
-                px = 0xFF000000u; /* opaque black */
-            } else if (c == '2') {
-                px = 0xFFFFFFFFu; /* opaque white */
+    int32_t hot_x = 0, hot_y = 0;
+    if (theme_image) {
+        /* XCursor pixels are ARGB8888 in memory on little-endian hosts,
+         * which is exactly GBM_FORMAT_ARGB8888; rows are packed */
+        for (uint32_t y = 0; y < theme_image->height; y++) {
+            memcpy(buf + (size_t)y * cw, theme_image->buffer + (size_t)y * theme_image->width * 4,
+                   (size_t)theme_image->width * 4);
+        }
+        hot_x = (int32_t)theme_image->hotspot_x;
+        hot_y = (int32_t)theme_image->hotspot_y;
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                     "KMSDRM: using XCursor theme cursor '%s' (%ux%u, hot %+d,%+d)",
+                     theme_cursor->name, theme_image->width, theme_image->height, hot_x, hot_y);
+    } else {
+        for (uint64_t y = 0; y < ch; y++) {
+            for (uint64_t x = 0; x < cw; x++) {
+                char c = cursor_arrow[(y * 16) / ch][(x * 16) / cw];
+                uint32_t px = 0;
+                if (c == '1') {
+                    px = 0xFF000000u; /* opaque black */
+                } else if (c == '2') {
+                    px = 0xFFFFFFFFu; /* opaque white */
+                }
+                buf[y * cw + x] = px;
             }
-            buf[y * cw + x] = px;
         }
     }
     int ret = SDLOP_GBM_gbm_bo_write(bo, buf, (size_t)cw * ch * 4);
@@ -1478,8 +1656,8 @@ static bool kmsdrm_ensure_cursor_bo(void)
     dd->cursor_bo = bo;
     dd->cursor_w = cw;
     dd->cursor_h = ch;
-    dd->cursor_hot_x = 0;
-    dd->cursor_hot_y = 0;
+    dd->cursor_hot_x = hot_x;
+    dd->cursor_hot_y = hot_y;
     dd->cursor_visible = false;
     return true;
 }
@@ -1820,7 +1998,7 @@ static void kmsdrm_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         if (ret > 0 && (pfd.revents & POLLIN)) {
             drmEventContext ev = { 0 };
             ev.version = DRM_EVENT_CONTEXT_VERSION;
-            ev.page_flip_handler = KMSDRM_FlipHandler;
+            ev.page_flip_handler2 = KMSDRM_FlipHandler;
             SDLOP_DRM_drmHandleEvent(vid->drm_fd, &ev);
         }
     }
@@ -2007,6 +2185,7 @@ static void kmsdrm_Quit(SDLop_VideoDevice *device)
 
     /* windows are destroyed by the core before this runs */
     kmsdrm_deinit_displays();      /* restores the CRTC, destroys cursor bo */
+    KMSDRM_XCursorQuit();          /* drop the cached XCursor theme */
     kmsdrm_vt_shutdown();          /* restore VT_AUTO mode on /dev/tty */
     if (vid->gbm_dev) {
         SDLOP_GBM_gbm_device_destroy(vid->gbm_dev);

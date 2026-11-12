@@ -19,6 +19,11 @@
 #include "sdlop_kmsdrm_sym.h"
 #undef SDLOP_DRM_SYM
 #undef SDLOP_GBM_SYM
+#undef SDLOP_DRM_ATOMIC_SYM
+#define SDLOP_DRM_ATOMIC_SYM(rc, fn, params) SDLOP_DYNADRM_##fn SDLOP_DRM_ATOMIC_##fn = NULL;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_ATOMIC_SYM
+static bool atomic_available = false;
 
 static void *drm_lib = NULL;
 static int drm_load_refcount = 0;
@@ -58,10 +63,35 @@ bool SDLOP_KMSDRM_LoadSymbols(void)
 #include "sdlop_kmsdrm_sym.h"
 #undef SDLOP_DRM_SYM
 #undef SDLOP_GBM_SYM
+#define SDLOP_DRM_ATOMIC_SYM(rc, fn, params) SDLOP_DRM_ATOMIC_##fn = NULL;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_ATOMIC_SYM
+        atomic_available = false;
         dlclose(drm_lib);
         drm_lib = NULL;
         return false;
     }
+    /* optional atomic modesetting symbols: missing -> legacy modesetting */
+    {
+        bool atomic_ok = true;
+#define SDLOP_DRM_ATOMIC_SYM(rc, fn, params)                              \
+    SDLOP_DRM_ATOMIC_##fn = (SDLOP_DYNADRM_##fn)(uintptr_t)dlsym(drm_lib, #fn); \
+    if (!SDLOP_DRM_ATOMIC_##fn) {                                         \
+        atomic_ok = false;                                                \
+    }
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_SYM
+#undef SDLOP_GBM_SYM
+#undef SDLOP_DRM_ATOMIC_SYM
+        if (!atomic_ok) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: libdrm atomic modesetting API not found; using legacy modesetting");
+            atomic_available = false;
+        } else {
+            atomic_available = true;
+        }
+    }
+
     drm_load_refcount = 1;
     return true;
 }
@@ -76,6 +106,10 @@ void SDLOP_KMSDRM_UnloadSymbols(void)
 #include "sdlop_kmsdrm_sym.h"
 #undef SDLOP_DRM_SYM
 #undef SDLOP_GBM_SYM
+#define SDLOP_DRM_ATOMIC_SYM(rc, fn, params) SDLOP_DRM_ATOMIC_##fn = NULL;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_ATOMIC_SYM
+    atomic_available = false;
     dlclose(drm_lib);
     drm_lib = NULL;
 }
@@ -152,4 +186,9 @@ void SDLOP_GBM_UnloadSymbols(void)
 bool SDLOP_GBM_Available(void)
 {
     return gbm_usable;
+}
+
+bool SDLOP_DRM_ATOMIC_Available(void)
+{
+    return atomic_available;
 }

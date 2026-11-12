@@ -154,10 +154,15 @@ cleanup_vm() { # $1 = qmp socket path; always releases hostfwd :2222
 }
 
 # Boot a scenario, run the in-guest checks. Prints scenario result lines.
+# SDLOP_QEMU_EXTRA_ENV (if set) is appended to every scenario's guest env -
+# used for the atomic-vs-legacy A/B comparison.
 go_scenario() {
     local name="$1"; shift
     local vga_args="$1"; shift
     local guest_env="$1"; shift || true
+    if [ -n "${SDLOP_QEMU_EXTRA_ENV:-}" ]; then
+        guest_env="${guest_env:+$guest_env }$SDLOP_QEMU_EXTRA_ENV"
+    fi
     local screendump_device="${1:-}"
     local qemu_display="${2:-none}"
     if [ "$qemu_display" = "gtk-gl" ]; then
