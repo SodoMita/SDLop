@@ -1268,6 +1268,10 @@ static bool kmsdrm_crtc_set(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windata, 
                     strerror(atomic_err));
         if (is_permission_error(atomic_err)) {
             windata->lost_master = true;
+        } else if (atomic_err == EINVAL || atomic_err == ENOSYS) {
+            /* hard rejection: this driver will not do atomic for this
+             * display either; stop paying for a failing ioctl per flip */
+            windata->display->atomic.available = false;
         }
         /* fall through to the legacy path */
     }
@@ -1335,6 +1339,7 @@ static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
                  * we stop asking for flips the driver rejected outright */
                 if (err == EINVAL || err == ENOSYS) {
                     vid->no_flip = true;
+                    windata->display->atomic.available = false;
                 }
                 SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
                             "KMSDRM: atomic flip failed (%s); falling back to modeset",

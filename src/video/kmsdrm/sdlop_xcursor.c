@@ -264,8 +264,10 @@ XcursorImageCreate (int width, int height)
 {
     XcursorImage    *image;
 
+    if (width <= 0 || height <= 0)
+	return NULL;
     image = malloc (sizeof (XcursorImage) +
-		    width * height * sizeof (XcursorPixel));
+		    (size_t) (unsigned) width * (unsigned) height * sizeof (XcursorPixel));
     if (!image)
 	return NULL;
     image->version = XCURSOR_IMAGE_VERSION;
@@ -342,10 +344,10 @@ _XcursorReadUInt (XcursorFile *file, XcursorUInt *u)
 
     if ((*file->read) (file, bytes, 4) != 4)
 	return XcursorFalse;
-    *u = ((bytes[0] << 0) |
-	  (bytes[1] << 8) |
-	  (bytes[2] << 16) |
-	  (bytes[3] << 24));
+    *u = ((uint32_t) bytes[0]) |
+	  ((uint32_t) bytes[1] << 8) |
+	  ((uint32_t) bytes[2] << 16) |
+	  ((uint32_t) bytes[3] << 24);
     return XcursorTrue;
 }
 
@@ -356,14 +358,16 @@ _XcursorFileHeaderDestroy (XcursorFileHeader *fileHeader)
 }
 
 static XcursorFileHeader *
-_XcursorFileHeaderCreate (int ntoc)
+_XcursorFileHeaderCreate (XcursorUInt ntoc)
 {
     XcursorFileHeader	*fileHeader;
 
+    /* ntoc comes straight from the file; keep it in the unsigned domain
+     * so the sanity bound cannot be bypassed by negative int conversion */
     if (ntoc > 0x10000)
 	return NULL;
     fileHeader = malloc (sizeof (XcursorFileHeader) +
-			 ntoc * sizeof (XcursorFileToc));
+			 (size_t) ntoc * sizeof (XcursorFileToc));
     if (!fileHeader)
 	return NULL;
     fileHeader->magic = XCURSOR_MAGIC;
@@ -393,6 +397,8 @@ _XcursorReadFileHeader (XcursorFile *file)
     if (!_XcursorReadUInt (file, &head.version))
 	return NULL;
     if (!_XcursorReadUInt (file, &head.ntoc))
+	return NULL;
+    if (head.header < XCURSOR_FILE_HEADER_LEN)
 	return NULL;
     skip = head.header - XCURSOR_FILE_HEADER_LEN;
     if (skip)
@@ -525,7 +531,7 @@ _XcursorReadImage (XcursorFile		*file,
     XcursorChunkHeader	chunkHeader;
     XcursorImage	head;
     XcursorImage	*image;
-    int			n;
+    uint32_t		n;
     XcursorPixel	*p;
 
     if (!file || !fileHeader)
@@ -543,8 +549,9 @@ _XcursorReadImage (XcursorFile		*file,
 	return NULL;
     if (!_XcursorReadUInt (file, &head.delay))
 	return NULL;
-    /* sanity check data */
-    if (head.width >= 0x10000 || head.height > 0x10000)
+    /* sanity check data: 4096px is far beyond any real cursor; the driver
+     * hardware-cursor cap is 256, and 4096 keeps the pixel buffer <= 64MB */
+    if (head.width > 4096 || head.height > 4096)
 	return NULL;
     if (head.width == 0 || head.height == 0)
 	return NULL;
@@ -850,7 +857,16 @@ _XcursorThemeInherits (const char *full)
 }
 
 static FILE *
+XcursorScanThemeDepth (const char *theme, const char *name, int depth);
+
+static FILE *
 XcursorScanTheme (const char *theme, const char *name)
+{
+    return XcursorScanThemeDepth (theme, name, 0);
+}
+
+static FILE *
+XcursorScanThemeDepth (const char *theme, const char *name, int depth)
 {
     FILE	*f = NULL;
     char	*full;
@@ -861,6 +877,8 @@ XcursorScanTheme (const char *theme, const char *name)
 
     if (!theme || !name)
         return NULL;
+    if (depth > 16)
+        return NULL;    /* inheritance chain too deep (or cyclic) */
 
     /*
      * Scan this theme
@@ -894,7 +912,7 @@ XcursorScanTheme (const char *theme, const char *name)
      * Recurse to scan inherited themes
      */
     for (i = inherits; i && f == NULL; i = _XcursorNextPath (i))
-	f = XcursorScanTheme (i, name);
+	f = XcursorScanThemeDepth (i, name, depth + 1);
     if (inherits != NULL)
 	free (inherits);
     return f;
@@ -985,12 +1003,28 @@ load_all_cursors_from_dir(const char *path, int size,
  * to data provided by the user.
  * \param user_data The data that should be passed to the load callback
  */
+static void
+xcursor_load_theme_depth(const char *theme, int size,
+		    void (*load_callback)(XcursorImages *, void *),
+		    void *user_data, int depth);
+
 void
 xcursor_load_theme(const char *theme, int size,
 		    void (*load_callback)(XcursorImages *, void *),
 		    void *user_data)
 {
+	xcursor_load_theme_depth(theme, size, load_callback, user_data, 0);
+}
+
+static void
+xcursor_load_theme_depth(const char *theme, int size,
+		    void (*load_callback)(XcursorImages *, void *),
+		    void *user_data, int depth)
+{
 	char *full, *dir;
+
+	if (depth > 16)
+		return;		/* inheritance chain too deep (or cyclic) */
 	char *inherits = NULL;
 	const char *path, *i;
 
@@ -1024,7 +1058,7 @@ xcursor_load_theme(const char *theme, int size,
 	}
 
 	for (i = inherits; i; i = _XcursorNextPath(i))
-		xcursor_load_theme(i, size, load_callback, user_data);
+		xcursor_load_theme_depth(i, size, load_callback, user_data, depth + 1);
 
 	if (inherits)
 		free(inherits);

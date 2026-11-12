@@ -546,15 +546,20 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_SetError("Could not get a framebuffer");
     }
 
+    bool present_ok = true;
     int ret = 0;
     const bool use_atomic = dd->atomic.available;
     if (!windata->bo || !windata->crtc_programmed) {
         /* first swap: the CRTC must be told what to scan out */
         if (use_atomic) {
             if (!KMSDRM_AtomicModeset(dev, dd, fb_info->fb_id)) {
+                int merr = errno;
                 SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
                             "KMSDRM: atomic modeset failed (%s); using legacy modeset for GL present",
-                            strerror(errno));
+                            strerror(merr));
+                if (merr == EINVAL || merr == ENOSYS) {
+                    dd->atomic.available = false; /* stop trying atomic every frame */
+                }
                 ret = -1;
             }
         } else {
@@ -592,11 +597,15 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
             if (ret != 0) {
                 if (is_permission_error(err)) {
                     windata->lost_master = true;
+                    present_ok = false;
                     SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: atomic flip lost DRM master");
                 } else {
                     SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
                                 "KMSDRM: atomic flip failed (%s); using modeset for GL present",
                                 strerror(err));
+                    if (err == EINVAL || err == ENOSYS) {
+                        dd->atomic.available = false; /* stop trying atomic every frame */
+                    }
                     ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
                                                    0, 0, &dd->connector->connector_id, 1, &dd->mode);
                     if (ret == 0) {
@@ -605,6 +614,7 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
                         SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
                                      "KMSDRM: atomic flip failed and modeset fallback failed: %s",
                                      strerror(errno));
+                        present_ok = false;
                     }
                 }
             }
@@ -634,6 +644,7 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
             if (ret != 0) {
                 if (is_permission_error(err)) {
                     windata->lost_master = true;
+                    present_ok = false;
                     SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: pageflip lost DRM master");
                 } else if (err == EINVAL || err == ENOSYS || err == EBUSY) {
                     /* this driver cannot page flip right now (e.g. virtio-gpu
@@ -655,14 +666,19 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
                         SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
                                      "KMSDRM: pageflip failed and modeset fallback failed: %s",
                                      strerror(errno));
+                        present_ok = false;
                     }
                 } else {
                     SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: pageflip failed: %s", strerror(err));
+                    present_ok = false;
                 }
             }
         }
     }
 
+    if (!present_ok) {
+        return SDL_SetError("KMSDRM: unable to present the frame to the scanout");
+    }
     return true;
 }
 

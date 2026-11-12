@@ -324,6 +324,12 @@ if(SDLop_BUILD_TESTS)
   target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
   add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
 
+  # KMS present-path benchmark (not a ctest gate; skips without KMS)
+  add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
+  target_link_libraries(bench_kmsdrm PRIVATE sdlop)
+  target_include_directories(bench_kmsdrm PRIVATE src)
+  target_compile_options(bench_kmsdrm PRIVATE -UNDEBUG)
+
   add_executable(test_gl tests/test_gl.c)
   target_link_libraries(test_gl PRIVATE sdlop ${GLESV2_LIBRARIES})
   target_include_directories(test_gl PRIVATE src ${GLESV2_INCLUDE_DIRS})
