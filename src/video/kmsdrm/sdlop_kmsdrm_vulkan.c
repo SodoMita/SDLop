@@ -34,6 +34,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 /* ------------------------------------------------------------------ */
 /* Minimal Vulkan type definitions (no vulkan.h)                       */
@@ -50,6 +52,9 @@
 #define VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   2
 #define VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    3
 #define VK_PHYSICAL_DEVICE_TYPE_CPU            4
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2      1000059000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT 1000247000
+#define VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME           "VK_EXT_physical_device_drm"
 
 typedef int32_t  VkResult_;
 typedef uint32_t VkFlags_;
@@ -151,6 +156,23 @@ typedef union KMSDRM_VkPhysicalDeviceProperties_
     unsigned char bytes[4096];
 } KMSDRM_VkPhysicalDeviceProperties_;
 
+/* VK_EXT_physical_device_drm: match a Vulkan device to the DRM device the
+ * backend picked (major/minor of the primary node) */
+typedef struct VkPhysicalDeviceDrmPropertiesEXT_
+{
+    uint32_t sType;
+    const void *pNext;
+    uint64_t drmDeviceID;
+    int32_t  drmPrimaryMajor, drmPrimaryMinor, drmRenderMajor, drmRenderMinor;
+} VkPhysicalDeviceDrmPropertiesEXT_;
+
+typedef struct VkPhysicalDeviceProperties2_
+{
+    uint32_t sType;
+    void *pNext;
+    KMSDRM_VkPhysicalDeviceProperties_ properties;
+} VkPhysicalDeviceProperties2_;
+
 typedef void *(*PFN_vkGetInstanceProcAddr_)(VkInstance_ instance, const char *pName);
 typedef VkResult_ (*PFN_vkEnumerateInstanceExtensionProperties_)(const char *pLayerName,
                                                                  uint32_t *pPropertyCount,
@@ -187,6 +209,12 @@ typedef VkResult_ (*PFN_vkCreateDisplayPlaneSurfaceKHR_)(VkInstance_ instance,
                                                          const VkDisplaySurfaceCreateInfoKHR_ *pCreateInfo,
                                                          const void *pAllocator,
                                                          VkSurfaceKHR_ *pSurface);
+typedef VkResult_ (*PFN_vkEnumerateDeviceExtensionProperties_)(VkPhysicalDevice_ physicalDevice,
+                                                               const char *pLayerName,
+                                                               uint32_t *pPropertyCount,
+                                                               VkExtensionProperties_ *pProperties);
+typedef void (*PFN_vkGetPhysicalDeviceProperties2_)(VkPhysicalDevice_ physicalDevice,
+                                                    VkPhysicalDeviceProperties2_ *pProperties);
 
 /* ------------------------------------------------------------------ */
 /* Instance extensions advertised to apps                              */
@@ -252,6 +280,60 @@ static bool kmsdrm_vulkan_extension_available(VkInstance_ instance, const char *
 /* ------------------------------------------------------------------ */
 /* Surface creation (SDL3's KMSDRM_Vulkan_CreateSurface)               */
 /* ------------------------------------------------------------------ */
+
+/* Does this Vulkan device drive the DRM device at (drm_major, drm_minor)?
+ * Returns false when VK_EXT_physical_device_drm (or the loader entry points
+ * needed to query it) is unavailable. */
+static bool kmsdrmvk_device_matches_drm(VkInstance_ instance, VkPhysicalDevice_ gpu,
+                                        uint32_t drm_major, uint32_t drm_minor)
+{
+    PFN_vkGetInstanceProcAddr_ gipa = kmsdrm_vk_gipa();
+    if (!gipa) {
+        return false;
+    }
+    PFN_vkEnumerateDeviceExtensionProperties_ pEnumDevExt =
+        (PFN_vkEnumerateDeviceExtensionProperties_)gipa(instance, "vkEnumerateDeviceExtensionProperties");
+    PFN_vkGetPhysicalDeviceProperties2_ pGetProps2 =
+        (PFN_vkGetPhysicalDeviceProperties2_)gipa(instance, "vkGetPhysicalDeviceProperties2");
+    if (!pEnumDevExt || !pGetProps2) {
+        return false;
+    }
+    uint32_t ext_count = 0;
+    if (pEnumDevExt(gpu, NULL, &ext_count, NULL) != VK_SUCCESS || ext_count == 0) {
+        return false;
+    }
+    VkExtensionProperties_ *exts = (VkExtensionProperties_ *)calloc(ext_count, sizeof(*exts));
+    if (!exts) {
+        return false;
+    }
+    if (pEnumDevExt(gpu, NULL, &ext_count, exts) != VK_SUCCESS) {
+        free(exts);
+        return false;
+    }
+    bool has_drm_ext = false;
+    for (uint32_t i = 0; i < ext_count; i++) {
+        if (strcmp(exts[i].extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0) {
+            has_drm_ext = true;
+            break;
+        }
+    }
+    free(exts);
+    if (!has_drm_ext) {
+        return false;
+    }
+    VkPhysicalDeviceDrmPropertiesEXT_ drm_props;
+    memset(&drm_props, 0, sizeof(drm_props));
+    drm_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+    drm_props.drmPrimaryMajor = -1;
+    drm_props.drmPrimaryMinor = -1;
+    VkPhysicalDeviceProperties2_ props2;
+    memset(&props2, 0, sizeof(props2));
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &drm_props;
+    pGetProps2(gpu, &props2);
+    return drm_props.drmPrimaryMajor == (int32_t)drm_major &&
+           drm_props.drmPrimaryMinor == (int32_t)drm_minor;
+}
 
 bool SDLOP_KMSDRM_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window,
                                        void *instance, const void *allocator, Uint64 *surface)
@@ -326,7 +408,28 @@ bool SDLOP_KMSDRM_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *wi
     }
     vkEnumeratePhysicalDevices((VkInstance_)instance, &gpu_count, physical_devices);
 
+    /* DRM device the backend drives — used to prefer the matching GPU */
+    uint32_t drm_major = 0, drm_minor = 0;
+    bool drm_fd_ok = false;
+    {
+        KMSDRM_DeviceData *vid = KMSDRM_GetDevice();
+        struct stat st;
+        if (vid && vid->drm_fd >= 0 && fstat(vid->drm_fd, &st) == 0) {
+            drm_major = (uint32_t)major(st.st_rdev);
+            drm_minor = (uint32_t)minor(st.st_rdev);
+            drm_fd_ok = true;
+        }
+    }
+
+    /* Iterate the candidates and pick the first device with at least one
+     * KMS display and a plane compatible with it. A device whose DRM node
+     * matches the backend's (VK_EXT_physical_device_drm) wins over plain
+     * enumeration order. Devices without KMS displays (e.g. lavapipe) are
+     * skipped like any other unusable candidate instead of aborting. */
     VkPhysicalDevice_ gpu = NULL;
+    uint32_t gpu_index = UINT32_MAX;
+    uint32_t gpu_api_version = 0, gpu_device_type = 0;
+    int gpu_score = -1;
     for (uint32_t i = 0; i < gpu_count; i++) {
         KMSDRM_VkPhysicalDeviceProperties_ props;
         memset(&props, 0, sizeof(props));
@@ -335,25 +438,101 @@ bool SDLOP_KMSDRM_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *wi
         memcpy(&api_version, props.bytes + 0, sizeof(api_version));
         memcpy(&device_type, props.bytes + 16, sizeof(device_type));
         /* accept every device kind (SDL3 only takes 1/2 and rejects lavapipe's CPU device) */
-        if (api_version >= VK_API_VERSION_1_0
-            && (device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
-                || device_type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
-                || device_type == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU
-                || device_type == VK_PHYSICAL_DEVICE_TYPE_CPU)) {
-            gpu = physical_devices[i];
+        if (api_version < VK_API_VERSION_1_0
+            || (device_type != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+                && device_type != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+                && device_type != VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU
+                && device_type != VK_PHYSICAL_DEVICE_TYPE_CPU)) {
+            continue;
+        }
+
+        uint32_t dcount = 0;
+        vkGetPhysicalDeviceDisplayPropertiesKHR(physical_devices[i], &dcount, NULL);
+        if (dcount == 0) {
             SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
-                        "SDLop KMS/Vulkan: using physical device %u (deviceType=%u apiVersion=%u.%u.%u)",
-                        i, device_type,
-                        (api_version >> 22) & 0x3ff,
-                        (api_version >> 12) & 0x3ff,
-                        api_version & 0xfff);
-            break;
+                        "SDLop KMS/Vulkan: physical device %u has no KMS displays, skipping", i);
+            continue;
+        }
+        VkDisplayPropertiesKHR_ *cand_displays =
+            (VkDisplayPropertiesKHR_ *)calloc(dcount, sizeof(*cand_displays));
+        if (!cand_displays) {
+            SDL_OutOfMemory();
+            goto clean;
+        }
+        vkGetPhysicalDeviceDisplayPropertiesKHR(physical_devices[i], &dcount, cand_displays);
+        VkDisplayKHR_ display0 = cand_displays[0].display;
+        free(cand_displays);
+
+        /* a plane that can drive display0 (bound to it, or unused) */
+        uint32_t pcount = 0;
+        vkGetPhysicalDeviceDisplayPlanePropertiesKHR(physical_devices[i], &pcount, NULL);
+        bool plane_ok = false;
+        if (pcount > 0) {
+            VkDisplayPlanePropertiesKHR_ *pprops =
+                (VkDisplayPlanePropertiesKHR_ *)calloc(pcount, sizeof(*pprops));
+            if (!pprops) {
+                SDL_OutOfMemory();
+                goto clean;
+            }
+            vkGetPhysicalDeviceDisplayPlanePropertiesKHR(physical_devices[i], &pcount, pprops);
+            for (uint32_t p = 0; p < pcount && !plane_ok; p++) {
+                if (pprops[p].currentDisplay != display0 && pprops[p].currentDisplay != NULL) {
+                    continue;
+                }
+                uint32_t supported_count = 0;
+                vkGetDisplayPlaneSupportedDisplaysKHR(physical_devices[i], p, &supported_count, NULL);
+                if (supported_count == 0) {
+                    continue;
+                }
+                VkDisplayKHR_ *supported =
+                    (VkDisplayKHR_ *)calloc(supported_count, sizeof(*supported));
+                if (!supported) {
+                    SDL_OutOfMemory();
+                    free(pprops);
+                    goto clean;
+                }
+                vkGetDisplayPlaneSupportedDisplaysKHR(physical_devices[i], p, &supported_count, supported);
+                for (uint32_t s2 = 0; s2 < supported_count; s2++) {
+                    if (supported[s2] == display0) {
+                        plane_ok = true;
+                        break;
+                    }
+                }
+                free(supported);
+            }
+            free(pprops);
+        }
+        if (!plane_ok) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                        "SDLop KMS/Vulkan: physical device %u has no plane compatible with its display, skipping",
+                        i);
+            continue;
+        }
+
+        int score = 10;
+        if (drm_fd_ok &&
+            kmsdrmvk_device_matches_drm((VkInstance_)instance, physical_devices[i], drm_major, drm_minor)) {
+            score += 100;
+        }
+        if (score > gpu_score) {
+            gpu_score = score;
+            gpu = physical_devices[i];
+            gpu_index = i;
+            gpu_api_version = api_version;
+            gpu_device_type = device_type;
         }
     }
     if (!gpu) {
-        SDL_SetError("Vulkan can't find a valid physical device");
+        SDL_SetError("Vulkan can't find a physical device with a KMS display and a compatible plane");
         goto clean;
     }
+    SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                "SDLop KMS/Vulkan: using physical device %u (deviceType=%u apiVersion=%u.%u.%u%s)",
+                gpu_index, gpu_device_type,
+                (gpu_api_version >> 22) & 0x3ff,
+                (gpu_api_version >> 12) & 0x3ff,
+                gpu_api_version & 0xfff,
+                gpu_score >= 110 ? ", DRM node matches" : "");
 
     uint32_t display_count = 0;
     vkGetPhysicalDeviceDisplayPropertiesKHR(gpu, &display_count, NULL);

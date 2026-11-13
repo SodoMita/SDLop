@@ -1230,16 +1230,21 @@ static void load_callback(XcursorImages *images, void *data) {
 	cursor = xcursor_create_from_xcursor_images(images, theme);
 
 	if (cursor) {
-		theme->cursor_count++;
-		theme->cursors =
+		/* grow the array through a temporary: a failed realloc must not
+		 * leak or strand the already-loaded cursors */
+		struct sdlop_xcursor **new_cursors =
 			realloc(theme->cursors,
-				theme->cursor_count * sizeof(theme->cursors[0]));
+				(theme->cursor_count + 1) * sizeof(new_cursors[0]));
 
-		if (theme->cursors == NULL) {
-			theme->cursor_count--;
-			free(cursor);
+		if (!new_cursors) {
+			/* keep the old array and its count untouched; drop just
+			 * the newly created cursor instead of dereferencing a
+			 * NULL array later */
+			xcursor_destroy(cursor);
 		} else {
-			theme->cursors[theme->cursor_count - 1] = cursor;
+			new_cursors[theme->cursor_count] = cursor;
+			theme->cursors = new_cursors;
+			theme->cursor_count++;
 		}
 	}
 

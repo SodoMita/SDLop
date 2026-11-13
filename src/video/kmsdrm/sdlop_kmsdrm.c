@@ -1450,19 +1450,19 @@ void KMSDRM_DestroySurfaces(KMSDRM_DeviceData *vid, SDL_Window *window)
     kmsdrm_destroy_surfaces(vid, window);
 }
 
-/* Recreate scanout buffers for the current mode (after a mode change). */
-bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window)
+/* Recreate scanout buffers for `mode` (a not-yet-committed mode change). */
+bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window,
+                            const drmModeModeInfo *mode)
 {
     (void)device;
     KMSDRM_DeviceData *vid = &kmsdrm;
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
-    KMSDRM_DisplayData *dd = windata->display;
 
     if (windata->waiting_for_flip) {
         KMSDRM_WaitPageflip(vid, windata, 500);
     }
 
-    uint32_t w = dd->mode.hdisplay, h = dd->mode.vdisplay;
+    uint32_t w = mode->hdisplay, h = mode->vdisplay;
 
     if (windata->gl_active) {
         /* mode-sized GBM/EGL scanout is stale; drop it and let the GL
@@ -1920,16 +1920,28 @@ static bool kmsdrm_mode_change(SDLop_VideoDevice *device, SDL_Window *window)
                    chosen.vtotal != dd->mode.vtotal;
 
     if (!changed) {
-        return true; /* nothing to do; surface size unchanged */
+        /* SDL updates window->w/h with the *requested* size before the
+         * backend runs; report the actual mode dimensions instead so the
+         * window stays consistent with the scanout surface */
+        window->w = (int)dd->mode.hdisplay;
+        window->h = (int)dd->mode.vdisplay;
+        return true;
     }
 
-    dd->mode = chosen;
-    window->w = (int)dd->mode.hdisplay;
-    window->h = (int)dd->mode.vdisplay;
-
-    if (!KMSDRM_RecreateScanout(device, window)) {
+    /* Stage the new mode: recreate the scanout against `chosen` first and
+     * commit dd->mode (plus the window dims + resize events) only after
+     * the rebuild succeeded. On failure the previous mode, the retained
+     * old buffers and the (non-NULL) cached surface all stay consistent. */
+    if (!KMSDRM_RecreateScanout(device, window, &chosen)) {
+        /* report the actual (unchanged) mode, not the requested size */
+        window->w = (int)dd->mode.hdisplay;
+        window->h = (int)dd->mode.vdisplay;
         return false;
     }
+    dd->mode = chosen;
+
+    window->w = (int)dd->mode.hdisplay;
+    window->h = (int)dd->mode.vdisplay;
 
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);

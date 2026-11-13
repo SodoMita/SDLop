@@ -175,6 +175,7 @@ int main(void)
             printf("  SKIP GL context (GBM/EGL missing?): %s\n", SDL_GetError());
         } else {
             SDL_GL_SetSwapInterval(0);
+            int swap_failures = 0;
             /* clear to a distinctive color a few times */
             for (int i = 0; i < 5; i++) {
                 /* GLES2 clear via raw GL symbols resolved lazily by the test */
@@ -190,9 +191,11 @@ int main(void)
                     pClearColor(0.9f, 0.1f, 0.5f, 1.0f); /* magenta-ish */
                     pClear(0x00004000u);                /* GL_COLOR_BUFFER_BIT */
                 }
-                SDL_GL_SwapWindow(glw);
+                if (!SDL_GL_SwapWindow(glw)) {
+                    swap_failures++;
+                    fprintf(stderr, "  note: GL swap %d failed: %s\n", i, SDL_GetError());
+                }
             }
-            CHECK(1, "GL swap loop completed (GBM + EGL + page flip)");
             /* optional: keep a magenta GL frame on screen for screendump checks
              * (hold while the context is still alive so the swap loop is valid) */
             const char *hold = getenv("SDLOP_TEST_KMSDRM_HOLD_GL");
@@ -200,12 +203,17 @@ int main(void)
                 int secs = atoi(hold);
                 if (secs > 0) {
                     for (int t = 0; t < secs * 20; t++) {
-                        SDL_GL_SwapWindow(glw);
+                        if (!SDL_GL_SwapWindow(glw)) {
+                            swap_failures++;
+                            fprintf(stderr, "  note: GL hold swap failed: %s\n", SDL_GetError());
+                            break;
+                        }
                         SDL_PumpEvents();
                         SDL_Delay(50);
                     }
                 }
             }
+            CHECK(swap_failures == 0, "GL swaps all presented (GBM + EGL + page flip)");
             SDL_GL_DestroyContext(ctx);
         }
         SDL_DestroyWindow(glw);

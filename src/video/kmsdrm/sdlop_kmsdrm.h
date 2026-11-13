@@ -147,7 +147,7 @@ bool KMSDRM_WaitPageflip(KMSDRM_DeviceData *viddata, KMSDRM_WindowData *windata,
 void KMSDRM_FlipHandler(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
                         unsigned int crtc_id, void *data);
 void KMSDRM_DestroySurfaces(KMSDRM_DeviceData *viddata, SDL_Window *window);
-bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window);
+bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window, const drmModeModeInfo *mode);
 
 KMSDRM_DeviceData *KMSDRM_GetDevice(void);
 void KMSDRM_DestroySwScanout(SDL_Window *window);
