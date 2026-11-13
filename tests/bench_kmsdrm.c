@@ -162,7 +162,13 @@ static bool bench_gl(int frames, int warmup)
         pClearColor(0.9f * phase, 0.1f, 0.5f, 1.0f);
         pClear(0x00004000u); /* GL_COLOR_BUFFER_BIT */
         uint64_t t0 = SDL_GetTicksNS();
-        SDL_GL_SwapWindow(w);
+        if (!SDL_GL_SwapWindow(w)) {
+            printf("  note: GL swap failed at frame %d: %s\n", i, SDL_GetError());
+            free(frame_ms);
+            SDL_GL_DestroyContext(ctx);
+            SDL_DestroyWindow(w);
+            return false;
+        }
         uint64_t t1 = SDL_GetTicksNS();
         SDL_PumpEvents();
         if (i >= warmup) {

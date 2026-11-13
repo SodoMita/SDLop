@@ -763,6 +763,12 @@ static bool kmsdrm_init_displays(void)
                 pref = m;
             }
         }
+        if (!pref) {
+            /* unreachable today (kmsdrm_pick_connector only returns
+             * connectors with count_modes > 0), but never deref blindly */
+            SDL_SetError("Connected connector has no display modes");
+            goto cleanup;
+        }
         vid->display.mode = *pref;
     }
 
@@ -1126,8 +1132,10 @@ bool KMSDRM_WaitPageflip(KMSDRM_DeviceData *viddata, KMSDRM_WindowData *windata,
                 return false;
             }
         }
-        if (pfd.revents & (POLLHUP | POLLERR)) {
-            SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: DRM fd hung up while waiting for page flip");
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
+                         "KMSDRM: DRM fd hung up or invalid (revents=0x%x) while waiting for page flip",
+                         pfd.revents);
             windata->waiting_for_flip = false;
             return false;
         }
