@@ -74,6 +74,10 @@ typedef struct WaylandDeviceData
         struct wl_output *output;
         uint32_t name; /* registry name, for global_remove */
         int32_t scale;
+        int32_t x, y;             /* geometry (logical origin) */
+        int32_t mode_w, mode_h;   /* current mode, pixels */
+        char name_str[64];        /* xdg output name, when known */
+        SDL_DisplayID display_id; /* core display, once registered */
     } outputs[SDLOP_MAX_OUTPUTS];
     int num_outputs;
     struct
@@ -971,13 +975,33 @@ static void output_geometry(void *data, struct wl_output *output, int32_t x, int
                             int32_t physical_width, int32_t physical_height, int32_t subpixel,
                             const char *make, const char *model, int32_t transform)
 {
-    (void)data; (void)output; (void)x; (void)y; (void)physical_width; (void)physical_height;
-    (void)subpixel; (void)make; (void)model; (void)transform;
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    (void)physical_width; (void)physical_height; (void)subpixel;
+    (void)make; (void)model; (void)transform;
+    for (int i = 0; i < d->num_outputs; i++) {
+        if (d->outputs[i].output == output) {
+            d->outputs[i].x = x;
+            d->outputs[i].y = y;
+            return;
+        }
+    }
 }
+
+#define WL_OUTPUT_MODE_CURRENT 0x1
 
 static void output_mode(void *data, struct wl_output *output, uint32_t flags, int32_t width, int32_t height, int32_t refresh)
 {
-    (void)data; (void)output; (void)flags; (void)width; (void)height; (void)refresh;
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    (void)refresh;
+    for (int i = 0; i < d->num_outputs; i++) {
+        if (d->outputs[i].output == output) {
+            if ((flags & WL_OUTPUT_MODE_CURRENT) || d->outputs[i].mode_w == 0) {
+                d->outputs[i].mode_w = width;
+                d->outputs[i].mode_h = height;
+            }
+            return;
+        }
+    }
 }
 
 static void output_scale(void *data, struct wl_output *output, int32_t factor)
@@ -993,7 +1017,28 @@ static void output_scale(void *data, struct wl_output *output, int32_t factor)
 
 static void output_done(void *data, struct wl_output *output)
 {
-    (void)data;
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    /* register the core display as soon as the server told us everything */
+    for (int i = 0; i < d->num_outputs; i++) {
+        if (d->outputs[i].output == output && d->outputs[i].display_id == 0) {
+            char name[64];
+            if (d->outputs[i].name_str[0]) {
+                snprintf(name, sizeof(name), "%s", d->outputs[i].name_str);
+            } else {
+                snprintf(name, sizeof(name), "wayland-%u", i + 1);
+            }
+            int w = d->outputs[i].mode_w > 0 ? d->outputs[i].mode_w : 1920;
+            int h = d->outputs[i].mode_h > 0 ? d->outputs[i].mode_h : 1080;
+            d->outputs[i].display_id =
+                SDLOP_AddDisplay(name, w, h, 0, SDL_ORIENTATION_LANDSCAPE, NULL, sdlop.init_done);
+            if (d->outputs[i].display_id != 0) {
+                int idx = SDLOP_GetDisplayIndexById(d->outputs[i].display_id);
+                if (idx >= 0 && d->outputs[i].scale > 0) {
+                    sdlop.displays[idx].content_scale = (float)d->outputs[i].scale;
+                }
+            }
+        }
+    }
     float s = wayland_output_scale(output);
     for (SDL_Window *w = sdlop.windows; w; w = w->next) {
         WaylandWindowData *wd = (WaylandWindowData *)w->driverdata;
@@ -1006,7 +1051,13 @@ static void output_done(void *data, struct wl_output *output)
 
 static void output_name(void *data, struct wl_output *output, const char *name)
 {
-    (void)data; (void)output; (void)name;
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    for (int i = 0; i < d->num_outputs; i++) {
+        if (d->outputs[i].output == output && name) {
+            snprintf(d->outputs[i].name_str, sizeof(d->outputs[i].name_str), "%s", name);
+            return;
+        }
+    }
 }
 
 static void output_description(void *data, struct wl_output *output, const char *description)
@@ -1190,6 +1241,9 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
                 wd->output = NULL; /* keeps its last scale until re-enter */
             }
         }
+        if (d->outputs[i].display_id) {
+            SDLOP_DelDisplay(d->outputs[i].display_id, sdlop.init_done);
+        }
         wl_output_destroy(d->outputs[i].output);
         /* compact the list */
         for (int j = i; j < d->num_outputs - 1; j++) {
@@ -1264,6 +1318,10 @@ static void wayland_Quit(SDLop_VideoDevice *device)
         wl_pointer_destroy(wl_data.pointer);
     }
     for (int i = 0; i < wl_data.num_outputs; i++) {
+        if (wl_data.outputs[i].display_id) {
+            SDLOP_DelDisplay(wl_data.outputs[i].display_id, false);
+            wl_data.outputs[i].display_id = 0;
+        }
         wl_output_destroy(wl_data.outputs[i].output);
         wl_data.outputs[i].output = NULL;
     }

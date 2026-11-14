@@ -14,6 +14,7 @@
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_pixels.h>
 #include <SDL3/SDL_rect.h>
+#include <SDL3/SDL_properties.h>
 
 /**
  * The type used to identify a window (opaque window handle).
@@ -399,5 +400,46 @@ typedef struct SDL_DisplayMode
     SDL_DisplayModeData *internal;  /**< Private */
 
 } SDL_DisplayMode;
+
+/* ---- Display enumeration (implemented by the core; identical names,
+ * values and signatures to SDL3 where they exist) ----
+ *
+ * Notes vs stock SDL3:
+ * - SDL_GetDisplays() returns a calloc'd array of display IDs terminated
+ *   by a 0 entry, like SDL3, but SDLop has no SDL_free - free() it.
+ * - SDL_GetDisplayUsableBounds() equals SDL_GetDisplayBounds() (no chrome).
+ * - The current display mode is the desktop mode (no mid-session mode change
+ *   tracking yet).
+ * - Panel-orientation data comes through SDL_EVENT_DISPLAY_* data1 and is
+ *   also logged by the KMSDRM driver (SDLop has no properties subsystem).
+ */
+extern SDL_DisplayID *SDL_GetDisplays(int *count);
+extern SDL_DisplayID SDL_GetPrimaryDisplay(void);
+extern const char *SDL_GetDisplayName(SDL_DisplayID displayID);
+extern bool SDL_GetDisplayBounds(SDL_DisplayID displayID, SDL_Rect *rect);
+extern bool SDL_GetDisplayUsableBounds(SDL_DisplayID displayID, SDL_Rect *rect);
+extern SDL_DisplayOrientation SDL_GetNaturalDisplayOrientation(SDL_DisplayID displayID);
+extern SDL_DisplayOrientation SDL_GetCurrentDisplayOrientation(SDL_DisplayID displayID);
+extern float SDL_GetDisplayContentScale(SDL_DisplayID displayID);
+extern const SDL_DisplayMode *SDL_GetDesktopDisplayMode(SDL_DisplayID displayID);
+extern const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID);
+extern SDL_DisplayID SDL_GetDisplayForPoint(const SDL_Point *point);
+extern SDL_DisplayID SDL_GetDisplayForRect(const SDL_Rect *rect);
+extern SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window *window);
+extern float SDL_GetWindowPixelDensity(SDL_Window *window);
+
+/* ---- Display properties (identical names/values/signatures to SDL3) ---- */
+extern SDL_PropertiesID SDL_GetDisplayProperties(SDL_DisplayID displayID);
+
+/** `SDL.display.HDR_enabled` (bool, diagnostic only). */
+#define SDL_PROP_DISPLAY_HDR_ENABLED_BOOLEAN             "SDL.display.HDR_enabled"
+/** `SDL.display.KMSDRM.panel_orientation` (number, degrees of clockwise rotation). */
+#define SDL_PROP_DISPLAY_KMSDRM_PANEL_ORIENTATION_NUMBER "SDL.display.KMSDRM.panel_orientation"
+
+extern SDL_DisplayMode **SDL_GetFullscreenDisplayModes(SDL_DisplayID displayID, int *count);
+extern bool SDL_GetClosestFullscreenDisplayMode(SDL_DisplayID displayID, int w, int h, float refresh_rate, bool include_high_density_modes, SDL_DisplayMode *closest);
+
+extern bool SDL_SetWindowFullscreenMode(SDL_Window *window, const SDL_DisplayMode *mode);
+extern const SDL_DisplayMode *SDL_GetWindowFullscreenMode(SDL_Window *window);
 
 #endif /* SDL_video_h_ */

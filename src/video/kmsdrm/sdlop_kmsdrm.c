@@ -59,6 +59,10 @@
 #include <sys/ioctl.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
+#include <linux/netlink.h>
+#include <sys/socket.h>
+#include <sys/sysmacros.h>
+#include <linux/major.h>
 #include <unistd.h>
 #include <strings.h>
 #include <stdarg.h>
@@ -287,6 +291,8 @@ static int KMSDRM_ConnectorGetOrientation(int fd, uint32_t connector_id)
     return orientation;
 }
 
+static void kmsdrm_hide_cursor(KMSDRM_DisplayData *dd); /* defined below with the cursor code */
+
 /* ------------------------------------------------------------------ */
 /* VT switch handling (VT_PROCESS mode, ported from SDL3)              */
 /* ------------------------------------------------------------------ */
@@ -378,12 +384,63 @@ static void kmsdrm_vt_shutdown(void)
 
 static void kmsdrm_vt_init(void)
 {
-    /* opening /dev/tty may fail (no controlling console, e.g. service or
-     * ssh) - in that case the kernel keeps VT_AUTO mode and we rely on the
-     * lost-master recovery paths instead */
-    int fd = open("/dev/tty", O_RDONLY | O_CLOEXEC);
+    /* VT selection (swa "vt_setup" behavior):
+     *   1. $TTYNO explicitly requests /dev/tty<N>;
+     *   2. otherwise reuse the controlling tty (historical behavior);
+     *   3. when there is no controlling console (ssh, display managers,
+     *      build services), allocate a free VT with VT_OPENQRY on
+     *      /dev/tty0 and run there, switching to it with
+     *      VT_ACTIVATE + VT_WAITACTIVE.
+     * When none of that works the kernel keeps VT_AUTO mode and we rely
+     * on the lost-master recovery paths instead. */
+    int fd = -1;
+    char tty_dev[32];
+    int vt_num = 0;         /* non-zero when we own a newly-allocated VT */
+
+    const char *tty_num_env = getenv("TTYNO");
+    if (tty_num_env && *tty_num_env) {
+        char *endptr = NULL;
+        unsigned long tty = strtoul(tty_num_env, &endptr, 10);
+        if (tty == 0 || !endptr || *endptr != '\0') {
+            kmsdrm_log("KMSDRM: invalid $TTYNO '%s'; ignoring", tty_num_env);
+        } else {
+            vt_num = (int)tty;
+            snprintf(tty_dev, sizeof(tty_dev), "/dev/tty%d", vt_num);
+            fd = open(tty_dev, O_RDWR | O_NOCTTY | O_CLOEXEC);
+            if (fd < 0) {
+                kmsdrm_log("KMSDRM: failed to open $TTYNO console %s: %s", tty_dev, strerror(errno));
+                vt_num = 0;
+            }
+        }
+    }
+    if (fd < 0 && !vt_num) {
+        fd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (fd < 0) {
+            /* no controlling console (e.g. ssh): allocate a free VT */
+            int tty0 = open("/dev/tty0", O_WRONLY | O_CLOEXEC);
+            if (tty0 >= 0) {
+                int free_vt = 0;
+                if (ioctl(tty0, VT_OPENQRY, &free_vt) == 0 && free_vt > 0) {
+                    snprintf(tty_dev, sizeof(tty_dev), "/dev/tty%d", free_vt);
+                    fd = open(tty_dev, O_RDWR | O_NOCTTY | O_CLOEXEC);
+                    if (fd >= 0) {
+                        vt_num = free_vt;
+                        kmsdrm_log("KMSDRM: no controlling tty; allocated free VT %d", vt_num);
+                    } else {
+                        kmsdrm_log("KMSDRM: failed to open allocated VT console %s: %s",
+                                   tty_dev, strerror(errno));
+                    }
+                } else {
+                    kmsdrm_log("KMSDRM: VT_OPENQRY on /dev/tty0 failed: %s", strerror(errno));
+                }
+                close(tty0);
+            } else {
+                kmsdrm_log("KMSDRM: no controlling tty and /dev/tty0: %s", strerror(errno));
+            }
+        }
+    }
     if (fd < 0) {
-        kmsdrm_log("KMSDRM: no controlling tty; VT switching left to the kernel");
+        kmsdrm_log("KMSDRM: no VT console available; VT switching left to the kernel");
         return;
     }
     char kbtype = 0;
@@ -433,6 +490,15 @@ static void kmsdrm_vt_init(void)
     }
 
     kmsdrm_vt_console_fd = fd;
+    if (vt_num > 0) {
+        /* switch to the VT we allocated/requested (swa behavior) */
+        if (ioctl(fd, VT_ACTIVATE, vt_num) != 0 ||
+            ioctl(fd, VT_WAITACTIVE, vt_num) != 0) {
+            kmsdrm_log("KMSDRM: could not switch to VT %d: %s", vt_num, strerror(errno));
+        } else {
+            kmsdrm_log("KMSDRM: switched to VT %d", vt_num);
+        }
+    }
     kmsdrm_log("KMSDRM: VT switching handled (relsig=%d acqsig=%d)",
                kmsdrm_vt_release_sig, kmsdrm_vt_acquire_sig);
 }
@@ -443,6 +509,13 @@ static void kmsdrm_vt_init(void)
 static void kmsdrm_vt_release(void)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
+    /* detach every HW cursor (best effort; DRM master is still ours here) */
+    for (int i = 0; i < vid->num_displays; i++) {
+        KMSDRM_DisplayData *dd = &vid->displays[i];
+        if (dd->connected && dd->cursor_visible) {
+            kmsdrm_hide_cursor(dd);
+        }
+    }
     for (SDL_Window *w = sdlop.windows; w; w = w->next) {
         KMSDRM_WindowData *windata = (KMSDRM_WindowData *)w->driverdata;
         if (!windata) {
@@ -625,70 +698,79 @@ static void kmsdrm_connector_name(KMSDRM_DisplayData *dd, drmModeConnector *conn
     }
 }
 
-/* Find the connector the user wants (SDLOP_KMSDRM_CONNECTOR substring,
- * case-insensitive), or the first connected one with modes. */
-static drmModeConnector *kmsdrm_pick_connector(int fd, drmModeRes *resources)
+static bool kmsdrm_crtc_in_use(const uint32_t *used, int n, uint32_t crtc_id)
 {
-    const char *filter = getenv("SDLOP_KMSDRM_CONNECTOR");
-    drmModeConnector *first = NULL;
-
-    for (int i = 0; i < resources->count_connectors; i++) {
-        drmModeConnector *conn = SDLOP_DRM_drmModeGetConnector(fd, resources->connectors[i]);
-        if (!conn) {
-            continue;
-        }
-        if (conn->connection != DRM_MODE_CONNECTED || conn->count_modes == 0) {
-            SDLOP_DRM_drmModeFreeConnector(conn);
-            continue;
-        }
-        if (!filter || !*filter) {
-            return conn; /* first usable */
-        }
-        char name[64];
-        const char *type = SDLOP_DRM_drmModeGetConnectorTypeName
-            ? SDLOP_DRM_drmModeGetConnectorTypeName(conn->connector_type) : "connector";
-        snprintf(name, sizeof(name), "%s-%u", type, conn->connector_type_id);
-        if (strcasestr(name, filter)) {
-            if (first) {
-                SDLOP_DRM_drmModeFreeConnector(first);
-            }
-            return conn;
-        }
-        if (!first) {
-            first = conn;
-        } else {
-            SDLOP_DRM_drmModeFreeConnector(conn);
+    for (int i = 0; i < n; i++) {
+        if (used[i] == crtc_id) {
+            return true;
         }
     }
-    return first; /* NULL if filter matched nothing: caller falls back */
+    return false;
 }
 
-static bool kmsdrm_init_displays(void)
+/* Pick a CRTC for an encoder: the encoder's current CRTC when it is free,
+ * else the first possible CRTC not used by another display, else the
+ * encoder's current CRTC (forced sharing), else any possible CRTC. */
+static bool kmsdrm_pick_crtc(drmModeRes *resources, drmModeEncoder *encoder,
+                             const uint32_t *used_crtcs, int num_used,
+                             uint32_t *crtc_id_out)
 {
-    KMSDRM_DeviceData *vid = &kmsdrm;
-    drmModeRes *resources = NULL;
+    if (encoder->crtc_id && !kmsdrm_crtc_in_use(used_crtcs, num_used, encoder->crtc_id)) {
+        *crtc_id_out = encoder->crtc_id;
+        return true;
+    }
+    for (int i = 0; i < resources->count_crtcs; i++) {
+        if ((encoder->possible_crtcs & (1 << i)) &&
+            !kmsdrm_crtc_in_use(used_crtcs, num_used, resources->crtcs[i])) {
+            *crtc_id_out = resources->crtcs[i];
+            return true;
+        }
+    }
+    if (encoder->crtc_id) {
+        *crtc_id_out = encoder->crtc_id; /* forced sharing */
+        return true;
+    }
+    for (int i = 0; i < resources->count_crtcs; i++) {
+        if (encoder->possible_crtcs & (1 << i)) {
+            *crtc_id_out = resources->crtcs[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static SDL_DisplayOrientation kmsdrm_orientation_from_degrees(int degrees)
+{
+    switch (degrees) {
+    case 90:  return SDL_ORIENTATION_PORTRAIT;
+    case 180: return SDL_ORIENTATION_LANDSCAPE_FLIPPED;
+    case 270: return SDL_ORIENTATION_PORTRAIT_FLIPPED;
+    default:  return SDL_ORIENTATION_LANDSCAPE;
+    }
+}
+
+/* Initialize one display from an already-connected connector with modes.
+ * On success `dd` owns connector+crtc and *used_crtcs gains the CRTC.
+ * On failure everything is freed and an error is logged. */
+static bool kmsdrm_init_display_one(KMSDRM_DeviceData *vid,
+                                    drmModeRes *resources,
+                                    drmModeConnector *connector, /* borrowed */
+                                    const uint32_t *used_crtcs, int num_used,
+                                    KMSDRM_DisplayData *dd)
+{
+    int fd = vid->drm_fd;
     drmModeEncoder *encoder = NULL;
-    drmModeConnector *connector = NULL;
     drmModeCrtc *crtc = NULL;
     bool result = false;
 
-    resources = SDLOP_DRM_drmModeGetResources(vid->drm_fd);
-    if (!resources) {
-        SDL_SetError("drmModeGetResources failed");
-        goto cleanup;
-    }
+    memset(dd, 0, sizeof(*dd));
+    dd->connected = true;
+    dd->display_id = 0;
 
-    connector = kmsdrm_pick_connector(vid->drm_fd, resources);
-    if (!connector) {
-        SDL_SetError("No connected connector%s%s",
-                     getenv("SDLOP_KMSDRM_CONNECTOR") ? " matching SDLOP_KMSDRM_CONNECTOR=" : "",
-                     getenv("SDLOP_KMSDRM_CONNECTOR") ? getenv("SDLOP_KMSDRM_CONNECTOR") : "");
-        goto cleanup;
-    }
-
-    /* Find the connector's current encoder, else the first supported one */
+    /* Find the connector's current encoder, else the first supported one
+     * (preferring encoders with a free possible CRTC). */
     for (int i = 0; i < resources->count_encoders; i++) {
-        encoder = SDLOP_DRM_drmModeGetEncoder(vid->drm_fd, resources->encoders[i]);
+        encoder = SDLOP_DRM_drmModeGetEncoder(fd, resources->encoders[i]);
         if (encoder && encoder->encoder_id == connector->encoder_id) {
             break;
         }
@@ -698,59 +780,69 @@ static bool kmsdrm_init_displays(void)
         }
     }
     if (!encoder) {
+        drmModeEncoder *fallback = NULL;
         for (int i = 0; i < resources->count_encoders; i++) {
-            encoder = SDLOP_DRM_drmModeGetEncoder(vid->drm_fd, resources->encoders[i]);
-            if (!encoder) {
+            drmModeEncoder *e = SDLOP_DRM_drmModeGetEncoder(fd, resources->encoders[i]);
+            if (!e) {
                 continue;
             }
             bool supported = false;
             for (int j = 0; j < connector->count_encoders; j++) {
-                if (connector->encoders[j] == encoder->encoder_id) {
+                if (connector->encoders[j] == e->encoder_id) {
                     supported = true;
                     break;
                 }
             }
-            if (supported) {
+            if (!supported) {
+                SDLOP_DRM_drmModeFreeEncoder(e);
+                continue;
+            }
+            uint32_t crtc_id = 0;
+            if (kmsdrm_pick_crtc(resources, e, used_crtcs, num_used, &crtc_id) &&
+                !kmsdrm_crtc_in_use(used_crtcs, num_used, crtc_id)) {
+                encoder = e; /* an encoder with a free CRTC wins */
                 break;
             }
-            SDLOP_DRM_drmModeFreeEncoder(encoder);
-            encoder = NULL;
+            if (!fallback) {
+                fallback = e;
+            } else {
+                SDLOP_DRM_drmModeFreeEncoder(e);
+            }
+        }
+        if (!encoder) {
+            encoder = fallback;
         }
     }
     if (!encoder) {
-        SDL_SetError("No encoder found for connector");
+        kmsdrm_log("KMSDRM: no encoder found for connector %u", connector->connector_id);
         goto cleanup;
     }
 
-    /* Find a CRTC: the encoder's current one, else the first possible one */
-    if (encoder->crtc_id) {
-        crtc = SDLOP_DRM_drmModeGetCrtc(vid->drm_fd, encoder->crtc_id);
-    }
-    if (!crtc) {
-        for (int i = 0; i < resources->count_crtcs; i++) {
-            if (encoder->possible_crtcs & (1 << i)) {
-                encoder->crtc_id = resources->crtcs[i];
-                crtc = SDLOP_DRM_drmModeGetCrtc(vid->drm_fd, encoder->crtc_id);
-                break;
-            }
+    /* Find a CRTC for the encoder */
+    {
+        uint32_t crtc_id = 0;
+        if (!kmsdrm_pick_crtc(resources, encoder, used_crtcs, num_used, &crtc_id)) {
+            kmsdrm_log("KMSDRM: no CRTC found for connector %u", connector->connector_id);
+            goto cleanup;
         }
+        crtc = SDLOP_DRM_drmModeGetCrtc(fd, crtc_id);
     }
     if (!crtc) {
-        SDL_SetError("No CRTC found for connector");
+        kmsdrm_log("KMSDRM: drmModeGetCrtc failed for connector %u", connector->connector_id);
         goto cleanup;
     }
 
     /* Save the current CRTC configuration so we can restore it on quit. */
-    vid->display.original_mode = crtc->mode;
-    vid->display.original_fb_id = crtc->buffer_id;
+    dd->original_mode = crtc->mode;
+    dd->original_fb_id = crtc->buffer_id;
     if (crtc->mode_valid == 0 || crtc->mode.hdisplay == 0) {
-        memset(&vid->display.original_mode, 0, sizeof(vid->display.original_mode));
+        memset(&dd->original_mode, 0, sizeof(dd->original_mode));
     }
 
     /* Initial display mode: the CRTC's current mode if sane, else the
      * preferred (or largest) connector mode. */
     if (crtc->mode_valid && crtc->mode.hdisplay > 0) {
-        vid->display.mode = crtc->mode;
+        dd->mode = crtc->mode;
     } else {
         drmModeModeInfo *pref = NULL;
         for (int i = 0; i < connector->count_modes; i++) {
@@ -764,49 +856,42 @@ static bool kmsdrm_init_displays(void)
             }
         }
         if (!pref) {
-            /* unreachable today (kmsdrm_pick_connector only returns
-             * connectors with count_modes > 0), but never deref blindly */
-            SDL_SetError("Connected connector has no display modes");
+            kmsdrm_log("KMSDRM: connector %u has no display modes", connector->connector_id);
             goto cleanup;
         }
-        vid->display.mode = *pref;
+        dd->mode = *pref;
     }
 
-    vid->display.connector = connector;
-    vid->display.crtc = crtc;
-    connector = NULL; /* owned by display now */
+    dd->connector = connector; /* takes ownership */
+    dd->crtc = crtc;
     crtc = NULL;
-    kmsdrm_connector_name(&vid->display, vid->display.connector);
-
-    kmsdrm_log("KMSDRM: using %s on %s (%dx%d, %d modes)",
-               vid->display.name, vid->devpath,
-               vid->display.mode.hdisplay, vid->display.mode.vdisplay,
-               vid->display.connector->count_modes);
+    kmsdrm_connector_name(dd, dd->connector);
 
     /* VRR: save the CRTC's current state; enable it if the connector says
      * it can do variable refresh rate (SDL3 behavior). Restored on quit. */
-    vid->display.saved_vrr = KMSDRM_CrtcGetVrr(vid->drm_fd, vid->display.crtc->crtc_id);
-    vid->display.vrr_enabled = false;
-    if (kmsdrm_connector_check_vrr_capable(vid->drm_fd, vid->display.connector->connector_id,
-                                           "VRR_CAPABLE")) {
-        KMSDRM_CrtcSetVrr(vid->drm_fd, vid->display.crtc->crtc_id, true);
-        vid->display.vrr_enabled = true;
+    dd->saved_vrr = KMSDRM_CrtcGetVrr(fd, dd->crtc->crtc_id);
+    dd->vrr_enabled = false;
+    if (kmsdrm_connector_check_vrr_capable(fd, dd->connector->connector_id, "VRR_CAPABLE")) {
+        KMSDRM_CrtcSetVrr(fd, dd->crtc->crtc_id, true);
+        dd->vrr_enabled = true;
         kmsdrm_log("KMSDRM: enabling VRR (connector reports VRR_CAPABLE)");
     }
 
     /* panel orientation (connector property); SDLop has no display
-     * properties API, so store + log it for diagnostics */
-    vid->display.panel_orientation_degrees =
-        KMSDRM_ConnectorGetOrientation(vid->drm_fd, vid->display.connector->connector_id);
-    if (vid->display.panel_orientation_degrees != 0) {
+     * properties API, so the value is stored on the display (it is also
+     * reported through SDL_GetNaturalDisplayOrientation) and logged. */
+    dd->panel_orientation_degrees =
+        KMSDRM_ConnectorGetOrientation(fd, dd->connector->connector_id);
+    if (dd->panel_orientation_degrees != 0) {
         kmsdrm_log("KMSDRM: panel orientation: %d degrees",
-                   vid->display.panel_orientation_degrees);
+                   dd->panel_orientation_degrees);
     }
 
     /* atomic modesetting probe: sets the client cap, finds the CRTC's
      * primary plane and caches the property ids. Never fatal - on any
      * failure the driver silently keeps the legacy path. */
-    KMSDRM_AtomicTryInit(vid, &vid->display);
+    KMSDRM_AtomicTryInit(vid, dd);
+    KMSDRM_LogPlanes(vid, dd);
 
     result = true;
 
@@ -817,78 +902,387 @@ cleanup:
     if (crtc) {
         SDLOP_DRM_drmModeFreeCrtc(crtc);
     }
-    if (connector) {
-        SDLOP_DRM_drmModeFreeConnector(connector);
+    if (!result) {
+        /* leave `dd` inert and disconnected; the caller keeps `connector` */
+        memset(dd, 0, sizeof(*dd));
     }
+    return result;
+}
+
+/* Initialize every connected connector as its own display (multi-display
+ * support, like SDL3). SDLOP_KMSDRM_CONNECTOR limits this to a single
+ * (matching) connector. */
+/* Register every connector mode as an exclusive fullscreen mode of the
+ * display (SDL3 behavior); the desktop mode is registered by
+ * SDLOP_AddDisplay itself. */
+static void kmsdrm_register_fullscreen_modes(KMSDRM_DisplayData *dd)
+{
+    drmModeConnector *conn = dd->connector;
+    if (!dd->display_id || !conn) {
+        return;
+    }
+    for (int i = 0; i < conn->count_modes; i++) {
+        const drmModeModeInfo *m = &conn->modes[i];
+        SDL_DisplayMode mode = { 0 };
+        uint32_t mhz = (uint32_t)KMSDRM_ModeRefreshMHz(m);
+        mode.displayID = dd->display_id;
+        mode.format = SDL_PIXELFORMAT_ARGB8888;
+        mode.w = (int)m->hdisplay;
+        mode.h = (int)m->vdisplay;
+        mode.pixel_density = 1.0f;
+        if (mhz > 0) {
+            mode.refresh_rate = mhz / 1000.0f;
+            mode.refresh_rate_numerator = mhz;
+            mode.refresh_rate_denominator = 1000;
+        }
+        SDLOP_AddFullscreenDisplayMode(dd->display_id, &mode);
+    }
+}
+
+/* Publish the display properties SDL3 exposes for KMSDRM backends.
+ * HDR is reported as false (SDLop has no HDR headroom source yet). */
+static void kmsdrm_publish_display_props(KMSDRM_DisplayData *dd)
+{
+    if (!dd->display_id) {
+        return;
+    }
+    SDL_PropertiesID props = SDL_GetDisplayProperties(dd->display_id);
+    if (!props) {
+        return;
+    }
+    SDL_SetBooleanProperty(props, SDL_PROP_DISPLAY_HDR_ENABLED_BOOLEAN, false);
+    if (dd->panel_orientation_degrees != 0) {
+        SDL_SetNumberProperty(props, SDL_PROP_DISPLAY_KMSDRM_PANEL_ORIENTATION_NUMBER,
+                              dd->panel_orientation_degrees);
+    }
+}
+
+static bool kmsdrm_init_displays(void)
+{
+    KMSDRM_DeviceData *vid = &kmsdrm;
+    drmModeRes *resources = NULL;
+    bool result = false;
+    uint32_t used_crtcs[SDLOP_MAX_DISPLAYS];
+    int num_used = 0;
+
+    resources = SDLOP_DRM_drmModeGetResources(vid->drm_fd);
+    if (!resources) {
+        SDL_SetError("drmModeGetResources failed");
+        goto cleanup;
+    }
+
+    const char *filter = getenv("SDLOP_KMSDRM_CONNECTOR");
+    drmModeConnector *first = NULL; /* fallback when the filter matches nothing */
+
+    vid->num_displays = 0;
+    for (int i = 0; i < resources->count_connectors; i++) {
+        drmModeConnector *conn = SDLOP_DRM_drmModeGetConnector(vid->drm_fd, resources->connectors[i]);
+        if (!conn) {
+            continue;
+        }
+        if (conn->connection != DRM_MODE_CONNECTED || conn->count_modes == 0) {
+            SDLOP_DRM_drmModeFreeConnector(conn);
+            continue;
+        }
+        bool match = true;
+        char name[64];
+        if (filter && *filter) {
+            const char *type = SDLOP_DRM_drmModeGetConnectorTypeName
+                ? SDLOP_DRM_drmModeGetConnectorTypeName(conn->connector_type) : "connector";
+            snprintf(name, sizeof(name), "%s-%u", type, conn->connector_type_id);
+            match = strcasestr(name, filter) != NULL;
+        }
+        if (!match) {
+            if (!first) {
+                first = conn;
+            } else {
+                SDLOP_DRM_drmModeFreeConnector(conn);
+            }
+            continue;
+        }
+        if (vid->num_displays >= SDLOP_MAX_DISPLAYS) {
+            SDLOP_DRM_drmModeFreeConnector(conn);
+            continue;
+        }
+        KMSDRM_DisplayData *dd = &vid->displays[vid->num_displays];
+        if (!kmsdrm_init_display_one(vid, resources, conn, used_crtcs, num_used, dd)) {
+            SDLOP_DRM_drmModeFreeConnector(conn);
+            continue; /* keep scanning other connectors */
+        }
+        uint32_t mhz = (uint32_t)KMSDRM_ModeRefreshMHz(&dd->mode);
+        dd->display_id = SDLOP_AddDisplay(dd->name,
+                                          (int)dd->mode.hdisplay, (int)dd->mode.vdisplay,
+                                          (int)mhz,
+                                          kmsdrm_orientation_from_degrees(dd->panel_orientation_degrees),
+                                          dd, sdlop.init_done);
+        used_crtcs[num_used++] = dd->crtc->crtc_id;
+        kmsdrm_register_fullscreen_modes(dd);
+        kmsdrm_publish_display_props(dd);
+        vid->num_displays++;
+        kmsdrm_log("KMSDRM: display %d: %s on %s (%dx%d, %d modes)",
+                   vid->num_displays - 1, dd->name, vid->devpath,
+                   dd->mode.hdisplay, dd->mode.vdisplay,
+                   dd->connector->count_modes);
+    }
+
+    /* Filter requested but matched nothing: fall back to the first usable
+     * connector (historical behavior), with a warning. */
+    if (vid->num_displays == 0 && first) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                    "KMSDRM: no connector matched SDLOP_KMSDRM_CONNECTOR=%s; using first usable",
+                    filter);
+        KMSDRM_DisplayData *dd = &vid->displays[0];
+        if (kmsdrm_init_display_one(vid, resources, first, used_crtcs, num_used, dd)) {
+            uint32_t mhz = (uint32_t)KMSDRM_ModeRefreshMHz(&dd->mode);
+            dd->display_id = SDLOP_AddDisplay(dd->name,
+                                              (int)dd->mode.hdisplay, (int)dd->mode.vdisplay,
+                                              (int)mhz,
+                                              kmsdrm_orientation_from_degrees(dd->panel_orientation_degrees),
+                                              dd, sdlop.init_done);
+            kmsdrm_register_fullscreen_modes(dd);
+            kmsdrm_publish_display_props(dd);
+            vid->num_displays = 1;
+        } else {
+            SDLOP_DRM_drmModeFreeConnector(first);
+        }
+    } else if (first) {
+        SDLOP_DRM_drmModeFreeConnector(first);
+    }
+
+    if (vid->num_displays == 0) {
+        SDL_SetError("No connected connector%s%s",
+                     getenv("SDLOP_KMSDRM_CONNECTOR") ? " matching SDLOP_KMSDRM_CONNECTOR=" : "",
+                     getenv("SDLOP_KMSDRM_CONNECTOR") ? getenv("SDLOP_KMSDRM_CONNECTOR") : "");
+        goto cleanup;
+    }
+
+    /* plane formats union is computed per display on demand; nothing here */
+
+    result = true;
+
+cleanup:
     if (resources) {
         SDLOP_DRM_drmModeFreeResources(resources);
     }
     return result;
 }
 
+/* Restore a CRTC to its original mode (fbcon's buffer usually survives).
+ * Best effort: failures are logged, not fatal. */
+static void kmsdrm_restore_original_mode(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd)
+{
+    if (vid->drm_fd < 0 || !dd->crtc) {
+        return;
+    }
+    drmModeModeInfo restore = dd->original_mode;
+    uint32_t fb = dd->original_fb_id;
+    if (restore.hdisplay == 0) {
+        /* original CRTC had no mode: use the preferred connector mode */
+        if (dd->connector && dd->connector->count_modes > 0) {
+            restore = dd->connector->modes[0];
+            for (int i = 0; i < dd->connector->count_modes; i++) {
+                if (dd->connector->modes[i].type & DRM_MODE_TYPE_PREFERRED) {
+                    restore = dd->connector->modes[i];
+                    break;
+                }
+            }
+        }
+    }
+    if (fb != 0 && restore.hdisplay > 0 && dd->connector) {
+        if (SDLOP_DRM_drmModeSetCrtc(vid->drm_fd, dd->crtc->crtc_id, fb, 0, 0,
+                                     &dd->connector->connector_id, 1,
+                                     &restore) != 0) {
+            /* not fatal: the console may have torn the buffer down */
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: could not restore original CRTC mode on %s", dd->name);
+        }
+    }
+}
+
+/* Restore everything for one display and remove it from the core display
+ * list (send_event = true for hotplug removal). */
+static void kmsdrm_teardown_display(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd, bool send_event)
+{
+    /* drop the cached atomic mode blob before the fd goes away */
+    if (vid->drm_fd >= 0 && dd->atomic.mode_blob
+        && SDLOP_DRM_ATOMIC_Available()) {
+        SDLOP_DRM_ATOMIC_drmModeDestroyPropertyBlob(vid->drm_fd, dd->atomic.mode_blob);
+    }
+    memset(&dd->atomic, 0, sizeof(dd->atomic));
+
+    /* restore the CRTC's VRR state to what it was at init (best effort) */
+    if (vid->drm_fd >= 0 && dd->crtc) {
+        KMSDRM_CrtcSetVrr(vid->drm_fd, dd->crtc->crtc_id, dd->saved_vrr);
+        dd->vrr_enabled = false;
+    }
+
+    kmsdrm_restore_original_mode(vid, dd);
+
+    /* if an atomic cursor plane was in use, drop its FB */
+    if (dd->atomic_cursor.fb_id && SDLOP_DRM_drmModeRmFB) {
+        SDLOP_DRM_drmModeRmFB(vid->drm_fd, dd->atomic_cursor.fb_id);
+    }
+    memset(&dd->atomic_cursor, 0, sizeof(dd->atomic_cursor));
+
+    if (dd->cursor_bo) {
+        if (dd->cursor_visible && dd->crtc) {
+            SDLOP_DRM_drmModeSetCursor(vid->drm_fd, dd->crtc->crtc_id, 0, 0, 0);
+            dd->cursor_visible = false;
+        }
+        SDLOP_GBM_gbm_bo_destroy(dd->cursor_bo);
+        dd->cursor_bo = NULL;
+    }
+    if (dd->connector) {
+        SDLOP_DRM_drmModeFreeConnector(dd->connector);
+        dd->connector = NULL;
+    }
+    if (dd->crtc) {
+        SDLOP_DRM_drmModeFreeCrtc(dd->crtc);
+        dd->crtc = NULL;
+    }
+    dd->connected = false;
+    if (dd->display_id) {
+        SDLOP_DelDisplay(dd->display_id, send_event);
+        dd->display_id = 0;
+    }
+}
+
 static void kmsdrm_deinit_displays(void)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
 
-    /* drop the cached atomic mode blob before the fd goes away */
-    if (vid->drm_fd >= 0 && vid->display.atomic.mode_blob
-        && SDLOP_DRM_ATOMIC_Available()) {
-        SDLOP_DRM_ATOMIC_drmModeDestroyPropertyBlob(vid->drm_fd, vid->display.atomic.mode_blob);
+    for (int i = 0; i < vid->num_displays; i++) {
+        kmsdrm_teardown_display(vid, &vid->displays[i], false);
     }
-    memset(&vid->display.atomic, 0, sizeof(vid->display.atomic));
+    vid->num_displays = 0;
 
-    /* restore the CRTC's VRR state to what it was at init (best effort) */
-    if (vid->drm_fd >= 0 && vid->display.crtc) {
-        KMSDRM_CrtcSetVrr(vid->drm_fd, vid->display.crtc->crtc_id, vid->display.saved_vrr);
-        vid->display.vrr_enabled = false;
-    }
-
-    /* Restore the CRTC to its original mode, if we know it and had a
-     * framebuffer at init time (fbcon's buffer usually survives). */
-    if (vid->drm_fd >= 0 && vid->display.crtc) {
-        drmModeModeInfo restore = vid->display.original_mode;
-        uint32_t fb = vid->display.original_fb_id;
-        if (restore.hdisplay == 0) {
-            /* original CRTC had no mode: use the preferred connector mode */
-            if (vid->display.connector && vid->display.connector->count_modes > 0) {
-                restore = vid->display.connector->modes[0];
-                for (int i = 0; i < vid->display.connector->count_modes; i++) {
-                    if (vid->display.connector->modes[i].type & DRM_MODE_TYPE_PREFERRED) {
-                        restore = vid->display.connector->modes[i];
-                        break;
-                    }
-                }
-            }
-        }
-        if (fb != 0 && restore.hdisplay > 0 && vid->display.connector) {
-            if (SDLOP_DRM_drmModeSetCrtc(vid->drm_fd, vid->display.crtc->crtc_id, fb, 0, 0,
-                                         &vid->display.connector->connector_id, 1,
-                                         &restore) != 0) {
-                /* not fatal: the console may have torn the buffer down */
-                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: could not restore original CRTC mode");
-            }
-        }
-    }
-
-    if (vid->display.cursor_bo) {
-        if (vid->display.cursor_visible) {
-            SDLOP_DRM_drmModeSetCursor(vid->drm_fd, vid->display.crtc->crtc_id, 0, 0, 0);
-            vid->display.cursor_visible = false;
-        }
-        SDLOP_GBM_gbm_bo_destroy(vid->display.cursor_bo);
-        vid->display.cursor_bo = NULL;
-    }
-    if (vid->display.connector) {
-        SDLOP_DRM_drmModeFreeConnector(vid->display.connector);
-        vid->display.connector = NULL;
-    }
-    if (vid->display.crtc) {
-        SDLOP_DRM_drmModeFreeCrtc(vid->display.crtc);
-        vid->display.crtc = NULL;
-    }
     if (vid->drm_fd >= 0) {
         close(vid->drm_fd);
         vid->drm_fd = -1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Connector hotplug (netlink uevents)                                */
+/* ------------------------------------------------------------------ */
+
+static bool kmsdrm_display_connector_alive(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd)
+{
+    if (!dd->connector) {
+        return false;
+    }
+    drmModeConnector *c = SDLOP_DRM_drmModeGetConnector(vid->drm_fd, dd->connector->connector_id);
+    bool alive = c && c->connection == DRM_MODE_CONNECTED && c->count_modes > 0;
+    if (c) {
+        SDLOP_DRM_drmModeFreeConnector(c);
+    }
+    return alive;
+}
+
+static void kmsdrm_hotplug_rescan(KMSDRM_DeviceData *vid)
+{
+    drmModeRes *resources = SDLOP_DRM_drmModeGetResources(vid->drm_fd);
+    if (!resources) {
+        return;
+    }
+
+    /* 1. retire displays whose connector vanished */
+    for (int i = 0; i < vid->num_displays; i++) {
+        KMSDRM_DisplayData *dd = &vid->displays[i];
+        if (!dd->connected) {
+            continue;
+        }
+        bool alive = false;
+        for (int j = 0; j < resources->count_connectors && !alive; j++) {
+            if (resources->connectors[j] == dd->connector->connector_id) {
+                alive = kmsdrm_display_connector_alive(vid, dd);
+            }
+        }
+        if (!alive) {
+            kmsdrm_log("KMSDRM: hotplug: display removed (%s)", dd->name);
+            kmsdrm_teardown_display(vid, dd, true);
+        }
+    }
+
+    /* 2. pick up newly connected connectors (reuse retired slots) */
+    uint32_t used_crtcs[SDLOP_MAX_DISPLAYS];
+    int num_used = 0;
+    for (int i = 0; i < vid->num_displays; i++) {
+        if (vid->displays[i].connected) {
+            used_crtcs[num_used++] = vid->displays[i].crtc->crtc_id;
+        }
+    }
+    for (int j = 0; j < resources->count_connectors; j++) {
+        drmModeConnector *conn = SDLOP_DRM_drmModeGetConnector(vid->drm_fd, resources->connectors[j]);
+        if (!conn || conn->connection != DRM_MODE_CONNECTED || conn->count_modes == 0) {
+            if (conn) {
+                SDLOP_DRM_drmModeFreeConnector(conn);
+            }
+            continue;
+        }
+        bool known = false;
+        for (int i = 0; i < vid->num_displays; i++) {
+            KMSDRM_DisplayData *dd = &vid->displays[i];
+            if (dd->connected && dd->connector->connector_id == conn->connector_id) {
+                known = true;
+                break;
+            }
+        }
+        if (known) {
+            SDLOP_DRM_drmModeFreeConnector(conn);
+            continue;
+        }
+        int slot = -1;
+        for (int i = 0; i < vid->num_displays; i++) {
+            if (!vid->displays[i].connected) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0 && vid->num_displays < SDLOP_MAX_DISPLAYS) {
+            slot = vid->num_displays++;
+        }
+        if (slot < 0) {
+            SDLOP_DRM_drmModeFreeConnector(conn);
+            continue;
+        }
+        KMSDRM_DisplayData *dd = &vid->displays[slot];
+        if (!kmsdrm_init_display_one(vid, resources, conn, used_crtcs, num_used, dd)) {
+            SDLOP_DRM_drmModeFreeConnector(conn);
+            continue; /* leave the slot retired */
+        }
+        uint32_t mhz = (uint32_t)KMSDRM_ModeRefreshMHz(&dd->mode);
+        dd->display_id = SDLOP_AddDisplay(dd->name,
+                                          (int)dd->mode.hdisplay, (int)dd->mode.vdisplay,
+                                          (int)mhz,
+                                          kmsdrm_orientation_from_degrees(dd->panel_orientation_degrees),
+                                          dd, true /* hotplug: send SDL_EVENT_DISPLAY_ADDED */);
+        used_crtcs[num_used++] = dd->crtc->crtc_id;
+        kmsdrm_register_fullscreen_modes(dd);
+        kmsdrm_publish_display_props(dd);
+        kmsdrm_log("KMSDRM: hotplug: display added (%s, %dx%d)",
+                   dd->name, dd->mode.hdisplay, dd->mode.vdisplay);
+    }
+
+    SDLOP_DRM_drmModeFreeResources(resources);
+}
+
+void KMSDRM_HotplugCheck(KMSDRM_DeviceData *vid)
+{
+    if (vid->hotplug_fd < 0) {
+        return;
+    }
+    char buf[4096];
+    for (int i = 0; i < 16; i++) {
+        ssize_t n = recv(vid->hotplug_fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+        if (n <= 0) {
+            break;
+        }
+        buf[n] = '\0';
+        if (strstr(buf, "SUBSYSTEM=drm")
+            && (strstr(buf, "HOTPLUG=1") || strstr(buf, "ACTION=change")
+                || strstr(buf, "ACTION=add") || strstr(buf, "ACTION=remove"))) {
+            kmsdrm_hotplug_rescan(vid);
+        }
     }
 }
 
@@ -964,6 +1358,45 @@ static drmModeModeInfo kmsdrm_select_mode(KMSDRM_DisplayData *dd, int w, int h, 
         m = &dd->mode; /* paranoia: connector reported modes at probe time */
     }
     return *m;
+}
+
+/* Pick the connector mode matching an explicitly requested exclusive
+ * fullscreen mode: same dimensions, closest refresh rate (SDL3 behavior). */
+static drmModeModeInfo kmsdrm_select_exclusive_mode(KMSDRM_DisplayData *dd,
+                                                    const SDL_DisplayMode *want)
+{
+    drmModeConnector *conn = dd->connector;
+    drmModeModeInfo *best = NULL;
+    long best_cost = LONG_MAX;
+    int want_mhz = 0;
+    if (want->refresh_rate_numerator > 0 && want->refresh_rate_denominator > 0) {
+        want_mhz = (int)((int64_t)want->refresh_rate_numerator * 1000 / want->refresh_rate_denominator);
+    }
+    for (int i = 0; conn && i < conn->count_modes; i++) {
+        drmModeModeInfo *m = &conn->modes[i];
+        if ((int)m->hdisplay != want->w || (int)m->vdisplay != want->h) {
+            continue;
+        }
+        long cost = want_mhz > 0 ? labs((long)KMSDRM_ModeRefreshMHz(m) - want_mhz) : 0;
+        if (!best || cost < best_cost) {
+            best = m;
+            best_cost = cost;
+        }
+    }
+    if (best) {
+        return *best;
+    }
+    /* the requested mode vanished from the connector: closest match */
+    return kmsdrm_select_mode(dd, want->w, want->h, true);
+}
+
+/* Mode selection that honors an explicit exclusive fullscreen request. */
+static drmModeModeInfo kmsdrm_select_mode_for_window(SDL_Window *window, KMSDRM_DisplayData *dd, bool fullscreen)
+{
+    if (fullscreen && window->has_fullscreen_mode && window->fullscreen_mode.w > 0) {
+        return kmsdrm_select_exclusive_mode(dd, &window->fullscreen_mode);
+    }
+    return kmsdrm_select_mode(dd, window->w, window->h, fullscreen);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1325,6 +1758,9 @@ static bool kmsdrm_crtc_set(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windata, 
 static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
 {
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+    if (!windata->display || !windata->display->connected) {
+        return SDL_SetError("KMSDRM: display disconnected (window has no live output)");
+    }
     int idx = windata->sw_draw;
     uint32_t fb_id = windata->sw_fb_id[idx];
 
@@ -1465,6 +1901,9 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window,
     (void)device;
     KMSDRM_DeviceData *vid = &kmsdrm;
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+    if (!windata->display || !windata->display->connected) {
+        return SDL_SetError("KMSDRM: display disconnected (window has no live output)");
+    }
 
     if (windata->waiting_for_flip) {
         KMSDRM_WaitPageflip(vid, windata, 500);
@@ -1607,10 +2046,9 @@ void KMSDRM_XCursorQuit(void)
     kmsdrm_cursor_theme_tried = false;
 }
 
-static bool kmsdrm_ensure_cursor_bo(void)
+static bool kmsdrm_ensure_cursor_bo(KMSDRM_DisplayData *dd)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
-    KMSDRM_DisplayData *dd = &vid->display;
 
     if (dd->cursor_bo) {
         return true;
@@ -1705,16 +2143,26 @@ static bool kmsdrm_ensure_cursor_bo(void)
     return true;
 }
 
-static void kmsdrm_show_cursor(void)
+static void kmsdrm_show_cursor(KMSDRM_DisplayData *dd)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
-    KMSDRM_DisplayData *dd = &vid->display;
 
     if (dd->cursor_visible) {
         return;
     }
-    if (!kmsdrm_ensure_cursor_bo()) {
+    if (!dd->connected) {
         return;
+    }
+    if (!kmsdrm_ensure_cursor_bo(dd)) {
+        return;
+    }
+    if (KMSDRM_AtomicCursorAvailable(vid, dd)) {
+        if (KMSDRM_AtomicCursorShow(vid, dd, (int32_t)(dd->cursor_hot_x),
+                                    (int32_t)(dd->cursor_hot_y))) {
+            dd->cursor_visible = true;
+            return;
+        }
+        /* fall through to the legacy ioctls */
     }
     uint32_t handle = SDLOP_GBM_gbm_bo_get_handle(dd->cursor_bo).u32;
     int ret = SDLOP_DRM_drmModeSetCursor2(vid->drm_fd, dd->crtc->crtc_id, handle,
@@ -1731,31 +2179,42 @@ static void kmsdrm_show_cursor(void)
     }
 }
 
-static void kmsdrm_hide_cursor(void)
+static void kmsdrm_hide_cursor(KMSDRM_DisplayData *dd)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
-    KMSDRM_DisplayData *dd = &vid->display;
 
     if (!dd->cursor_visible) {
         return;
     }
-    SDLOP_DRM_drmModeSetCursor(vid->drm_fd, dd->crtc->crtc_id, 0, 0, 0);
+    if (dd->atomic_cursor.plane_id) {
+        if (KMSDRM_AtomicCursorHide(vid, dd)) {
+            dd->cursor_visible = false;
+            return;
+        }
+        /* fall through to the legacy ioctl */
+    }
+    if (dd->crtc) {
+        SDLOP_DRM_drmModeSetCursor(vid->drm_fd, dd->crtc->crtc_id, 0, 0, 0);
+    }
     dd->cursor_visible = false;
 }
 
-static void kmsdrm_move_cursor(float x, float y)
+static void kmsdrm_move_cursor(KMSDRM_DisplayData *dd, float x, float y)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
-    KMSDRM_DisplayData *dd = &vid->display;
 
     if (!dd->cursor_visible) {
         return;
     }
-    int ix = (int)x, iy = (int)y;
+    int ix = (int)(x - (float)dd->cursor_hot_x), iy = (int)(y - (float)dd->cursor_hot_y);
     if (ix < 0) ix = 0;
     if (iy < 0) iy = 0;
     if (ix > (int)dd->mode.hdisplay - 1) ix = (int)dd->mode.hdisplay - 1;
     if (iy > (int)dd->mode.vdisplay - 1) iy = (int)dd->mode.vdisplay - 1;
+    if (dd->atomic_cursor.plane_id) {
+        KMSDRM_AtomicCursorShow(vid, dd, (int32_t)x, (int32_t)y);
+        return;
+    }
     SDLOP_DRM_drmModeMoveCursor(vid->drm_fd, dd->crtc->crtc_id, ix, iy);
 }
 
@@ -1767,7 +2226,10 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
     KMSDRM_DeviceData *vid = &kmsdrm;
-    KMSDRM_DisplayData *dd = &vid->display;
+    if (vid->num_displays == 0) {
+        return SDL_SetError("KMSDRM: no displays");
+    }
+    KMSDRM_DisplayData *dd = &vid->displays[0]; /* primary display by default */
 
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)calloc(1, sizeof(*windata));
     if (!windata) {
@@ -1782,6 +2244,13 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     /* Vulkan windows get their scanout from VK_KHR_display instead of the
      * dumb/GBM paths; leave the CRTC alone and keep the requested size */
     if (window->flags & SDL_WINDOW_VULKAN) {
+        {
+            SDL_Rect vb;
+            if (SDLOP_GetDisplayBoundsById(dd->display_id, &vb)) {
+                window->x = vb.x;
+                window->y = vb.y;
+            }
+        }
         window->driverdata = windata;
         sdlop.keyboard_focus = window;
         sdlop.mouse_focus = window;
@@ -1801,14 +2270,22 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 
     /* pick the mode (windowed = closest requested, fullscreen = preferred) */
     bool fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
-    drmModeModeInfo chosen = kmsdrm_select_mode(dd, window->w, window->h, fullscreen);
+    drmModeModeInfo chosen = kmsdrm_select_mode_for_window(window, dd, fullscreen);
     dd->mode = chosen;
 
-    /* KMS windows always fill their mode */
+    /* KMS windows always fill their mode; snap to the display's bounds */
     window->w = (int)dd->mode.hdisplay;
     window->h = (int)dd->mode.vdisplay;
-    window->x = 0;
-    window->y = 0;
+    {
+        SDL_Rect bounds;
+        if (SDLOP_GetDisplayBoundsById(dd->display_id, &bounds)) {
+            window->x = bounds.x;
+            window->y = bounds.y;
+        } else {
+            window->x = 0;
+            window->y = 0;
+        }
+    }
 
     if (!kmsdrm_create_dumb(vid, windata, dd->mode.hdisplay, dd->mode.vdisplay)) {
         free(windata);
@@ -1819,9 +2296,9 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     kmsdrm_fill_sw(windata, dd->mode.hdisplay, dd->mode.vdisplay, windata->clear_color);
 
     /* hardware cursor (best effort; needs GBM) */
-    if (kmsdrm_ensure_cursor_bo()) {
-        kmsdrm_move_cursor((float)window->w / 2.0f, (float)window->h / 2.0f);
-        kmsdrm_show_cursor();
+    if (kmsdrm_ensure_cursor_bo(dd)) {
+        kmsdrm_move_cursor(dd, (float)window->w / 2.0f, (float)window->h / 2.0f);
+        kmsdrm_show_cursor(dd);
     }
 
     window->driverdata = windata;
@@ -1846,6 +2323,9 @@ static void kmsdrm_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
 
     if (windata->waiting_for_flip) {
         KMSDRM_WaitPageflip(vid, windata, 500);
+    }
+    if (windata->display && windata->display->cursor_visible) {
+        kmsdrm_hide_cursor(windata->display);
     }
 
     /* destroy GL scanout (if any) */
@@ -1878,7 +2358,7 @@ static void kmsdrm_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!windata->crtc_programmed) {
         kmsdrm_present_sw(vid, window);
     }
-    kmsdrm_show_cursor();
+    kmsdrm_show_cursor(windata->display);
 }
 
 static void kmsdrm_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
@@ -1900,17 +2380,122 @@ static bool kmsdrm_SetWindowTitle(SDLop_VideoDevice *device, SDL_Window *window)
     return true; /* no window chrome on KMS */
 }
 
+/* Reposition a window. On KMS a window "lives" on exactly one display;
+ * positioning the window's center on a different display moves scanout to
+ * that display (the window is snapped to the display's bounds and sized
+ * to its mode, like every KMS window). */
 static bool kmsdrm_SetWindowPosition(SDLop_VideoDevice *device, SDL_Window *window)
 {
-    (void)device;
-    (void)window;
-    return SDL_SetError("KMS does not allow absolute window positioning");
+    KMSDRM_DeviceData *vid = &kmsdrm;
+    KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+    if (!windata || !windata->display) {
+        return true; /* window was created before any display? */
+    }
+
+    /* which display does the requested position land on? use the same
+     * largest-overlap rule as SDL_GetDisplayForWindow (point sampling fails
+     * when the window center lands exactly on a display boundary) */
+    SDL_Rect want = { window->x, window->y, window->w, window->h };
+    SDL_DisplayID target_id = SDL_GetDisplayForRect(&want);
+    int target_index = SDLOP_GetDisplayIndexById(target_id);
+    if (target_index < 0) {
+        target_index = 0;
+    }
+    if (vid->num_displays == 0) {
+        return SDL_SetError("KMSDRM: no displays");
+    }
+
+    KMSDRM_DisplayData *old_dd = windata->display;
+    KMSDRM_DisplayData *new_dd = &vid->displays[target_index];
+
+    if (new_dd == old_dd || !new_dd->connected) {
+        /* snap to the display bounds (KMS windows always fill their mode) */
+        SDL_Rect bounds;
+        if (SDLOP_GetDisplayBoundsById(old_dd->display_id, &bounds)) {
+            window->x = bounds.x;
+            window->y = bounds.y;
+        }
+        return true;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                "KMSDRM: moving window to display %d (%s)", target_index, new_dd->name);
+
+    /* the cursor follows the window; hide it on the old display */
+    if (old_dd->cursor_visible) {
+        kmsdrm_hide_cursor(old_dd);
+    }
+
+    /* if this window is the last one on the old display, restore its
+     * original CRTC to the initial (console) configuration */
+    int windows_on_old = 0;
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        KMSDRM_WindowData *wd = (KMSDRM_WindowData *)w->driverdata;
+        if (wd && wd->display == old_dd) {
+            windows_on_old++;
+        }
+    }
+    if (windows_on_old <= 1 && !(window->flags & SDL_WINDOW_VULKAN)) {
+        kmsdrm_restore_original_mode(vid, old_dd);
+    }
+
+    windata->display = new_dd;
+    windata->crtc_programmed = false;
+
+    /* pick the mode for the new display and rebuild scanout */
+    bool fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
+    drmModeModeInfo chosen = kmsdrm_select_mode_for_window(window, new_dd, fullscreen);
+    if (!KMSDRM_RecreateScanout(device, window, &chosen)) {
+        /* roll back to the old display (buffers are display-agnostic) */
+        windata->display = old_dd;
+        windata->crtc_programmed = false;
+        window->w = (int)old_dd->mode.hdisplay;
+        window->h = (int)old_dd->mode.vdisplay;
+        SDL_Rect bounds;
+        if (SDLOP_GetDisplayBoundsById(old_dd->display_id, &bounds)) {
+            window->x = bounds.x;
+            window->y = bounds.y;
+        }
+        if (old_dd->cursor_bo) {
+            kmsdrm_move_cursor(old_dd, window->w / 2.0f, window->h / 2.0f);
+            kmsdrm_show_cursor(old_dd);
+        }
+        return false;
+    }
+    new_dd->mode = chosen;
+    window->w = (int)chosen.hdisplay;
+    window->h = (int)chosen.vdisplay;
+
+    SDL_Rect nb;
+    if (SDLOP_GetDisplayBoundsById(new_dd->display_id, &nb)) {
+        window->x = nb.x;
+        window->y = nb.y;
+    } else {
+        window->x = 0;
+        window->y = 0;
+    }
+
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, window->x, window->y);
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
+
+    /* put the cursor on the new display */
+    if (!(window->flags & SDL_WINDOW_VULKAN)) {
+        if (kmsdrm_ensure_cursor_bo(new_dd)) {
+            kmsdrm_move_cursor(new_dd, window->w / 2.0f, window->h / 2.0f);
+            kmsdrm_show_cursor(new_dd);
+        }
+    }
+    return true;
 }
 
 static bool kmsdrm_mode_change(SDLop_VideoDevice *device, SDL_Window *window)
 {
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
     KMSDRM_DisplayData *dd = windata->display;
+    if (!dd->connected) {
+        return SDL_SetError("KMSDRM: display disconnected (window has no live output)");
+    }
 
     /* Vulkan windows: the display mode is negotiated with the Vulkan driver
      * when the VK_KHR_display surface is created; don't modeset here */
@@ -1919,7 +2504,7 @@ static bool kmsdrm_mode_change(SDLop_VideoDevice *device, SDL_Window *window)
     }
 
     bool fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
-    drmModeModeInfo chosen = kmsdrm_select_mode(dd, window->w, window->h, fullscreen);
+    drmModeModeInfo chosen = kmsdrm_select_mode_for_window(window, dd, fullscreen);
 
     bool changed = chosen.hdisplay != dd->mode.hdisplay ||
                    chosen.vdisplay != dd->mode.vdisplay ||
@@ -2025,10 +2610,14 @@ static bool kmsdrm_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Win
 {
     (void)device;
     (void)window;
-    if (enabled) {
-        kmsdrm_hide_cursor();
-    } else {
-        kmsdrm_show_cursor();
+    KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+    KMSDRM_DisplayData *dd = windata ? windata->display : NULL;
+    if (dd) {
+        if (enabled) {
+            kmsdrm_hide_cursor(dd);
+        } else {
+            kmsdrm_show_cursor(dd);
+        }
     }
     return true;
 }
@@ -2042,6 +2631,9 @@ static void kmsdrm_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
     (void)device;
     (void)timeout_ms;
     KMSDRM_DeviceData *vid = &kmsdrm;
+
+    /* connector hotplug (netlink uevents); no-op when nothing changed */
+    KMSDRM_HotplugCheck(vid);
 
     /* handle VT switch requests (release: drop master; acquire: re-take) */
     kmsdrm_vt_check();
@@ -2069,7 +2661,7 @@ static void kmsdrm_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         if (!sdlop.relative_mode_window &&
             (!windata->cursor_pos_valid ||
              windata->cursor_x != mx || windata->cursor_y != my)) {
-            kmsdrm_move_cursor(mx, my);
+            kmsdrm_move_cursor(windata->display, mx, my);
             windata->cursor_x = mx;
             windata->cursor_y = my;
             windata->cursor_pos_valid = true;
@@ -2156,6 +2748,8 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
     memset(vid, 0, sizeof(*vid));
     vid->drm_fd = -1;
     vid->devindex = -1;
+    vid->hotplug_fd = -1;
+    vid->num_displays = 0;
 
     if (!SDLOP_KMSDRM_LoadSymbols()) {
         return false; /* error set by the loader */
@@ -2204,6 +2798,26 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
         goto failed_close;
     }
 
+    /* connector hotplug uevents via a non-blocking netlink socket */
+    {
+        const char *hotplug_env = getenv("SDLOP_KMSDRM_HOTPLUG");
+        if (!(hotplug_env && hotplug_env[0] == '0')) {
+            int hfd = socket(PF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                             NETLINK_KOBJECT_UEVENT);
+            if (hfd >= 0) {
+                struct sockaddr_nl sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.nl_family = AF_NETLINK;
+                sa.nl_groups = 1; /* kernel uevents */
+                if (bind(hfd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                    close(hfd);
+                } else {
+                    vid->hotplug_fd = hfd;
+                }
+            }
+        }
+    }
+
     uint64_t async_flip = 0;
     if (SDLOP_DRM_drmGetCap(vid->drm_fd, DRM_CAP_ASYNC_PAGE_FLIP, &async_flip) == 0) {
         vid->async_pageflip_support = async_flip != 0;
@@ -2224,9 +2838,10 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
 
 failed_close:
     kmsdrm_vt_shutdown();
-    if (vid->drm_fd >= 0) {
-        close(vid->drm_fd);
-        vid->drm_fd = -1;
+    kmsdrm_deinit_displays(); /* tears down any displays we managed to add */
+    if (vid->hotplug_fd >= 0) {
+        close(vid->hotplug_fd);
+        vid->hotplug_fd = -1;
     }
 failed:
     SDLOP_KMSDRM_UnloadSymbols();
@@ -2238,6 +2853,10 @@ static void kmsdrm_Quit(SDLop_VideoDevice *device)
     (void)device;
     KMSDRM_DeviceData *vid = &kmsdrm;
 
+    if (vid->hotplug_fd >= 0) {
+        close(vid->hotplug_fd);
+        vid->hotplug_fd = -1;
+    }
     /* windows are destroyed by the core before this runs */
     kmsdrm_deinit_displays();      /* restores the CRTC, destroys cursor bo */
     KMSDRM_XCursorQuit();          /* drop the cached XCursor theme */

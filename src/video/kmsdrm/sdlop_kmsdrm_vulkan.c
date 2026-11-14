@@ -579,9 +579,17 @@ bool SDLOP_KMSDRM_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *wi
 
     if (!display_mode) {
         KMSDRM_DeviceData *vid = KMSDRM_GetDevice();
+        KMSDRM_DisplayData *vdd = NULL;
+        if (window && window->driverdata) {
+            KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+            vdd = windata->display;
+        }
+        if (!vdd && vid && vid->num_displays > 0) {
+            vdd = &vid->displays[0];
+        }
         uint32_t refresh_mhz = 60000; /* fallback: 60 Hz */
-        if (vid && vid->display.mode.clock != 0) {
-            int mhz = KMSDRM_ModeRefreshMHz(&vid->display.mode);
+        if (vdd && vdd->mode.clock != 0) {
+            int mhz = KMSDRM_ModeRefreshMHz(&vdd->mode);
             if (mhz > 0) {
                 refresh_mhz = (uint32_t)mhz;
             }

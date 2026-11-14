@@ -305,12 +305,17 @@ static bool emscripten_Init(SDLop_VideoDevice *device)
     if (emscripten_get_canvas_element_size("#canvas", &w, &h) != EMSCRIPTEN_RESULT_SUCCESS) {
         return SDL_SetError("Emscripten: no #canvas element");
     }
+    SDLOP_AddDisplay("emscripten", w > 0 ? w : 1280, h > 0 ? h : 720, 60000,
+                     SDL_ORIENTATION_LANDSCAPE, NULL, sdlop.init_done);
     return true;
 }
 
 static void emscripten_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    while (sdlop.num_displays > 0) {
+        SDLOP_DelDisplay(sdlop.displays[sdlop.num_displays - 1].id, false);
+    }
 }
 
 static bool emscripten_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)

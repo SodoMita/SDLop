@@ -37,6 +37,11 @@
 #define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
 #endif
 
+/* libdrm's drmModeAtomicSetObjectProperty is an inline wrapper around
+ * drmModeAtomicAddProperty in libdrm_mode.h; SDLop dlopens only the latter,
+ * so alias the name here. */
+#define SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty SDLOP_DRM_ATOMIC_drmModeAtomicAddProperty
+
 bool KMSDRM_AtomicEnabled(void)
 {
     const char *v = getenv("SDLOP_KMSDRM_ATOMIC");
@@ -384,4 +389,268 @@ int KMSDRM_AtomicFlip(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd, uint32_t f
     SDLOP_DRM_ATOMIC_drmModeAtomicFree(req);
     errno = err;
     return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Atomic cursor plane (env-gated: SDLOP_KMSDRM_ATOMIC_CURSOR=1)      */
+/*                                                                     */
+/* Some atomic-only drivers reject the legacy SetCursor ioctls. When  */
+/* the env gate is set and the CRTC has a cursor plane, the hardware  */
+/* cursor is driven through an atomic commit instead (SDL3 behavior,  */
+/* KMSDRM USE_ATOMIC_CURSOR). Falls back to legacy ioctls otherwise.  */
+/* ------------------------------------------------------------------ */
+
+static bool atomic_cursor_env_enabled(void)
+{
+    const char *v = getenv("SDLOP_KMSDRM_ATOMIC_CURSOR");
+    return v && v[0] == '1';
+}
+
+/* Discover the CRTC's cursor plane + cache prop ids. Cheap no-op once done. */
+static bool atomic_cursor_discover(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd)
+{
+    if (dd->atomic_cursor.plane_id) {
+        return true;
+    }
+    int fd = vid->drm_fd;
+    drmModeResPtr res = SDLOP_DRM_drmModeGetResources(fd);
+    if (!res) {
+        return false;
+    }
+    int crtc_index = -1;
+    for (int i = 0; i < res->count_crtcs; i++) {
+        if (res->crtcs[i] == dd->crtc->crtc_id) {
+            crtc_index = i;
+            break;
+        }
+    }
+    SDLOP_DRM_drmModeFreeResources(res);
+    if (crtc_index < 0) {
+        return false;
+    }
+    drmModePlaneResPtr plane_res = SDLOP_DRM_ATOMIC_drmModeGetPlaneResources(fd);
+    if (!plane_res) {
+        return false;
+    }
+    for (uint32_t i = 0; i < plane_res->count_planes && !dd->atomic_cursor.plane_id; ++i) {
+        drmModePlanePtr plane = SDLOP_DRM_ATOMIC_drmModeGetPlane(fd, plane_res->planes[i]);
+        if (!plane) {
+            continue;
+        }
+        uint64_t type = 0;
+        bool is_cursor = atomic_prop_get_value(fd, plane->plane_id, DRM_MODE_OBJECT_PLANE,
+                                               "type", &type)
+                         && type == DRM_PLANE_TYPE_CURSOR;
+        if (is_cursor && (plane->possible_crtcs & (1u << crtc_index))) {
+            dd->atomic_cursor.plane_id = plane->plane_id;
+            dd->atomic_cursor.prop_fb_id = atomic_prop_id(fd, plane->plane_id,
+                                                          DRM_MODE_OBJECT_PLANE, "FB_ID");
+            dd->atomic_cursor.prop_crtc_id = atomic_prop_id(fd, plane->plane_id,
+                                                            DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+            dd->atomic_cursor.prop_crtc_x = atomic_prop_id(fd, plane->plane_id,
+                                                           DRM_MODE_OBJECT_PLANE, "CRTC_X");
+            dd->atomic_cursor.prop_crtc_y = atomic_prop_id(fd, plane->plane_id,
+                                                           DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+            dd->atomic_cursor.prop_crtc_w = atomic_prop_id(fd, plane->plane_id,
+                                                           DRM_MODE_OBJECT_PLANE, "CRTC_W");
+            dd->atomic_cursor.prop_crtc_h = atomic_prop_id(fd, plane->plane_id,
+                                                           DRM_MODE_OBJECT_PLANE, "CRTC_H");
+            dd->atomic_cursor.prop_src_x = atomic_prop_id(fd, plane->plane_id,
+                                                          DRM_MODE_OBJECT_PLANE, "SRC_X");
+            dd->atomic_cursor.prop_src_y = atomic_prop_id(fd, plane->plane_id,
+                                                          DRM_MODE_OBJECT_PLANE, "SRC_Y");
+            dd->atomic_cursor.prop_src_w = atomic_prop_id(fd, plane->plane_id,
+                                                          DRM_MODE_OBJECT_PLANE, "SRC_W");
+            dd->atomic_cursor.prop_src_h = atomic_prop_id(fd, plane->plane_id,
+                                                          DRM_MODE_OBJECT_PLANE, "SRC_H");
+            if (!dd->atomic_cursor.prop_fb_id || !dd->atomic_cursor.prop_crtc_id
+                || !dd->atomic_cursor.prop_crtc_x || !dd->atomic_cursor.prop_crtc_y
+                || !dd->atomic_cursor.prop_crtc_w || !dd->atomic_cursor.prop_crtc_h
+                || !dd->atomic_cursor.prop_src_w || !dd->atomic_cursor.prop_src_h) {
+                /* kernel/driver doesn't expose the standard cursor plane
+                 * properties the way sdlop needs them; refuse */
+                memset(&dd->atomic_cursor, 0, sizeof(dd->atomic_cursor));
+            }
+        }
+        SDLOP_DRM_ATOMIC_drmModeFreePlane(plane);
+    }
+    SDLOP_DRM_ATOMIC_drmModeFreePlaneResources(plane_res);
+    return dd->atomic_cursor.plane_id != 0;
+}
+
+/* True when the atomic cursor path can be used for this display right now. */
+bool KMSDRM_AtomicCursorAvailable(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd)
+{
+    if (!atomic_cursor_env_enabled() || !SDLOP_DRM_ATOMIC_Available()) {
+        return false;
+    }
+    if (!dd->atomic.available) {
+        return false; /* atomic client cap was refused -> legacy only */
+    }
+    return atomic_cursor_discover(vid, dd);
+}
+
+/* Show or move the cursor. x/y are window coordinates of the pointer; the
+ * hotspot is subtracted like the legacy drmModeSetCursor2 path. */
+bool KMSDRM_AtomicCursorShow(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd,
+                             int32_t x, int32_t y)
+{
+    if (!dd->cursor_bo) {
+        return false;
+    }
+    int fd = vid->drm_fd;
+
+    /* build the FB from the cursor bo on first use */
+    if (!dd->atomic_cursor.fb_id) {
+        uint32_t handle = SDLOP_GBM_gbm_bo_get_handle(dd->cursor_bo).u32;
+        uint32_t pitch = SDLOP_GBM_gbm_bo_get_stride(dd->cursor_bo);
+        uint32_t offsets[4] = { 0, 0, 0, 0 };
+        uint32_t handles[4] = { handle, 0, 0, 0 };
+        uint32_t pitches[4] = { pitch, 0, 0, 0 };
+        uint32_t fb_id = 0;
+        if (!SDLOP_DRM_drmModeAddFB2(fd, (uint32_t)dd->cursor_w, (uint32_t)dd->cursor_h,
+                                     GBM_FORMAT_ARGB8888, handles, pitches, offsets,
+                                     &fb_id, 0)) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "KMSDRM: atomic cursor AddFB2 failed: %s", strerror(errno));
+            return false;
+        }
+        dd->atomic_cursor.fb_id = fb_id;
+    }
+
+    int32_t cx = x - dd->cursor_hot_x;
+    int32_t cy = y - dd->cursor_hot_y;
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+    if (cx > (int32_t)dd->mode.hdisplay - 1) cx = (int32_t)dd->mode.hdisplay - 1;
+    if (cy > (int32_t)dd->mode.vdisplay - 1) cy = (int32_t)dd->mode.vdisplay - 1;
+    uint32_t sw = (uint32_t)dd->cursor_w << 16;
+    uint32_t sh = (uint32_t)dd->cursor_h << 16;
+
+    drmModeAtomicReqPtr req = SDLOP_DRM_ATOMIC_drmModeAtomicAlloc();
+    if (!req) {
+        return false;
+    }
+    uint32_t pid = dd->atomic_cursor.plane_id;
+    bool ok = true;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_fb_id, dd->atomic_cursor.fb_id) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_crtc_id, dd->crtc->crtc_id) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_crtc_x, (uint64_t)(int64_t)cx) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_crtc_y, (uint64_t)(int64_t)cy) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_crtc_w, dd->cursor_w) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_crtc_h, dd->cursor_h) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_src_x, 0) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_src_y, 0) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_src_w, sw) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_src_h, sh) == 0;
+
+    int ret = ok ? SDLOP_DRM_ATOMIC_drmModeAtomicCommit(fd, req,
+                                                        DRM_MODE_ATOMIC_NONBLOCK, NULL)
+                 : -1;
+    int err = errno;
+    SDLOP_DRM_ATOMIC_drmModeAtomicFree(req);
+    if (ret != 0) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                     "KMSDRM: atomic cursor commit failed: %s",
+                     ok ? strerror(err) : "set property failed");
+        return false;
+    }
+    return true;
+}
+
+/* Hide the cursor: drop the plane's FB. */
+bool KMSDRM_AtomicCursorHide(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd)
+{
+    int fd = vid->drm_fd;
+    uint32_t pid = dd->atomic_cursor.plane_id;
+    drmModeAtomicReqPtr req = SDLOP_DRM_ATOMIC_drmModeAtomicAlloc();
+    if (!req) {
+        return false;
+    }
+    bool ok = true;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_fb_id, 0) == 0;
+    ok = ok && SDLOP_DRM_ATOMIC_drmModeAtomicSetObjectProperty(req, pid,
+             dd->atomic_cursor.prop_crtc_id, 0) == 0;
+    if (!ok) {
+        SDLOP_DRM_ATOMIC_drmModeAtomicFree(req);
+        return false;
+    }
+    int commit = SDLOP_DRM_ATOMIC_drmModeAtomicCommit(fd, req,
+                                                      DRM_MODE_ATOMIC_NONBLOCK, NULL);
+    int err = errno;
+    SDLOP_DRM_ATOMIC_drmModeAtomicFree(req);
+    if (commit != 0) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                     "KMSDRM: atomic cursor hide failed: %s", strerror(err));
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Plane-info debug logging (SDLOP_KMSDRM_DEBUG=1 or any log level)   */
+/* ------------------------------------------------------------------ */
+
+void KMSDRM_LogPlanes(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd)
+{
+    int fd = vid->drm_fd;
+    if (!SDLOP_DRM_ATOMIC_Available()) {
+        return;
+    }
+    int crtc_index = -1;
+    drmModeResPtr res = SDLOP_DRM_drmModeGetResources(fd);
+    if (res) {
+        for (int i = 0; i < res->count_crtcs; i++) {
+            if (res->crtcs[i] == dd->crtc->crtc_id) {
+                crtc_index = i;
+                break;
+            }
+        }
+        SDLOP_DRM_drmModeFreeResources(res);
+    }
+    drmModePlaneResPtr plane_res = SDLOP_DRM_ATOMIC_drmModeGetPlaneResources(fd);
+    if (!plane_res) {
+        return;
+    }
+    for (uint32_t i = 0; i < plane_res->count_planes; ++i) {
+        drmModePlanePtr plane = SDLOP_DRM_ATOMIC_drmModeGetPlane(fd, plane_res->planes[i]);
+        if (!plane) {
+            continue;
+        }
+        uint64_t type = ~0ull;
+        atomic_prop_get_value(fd, plane->plane_id, DRM_MODE_OBJECT_PLANE, "type", &type);
+        const char *type_name = type == DRM_PLANE_TYPE_PRIMARY ? "primary"
+                              : type == DRM_PLANE_TYPE_CURSOR ? "cursor"
+                              : type == DRM_PLANE_TYPE_OVERLAY ? "overlay" : "?";
+        char formats[160];
+        size_t off = 0;
+        for (uint32_t j = 0; j < plane->count_formats && off < sizeof(formats) - 5; ++j) {
+            uint32_t f = plane->formats[j];
+            formats[off++] = (char)(f & 0xff);
+            formats[off++] = (char)((f >> 8) & 0xff);
+            formats[off++] = (char)((f >> 16) & 0xff);
+            formats[off++] = (char)((f >> 24) & 0xff);
+            formats[off++] = ' ';
+        }
+        formats[off] = '\0';
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                     "KMSDRM: plane %u: type=%s possible_crtcs=0x%x%s formats: %s",
+                     plane->plane_id, type_name, plane->possible_crtcs,
+                     (crtc_index >= 0 && (plane->possible_crtcs & (1u << crtc_index)))
+                         ? " (can scan out this display)" : "",
+                     formats);
+        SDLOP_DRM_ATOMIC_drmModeFreePlane(plane);
+    }
+    SDLOP_DRM_ATOMIC_drmModeFreePlaneResources(plane_res);
 }

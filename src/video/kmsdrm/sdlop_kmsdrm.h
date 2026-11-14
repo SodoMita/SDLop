@@ -87,6 +87,21 @@ typedef struct KMSDRM_DisplayData
     int32_t cursor_hot_x, cursor_hot_y;
     bool cursor_visible;
     bool default_cursor_shown;
+
+    /* multi-display bookkeeping */
+    SDL_DisplayID display_id;       /* core display (0 = none/retired) */
+    bool connected;                 /* connector still present (hotplug) */
+    int cursor_reference_count;     /* windows using this display's cursor */
+
+    /* atomic cursor plane (env-gated: SDLOP_KMSDRM_ATOMIC_CURSOR=1).
+     * Discovered once; 0 = unavailable. */
+    struct KMSDRM_AtomicCursor {
+        uint32_t plane_id;          /* 0 = not found */
+        uint32_t fb_id;             /* FB built from cursor_bo (0 = none) */
+        uint32_t prop_fb_id, prop_crtc_id;
+        uint32_t prop_crtc_x, prop_crtc_y, prop_crtc_w, prop_crtc_h;
+        uint32_t prop_src_x, prop_src_y, prop_src_w, prop_src_h;
+    } atomic_cursor;
 } KMSDRM_DisplayData;
 
 typedef struct KMSDRM_WindowData
@@ -132,7 +147,11 @@ typedef struct KMSDRM_DeviceData
     int drm_fd;
     char devpath[32];
 
-    KMSDRM_DisplayData display;     /* primary (and only) display driven by this device */
+    KMSDRM_DisplayData displays[SDLOP_MAX_DISPLAYS];
+    int num_displays;
+
+    /* netlink socket for connector hotplug uevents (non-blocking, -1 = off) */
+    int hotplug_fd;
 
     struct gbm_device *gbm_dev;
     bool gbm_init;
@@ -151,6 +170,9 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window, const
 
 KMSDRM_DeviceData *KMSDRM_GetDevice(void);
 void KMSDRM_DestroySwScanout(SDL_Window *window);
+/* Hotplug: re-scan connected connectors; add/remove core displays.
+ * No-op unless hotplug_fd is open and a drm uevent arrived. */
+void KMSDRM_HotplugCheck(KMSDRM_DeviceData *vid);
 /* Atomic modesetting (sdlop_kmsdrm_atomic.c): enter on first present /
  * mode reprogram; page flip via drmModeAtomicCommit otherwise. Falls back
  * to the legacy drmModeSetCrtc/drmModePageFlip path internally on failure. */
@@ -159,6 +181,13 @@ bool KMSDRM_AtomicModeset(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd, uint32
 int KMSDRM_AtomicFlip(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd, uint32_t fb_id,
                       void *flip_cookie);   /* 0 queued, -1 error (errno set) */
 bool KMSDRM_AtomicEnabled(void);    /* env knob: SDLOP_KMSDRM_ATOMIC=0 disables */
+/* Atomic cursor plane (sdlop_kmsdrm_atomic.c): true when
+ * SDLOP_KMSDRM_ATOMIC_CURSOR=1 and the CRTC has a usable cursor plane. */
+bool KMSDRM_AtomicCursorAvailable(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd);
+bool KMSDRM_AtomicCursorShow(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd,
+                             int32_t x, int32_t y);
+bool KMSDRM_AtomicCursorHide(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd);
+void KMSDRM_LogPlanes(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd);
 /* Union of fourccs advertised by every plane on the device (all CRTCs);
  * used to pick a GL scanout format the KMS planes actually accept
  * (virtio-gpu 2D's primary plane is XR24-only). Returns false when the

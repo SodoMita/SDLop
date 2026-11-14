@@ -34,6 +34,7 @@ if(EMSCRIPTEN)
     src/SDL_log.c
     src/SDL_timer.c
     src/SDL_events.c
+    src/SDL_properties.c
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
@@ -198,6 +199,7 @@ set(SDLop_SOURCES
   src/SDL_log.c
   src/SDL_timer.c
   src/SDL_events.c
+  src/SDL_properties.c
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c

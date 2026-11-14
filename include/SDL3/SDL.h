@@ -17,6 +17,7 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
+#include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_blendmode.h>
 #include <SDL3/SDL_pixels.h>
 #include <SDL3/SDL_rect.h>

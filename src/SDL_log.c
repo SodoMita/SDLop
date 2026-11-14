@@ -8,16 +8,57 @@
 #include <SDL3/SDL_log.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <strings.h>
+#include <stdlib.h>
 
 static const char *priority_names[] = {
     "TRACE", "VERBOSE", "DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"
 };
 
-static SDL_LogPriority min_priority = SDL_LOG_PRIORITY_INFO;
+static SDL_LogPriority min_priority = SDL_LOG_PRIORITY_INVALID; /* lazy: from $SDLOP_LOG_PRIORITY, else INFO */
+
+static SDL_LogPriority sdlop_default_priority(void)
+{
+    const char *v = getenv("SDLOP_LOG_PRIORITY");
+    if (!v || !*v) {
+        return SDL_LOG_PRIORITY_INFO;
+    }
+    struct { const char *name; SDL_LogPriority prio; } map[] = {
+        { "trace", SDL_LOG_PRIORITY_TRACE },
+        { "verbose", SDL_LOG_PRIORITY_VERBOSE },
+        { "debug", SDL_LOG_PRIORITY_DEBUG },
+        { "info", SDL_LOG_PRIORITY_INFO },
+        { "warn", SDL_LOG_PRIORITY_WARN },
+        { "error", SDL_LOG_PRIORITY_ERROR },
+        { "critical", SDL_LOG_PRIORITY_CRITICAL },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (strcasecmp(v, map[i].name) == 0) {
+            return map[i].prio;
+        }
+    }
+    return SDL_LOG_PRIORITY_INFO;
+}
+
+void SDL_SetLogPriority(int category, SDL_LogPriority priority)
+{
+    (void)category; /* SDLop uses a single global threshold */
+    if (priority >= SDL_LOG_PRIORITY_TRACE && priority < SDL_LOG_PRIORITY_COUNT) {
+        min_priority = priority;
+    }
+}
+
+static SDL_LogPriority sdlop_min_priority(void)
+{
+    if (min_priority == SDL_LOG_PRIORITY_INVALID) {
+        min_priority = sdlop_default_priority();
+    }
+    return min_priority;
+}
 
 void SDL_LogMessage(int category, SDL_LogPriority priority, const char *fmt, ...)
 {
-    if (priority < min_priority) {
+    if (priority < sdlop_min_priority()) {
         return;
     }
     va_list ap;
@@ -42,7 +83,7 @@ void SDL_Log(const char *fmt, ...)
 #define SDLOP_LOG_FN(name, prio)                        \
     void name(int category, const char *fmt, ...)       \
     {                                                   \
-        if ((prio) < min_priority) {                    \
+        if ((prio) < sdlop_min_priority()) {            \
             return;                                     \
         }                                               \
         va_list ap;                                     \

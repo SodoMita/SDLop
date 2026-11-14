@@ -77,6 +77,57 @@ int main(void)
     CHECK(strcmp(SDL_GetCurrentVideoDriver(), "kmsdrm") == 0,
           "video driver is kmsdrm (got %s)", SDL_GetCurrentVideoDriver());
 
+    printf("-- displays --\n");
+    int num_displays = 0;
+    SDL_DisplayID *display_ids = SDL_GetDisplays(&num_displays);
+    CHECK(display_ids != NULL, "SDL_GetDisplays returns a list");
+    CHECK(num_displays >= 1, "at least one display (got %d)", num_displays);
+    {
+        const char *exp = getenv("SDLOP_TEST_EXPECT_DISPLAYS");
+        if (exp && *exp) {
+            CHECK(num_displays == atoi(exp), "expected %s displays (got %d)", exp, num_displays);
+        }
+    }
+    SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    CHECK(primary == (display_ids && num_displays > 0 ? display_ids[0] : 0),
+          "primary display is the first entry");
+    for (int i = 0; i < num_displays; i++) {
+        const char *name = SDL_GetDisplayName(display_ids[i]);
+        CHECK(name != NULL, "display %d has a name", i);
+        printf("  display %d: id=%u name=%s\n", i, display_ids[i], name ? name : "?");
+        SDL_Rect bounds = { 0, 0, 0, 0 };
+        CHECK(SDL_GetDisplayBounds(display_ids[i], &bounds), "display %d bounds", i);
+        CHECK(bounds.w > 0 && bounds.h > 0, "display %d bounds positive (%dx%d)",
+              i, bounds.w, bounds.h);
+        const SDL_DisplayMode *desktop = SDL_GetDesktopDisplayMode(display_ids[i]);
+        CHECK(desktop != NULL, "display %d desktop mode", i);
+        if (desktop) {
+            CHECK(desktop->w == bounds.w && desktop->h == bounds.h,
+                  "display %d desktop mode matches bounds (%dx%d)", i, desktop->w, desktop->h);
+        }
+        const SDL_DisplayMode *current = SDL_GetCurrentDisplayMode(display_ids[i]);
+        CHECK(current != NULL, "display %d current mode", i);
+        int nmodes = 0;
+        SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(display_ids[i], &nmodes);
+        CHECK(modes != NULL && nmodes >= 1, "display %d has fullscreen modes (got %d)", i, nmodes);
+        SDL_DisplayMode closest;
+        memset(&closest, 0, sizeof(closest));
+        CHECK(SDL_GetClosestFullscreenDisplayMode(display_ids[i], bounds.w / 2, bounds.h / 2,
+                                                  0.0f, false, &closest),
+              "display %d closest fullscreen mode", i);
+        CHECK(SDL_GetDisplayProperties(display_ids[i]) != 0,
+              "display %d properties", i);
+        free(modes);
+    }
+    /* bounds are laid out left-to-right and non-overlapping */
+    for (int i = 1; i < num_displays; i++) {
+        SDL_Rect b0 = { 0, 0, 0, 0 }, b1 = { 0, 0, 0, 0 };
+        SDL_GetDisplayBounds(display_ids[i - 1], &b0);
+        SDL_GetDisplayBounds(display_ids[i], &b1);
+        CHECK(b1.x >= b0.x + b0.w, "display %d does not overlap display %d (x %d vs %d)",
+              i, i - 1, b1.x, b0.x + b0.w);
+    }
+
     printf("-- software (dumb buffer) path --\n");
     SDL_Window *w = SDL_CreateWindow("SDLop kmsdrm test", 320, 200, 0);
     if (!w) {
@@ -128,6 +179,53 @@ int main(void)
         printf("  note: SDL_SetWindowSize failed: %s\n", SDL_GetError());
     }
 
+    /* multi-display: move the window to the second display and back */
+    if (num_displays >= 2) {
+        printf("-- multi-display window move --\n");
+        SDL_Rect b1 = { 0, 0, 0, 0 };
+        SDL_GetDisplayBounds(display_ids[1], &b1);
+        SDL_Point p1 = { b1.x + b1.w / 2, b1.y + b1.h / 2 };
+        CHECK(SDL_GetDisplayForPoint(&p1) == display_ids[1],
+              "point on the second display resolves to it");
+        CHECK(SDL_SetWindowPosition(w, p1.x, p1.y), "move window to second display");
+        SDL_DisplayID on = SDL_GetDisplayForWindow(w);
+        printf("  window now on display %u (second=%u)\n", on, display_ids[1]);
+        CHECK(on == display_ids[1], "window reports second display");
+        SDL_Surface *smove = SDL_GetWindowSurface(w);
+        if (smove) {
+            paint_bands(smove);
+            CHECK(SDL_UpdateWindowSurface(w), "present on second display");
+        }
+        /* and back to the first display */
+        CHECK(SDL_SetWindowPosition(w, 0, 0), "move window back to first display");
+        CHECK(SDL_GetDisplayForWindow(w) == display_ids[0], "window reports first display");
+    }
+
+    /* fullscreen mode selection (exclusive fullscreen mode API) */
+    {
+        printf("-- fullscreen display mode request --\n");
+        int nmodes = 0;
+        SDL_DisplayID d0 = (num_displays > 0) ? display_ids[0] : primary;
+        SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d0, &nmodes);
+        CHECK(modes && nmodes >= 1, "first display has fullscreen modes");
+        if (modes && nmodes >= 1) {
+            /* request the smallest listed mode; window must store it */
+            SDL_DisplayMode want = *modes[nmodes - 1]; /* sorted largest first */
+            CHECK(SDL_SetWindowFullscreenMode(w, &want),
+                  "set window fullscreen mode %dx%d", want.w, want.h);
+            const SDL_DisplayMode *stored = SDL_GetWindowFullscreenMode(w);
+            CHECK(stored != NULL, "window reports the exclusive fullscreen mode");
+            if (stored) {
+                CHECK(stored->w == want.w && stored->h == want.h,
+                      "exclusive mode matches request (%dx%d)", stored->w, stored->h);
+            }
+            /* NULL restores borderless/desktop fullscreen mode */
+            CHECK(SDL_SetWindowFullscreenMode(w, NULL), "clear fullscreen mode");
+            CHECK(SDL_GetWindowFullscreenMode(w) == NULL, "exclusive mode cleared");
+        }
+        free(modes);
+    }
+
     /* fullscreen toggle */
     printf("-- fullscreen --\n");
     if (SDL_SetWindowFullscreen(w, true)) {
@@ -162,6 +260,8 @@ int main(void)
         }
     }
     SDL_DestroyWindow(w);
+    free(display_ids);
+    display_ids = NULL;
 
     printf("-- GL (GBM + EGL) path --\n");
     SDL_Window *glw = SDL_CreateWindow("SDLop kmsdrm gl test", 640, 480, SDL_WINDOW_OPENGL);

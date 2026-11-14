@@ -11,12 +11,16 @@
 static bool dummy_Init(SDLop_VideoDevice *device)
 {
     (void)device;
+    SDLOP_AddDisplay("dummy", 1024, 768, 60000, SDL_ORIENTATION_LANDSCAPE, NULL, sdlop.init_done);
     return true;
 }
 
 static void dummy_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    while (sdlop.num_displays > 0) {
+        SDLOP_DelDisplay(sdlop.displays[sdlop.num_displays - 1].id, false);
+    }
 }
 
 static bool dummy_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
