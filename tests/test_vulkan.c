@@ -13,6 +13,8 @@
 #include <alloca.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
+#include <dirent.h>
 
 #define CHECK(cond, ...)                          \
     do {                                          \
@@ -25,9 +27,28 @@
         }                                         \
     } while (0)
 
+static bool kmsdrm_has_dri(void)
+{
+    DIR *d = opendir("/dev/dri");
+    if (!d) {
+        return false;
+    }
+    bool found = false;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "card", 4) == 0 && e->d_name[4] >= '0' && e->d_name[4] <= '9') {
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
 int main(void)
 {
     int failures = 0;
+    int skipped = 0;
     VkInstance instance = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -43,7 +64,13 @@ int main(void)
     VkFence fence = VK_NULL_HANDLE;
     SDL_Window *w = NULL;
 
-    if (!getenv("WAYLAND_DISPLAY")) {
+    const char *vdrv = getenv("SDL_VIDEODRIVER");
+    bool kmsdrm = vdrv && strcasecmp(vdrv, "kmsdrm") == 0;
+    if (kmsdrm && !kmsdrm_has_dri()) {
+        printf("test_vulkan: SKIP (no /dev/dri cards for SDL_VIDEODRIVER=kmsdrm)\n");
+        return 0;
+    }
+    if (!getenv("WAYLAND_DISPLAY") && !kmsdrm) {
         printf("test_vulkan: SKIP (WAYLAND_DISPLAY not set)\n");
         return 0;
     }
@@ -74,6 +101,33 @@ int main(void)
         .ppEnabledExtensionNames = exts,
     };
     CHECK(vkCreateInstance(&ici, NULL, &instance) == VK_SUCCESS, "vkCreateInstance");
+
+    if (kmsdrm) {
+        /* the KMS WSI needs a functional VK_KHR_display; lavapipe advertises
+         * the extension but enumerates no displays, so there is nothing to
+         * test here on this stack - SKIP rather than FAIL */
+        uint32_t gpu_count = 0;
+        vkEnumeratePhysicalDevices(instance, &gpu_count, NULL);
+        int has_displays = 0;
+        if (gpu_count > 0) {
+            VkPhysicalDevice *gpus = malloc(gpu_count * sizeof(*gpus));
+            if (gpus) {
+                vkEnumeratePhysicalDevices(instance, &gpu_count, gpus);
+                for (uint32_t i = 0; i < gpu_count && !has_displays; i++) {
+                    uint32_t dc = 0;
+                    VkResult r = vkGetPhysicalDeviceDisplayPropertiesKHR(gpus[i], &dc, NULL);
+                    has_displays = (r == VK_SUCCESS && dc > 0);
+                }
+                free(gpus);
+            }
+        }
+        if (!has_displays) {
+            printf("test_vulkan: SKIP (no Vulkan displays on this driver; lavapipe's VK_KHR_display is a stub)\n");
+            skipped = 1;
+            goto cleanup;
+        }
+    }
+
     CHECK(SDL_Vulkan_CreateSurface(w, instance, NULL, &surface), "SDL_Vulkan_CreateSurface: %s", SDL_GetError());
 
     uint32_t gpu_count = 0;
@@ -282,6 +336,9 @@ cleanup:
     }
     SDL_Quit();
 
+    if (skipped) {
+        return 0;
+    }
     if (failures) {
         printf("test_vulkan: FAIL (%d checks)\n", failures);
         return 1;

@@ -55,6 +55,8 @@ void SDL_Vulkan_UnloadLibrary(void)
     }
 }
 
+/* Default for drivers that don't override it (wayland keep this for
+ * compatibility with apps built against the previous hardcoded list). */
 static const char *const sdlop_vulkan_extensions[] = {
     "VK_KHR_surface",
     "VK_KHR_wayland_surface",
@@ -63,6 +65,9 @@ static const char *const sdlop_vulkan_extensions[] = {
 
 char const *const *SDL_Vulkan_GetInstanceExtensions(Uint32 *count)
 {
+    if (sdlop.video && sdlop.video->Vulkan_GetInstanceExtensions) {
+        return sdlop.video->Vulkan_GetInstanceExtensions(sdlop.video, count);
+    }
     if (count) {
         *count = 2;
     }

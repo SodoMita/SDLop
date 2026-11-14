@@ -34,6 +34,7 @@ if(EMSCRIPTEN)
     src/SDL_log.c
     src/SDL_timer.c
     src/SDL_events.c
+    src/SDL_properties.c
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
@@ -91,6 +92,9 @@ pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 pkg_check_modules(EGL REQUIRED egl)
 pkg_check_modules(GLESV2 REQUIRED glesv2)
+# KMSDRM driver: libdrm/libgbm headers only - both libraries are dlopen-ed at runtime
+pkg_check_modules(LIBDRM REQUIRED libdrm)
+pkg_check_modules(GBM REQUIRED gbm)
 
 find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
 pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
@@ -195,6 +199,7 @@ set(SDLop_SOURCES
   src/SDL_log.c
   src/SDL_timer.c
   src/SDL_events.c
+  src/SDL_properties.c
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
@@ -210,6 +215,12 @@ set(SDLop_SOURCES
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
   src/video/wayland/sdlop_wayland_protos.c
+  src/video/kmsdrm/sdlop_kmsdrm.c
+  src/video/kmsdrm/sdlop_kmsdrm_atomic.c
+  src/video/kmsdrm/sdlop_kmsdrm_dyn.c
+  src/video/kmsdrm/sdlop_kmsdrm_gl.c
+  src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
+  src/video/kmsdrm/sdlop_xcursor.c
   src/video/dummy/sdlop_dummy.c
 )
 
@@ -229,7 +240,9 @@ set(SDLop_LIB_INCS
   ${WAYLAND_CLIENT_INCLUDE_DIRS}
   ${XKBCOMMON_INCLUDE_DIRS}
   ${EGL_INCLUDE_DIRS}
-  ${GLESV2_INCLUDE_DIRS})
+  ${GLESV2_INCLUDE_DIRS}
+  ${LIBDRM_INCLUDE_DIRS}
+  ${GBM_INCLUDE_DIRS})
 
 add_library(sdlop STATIC ${SDLop_SOURCES})
 add_library(SDLop::SDLop ALIAS sdlop)
@@ -240,11 +253,12 @@ target_include_directories(sdlop PUBLIC
 target_include_directories(sdlop PRIVATE
   src
   src/video/wayland
+  src/video/kmsdrm
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_directories(sdlop PUBLIC ${SDLop_LIB_DIRS})
 target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_WAYLAND=1)
+target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
 
 add_library(sdlop_shared SHARED ${SDLop_SOURCES})
 add_dependencies(sdlop_shared sdlop_wayland_protocols)
@@ -254,11 +268,12 @@ target_include_directories(sdlop_shared PUBLIC
 target_include_directories(sdlop_shared PRIVATE
   src
   src/video/wayland
+  src/video/kmsdrm
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_directories(sdlop_shared PUBLIC ${SDLop_LIB_DIRS})
 target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1)
+target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
 
 # ---------------------------------------------------------------------------
 # Examples
@@ -304,6 +319,18 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(test_wayland PRIVATE src)
   target_compile_options(test_wayland PRIVATE -UNDEBUG)
   add_test(NAME test_wayland COMMAND test_wayland)
+
+  add_executable(test_kmsdrm tests/test_kmsdrm.c)
+  target_link_libraries(test_kmsdrm PRIVATE sdlop)
+  target_include_directories(test_kmsdrm PRIVATE src)
+  target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
+  add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
+
+  # KMS present-path benchmark (not a ctest gate; skips without KMS)
+  add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
+  target_link_libraries(bench_kmsdrm PRIVATE sdlop)
+  target_include_directories(bench_kmsdrm PRIVATE src)
+  target_compile_options(bench_kmsdrm PRIVATE -UNDEBUG)
 
   add_executable(test_gl tests/test_gl.c)
   target_link_libraries(test_gl PRIVATE sdlop ${GLESV2_LIBRARIES})
