@@ -31,6 +31,12 @@
 
 #include "xdg-shell-client-protocol.h"
 
+/* wayland-protocols < 1.32 (Debian 12, Ubuntu 22.04) predates the
+ * xdg_toplevel "suspended" state; the value is fixed by the protocol */
+#ifndef XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION
+#define XDG_TOPLEVEL_STATE_SUSPENDED 9
+#endif
+
 typedef struct WaylandWindowData
 {
     struct wl_surface *surface;
@@ -506,8 +512,8 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_
     (void)data;
     (void)keyboard;
     (void)serial;
-    (void)group;
-    SDLOP_KeyboardUpdateXkbModifiers(mods_depressed, mods_latched, mods_locked);
+    /* wl_keyboard.modifiers carries the effective (locked) layout group */
+    SDLOP_KeyboardUpdateXkbState(mods_depressed, mods_latched, mods_locked, 0, 0, group);
 }
 
 static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay)

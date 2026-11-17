@@ -16,5 +16,6 @@ SDLOP_EGL_SYM(EGLBoolean, eglQueryContext, (EGLDisplay, EGLContext, EGLint, EGLi
 SDLOP_EGL_SYM(EGLBoolean, eglQuerySurface, (EGLDisplay, EGLSurface, EGLint, EGLint *))
 SDLOP_EGL_SYM(EGLBoolean, eglGetConfigAttrib, (EGLDisplay, EGLConfig, EGLint, EGLint *))
 SDLOP_EGL_SYM(EGLint, eglGetError, (void))
+SDLOP_EGL_SYM(EGLContext, eglGetCurrentContext, (void))
 SDLOP_EGL_SYM(EGLBoolean, eglBindAPI, (EGLenum))
 SDLOP_EGL_SYM(SDLOP_EGLProc, eglGetProcAddress, (const char *))

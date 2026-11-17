@@ -29,14 +29,15 @@ int main(void) {
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
   rings and fires your callback *on the worker thread*. Native evdev codes,
-  zero translation cost, kernel timestamps. Falls back to Wayland seat input
-  when `/dev/input` is not readable.
+  zero translation cost, kernel timestamps. Falls back to Wayland seat / X11
+  input when `/dev/input` is not readable.
 
 ## Status
 
 | Platform | State |
 |---|---|
 | Linux / Wayland (wl_compositor + xdg-shell, wl_seat fallback input) | ✅ done, tested against Weston 14 + sway 1.10 (pixman) |
+| Linux / X11 (pure XCB; MIT-SHM, XKB, XInput2 raw motion, RandR 1.5 — all `dlopen`-ed) | ✅ done, tested on Xvfb with and without a WM (openbox) |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
 | Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
 | OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
@@ -57,7 +58,7 @@ int main(void) {
             │   └─► SPSC ring ──► SDLop_PollRawEvents              │
             └───────────────┬──────────────────────────────────────┘
                             │ eventfd wake
-   Wayland display ────► SDL_PumpEvents (main thread)
+   Wayland / X11 fd ───► SDL_PumpEvents (main thread)
    (windows, fallback input)   │
                                ▼
                     SDL_PollEvent / SDL_WaitEvent / state queries
@@ -69,10 +70,10 @@ int main(void) {
 - **One translation, one place.** Raw events keep native evdev codes
   (zero cost). The single evdev→`SDL_Scancode` table lookup happens only when
   draining into SDL events.
-- **Evdev-preferred, Wayland-fallback.** When the worker sees a keyboard or
-  pointer device, the corresponding `wl_seat` stream is ignored (keymap and
-  modifier state are still consumed for correct layout/keysyms via
-  xkbcommon). No double-delivered events.
+- **Evdev-preferred, window-system fallback.** When the worker sees a keyboard
+  or pointer device, the corresponding `wl_seat` / X11 core input stream is
+  ignored (keymap and modifier state are still consumed for correct
+  layout/keysyms via xkbcommon). No double-delivered events.
 - **Kernel timestamps** flow into `SDL_Event.timestamp` (ns) and every
   `SDLop_RawEvent.timestamp_ns`, so you can measure end-to-end latency.
 
@@ -192,18 +193,33 @@ standard on Wayland distros. Static `libsdlop.a` and shared `libSDLop.so`
 are produced.
 
 Runtime loading is SDL3-style dynamic: `libwayland-client.so.0`,
-`libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1` and `libvulkan.so.1`
-are all `dlopen`-ed on demand — nothing optional is linked
+`libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1`, `libvulkan.so.1`
+and the X11 libraries (`libxcb.so.1`, `libxcb-shm.so.0`, `libxcb-xkb.so.1`,
+`libxkbcommon-x11.so.0`, `libxcb-xinput.so.0`, `libxcb-randr.so.0`, and
+`libX11.so.6` only for EGL stacks without
+`EGL_EXT_platform_xcb`) are all `dlopen`-ed on demand — nothing optional is linked
 (`objdump -p libSDLop.so` shows NEEDED: libc and libm only). Apps link just
 `-lsdlop` (plus `-lpthread -ldl -lm` where the toolchain doesn't fold them
 into libc). Missing libs degrade gracefully: no wayland-client -> dummy
-video driver; no xkbcommon -> windowing still works. Override probe names
-with `SDLOP_LIB_WAYLAND` / `SDLOP_LIB_XKB` / `SDLOP_LIB_EGL`.
+video driver; no xkbcommon -> windowing still works; no libxcb-shm /
+-xkb / -xinput / -randr -> X11 uses `xcb_put_image`, core keymaps,
+warp-based relative mode and a single root display. Override probe names
+with `SDLOP_LIB_WAYLAND` / `SDLOP_LIB_XKB` / `SDLOP_LIB_EGL` /
+`SDLOP_LIB_XCB` / `SDLOP_LIB_XCB_SHM` / `SDLOP_LIB_XCB_XKB` /
+`SDLOP_LIB_XKBCOMMON_X11` / `SDLOP_LIB_XCB_XINPUT` / `SDLOP_LIB_XCB_RANDR` /
+`SDLOP_LIB_X11` (the value `none` disables a module).
+
+Driver order is wayland → x11 → kmsdrm → dummy (X11 is used when
+`WAYLAND_DISPLAY` is unset or the compositor is unreachable);
+`SDL_VIDEODRIVER=x11` forces it, e.g. to run under XWayland. Building the X11
+driver needs only the xcb **headers** (`libxcb*-dev`, `libxkbcommon-x11-dev`);
+without them it is skipped (`-DSDLOP_VIDEO_X11=OFF` disables it explicitly).
 
 Tests that need privileges/compositor skip cleanly:
 
 ```sh
 WAYLAND_DISPLAY=wayland-0 ctest --test-dir build   # wayland integration test
+xvfb-run -s "-screen 0 1280x1024x24" ctest --test-dir build  # X11 suite
 sudo ./build/test_evdev_uinput                     # raw evdev end-to-end
 ```
 
@@ -275,6 +291,17 @@ Highlights:
   otherwise SDLop silently uses Wayland seat input. Like asyncinput, the raw
   path bypasses compositor keyboard focus/layout.
 - Wayland cannot position windows: `SDL_SetWindowPosition` returns false.
+- X11 specifics: EWMH (`_NET_WM_STATE`) is used for fullscreen/maximize when a
+  WM advertises it; without a WM SDLop emulates both (borderless
+  display-sized window, like SDL3's legacy path). Key repeat is detected via
+  XKB detectable auto-repeat (timestamp pairing as fallback) and generated
+  client-side like on Wayland. Relative mouse mode = XInput2 raw motion +
+  confined pointer grab + blank cursor; warp-to-center without XInput2.
+  Content scale follows `SDL_VIDEO_X11_SCALING_FACTOR`, `Xft.dpi`, then
+  `GDK_SCALE`. GL goes through EGL (`EGL_PLATFORM_XCB_EXT`, else
+  `EGL_PLATFORM_X11_EXT` on a private Xlib connection; GLX is not used).
+  `SDLOP_X11_NO_SHM=1` disables MIT-SHM. No IME/XIM yet (text comes from
+  xkbcommon).
 - Relative mouse mode uses real pointer lock (`zwp_pointer_constraints` +
   `zwp_relative_pointer`) on Wayland when the compositor has a seat/pointer,
   and raw evdev deltas when the worker thread is active; the window-system

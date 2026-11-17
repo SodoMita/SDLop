@@ -121,6 +121,7 @@ struct SDLop_VideoDevice
 /* Provided by backends */
 extern SDLop_VideoDevice SDLop_emscripten_device;
 extern SDLop_VideoDevice SDLop_wayland_device;
+extern SDLop_VideoDevice SDLop_x11_device;
 extern SDLop_VideoDevice SDLop_kmsdrm_device;
 extern SDLop_VideoDevice SDLop_dummy_device;
 
@@ -228,6 +229,8 @@ SDL_WindowID SDLOP_FocusWindowID(void);   /* focused window id or 0 */
 bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length); /* wayland */
 bool SDLOP_KeyboardSetDefaultKeymap(void);
 void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked);
+void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locked,
+                                  Uint32 base_group, Uint32 latched_group, Uint32 locked_group); /* x11/wayland */
 bool SDLOP_KeyboardKeyRepeats(SDL_Scancode sc);
 void SDLOP_KeyboardProcessRepeats(void);
 void SDLOP_KeyboardQuit(void);

@@ -70,8 +70,8 @@ int main(void)
         printf("test_vulkan: SKIP (no /dev/dri cards for SDL_VIDEODRIVER=kmsdrm)\n");
         return 0;
     }
-    if (!getenv("WAYLAND_DISPLAY") && !kmsdrm) {
-        printf("test_vulkan: SKIP (WAYLAND_DISPLAY not set)\n");
+    if (!getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY") && !kmsdrm) {
+        printf("test_vulkan: SKIP (neither WAYLAND_DISPLAY nor DISPLAY set)\n");
         return 0;
     }
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);

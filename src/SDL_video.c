@@ -19,6 +19,9 @@ static SDLop_VideoDevice *const video_drivers[] = {
 #if SDLop_VIDEO_WAYLAND
     &SDLop_wayland_device,
 #endif
+#if SDLop_VIDEO_X11
+    &SDLop_x11_device,
+#endif
 #if SDLop_VIDEO_KMSDRM
     &SDLop_kmsdrm_device,
 #endif
@@ -54,6 +57,7 @@ bool SDLOP_VideoInit(void)
     for (int i = 0; i < SDLOP_NUM_VIDEO_DRIVERS; i++) {
         if (video_drivers[i]->Init(video_drivers[i])) {
             sdlop.video = video_drivers[i];
+            SDL_ClearError(); /* drop errors of drivers tried before */
             return true;
         }
     }

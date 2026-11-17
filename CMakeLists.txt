@@ -102,6 +102,10 @@ endif()
 #   gbm            - gbm.h
 #   libdrm         - xf86drm.h + xf86drmMode.h (headers only: the libdrm
 #                    library itself is dlopen'ed at run time - never linked)
+#   xcb, xcb-shm, xcb-xkb, xcb-xinput, xcb-randr, xkbcommon-x11
+#                  - X11 driver headers (optional: the driver is skipped when
+#                    they are missing; SDLOP_VIDEO_X11=OFF disables it). The
+#                    libraries are dlopen'ed when the driver initializes.
 # libvulkan / glesv2 / wayland-server are needed ONLY by tests, examples and
 # benchmarks; those targets are skipped (with a message) when absent - see
 # below.
@@ -112,6 +116,14 @@ pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 pkg_check_modules(EGL REQUIRED egl)
 pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
+option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
+if(SDLOP_VIDEO_X11)
+  pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xkbcommon-x11)
+  if(NOT X11_XCB_FOUND)
+    message(STATUS "xcb headers not found - building without the X11 driver")
+    set(SDLOP_VIDEO_X11 OFF)
+  endif()
+endif()
 # GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
 pkg_check_modules(GLESV2 glesv2)
 find_package(Vulkan QUIET)
@@ -244,6 +256,15 @@ set(SDLop_SOURCES
   src/video/kmsdrm/sdlop_xcursor.c
   src/video/dummy/sdlop_dummy.c
 )
+set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+if(SDLOP_VIDEO_X11)
+  list(APPEND SDLop_SOURCES
+    src/video/x11/sdlop_x11.c
+    src/video/x11/sdlop_x11_dyn.c
+    src/video/x11/sdlop_x11_gl.c
+    src/video/x11/sdlop_x11_vulkan.c)
+  list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+endif()
 
 # SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
 # at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
@@ -259,7 +280,8 @@ set(SDLop_LIB_INCS
   ${XKBCOMMON_INCLUDE_DIRS}
   ${EGL_INCLUDE_DIRS}
   ${GBM_INCLUDE_DIRS}
-  ${LIBDRM_INCLUDE_DIRS})
+  ${LIBDRM_INCLUDE_DIRS}
+  ${X11_XCB_INCLUDE_DIRS})
 
 add_library(sdlop STATIC ${SDLop_SOURCES})
 add_library(SDLop::SDLop ALIAS sdlop)
@@ -274,7 +296,7 @@ target_include_directories(sdlop PRIVATE
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
 
 add_library(sdlop_shared SHARED ${SDLop_SOURCES})
 add_dependencies(sdlop_shared sdlop_wayland_protocols)
@@ -288,7 +310,7 @@ target_include_directories(sdlop_shared PRIVATE
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
 
 # ---------------------------------------------------------------------------
 # Examples
@@ -358,6 +380,30 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(test_wayland PRIVATE src)
   target_compile_options(test_wayland PRIVATE -UNDEBUG)
   add_test(NAME test_wayland COMMAND test_wayland)
+
+  # X11 driver integration test (needs a running X server, e.g. xvfb-run;
+  # skips without DISPLAY). Only the *test* links xcb/xcb-xtest - it drives
+  # input through XTest and verifies state from its own connection.
+  if(SDLOP_VIDEO_X11)
+    pkg_check_modules(X11_TEST_DEPS xcb xcb-xtest)
+    if(X11_TEST_DEPS_FOUND)
+      add_executable(test_x11 tests/test_x11.c)
+      target_link_libraries(test_x11 PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+      target_include_directories(test_x11 PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11 PRIVATE -UNDEBUG)
+      add_test(NAME test_x11 COMMAND test_x11)
+      # same suite through the xcb_put_image fallback (no MIT-SHM)
+      add_test(NAME test_x11_noshm COMMAND test_x11)
+      # and with only libxcb itself: no SHM / XKB / XInput2 / RandR, i.e.
+      # put_image, core keymap + timestamp repeat detection, warp-based
+      # relative mode and a single root-window display
+      add_test(NAME test_x11_minimal COMMAND test_x11)
+      set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
+      set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
+        "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none")
+    endif()
+  endif()
 
   add_executable(test_kmsdrm tests/test_kmsdrm.c)
   target_link_libraries(test_kmsdrm PRIVATE sdlop)

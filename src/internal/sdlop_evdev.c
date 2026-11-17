@@ -277,7 +277,7 @@ static void *worker_main(void *arg)
 bool SDLOP_RawInputInit(void)
 {
     if (getenv("SDLOP_DISABLE_RAW_INPUT")) {
-        return false;
+        return SDL_SetError("disabled by SDLOP_DISABLE_RAW_INPUT");
     }
     memset(&raw, 0, sizeof(raw));
     pthread_mutex_init(&raw.cb_mutex, NULL);

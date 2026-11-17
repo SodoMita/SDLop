@@ -235,13 +235,22 @@ static void sdlop_sync_mods_from_xkb(void)
     sdlop.modstate = mod;
 }
 
-void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
+void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locked,
+                                  Uint32 base_group, Uint32 latched_group, Uint32 locked_group)
 {
     if (!xkb_st) {
         return;
     }
-    SDLOP_XKB_xkb_state_update_mask(xkb_st, depressed, latched, locked, 0, 0, 0);
+    /* the layout group matters for multi-layout setups (us,ru ...): key
+     * text and keycodes follow the active group */
+    SDLOP_XKB_xkb_state_update_mask(xkb_st, depressed, latched, locked,
+                                    base_group, latched_group, locked_group);
     sdlop_sync_mods_from_xkb();
+}
+
+void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
+{
+    SDLOP_KeyboardUpdateXkbState(depressed, latched, locked, 0, 0, 0);
 }
 
 /* ------------------------------------------------------------------ */

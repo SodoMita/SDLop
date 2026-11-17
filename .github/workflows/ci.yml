@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.wm }}${{ matrix.sanitizers == 'ON' && ', ASan+UBSan' || '' }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - wm: no WM           # bare Xvfb: exercises the legacy/no-EWMH paths
+            sanitizers: 'OFF'
+          - wm: openbox         # EWMH window manager: _NET_WM_STATE paths
+            sanitizers: 'OFF'
+          - wm: openbox
+            sanitizers: 'ON'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkgconf \
+            libwayland-dev libwayland-bin wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl-dev libgbm-dev libdrm-dev libgles-dev \
+            libvulkan-dev mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri \
+            libxcb1-dev libxcb-shm0-dev libxcb-xkb-dev libxcb-xinput-dev \
+            libxcb-randr0-dev libxcb-xtest0-dev libx11-6 \
+            xvfb xauth openbox
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSDLOP_SANITIZERS=${{ matrix.sanitizers }}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: No link-time dependencies on optional libraries
+        run: |
+          objdump -p build/libSDLop.so | grep NEEDED
+          if objdump -p build/libSDLop.so | grep NEEDED | grep -Ev 'lib(c|m|dl|pthread)\.so|ld-linux'; then
+            echo "::error::libSDLop.so links an optional library - everything must be dlopen'ed"
+            exit 1
+          fi
+
+      - name: Test (Xvfb, ${{ matrix.wm }})
+        env:
+          XDG_RUNTIME_DIR: /tmp/xdg
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp +extension RANDR +extension MIT-SHM &
+          export DISPLAY=:99
+          for i in $(seq 100); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
+          if [ "${{ matrix.wm }}" = openbox ]; then
+            openbox --sm-disable &
+            sleep 2
+          fi
+          cd build
+          ctest --output-on-failure --timeout 120 -j"$(nproc)"
