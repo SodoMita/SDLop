@@ -80,6 +80,140 @@ static bool is_permission_error(int err)
     return err == EPERM || err == EACCES;
 }
 
+/* The scanout-format ladder for the GL GBM surface (SDL3-era breadth):
+ * one try per entry, first GBM-and-plane-supported format wins. Starts
+ * with the common 32-bit formats, then 10-bit, 565/1555/4444/5551,
+ * 24-bit RGB and 16-bit-per-channel integer. Every entry is a single-plane
+ * packed RGB format; planar YUV formats are not GL render targets. */
+static const uint32_t scanout_format_ladder[] = {
+    /* 32-bit */
+    GBM_FORMAT_XRGB8888, GBM_FORMAT_ARGB8888, GBM_FORMAT_XBGR8888, GBM_FORMAT_ABGR8888,
+    GBM_FORMAT_RGBX8888, GBM_FORMAT_RGBA8888, GBM_FORMAT_BGRX8888, GBM_FORMAT_BGRA8888,
+    /* 10-bit (two common layouts) */
+    GBM_FORMAT_XRGB2101010, GBM_FORMAT_ARGB2101010, GBM_FORMAT_XBGR2101010, GBM_FORMAT_ABGR2101010,
+    GBM_FORMAT_RGBX1010102, GBM_FORMAT_RGBA1010102, GBM_FORMAT_BGRX1010102, GBM_FORMAT_BGRA1010102,
+    /* 565 */
+    GBM_FORMAT_RGB565, GBM_FORMAT_BGR565,
+    /* 1555 */
+    GBM_FORMAT_ARGB1555, GBM_FORMAT_ABGR1555, GBM_FORMAT_XRGB1555, GBM_FORMAT_XBGR1555,
+    /* 5551 */
+    GBM_FORMAT_RGBA5551, GBM_FORMAT_BGRA5551, GBM_FORMAT_RGBX5551, GBM_FORMAT_BGRX5551,
+    /* 4444 */
+    GBM_FORMAT_ARGB4444, GBM_FORMAT_ABGR4444, GBM_FORMAT_XRGB4444, GBM_FORMAT_XBGR4444,
+    GBM_FORMAT_RGBA4444, GBM_FORMAT_BGRA4444, GBM_FORMAT_RGBX4444, GBM_FORMAT_BGRX4444,
+    /* 24-bit RGB */
+    GBM_FORMAT_RGB888, GBM_FORMAT_BGR888,
+    /* 332 */
+    GBM_FORMAT_RGB332, GBM_FORMAT_BGR233,
+    /* 16-bit per channel integer (not float) */
+    GBM_FORMAT_XBGR16161616, GBM_FORMAT_ABGR16161616,
+};
+
+/* cached union of plane fourccs for the GL pick; the KMS device does not
+ * change once the driver is up */
+static uint32_t plane_union[128];
+static size_t plane_union_count;
+static bool plane_union_known;
+static bool plane_union_fetched;
+
+static void plane_union_load(int fd)
+{
+    if (plane_union_fetched) {
+        return;
+    }
+    plane_union_fetched = true;
+    plane_union_known = KMSDRM_PlaneFormatsUnionList(fd, plane_union,
+                                                     sizeof(plane_union) / sizeof(plane_union[0]),
+                                                     &plane_union_count);
+    if (!plane_union_known) {
+        plane_union_count = 0;
+    }
+}
+
+static bool plane_accepts(uint32_t fourcc)
+{
+    if (!plane_union_known) {
+        return true; /* no plane info: let GBM decide (legacy behavior) */
+    }
+    for (size_t i = 0; i < plane_union_count; ++i) {
+        if (plane_union[i] == fourcc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* channel sizes for the chosen format, reported to the app as the default
+ * GL attributes */
+static void format_channel_sizes(uint32_t fmt, int *r, int *g, int *b, int *a)
+{
+    switch (fmt) {
+    case GBM_FORMAT_RGB565:
+    case GBM_FORMAT_BGR565:
+        *r = 5; *g = 6; *b = 5; *a = 0;
+        break;
+    case GBM_FORMAT_ARGB1555:
+    case GBM_FORMAT_ABGR1555:
+        *r = 5; *g = 5; *b = 5; *a = 1;
+        break;
+    case GBM_FORMAT_XRGB1555:
+    case GBM_FORMAT_XBGR1555:
+        *r = 5; *g = 5; *b = 5; *a = 0;
+        break;
+    case GBM_FORMAT_RGBA5551:
+    case GBM_FORMAT_BGRA5551:
+        *r = 5; *g = 5; *b = 5; *a = 1;
+        break;
+    case GBM_FORMAT_RGBX5551:
+    case GBM_FORMAT_BGRX5551:
+        *r = 5; *g = 5; *b = 5; *a = 0;
+        break;
+    case GBM_FORMAT_ARGB4444:
+    case GBM_FORMAT_ABGR4444:
+    case GBM_FORMAT_RGBA4444:
+    case GBM_FORMAT_BGRA4444:
+        *r = 4; *g = 4; *b = 4; *a = 4;
+        break;
+    case GBM_FORMAT_XRGB4444:
+    case GBM_FORMAT_XBGR4444:
+    case GBM_FORMAT_RGBX4444:
+    case GBM_FORMAT_BGRX4444:
+        *r = 4; *g = 4; *b = 4; *a = 0;
+        break;
+    case GBM_FORMAT_RGB332:
+    case GBM_FORMAT_BGR233:
+        *r = 3; *g = 3; *b = 2; *a = 0;
+        break;
+    case GBM_FORMAT_XRGB2101010:
+    case GBM_FORMAT_XBGR2101010:
+    case GBM_FORMAT_RGBX1010102:
+    case GBM_FORMAT_BGRX1010102:
+        *r = 10; *g = 10; *b = 10; *a = 0;
+        break;
+    case GBM_FORMAT_ARGB2101010:
+    case GBM_FORMAT_ABGR2101010:
+    case GBM_FORMAT_RGBA1010102:
+    case GBM_FORMAT_BGRA1010102:
+        *r = 10; *g = 10; *b = 10; *a = 2;
+        break;
+    case GBM_FORMAT_XBGR16161616:
+        *r = 16; *g = 16; *b = 16; *a = 0;
+        break;
+    case GBM_FORMAT_ABGR16161616:
+        *r = 16; *g = 16; *b = 16; *a = 16;
+        break;
+    case GBM_FORMAT_ARGB8888:
+    case GBM_FORMAT_ABGR8888:
+    case GBM_FORMAT_RGBA8888:
+    case GBM_FORMAT_BGRA8888:
+        *r = 8; *g = 8; *b = 8; *a = 8;
+        break;
+    default: /* XRGB8888 and friends, RGB888/BGR888: no alpha */
+        *r = 8; *g = 8; *b = 8; *a = 0;
+        break;
+    }
+}
+
 static bool ensure_gbm(KMSDRM_DeviceData *dev)
 {
     if (!SDLOP_GBM_LoadSymbols()) {
@@ -278,48 +412,92 @@ static bool kmsdrm_gl_create_surfaces(SDLop_VideoDevice *device, SDL_Window *win
     KMSDRM_DisplayData *dd = windata->display;
     uint32_t w = dd->mode.hdisplay, h = dd->mode.vdisplay;
 
-    uint32_t fmt = kmsdrm_gl_visual_id;
-    uint32_t flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
+    const uint32_t scanout_flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
 
-    if (!SDLOP_GBM_gbm_device_is_format_supported(dev->gbm_dev, fmt, flags)) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
-                    "KMSDRM: GBM format 0x%08x not supported for scanout+rendering, trying anyway",
-                    fmt);
-    }
-
-    windata->gs = SDLOP_GBM_gbm_surface_create(dev->gbm_dev, w, h, fmt, flags);
-    if (!windata->gs) {
-        return SDL_SetError("gbm_surface_create failed");
-    }
-
-    /* need a config bound to the context before making the surface current */
-    SDL_GLContext current = SDLOP_GL_CurrentContext();
-    EGLConfig config = NULL;
-    if (current) {
-        config = config_for_context((KMSDRMGLContext *)current);
-    }
-    if (!config) {
-        uint32_t api = (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) ||
-                       ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3)
-                           ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
-        if (!pick_config(&config, api)) {
-            SDLOP_GBM_gbm_surface_destroy(windata->gs);
-            windata->gs = NULL;
-            return false;
+    /* Prefer the plane-aware pick (see ensure_gbm), then fall back down a
+     * full ladder of common scanout formats (SDL3 behavior, commit 68655e9,
+     * extended to 10-bit/565/1555/4444/5551/24-bit/16-bit) -- a single
+     * hardcoded format is not portable (XR24-only planes, NVIDIA).
+     * The plane-format union (authoritative) filters the ladder.
+     * The chosen format updates kmsdrm_gl_visual_id so the EGL config
+     * lookup below binds to the right native visual. */
+    plane_union_load(vid()->drm_fd);
+    uint32_t candidates[sizeof(scanout_format_ladder) / sizeof(scanout_format_ladder[0]) + 1];
+    int ncand = 0;
+    candidates[ncand++] = kmsdrm_gl_visual_id;
+    for (size_t i = 0; i < sizeof(scanout_format_ladder) / sizeof(scanout_format_ladder[0]); i++) {
+        bool dup = false;
+        for (int j = 0; j < ncand; j++) {
+            if (candidates[j] == scanout_format_ladder[i]) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup && plane_accepts(scanout_format_ladder[i])) {
+            candidates[ncand++] = scanout_format_ladder[i];
         }
     }
 
-    windata->egl_surface = SDLOP_EGL_eglCreateWindowSurface(egl_display, config,
-                                                            (EGLNativeWindowType)windata->gs, NULL);
-    if (windata->egl_surface == EGL_NO_SURFACE) {
-        SDLOP_GBM_gbm_surface_destroy(windata->gs);
-        windata->gs = NULL;
-        return SDL_SetError("eglCreateWindowSurface failed: 0x%x", SDLOP_EGL_eglGetError());
+    SDL_GLContext current = SDLOP_GL_CurrentContext();
+    for (int ci = 0; ci < ncand; ci++) {
+        uint32_t fmt = candidates[ci];
+        if (!SDLOP_GBM_gbm_device_is_format_supported(dev->gbm_dev, fmt, scanout_flags)) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "KMSDRM: GBM format 0x%08x not supported, trying next", fmt);
+            continue;
+        }
+        windata->gs = SDLOP_GBM_gbm_surface_create(dev->gbm_dev, w, h, fmt, scanout_flags);
+        if (!windata->gs && errno == ENOSYS) {
+            /* NVIDIA: the scanout flag is rejected; retry without it (SDL3 behavior) */
+            windata->gs = SDLOP_GBM_gbm_surface_create(dev->gbm_dev, w, h, fmt, 0);
+        }
+        if (!windata->gs) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: gbm_surface_create(0x%08x) failed", fmt);
+            continue;
+        }
+        kmsdrm_gl_visual_id = fmt;
+        /* report the format's channel sizes to the app's GL attributes
+         * (SDL3 sets gl_config from the chosen format too) */
+        format_channel_sizes(fmt,
+                             &sdlop_glattrs.red_size,
+                             &sdlop_glattrs.green_size,
+                             &sdlop_glattrs.blue_size,
+                             &sdlop_glattrs.alpha_size);
+
+        /* need a config bound to the context before making the surface current */
+        EGLConfig config = NULL;
+        if (current) {
+            config = config_for_context((KMSDRMGLContext *)current);
+        }
+        if (!config) {
+            uint32_t api = (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) ||
+                           ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3)
+                               ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
+            if (!pick_config(&config, api)) {
+                SDLOP_GBM_gbm_surface_destroy(windata->gs);
+                windata->gs = NULL;
+                continue; /* the next format may match an EGL config */
+            }
+        }
+
+        windata->egl_surface = SDLOP_EGL_eglCreateWindowSurface(egl_display, config,
+                                                                (EGLNativeWindowType)windata->gs, NULL);
+        if (windata->egl_surface == EGL_NO_SURFACE) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: eglCreateWindowSurface(0x%08x) failed: 0x%x",
+                        fmt, SDLOP_EGL_eglGetError());
+            SDLOP_GBM_gbm_surface_destroy(windata->gs);
+            windata->gs = NULL;
+            continue;
+        }
+
+        windata->egl_surface_dirty = false;
+        KMSDRM_DeferEvent(window, KMSDRM_DEFER_SIZE);
+        return true;
     }
 
-    windata->egl_surface_dirty = false;
-    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, (int)w, (int)h);
-    return true;
+    return SDL_SetError("KMSDRM: could not create a GBM/EGL scanout surface in any supported format");
 }
 
 /* Destroy EGL/GBM scanout resources for a window (context survives). */
@@ -327,12 +505,6 @@ void KMSDRM_DestroyGLSurfaces(KMSDRM_WindowData *windata)
 {
     if (egl_initialized) {
         SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    }
-    if (windata->egl_surface && windata->egl_surface != EGL_NO_SURFACE) {
-        if (egl_initialized) {
-            SDLOP_EGL_eglDestroySurface(egl_display, windata->egl_surface);
-        }
-        windata->egl_surface = EGL_NO_SURFACE;
     }
     if (windata->bo) {
         if (windata->gs) {
@@ -345,6 +517,15 @@ void KMSDRM_DestroyGLSurfaces(KMSDRM_WindowData *windata)
             SDLOP_GBM_gbm_surface_release_buffer(windata->gs, windata->next_bo);
         }
         windata->next_bo = NULL;
+    }
+    /* EGL surface goes after the GBM buffers are released: some drivers
+     * crash destroying an EGL surface that still owns locked GBM buffers
+     * (SDL3 commit 463b6be) */
+    if (windata->egl_surface && windata->egl_surface != EGL_NO_SURFACE) {
+        if (egl_initialized) {
+            SDLOP_EGL_eglDestroySurface(egl_display, windata->egl_surface);
+        }
+        windata->egl_surface = EGL_NO_SURFACE;
     }
     if (windata->gs) {
         SDLOP_GBM_gbm_surface_destroy(windata->gs);
@@ -502,6 +683,9 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
     if (!windata || !dd) {
         return SDL_SetError("Invalid window");
     }
+    if (!dd->connected) {
+        return SDL_SetError("KMSDRM: display disconnected (window has no live output)");
+    }
 
     /* switched away from this VT, or the mode changed: (re)create the
      * GBM/EGL scanout surfaces for the current mode */
@@ -633,7 +817,22 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
             }
         } else {
             int err = errno;
-            if (err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {
+            if (err == EINVAL && (flip_flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
+                /* some drivers claim async flips but can't (or fail
+                 * intermittently): retry synchronously without the async
+                 * flag (SDL3 commit 69dd29e) */
+                flip_flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
+                ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
+                                                flip_flags, &windata->waiting_for_flip);
+                err = errno;
+                if (ret == 0) {
+                    windata->waiting_for_flip = true;
+                    if (kmsdrm_double_buffer()) {
+                        KMSDRM_WaitPageflip(dev, windata, 1500);
+                    }
+                }
+            }
+            if (ret != 0 && err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {
                 ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
                                                 flip_flags, &windata->waiting_for_flip);
                 if (ret == 0) {

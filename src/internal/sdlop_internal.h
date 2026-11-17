@@ -35,7 +35,31 @@ struct SDL_Window
     SDL_Surface *surface;   /* software window surface (owned by window) */
     void *driverdata;
     struct SDL_Window *next;
+    SDL_DisplayID displayID;          /* display the window is currently on */
+    bool has_fullscreen_mode;         /* an exclusive fullscreen mode was requested */
+    SDL_DisplayMode fullscreen_mode;  /* requested exclusive mode (displayID set) */
 };
+
+/* ------------------------------------------------------------------ */
+/* Video displays                                                      */
+/* ------------------------------------------------------------------ */
+
+#define SDLOP_MAX_DISPLAYS 16
+
+typedef struct SDLop_Display
+{
+    SDL_DisplayID id;
+    char *name;
+    SDL_Rect bounds;                /* absolute desktop rectangle (left-to-right) */
+    float content_scale;
+    SDL_DisplayOrientation natural_orientation;
+    SDL_DisplayOrientation current_orientation;
+    SDL_DisplayMode desktop_mode;   /* sdlop reports desktop mode == current mode */
+    SDL_DisplayMode *fullscreen_modes;   /* sorted largest first; desktop mode always present */
+    int num_fullscreen_modes;
+    SDL_PropertiesID props;              /* display properties group (0 until first access) */
+    void *internal;                 /* driver data (KMSDRM_DisplayData*, ...) */
+} SDLop_Display;
 
 /* ------------------------------------------------------------------ */
 /* Video driver interface                                              */
@@ -117,6 +141,9 @@ typedef struct SDLop_Globals
     SDL_Window *windows;        /* linked list */
     int num_windows;
     SDL_WindowID next_window_id;
+    SDLop_Display displays[SDLOP_MAX_DISPLAYS];
+    int num_displays;
+    SDL_DisplayID next_display_id;
 
     /* keyboard state (SDL_GetKeyboardState) */
     bool keystate[SDL_SCANCODE_COUNT];
@@ -152,6 +179,11 @@ typedef struct SDLop_Globals
 
     /* event queue wakeup (raw input worker -> main thread) */
     int wake_fd;                /* eventfd, read to reset */
+
+    /* KMSDRM VT-switch signals owned by the driver's signalfd; helper
+     * threads (raw evdev worker) block these so the signals are always
+     * consumed via the fd, never via a default disposition. 0 = unset. */
+    int vt_signals[2];
 } SDLop_Globals;
 
 extern SDLop_Globals sdlop;
@@ -201,7 +233,7 @@ void SDLOP_KeyboardProcessRepeats(void);
 void SDLOP_KeyboardQuit(void);
 /* Resolve scancode (evdev raw code) -> SDL_Keycode + text using xkb.
  * Returns the keycode; fills text_utf8 (may write "") when non-NULL. */
-SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size);
+SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out);
 
 /* Raw input worker (evdev), implemented in sdlop_evdev.c */
 bool SDLOP_RawInputInit(void);      /* starts worker thread if possible */
@@ -217,6 +249,19 @@ void SDLOP_VideoQuit(void);
 void SDLOP_AddWindow(SDL_Window *window);
 void SDLOP_RemoveWindow(SDL_Window *window);
 void SDLOP_SendQuitEvent(void);
+
+/* Display list management (used by backends). Bounds are laid out
+ * left-to-right on every add/remove, like SDL3. */
+SDL_DisplayID SDLOP_AddDisplay(const char *name, int w, int h, int refresh_mhz,
+                               SDL_DisplayOrientation natural_orientation,
+                               void *internal, bool send_event);
+void SDLOP_DelDisplay(SDL_DisplayID displayID, bool send_event);
+void SDLOP_SendDisplayEvent(SDL_DisplayID displayID, SDL_EventType type, Sint32 data1, Sint32 data2);
+bool SDLOP_GetDisplayBoundsById(SDL_DisplayID displayID, SDL_Rect *rect);
+int SDLOP_GetDisplayIndexById(SDL_DisplayID displayID); /* -1 when absent */
+SDL_DisplayID SDLOP_GetDisplayIdAtIndex(int index);      /* 0 when absent */
+bool SDLOP_AddFullscreenDisplayMode(SDL_DisplayID displayID, const SDL_DisplayMode *mode);
+void SDLOP_UpdateWindowDisplay(SDL_Window *window);      /* re-resolves window->displayID */
 
 /* GL attributes (SDL_gl.c) */
 typedef struct SDLOP_GLAttributes

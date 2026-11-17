@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -178,6 +179,22 @@ static void dispatch_callbacks(const SDLop_RawEvent *event)
 static void *worker_main(void *arg)
 {
     (void)arg;
+
+    /* The KMSDRM driver consumes its VT-switch signals via signalfd; block
+     * them here as well so they are never delivered to (or default-acted on
+     * by) this thread. They are published via sdlop.vt_signals before this
+     * thread starts (video init runs before raw-input init). */
+    if (sdlop.vt_signals[0] > 0 || sdlop.vt_signals[1] > 0) {
+        sigset_t vt_mask;
+        sigemptyset(&vt_mask);
+        if (sdlop.vt_signals[0] > 0) {
+            sigaddset(&vt_mask, sdlop.vt_signals[0]);
+        }
+        if (sdlop.vt_signals[1] > 0) {
+            sigaddset(&vt_mask, sdlop.vt_signals[1]);
+        }
+        pthread_sigmask(SIG_BLOCK, &vt_mask, NULL);
+    }
     struct epoll_event evs[SDLOP_MAX_EPOLL_EVENTS];
     struct input_event batch[SDLOP_MAX_EVENTS_PER_READ];
 

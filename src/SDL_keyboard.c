@@ -12,6 +12,7 @@
 #include "internal/sdlop_internal.h"
 
 #include <string.h>
+#include <stdlib.h>
 #include <strings.h>
 #include "internal/scancode_evdev.h"
 #include "internal/sdlop_xkb_dyn.h"
@@ -159,11 +160,20 @@ bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
             return SDL_SetError("SDLOP_XKB_xkb_context_new() failed");
         }
     }
-    struct xkb_keymap *km = SDLOP_XKB_xkb_keymap_new_from_string(xkb_ctx, keymap_string, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    /* The compositor sends `length` bytes over an mmap'd fd; they are NOT
+     * readable past that point (and may not be NUL-terminated within it),
+     * but xkb requires a C string. Copy and terminate defensively. */
+    char *terminated = (char *)malloc(length + 1);
+    if (!terminated) {
+        return SDL_SetError("Out of memory parsing keymap");
+    }
+    memcpy(terminated, keymap_string, length);
+    terminated[length] = '\0';
+    struct xkb_keymap *km = SDLOP_XKB_xkb_keymap_new_from_string(xkb_ctx, terminated, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    free(terminated);
     if (!km) {
         return SDL_SetError("Could not parse Wayland xkb keymap");
     }
-    (void)length;
     return set_keymap(km);
 }
 
@@ -189,13 +199,14 @@ bool SDLOP_KeyboardSetDefaultKeymap(void)
     return set_keymap(km);
 }
 
-void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
+/* rebuild the caps/num/level5/mode bits (and cross-check the L/R bits)
+ * from xkb's effective modifier state; shared by the mask-based wayland
+ * path and the key-event-based raw path */
+static void sdlop_sync_mods_from_xkb(void)
 {
     if (!xkb_st) {
         return;
     }
-    SDLOP_XKB_xkb_state_update_mask(xkb_st, depressed, latched, locked, 0, 0, 0);
-
     SDL_Keymod mod = sdlop.modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT | SDL_KMOD_LCTRL | SDL_KMOD_RCTRL | SDL_KMOD_LALT | SDL_KMOD_RALT | SDL_KMOD_LGUI | SDL_KMOD_RGUI);
 
     /* toggle locks come from xkb; left/right bits are tracked from key events */
@@ -224,6 +235,15 @@ void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 l
     sdlop.modstate = mod;
 }
 
+void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
+{
+    if (!xkb_st) {
+        return;
+    }
+    SDLOP_XKB_xkb_state_update_mask(xkb_st, depressed, latched, locked, 0, 0, 0);
+    sdlop_sync_mods_from_xkb();
+}
+
 /* ------------------------------------------------------------------ */
 /* keysym -> SDL_Keycode                                               */
 /* ------------------------------------------------------------------ */
@@ -235,12 +255,12 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
     if (sym >= XKB_KEY_a && sym <= XKB_KEY_z) {
         return (SDL_Keycode)sym;
     }
-    if (sym > 0x20 && sym < 0x100 && sym != 0x7f) {
-        return (SDL_Keycode)sym;
+    if (sym >= 0x20 && sym < 0x100 && sym != 0x7f) {
+        return (SDL_Keycode)sym; /* space (0x20) == SDLK_SPACE */
     }
 
     /* SDL3 gives these ASCII values rather than scancode-mask codes */
-    if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+    if (sym == XKB_KEY_Return) {
         return SDLK_RETURN;
     }
     if (sym == XKB_KEY_Escape) {
@@ -280,7 +300,6 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
         { XKB_KEY_Print, SDL_SCANCODE_PRINTSCREEN },
         { XKB_KEY_Pause, SDL_SCANCODE_PAUSE },
         { XKB_KEY_Menu, SDL_SCANCODE_APPLICATION },
-        { XKB_KEY_space, SDL_SCANCODE_SPACE },
         { XKB_KEY_Shift_L, SDL_SCANCODE_LSHIFT },
         { XKB_KEY_Shift_R, SDL_SCANCODE_RSHIFT },
         { XKB_KEY_Control_L, SDL_SCANCODE_LCTRL },
@@ -321,23 +340,32 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
     return SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_UNKNOWN);
 }
 
-SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size)
+SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out)
 {
     if (text_utf8 && text_size) {
         text_utf8[0] = '\0';
+    }
+    if (repeats_out) {
+        *repeats_out = false;
     }
     if (!xkb_st || rawcode == 0) {
         return SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_UNKNOWN);
     }
     xkb_keycode_t xk = (xkb_keycode_t)rawcode + 8; /* evdev -> xkb offset */
 
+    /* resolved once for both text + key repeat bookkeeping */
+    bool repeats = SDLOP_XKB_xkb_keymap_key_repeats(keymap, xk) == 1;
+    if (repeats_out) {
+        *repeats_out = repeats;
+    }
+
     /* key code: resolved on the base layout (clean state) like SDL3 */
     xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, xk);
     SDL_Keycode key = keysym_to_keycode(sym);
 
     /* text: from the live state, respecting modifiers */
-    if (key_event && text_utf8) {
-        if (SDLOP_XKB_xkb_keymap_key_repeats(keymap, xk)) {
+    if (key_event && text_utf8 && repeats) {
+        {
             int len = SDLOP_XKB_xkb_state_key_get_utf8(xkb_st, xk, text_utf8, text_size);
             if (len <= 0 || len >= (int)text_size) {
                 text_utf8[0] = '\0';
@@ -385,7 +413,7 @@ static SDL_Keymod modifier_bit_for(SDL_Scancode sc)
     case SDL_SCANCODE_LCTRL:  return SDL_KMOD_LCTRL;
     case SDL_SCANCODE_RCTRL:  return SDL_KMOD_RCTRL;
     case SDL_SCANCODE_LALT:   return SDL_KMOD_LALT;
-    case SDL_SCANCODE_RALT:   return (sdlop.modstate & SDL_KMOD_MODE) ? (SDL_KMOD_RALT) : SDL_KMOD_RALT;
+    case SDL_SCANCODE_RALT:   return SDL_KMOD_RALT;
     case SDL_SCANCODE_LGUI:   return SDL_KMOD_LGUI;
     case SDL_SCANCODE_RGUI:   return SDL_KMOD_RGUI;
     default: return SDL_KMOD_NONE;
@@ -402,6 +430,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
         return;
     }
 
+    Uint16 xkb_raw = rawcode ? rawcode : evdev_from_scancode(scancode);
     SDL_Keymod mod = sdlop.modstate;
     SDL_Keymod modbit = modifier_bit_for(scancode);
 
@@ -418,9 +447,21 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     }
     sdlop.modstate = mod;
 
-    /* resolve keycode + text */
+    /* keep the live xkb state in sync (raw evdev path has no other way to
+     * track modifiers/locks; wayland additionally receives absolute masks
+     * from the compositor, which simply re-assert this state). Repeats are
+     * already reflected in the state from the initial press. */
+    if (xkb_st && xkb_raw && !repeat) {
+        SDLOP_XKB_xkb_state_update_key(xkb_st, (xkb_keycode_t)xkb_raw + 8,
+                                       down ? XKB_KEY_DOWN : XKB_KEY_UP);
+        sdlop_sync_mods_from_xkb();
+        mod = sdlop.modstate;
+    }
+
+    /* resolve keycode (+ text, only needed for key presses) */
+    bool key_repeats = false;
     char text[64];
-    SDL_Keycode key = SDLOP_KeyboardTranslateKey(rawcode ? rawcode : evdev_from_scancode(scancode), true, text, sizeof(text));
+    SDL_Keycode key = SDLOP_KeyboardTranslateKey(xkb_raw, down, text, sizeof(text), &key_repeats);
 
     SDL_Event event;
     SDL_zero(event);
@@ -442,7 +483,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
 
     /* key repeat management (raw path has no server-generated repeats) */
     if (down && !repeat) {
-        if (SDLOP_KeyboardKeyRepeats(scancode)) {
+        if (key_repeats) {
             sdlop.repeat_scancode = scancode;
             sdlop.repeat_rawcode = rawcode;
             sdlop.repeat_active = true;
@@ -521,7 +562,7 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
         SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, 0, 0, 0, 0, 0, 0);
         return keysym_to_keycode(sym);
     }
-    return SDLOP_KeyboardTranslateKey(raw, key_event, NULL, 0);
+    return SDLOP_KeyboardTranslateKey(raw, key_event, NULL, 0, NULL);
 }
 
 SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)

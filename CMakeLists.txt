@@ -34,6 +34,7 @@ if(EMSCRIPTEN)
     src/SDL_log.c
     src/SDL_timer.c
     src/SDL_events.c
+    src/SDL_properties.c
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
@@ -85,15 +86,36 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Dependencies
+#
+# SDLop dlopen-s every optional library at run time (wayland-client,
+# xkbcommon, EGL, libdrm, libgbm, libvulkan - see the *_dyn.c loaders), so the
+# sdlop/sdlop_shared targets link ONLY pthread, dl and m. No -dev package may
+# be required just to produce the library on systems where the corresponding
+# library is absent.
+#
+# The checks below are build-time *header* probes for the drivers that are
+# compiled into the core (mirrors SDL3: headers are needed to build a driver,
+# the library is loaded with dlopen when the driver initializes):
+#   wayland-client - headers + wayland.xml consumed by wayland-scanner
+#   xkbcommon      - xkbcommon.h (enums/types for the dlopen'd symbols)
+#   egl            - EGL/egl.h + eglext.h
+#   gbm            - gbm.h
+#   libdrm         - xf86drm.h + xf86drmMode.h (headers only: the libdrm
+#                    library itself is dlopen'ed at run time - never linked)
+# libvulkan / glesv2 / wayland-server are needed ONLY by tests, examples and
+# benchmarks; those targets are skipped (with a message) when absent - see
+# below.
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 pkg_check_modules(EGL REQUIRED egl)
-pkg_check_modules(GLESV2 REQUIRED glesv2)
-# KMSDRM driver: libdrm/libgbm headers only - both libraries are dlopen-ed at runtime
-pkg_check_modules(LIBDRM REQUIRED libdrm)
 pkg_check_modules(GBM REQUIRED gbm)
+pkg_check_modules(LIBDRM REQUIRED libdrm)
+# GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
+pkg_check_modules(GLESV2 glesv2)
+find_package(Vulkan QUIET)
+pkg_check_modules(WAYLAND_SERVER wayland-server)
 
 find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
 pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
@@ -198,6 +220,7 @@ set(SDLop_SOURCES
   src/SDL_log.c
   src/SDL_timer.c
   src/SDL_events.c
+  src/SDL_properties.c
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
@@ -229,18 +252,14 @@ set(SDLop_LIB_DEPS
   pthread
   dl
   m)
-set(SDLop_LIB_DIRS
-  ${WAYLAND_CLIENT_LIBRARY_DIRS}
-  ${XKBCOMMON_LIBRARY_DIRS}
-  ${EGL_LIBRARY_DIRS}
-  ${GLESV2_LIBRARY_DIRS})
+# dlopen-ed at run time - the core targets link none of these libraries.
+# Only their header search paths are needed.
 set(SDLop_LIB_INCS
   ${WAYLAND_CLIENT_INCLUDE_DIRS}
   ${XKBCOMMON_INCLUDE_DIRS}
   ${EGL_INCLUDE_DIRS}
-  ${GLESV2_INCLUDE_DIRS}
-  ${LIBDRM_INCLUDE_DIRS}
-  ${GBM_INCLUDE_DIRS})
+  ${GBM_INCLUDE_DIRS}
+  ${LIBDRM_INCLUDE_DIRS})
 
 add_library(sdlop STATIC ${SDLop_SOURCES})
 add_library(SDLop::SDLop ALIAS sdlop)
@@ -254,7 +273,6 @@ target_include_directories(sdlop PRIVATE
   src/video/kmsdrm
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
-target_link_directories(sdlop PUBLIC ${SDLop_LIB_DIRS})
 target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
 target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
 
@@ -269,7 +287,6 @@ target_include_directories(sdlop_shared PRIVATE
   src/video/kmsdrm
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
-target_link_directories(sdlop_shared PUBLIC ${SDLop_LIB_DIRS})
 target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
 target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
 
@@ -277,19 +294,26 @@ target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO
 # Examples
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_EXAMPLES)
-  find_package(Vulkan REQUIRED)
   foreach(ex window wasd raw_latency surface_plasma)
     add_executable(${ex} examples/${ex}.c)
     target_link_libraries(${ex} PRIVATE sdlop m)
   endforeach()
 
-  add_executable(vulkan_clear examples/vulkan_clear.c)
-  target_link_libraries(vulkan_clear PRIVATE sdlop Vulkan::Vulkan m)
+  if(Vulkan_FOUND)
+    add_executable(vulkan_clear examples/vulkan_clear.c)
+    target_link_libraries(vulkan_clear PRIVATE sdlop Vulkan::Vulkan m)
+  else()
+    message(STATUS "Vulkan not found - skipping vulkan_clear example")
+  endif()
 
   # GL example talks GLES2 directly
-  add_executable(gl_triangle examples/gl_triangle.c)
-  target_link_libraries(gl_triangle PRIVATE sdlop ${GLESV2_LIBRARIES})
-  target_include_directories(gl_triangle PRIVATE ${GLESV2_INCLUDE_DIRS})
+  if(GLESV2_FOUND)
+    add_executable(gl_triangle examples/gl_triangle.c)
+    target_link_libraries(gl_triangle PRIVATE sdlop ${GLESV2_LIBRARIES})
+    target_include_directories(gl_triangle PRIVATE ${GLESV2_INCLUDE_DIRS})
+  else()
+    message(STATUS "GLESv2 not found - skipping gl_triangle example")
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -330,58 +354,72 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(bench_kmsdrm PRIVATE src)
   target_compile_options(bench_kmsdrm PRIVATE -UNDEBUG)
 
-  add_executable(test_gl tests/test_gl.c)
-  target_link_libraries(test_gl PRIVATE sdlop ${GLESV2_LIBRARIES})
-  target_include_directories(test_gl PRIVATE src ${GLESV2_INCLUDE_DIRS})
-  target_compile_options(test_gl PRIVATE -UNDEBUG)
-  add_test(NAME test_gl COMMAND test_gl)
+  if(GLESV2_FOUND)
+    add_executable(test_gl tests/test_gl.c)
+    target_link_libraries(test_gl PRIVATE sdlop ${GLESV2_LIBRARIES})
+    target_include_directories(test_gl PRIVATE src ${GLESV2_INCLUDE_DIRS})
+    target_compile_options(test_gl PRIVATE -UNDEBUG)
+    add_test(NAME test_gl COMMAND test_gl)
+  else()
+    message(STATUS "GLESv2 not found - skipping test_gl")
+  endif()
 
-  find_package(Vulkan REQUIRED)
   # pointer lock integration test (runs against tests/mini_compositor.c)
-  pkg_check_modules(WAYLAND_SERVER REQUIRED wayland-server)
-  add_executable(mini_compositor tests/mini_compositor.c
-    ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-    ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-    ${WL_GEN_DIR}/relative-pointer-server-protocol.c)
-  add_dependencies(mini_compositor sdlop_wayland_protocols)
-  target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
-  target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
+  if(WAYLAND_SERVER_FOUND)
+    add_executable(mini_compositor tests/mini_compositor.c
+      ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+      ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+      ${WL_GEN_DIR}/relative-pointer-server-protocol.c)
+    add_dependencies(mini_compositor sdlop_wayland_protocols)
+    target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
+    target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
 
-  add_executable(test_pointer_lock tests/test_pointer_lock.c)
-  target_link_libraries(test_pointer_lock PRIVATE sdlop m)
-  target_include_directories(test_pointer_lock PRIVATE src)
-  target_compile_options(test_pointer_lock PRIVATE -UNDEBUG)
-  add_dependencies(test_pointer_lock mini_compositor)
-  add_test(NAME test_pointer_lock COMMAND test_pointer_lock $<TARGET_FILE:mini_compositor>)
+    add_executable(test_pointer_lock tests/test_pointer_lock.c)
+    target_link_libraries(test_pointer_lock PRIVATE sdlop m)
+    target_include_directories(test_pointer_lock PRIVATE src)
+    target_compile_options(test_pointer_lock PRIVATE -UNDEBUG)
+    add_dependencies(test_pointer_lock mini_compositor)
+    add_test(NAME test_pointer_lock COMMAND test_pointer_lock $<TARGET_FILE:mini_compositor>)
 
-  add_executable(test_touch tests/test_touch.c)
-  target_link_libraries(test_touch PRIVATE sdlop m)
-  target_include_directories(test_touch PRIVATE src)
-  target_compile_options(test_touch PRIVATE -UNDEBUG)
-  add_dependencies(test_touch mini_compositor)
-  add_test(NAME test_touch COMMAND test_touch $<TARGET_FILE:mini_compositor>)
+    add_executable(test_touch tests/test_touch.c)
+    target_link_libraries(test_touch PRIVATE sdlop m)
+    target_include_directories(test_touch PRIVATE src)
+    target_compile_options(test_touch PRIVATE -UNDEBUG)
+    add_dependencies(test_touch mini_compositor)
+    add_test(NAME test_touch COMMAND test_touch $<TARGET_FILE:mini_compositor>)
+  else()
+    message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch")
+  endif()
 
   add_executable(smoke_relative_mode tests/smoke_relative_mode.c)
   target_link_libraries(smoke_relative_mode PRIVATE sdlop)
   add_test(NAME smoke_relative_mode COMMAND smoke_relative_mode)
 
-  add_executable(test_gl_matrix tests/test_gl_matrix.c)
-  target_link_libraries(test_gl_matrix PRIVATE sdlop ${GLESV2_LIBRARIES})
-  target_include_directories(test_gl_matrix PRIVATE src ${GLESV2_INCLUDE_DIRS})
-  target_compile_options(test_gl_matrix PRIVATE -UNDEBUG)
-  add_test(NAME test_gl_matrix COMMAND test_gl_matrix)
+  if(GLESV2_FOUND)
+    add_executable(test_gl_matrix tests/test_gl_matrix.c)
+    target_link_libraries(test_gl_matrix PRIVATE sdlop ${GLESV2_LIBRARIES})
+    target_include_directories(test_gl_matrix PRIVATE src ${GLESV2_INCLUDE_DIRS})
+    target_compile_options(test_gl_matrix PRIVATE -UNDEBUG)
+    add_test(NAME test_gl_matrix COMMAND test_gl_matrix)
+  else()
+    message(STATUS "GLESv2 not found - skipping test_gl_matrix")
+  endif()
 
-  add_executable(test_vulkan tests/test_vulkan.c)
-  target_link_libraries(test_vulkan PRIVATE sdlop Vulkan::Vulkan)
-  target_include_directories(test_vulkan PRIVATE src)
-  target_compile_options(test_vulkan PRIVATE -UNDEBUG)
-  add_test(NAME test_vulkan COMMAND test_vulkan)
+  if(Vulkan_FOUND)
+    add_executable(test_vulkan tests/test_vulkan.c)
+    target_link_libraries(test_vulkan PRIVATE sdlop Vulkan::Vulkan)
+    target_include_directories(test_vulkan PRIVATE src)
+    target_compile_options(test_vulkan PRIVATE -UNDEBUG)
+    add_test(NAME test_vulkan COMMAND test_vulkan)
 
-  add_executable(test_vulkan_compute tests/test_vulkan_compute.c)
-  target_link_libraries(test_vulkan_compute PRIVATE sdlop Vulkan::Vulkan)
-  target_include_directories(test_vulkan_compute PRIVATE src tests)
-  target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
-  add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
+    add_executable(test_vulkan_compute tests/test_vulkan_compute.c)
+    target_link_libraries(test_vulkan_compute PRIVATE sdlop Vulkan::Vulkan)
+    target_include_directories(test_vulkan_compute PRIVATE src tests)
+    target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
+    add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
+  else()
+    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute")
+  endif()
 
   # wlr virtual-input protocols (vendored XMLs) for the sway end-to-end test
   add_custom_command(
@@ -404,13 +442,17 @@ if(SDLop_BUILD_TESTS)
             ${WL_GEN_DIR}/virtual-keyboard-protocol.c
     DEPENDS ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
 
-  add_executable(test_virtual_input tests/test_virtual_input.c
-    ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-    ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
-  target_link_libraries(test_virtual_input PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
-  target_include_directories(test_virtual_input PRIVATE src ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
-  target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
-  add_test(NAME test_virtual_input COMMAND test_virtual_input)
+  if(WAYLAND_CLIENT_FOUND)
+    add_executable(test_virtual_input tests/test_virtual_input.c
+      ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+      ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
+    target_link_libraries(test_virtual_input PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
+    target_include_directories(test_virtual_input PRIVATE src ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
+    target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
+    add_test(NAME test_virtual_input COMMAND test_virtual_input)
+  else()
+    message(STATUS "wayland-client not found - skipping test_virtual_input")
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -429,9 +471,13 @@ if(SDLop_BUILD_BENCHMARKS)
   else()
     message(STATUS "SDL3 not found - skipping comparison benchmark")
   endif()
-  add_executable(bench_render bench/bench_render.c)
-  target_link_libraries(bench_render PRIVATE sdlop ${GLESV2_LIBRARIES})
-  target_include_directories(bench_render PRIVATE ${GLESV2_INCLUDE_DIRS})
+  if(GLESV2_FOUND)
+    add_executable(bench_render bench/bench_render.c)
+    target_link_libraries(bench_render PRIVATE sdlop ${GLESV2_LIBRARIES})
+    target_include_directories(bench_render PRIVATE ${GLESV2_INCLUDE_DIRS})
+  else()
+    message(STATUS "GLESv2 not found - skipping bench_render")
+  endif()
   add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
   target_link_libraries(bench_raw_latency PRIVATE sdlop)
   target_include_directories(bench_raw_latency PRIVATE src tests)
@@ -447,10 +493,10 @@ endif()
 # Wayland behaviour injector (virtual pointer + keyboard script driver);
 # pairs with the shared behaviour_probe_wayland on the agent branch and
 # tests/run_behaviour_wayland.sh
-if (NOT EMSCRIPTEN)
+if (NOT EMSCRIPTEN AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND)
   add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
-  target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR})
-  target_link_libraries(wl_injector PRIVATE wayland-client xkbcommon)
+  target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+  target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
 endif()
 
 # API subset gate: every SDL_* symbol exported by SDLop must also be exported
@@ -465,8 +511,11 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
   # only - every other test keeps full leak checking
-  set_tests_properties(test_gl test_gl_matrix test_vulkan_compute
-    PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+  foreach(t test_gl test_gl_matrix test_vulkan_compute)
+    if (TARGET ${t})
+      set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endif()
+  endforeach()
   # test_surface asserts the alloc-failure contract (CreateSurface must
   # return NULL); ASan's allocator aborts on OOM unless allowed to return null
   set_tests_properties(test_surface

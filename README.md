@@ -175,7 +175,7 @@ are produced.
 Runtime loading is SDL3-style dynamic: `libwayland-client.so.0`,
 `libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1` and `libvulkan.so.1`
 are all `dlopen`-ed on demand — nothing optional is linked
-(`objdump -p libSDLop.so` shows NEEDED: libc only). Apps link just
+(`objdump -p libSDLop.so` shows NEEDED: libc and libm only). Apps link just
 `-lsdlop` (plus `-lpthread -ldl -lm` where the toolchain doesn't fold them
 into libc). Missing libs degrade gracefully: no wayland-client -> dummy
 video driver; no xkbcommon -> windowing still works. Override probe names

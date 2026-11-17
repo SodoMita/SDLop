@@ -135,8 +135,9 @@ static SDL_Keycode resolve(SDL_Scancode sc, SDL_Keymod mod, bool key_event, char
     return (SDL_Keycode)(unsigned char)ch;
 }
 
-SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size)
+SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out)
 {
+    (void)repeats_out;
     /* the raw evdev path does not exist on the web */
     (void)rawcode;
     (void)key_event;

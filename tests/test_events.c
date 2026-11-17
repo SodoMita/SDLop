@@ -127,6 +127,61 @@ int main(void)
     assert(!(SDL_GetModState() & SDL_KMOD_LSHIFT));
     SDL_FlushEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP);
 
+    /* xkb-backed checks: skip gracefully when libxkbcommon (dlopen'd at
+     * run time) is not installed on this system */
+    bool have_xkb = SDLOP_KeyboardSetDefaultKeymap();
+    if (have_xkb) {
+        /* text input must be enabled on the focused window (SDL3 semantics) */
+        assert(SDL_StartTextInput(w));
+
+        /* xkb live state sync (raw path): Shift -> uppercase text */
+        SDL_FlushEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_TEXT_INPUT);
+        SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_LSHIFT, 42, 0);
+        SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_A, 30, 0);
+        {
+            SDL_Event ev;
+            bool saw_text = false;
+            while (SDL_PollEvent(&ev)) {
+                if (ev.type == SDL_EVENT_TEXT_INPUT) {
+                    saw_text = strcmp(ev.text.text, "A") == 0;
+                }
+            }
+            assert(saw_text);
+        }
+        assert(SDL_GetModState() & SDL_KMOD_LSHIFT);
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, 30, 0);
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_LSHIFT, 42, 0);
+        assert(!(SDL_GetModState() & SDL_KMOD_LSHIFT));
+
+        /* caps lock toggles text and the CAPS modbit */
+        SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_CAPSLOCK, 58, 0);
+        assert(SDL_GetModState() & SDL_KMOD_CAPS);
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_CAPSLOCK, 58, 0);
+        SDL_FlushEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_TEXT_INPUT);
+        SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_A, 30, 0);
+        {
+            SDL_Event ev;
+            bool saw_text = false;
+            while (SDL_PollEvent(&ev)) {
+                if (ev.type == SDL_EVENT_TEXT_INPUT) {
+                    saw_text = strcmp(ev.text.text, "A") == 0;
+                }
+            }
+            assert(saw_text);
+        }
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, 30, 0);
+        SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_CAPSLOCK, 58, 0);
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_CAPSLOCK, 58, 0);
+        assert(!(SDL_GetModState() & SDL_KMOD_CAPS));
+        SDL_FlushEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_TEXT_INPUT);
+
+        /* SDL3 keycode semantics: space is SDLK_SPACE, KP_Enter is scancode-masked */
+        assert(SDL_GetKeyFromScancode(SDL_SCANCODE_SPACE, SDL_KMOD_NONE, true) == SDLK_SPACE);
+        assert(SDL_GetKeyFromScancode(SDL_SCANCODE_KP_ENTER, SDL_KMOD_NONE, true) ==
+               SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_KP_ENTER));
+        assert(SDL_GetKeyFromScancode(SDL_SCANCODE_RETURN, SDL_KMOD_NONE, true) == SDLK_RETURN);
+    }
+
     /* --- mouse state --- */
     extern void SDLOP_SendMouseMotion(float x, float y, float xrel, float yrel, Uint64 ts);
     extern void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 ts);
@@ -270,6 +325,7 @@ int main(void)
 
 #ifndef __EMSCRIPTEN__ /* the web backend has no xkb keymaps */
     /* --- stock parity: KEYMAP_CHANGED fires for a replaced keymap --- */
+    if (have_xkb) {
     static const char minimal_keymap[] =
         "xkb_keymap {\n"
         "xkb_keycodes \"min\" { minimum = 8; maximum = 255;\n"
@@ -291,7 +347,7 @@ int main(void)
         "  key <AD02> { type= \"ALPHABETIC\", symbols[Group1]= [ w, W ] };\n"
         "  key <LFSH> { [ Shift_L ] }; key <RTSH> { [ Shift_R ] };\n"
         "  key <LCTL> { [ Control_L ] }; key <CAPS> { [ Caps_Lock ] }; }; };\n";
-    assert(SDLOP_KeyboardSetDefaultKeymap()); /* ensure one exists: first keymap sends no event */
+    /* ensure one exists: first keymap sends no event */
     SDL_FlushEvent(SDL_EVENT_KEYMAP_CHANGED);
     assert(SDLOP_KeyboardSetKeymapString(minimal_keymap, sizeof(minimal_keymap) - 1));
     {
@@ -304,6 +360,7 @@ int main(void)
         }
         assert(saw);
     }
+    } /* have_xkb */
 
 #endif /* !__EMSCRIPTEN__ */
 

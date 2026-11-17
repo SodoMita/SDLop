@@ -24,7 +24,8 @@
 #   bochs         stdvga + bochs-display,id=bochs0, SDLOP_KMSDRM_DEVICE=1
 #   virtio        stdvga + virtio-gpu-pci,id=gpu0, SDLOP_KMSDRM_DEVICE=1
 #   virtio-gl     stdvga + virtio-gpu-gl-pci,id=gpu0, SDLOP_KMSDRM_DEVICE=1, xvfb+gtk,gl=on
-#   dual-head     stdvga + bochs-display (default probe picks stdvga)
+#   dual-head     stdvga + virtio-gpu-pci max_outputs=2, -display gtk under Xvfb (both heads
+#                 connect only with a UI backend); SDLOP_KMSDRM_DEVICE=1, test asserts 2 displays
 #   card-select   stdvga + bochs-display,id=bochs0, SDLOP_KMSDRM_DEVICE=1
 #   no-flip       virtio scenario with SDLOP_KMSDRM_NOFLIP=1
 #   bad-device    SDLOP_KMSDRM_DEVICE=99                     (graceful failure, no crash)
@@ -55,6 +56,7 @@ guest_scp() { sshpass -proot scp "${SCP_OPTS[@]}" "$@"; }
 # display modes:
 #   none   - headless (default)
 #   gtk-gl - virtual X (xvfb) + gtk,gl=on; needed for virtio-gpu-gl-pci
+#   gtk    - virtual X (xvfb) + plain gtk; needed to connect all virtio-gpu heads
 #            (virgl) on hosts without a /dev/dri render node; QEMU's
 #            egl-headless requires one, but GLX on Xvfb works via llvmpipe
 qemu_common() {
@@ -62,6 +64,7 @@ qemu_common() {
     local display_args
     case "$mode" in
         gtk-gl) display_args="-display gtk,gl=on" ;;
+        gtk)    display_args="-display gtk" ;;
         *)      display_args="-display none" ;;
     esac
     echo -machine pc,accel=tcg -cpu qemu64 -m "$MEM" -smp "$SMP" \
@@ -100,15 +103,50 @@ go_install() {
             -extract /install.amd/initrd.gz "$INITRD" || return 1
     fi
     [ -f "$DISK" ] || qemu-img create -f qcow2 "$DISK" 10G
-    echo "serving preseed on :8080 (ctrl+c when the install powers off)"
+    local qmp="$STATE/qmp-install.sock"
+    rm -f "$qmp"
+    echo "serving preseed on :8080 (guest powers off when install completes)"
     (cd "$SERVE" && exec python3 -m http.server 8080 --bind 0.0.0.0 >"$LOGS/http.log" 2>&1) &
     local http_pid=$!
+    # The preseed's empty finish-install/final-message makes d-i power off
+    # without showing a dialog (we cannot answer it: -serial file: is a
+    # write-only log and the installer reads /dev/console = ttyS0). The
+    # watcher below is a safety net: if the "Installation complete" dialog
+    # still appears, power the guest off from the host (all writes are
+    # already done at that point).
+    (
+        for _ in $(seq 1 360); do
+            if grep -qa 'Installation complete' "$LOGS/guest-install.log" 2>/dev/null; then
+                sleep 10
+                python3 "$SCRIPT_DIR/qmp_quit.py" "$qmp" >/dev/null 2>&1
+                exit 0
+            fi
+            sleep 5
+        done
+        echo "warning: install watcher timed out" >&2
+        exit 1
+    ) &
+    local watcher=$!
     # shellcheck disable=SC2086
     qemu-system-x86_64 $(qemu_common install | tr '\n' ' ') \
         -kernel "$VMLINUZ" -initrd "$INITRD" \
         -append "auto=true priority=critical preseed/url=http://10.0.2.2:8080/preseed.cfg console=ttyS0,115200" \
-        -cdrom "$ISO" -monitor none -no-reboot
-    kill "$http_pid" 2>/dev/null || true
+        -cdrom "$ISO" -monitor none -qmp unix:"$qmp",server=on,wait=off -no-reboot
+    local qemu_rc=$?
+    kill "$watcher" "$http_pid" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    wait "$http_pid" 2>/dev/null || true
+    if [ "$qemu_rc" -ne 0 ]; then
+        echo "install FAILED (qemu rc=$qemu_rc)" >&2
+        return 1
+    fi
+    # sanity check: a populated root filesystem is far bigger than this
+    local disk_size
+    disk_size=$(stat -c %s "$DISK")
+    if [ "$disk_size" -lt 524288000 ]; then
+        echo "install FAILED: disk suspiciously small ($disk_size bytes); guest disk would be unusable" >&2
+        return 1
+    fi
     echo "install finished (guest powered off). State: $STATE"
 }
 
@@ -119,7 +157,7 @@ go_deploy() {
     # shellcheck disable=SC2046
     qemu-system-x86_64 $(qemu_common deploy | tr '\n' ' ') \
         -vga std -monitor none -qmp unix:"$qmp",server=on,wait=off -daemonize || return 1
-    if ! wait_for_ssh deploy 300; then
+    if ! wait_for_ssh deploy 600; then
         echo "guest did not come up; see $LOGS/guest-deploy.log" >&2
         cleanup_vm "$qmp"
         return 1
@@ -165,11 +203,12 @@ go_scenario() {
     fi
     local screendump_device="${1:-}"
     local qemu_display="${2:-none}"
-    if [ "$qemu_display" = "gtk-gl" ]; then
-        # virgl needs an X/GL stack; QEMU's egl-headless wants a /dev/dri
-        # render node we do not have, so give it an Xvfb display instead
+    if [ "$qemu_display" = "gtk-gl" ] || [ "$qemu_display" = "gtk" ]; then
+        # gtk needs an X server; virgl additionally wants GL. QEMU's
+        # egl-headless wants a /dev/dri render node we do not have, so give
+        # it an Xvfb display instead
         if ! command -v Xvfb >/dev/null; then
-            echo "RESULT $name FAIL (Xvfb not installed; needed for virgl)" >&2
+            echo "RESULT $name FAIL (Xvfb not installed; needed for gtk)" >&2
             return 1
         fi
         if [ -z "${DISPLAY:-}" ]; then
@@ -187,7 +226,7 @@ go_scenario() {
     # shellcheck disable=SC2046,SC2086
     $(qemu_cmd "$qemu_display") $(qemu_common "$name" "$qemu_display" | tr '\n' ' ') \
         $vga_args -monitor none -qmp unix:"$qmp",server=on,wait=off -daemonize || { echo "RESULT $name FAIL (qemu start)"; return 1; }
-    if ! wait_for_ssh "$name" 240; then
+    if ! wait_for_ssh "$name" 420; then
         echo "RESULT $name FAIL (no ssh)" >&2
         cleanup_vm "$qmp"
         return 1
@@ -304,7 +343,7 @@ go_all() {
     go_scenario virtio      "-vga std -device virtio-gpu-pci,id=gpu0" "SDLOP_KMSDRM_DEVICE=1" "gpu0" || failed+=(virtio)
     go_scenario virtio-gl   "-vga std -device virtio-gpu-gl-pci,id=gpu0" "SDLOP_KMSDRM_DEVICE=1" "gpu0" "gtk-gl" || failed+=(virtio-gl)
     go_scenario no-flip     "-vga std -device virtio-gpu-pci,id=gpu0" "SDLOP_KMSDRM_DEVICE=1 SDLOP_KMSDRM_NOFLIP=1" "gpu0" || failed+=(no-flip)
-    go_scenario dual-head   "-vga std -device bochs-display,id=bochs0" "" "" || failed+=(dual-head)
+    go_scenario dual-head   "-vga std -device virtio-gpu-pci,id=gpu0,max_outputs=2" "SDLOP_KMSDRM_DEVICE=1 SDLOP_TEST_EXPECT_DISPLAYS=2" "gpu0" "gtk" || failed+=(dual-head)
     go_scenario card-select "-vga std -device bochs-display,id=bochs0" "SDLOP_KMSDRM_DEVICE=1" "bochs0" || failed+=(card-select)
     go_scenario bad-device  "-vga std" "SDLOP_KMSDRM_DEVICE=99" || failed+=(bad-device)
     echo
@@ -327,7 +366,7 @@ case "${1:-}" in
                     virtio)      go_scenario virtio      "-vga std -device virtio-gpu-pci,id=gpu0" "SDLOP_KMSDRM_DEVICE=1" "gpu0" ;;
                     virtio-gl)   go_scenario virtio-gl   "-vga std -device virtio-gpu-gl-pci,id=gpu0" "SDLOP_KMSDRM_DEVICE=1" "gpu0" "gtk-gl" ;;
                     no-flip)     go_scenario no-flip     "-vga std -device virtio-gpu-pci,id=gpu0" "SDLOP_KMSDRM_DEVICE=1 SDLOP_KMSDRM_NOFLIP=1" "gpu0" ;;
-                    dual-head)   go_scenario dual-head   "-vga std -device bochs-display,id=bochs0" "" "" ;;
+                    dual-head)   go_scenario dual-head   "-vga std -device virtio-gpu-pci,id=gpu0,max_outputs=2" "SDLOP_KMSDRM_DEVICE=1 SDLOP_TEST_EXPECT_DISPLAYS=2" "gpu0" "gtk" ;;
                     card-select) go_scenario card-select "-vga std -device bochs-display,id=bochs0" "SDLOP_KMSDRM_DEVICE=1" "bochs0" ;;
                     bad-device)  go_scenario bad-device  "-vga std" "SDLOP_KMSDRM_DEVICE=99" ;;
                     *) echo "unknown scenario: $1" >&2; exit 2 ;;

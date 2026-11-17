@@ -11,6 +11,7 @@ SDLOP_XKB_SYM(int, xkb_keymap_key_repeats, (const struct xkb_keymap *, xkb_keyco
 SDLOP_XKB_SYM(struct xkb_state *, xkb_state_new, (struct xkb_keymap *))
 SDLOP_XKB_SYM(void, xkb_state_unref, (struct xkb_state *))
 SDLOP_XKB_SYM(int, xkb_state_update_mask, (struct xkb_state *, xkb_mod_mask_t, xkb_mod_mask_t, xkb_mod_mask_t, xkb_layout_index_t, xkb_layout_index_t, xkb_layout_index_t))
+SDLOP_XKB_SYM(enum xkb_state_component, xkb_state_update_key, (struct xkb_state *, xkb_keycode_t, enum xkb_key_direction))
 SDLOP_XKB_SYM(xkb_keysym_t, xkb_state_key_get_one_sym, (struct xkb_state *, xkb_keycode_t))
 SDLOP_XKB_SYM(int, xkb_state_key_get_utf8, (struct xkb_state *, xkb_keycode_t, char *, size_t))
 SDLOP_XKB_SYM(enum xkb_state_component, xkb_state_mod_index_is_active, (struct xkb_state *, xkb_mod_index_t, enum xkb_state_component))

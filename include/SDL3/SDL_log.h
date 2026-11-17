@@ -39,6 +39,7 @@ typedef enum SDL_LogPriority
 /**
  * Log a message with the application category and INFO priority.
  */
+extern void SDL_SetLogPriority(int category, SDL_LogPriority priority);
 extern void SDL_Log(const char *fmt, ...)
 #if defined(__GNUC__) || defined(__clang__)
     __attribute__((format(printf, 1, 2)))
