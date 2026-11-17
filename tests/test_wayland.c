@@ -32,6 +32,7 @@ int main(void)
     }
     /* keep the test deterministic: window-system input only */
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    setenv("SDL_VIDEODRIVER", "wayland", 1); /* never fall back to x11 */
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());

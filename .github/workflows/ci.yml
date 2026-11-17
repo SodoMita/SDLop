@@ -44,7 +44,8 @@ jobs:
       - name: No link-time dependencies on optional libraries
         run: |
           objdump -p build/libSDLop.so | grep NEEDED
-          if objdump -p build/libSDLop.so | grep NEEDED | grep -Ev 'lib(c|m|dl|pthread)\.so|ld-linux'; then
+          # sanitizer builds legitimately pull in the ASan/UBSan runtimes
+          if objdump -p build/libSDLop.so | grep NEEDED | grep -Ev 'lib(c|m|dl|pthread|asan|ubsan|gcc_s|stdc\+\+)\.so|ld-linux'; then
             echo "::error::libSDLop.so links an optional library - everything must be dlopen'ed"
             exit 1
           fi
