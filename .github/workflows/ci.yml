@@ -20,7 +20,7 @@ jobs:
           - wm: openbox
             sanitizers: 'ON'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -63,4 +63,13 @@ jobs:
             sleep 2
           fi
           cd build
-          ctest --output-on-failure --timeout 120 -j"$(nproc)"
+          if ! ctest --output-on-failure --timeout 120 -j"$(nproc)"; then
+            # surface the failing checks as one annotation (visible via the
+            # check-runs API / PR UI without downloading logs)
+            {
+              echo "failed: $(cut -d: -f2 Testing/Temporary/LastTestsFailed.log | tr '\n' ' ')"
+              grep -hE 'FAIL|ERROR|Assertion|Sanitizer|SUMMARY|timeout' Testing/Temporary/LastTest.log | head -40
+            } | sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}' > /tmp/annot
+            echo "::error title=ctest failures::$(cat /tmp/annot)"
+            exit 1
+          fi
