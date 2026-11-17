@@ -35,5 +35,5 @@ jobs:
         run: >-
           xvfb-run -a -s "-screen 0 1280x800x24"
           env SDL_VIDEODRIVER=x11
-          ctest --test-dir build --output-on-failure
+          ctest --test-dir build --output-on-failure --timeout 90
           -R "^(test_x11|test_gl|test_gl_matrix|test_vulkan)$"
