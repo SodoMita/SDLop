@@ -1,0 +1,39 @@
+name: X11 (Xvfb)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  x11-xvfb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and headless-display dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config \
+            libwayland-dev libwayland-bin wayland-protocols \
+            libxkbcommon-dev libx11-dev \
+            libegl1-mesa-dev libgbm-dev libdrm-dev \
+            libgles2-mesa-dev libvulkan-dev mesa-vulkan-drivers \
+            xvfb xauth
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DSDLop_BUILD_TESTS=ON
+          -DSDLop_BUILD_EXAMPLES=OFF
+          -DSDLop_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run X11, EGL, and Vulkan WSI tests in Xvfb
+        run: >-
+          xvfb-run -a -s "-screen 0 1280x800x24"
+          env SDL_VIDEODRIVER=x11
+          ctest --test-dir build --output-on-failure
+          -R "^(test_x11|test_gl|test_gl_matrix|test_vulkan)$"

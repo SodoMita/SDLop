@@ -37,6 +37,7 @@ int main(void) {
 | Platform | State |
 |---|---|
 | Linux / Wayland (wl_compositor + xdg-shell, wl_seat fallback input) | ✅ done, tested against Weston 14 + sway 1.10 (pixman) |
+| Linux / X11 (Xlib windows/events, XImage surfaces, EGL + Vulkan WSI) | 🧪 runtime-loaded backend; Xvfb integration tests are wired into CI |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
 | Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
 | OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
@@ -57,7 +58,7 @@ int main(void) {
             │   └─► SPSC ring ──► SDLop_PollRawEvents              │
             └───────────────┬──────────────────────────────────────┘
                             │ eventfd wake
-   Wayland display ────► SDL_PumpEvents (main thread)
+   Wayland / X11 display ─► SDL_PumpEvents (main thread)
    (windows, fallback input)   │
                                ▼
                     SDL_PollEvent / SDL_WaitEvent / state queries
@@ -187,18 +188,24 @@ implementing the wlr virtual-pointer + virtual-keyboard protocols.
 input rather than `/dev/input`.
 
 Build deps: `wayland-protocols` + `wayland-scanner` (for the generated
-protocol code) and the `wayland-client`/`xkbcommon`/`EGL` **headers** — all
-standard on Wayland distros. Static `libsdlop.a` and shared `libSDLop.so`
-are produced.
+protocol code) and the `wayland-client`/`xkbcommon`/`EGL` **headers**. X11 is
+optional at build time: when `X11/Xlib.h` is found, SDLop compiles the X11
+backend; no X11 library is linked. Static `libsdlop.a` and shared
+`libSDLop.so` are produced.
 
 Runtime loading is SDL3-style dynamic: `libwayland-client.so.0`,
-`libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1` and `libvulkan.so.1`
-are all `dlopen`-ed on demand — nothing optional is linked
+`libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1`, `libX11.so.6` and
+`libvulkan.so.1` are loaded on demand — nothing optional is linked
 (`objdump -p libSDLop.so` shows NEEDED: libc and libm only). Apps link just
 `-lsdlop` (plus `-lpthread -ldl -lm` where the toolchain doesn't fold them
-into libc). Missing libs degrade gracefully: no wayland-client -> dummy
-video driver; no xkbcommon -> windowing still works. Override probe names
-with `SDLOP_LIB_WAYLAND` / `SDLOP_LIB_XKB` / `SDLOP_LIB_EGL`.
+into libc). Missing window-system libraries degrade gracefully: driver
+selection can fall through from Wayland/X11 to KMS or dummy; without
+xkbcommon, windowing still works but keyboard translation is limited. Override
+probe names with `SDLOP_LIB_WAYLAND` / `SDLOP_LIB_XKB` / `SDLOP_LIB_EGL` /
+`SDLOP_LIB_X11`.
+
+The X11 path is exercised by `.github/workflows/x11-xvfb.yml`; locally, run
+`xvfb-run -a env SDL_VIDEODRIVER=x11 ctest --test-dir build -R 'test_x11|test_gl|test_gl_matrix|test_vulkan'`.
 
 Tests that need privileges/compositor skip cleanly:
 

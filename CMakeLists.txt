@@ -107,6 +107,17 @@ endif()
 # below.
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
+# X11 is an optional compile-time backend. We include it only when the Xlib
+# headers are available; libX11 itself is loaded with dlopen by sdlop_x11_dyn.
+find_path(X11_INCLUDE_DIR NAMES X11/Xlib.h)
+if(X11_INCLUDE_DIR)
+  set(SDLop_VIDEO_X11 1)
+  message(STATUS "X11 headers found - enabling the runtime-loaded X11 backend")
+else()
+  set(SDLop_VIDEO_X11 0)
+  message(STATUS "X11 headers not found - X11 backend disabled")
+endif()
+
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 pkg_check_modules(EGL REQUIRED egl)
@@ -245,9 +256,17 @@ set(SDLop_SOURCES
   src/video/dummy/sdlop_dummy.c
 )
 
-# SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
-# at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
-# where those libraries are absent.
+if(SDLop_VIDEO_X11)
+  list(APPEND SDLop_SOURCES
+    src/video/x11/sdlop_x11.c
+    src/video/x11/sdlop_x11_dyn.c
+    src/video/x11/sdlop_x11_gl.c
+    src/video/x11/sdlop_x11_vulkan.c)
+endif()
+
+# SDL3-style dynamic loading: Xlib, wayland-client, xkbcommon and EGL are
+# dlopen-ed at runtime, NOT linked - SDLop and its other drivers work on
+# systems where those libraries are absent.
 set(SDLop_LIB_DEPS
   pthread
   dl
@@ -260,6 +279,9 @@ set(SDLop_LIB_INCS
   ${EGL_INCLUDE_DIRS}
   ${GBM_INCLUDE_DIRS}
   ${LIBDRM_INCLUDE_DIRS})
+if(SDLop_VIDEO_X11)
+  list(APPEND SDLop_LIB_INCS ${X11_INCLUDE_DIR})
+endif()
 
 add_library(sdlop STATIC ${SDLop_SOURCES})
 add_library(SDLop::SDLop ALIAS sdlop)
@@ -274,7 +296,7 @@ target_include_directories(sdlop PRIVATE
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_X11=${SDLop_VIDEO_X11})
 
 add_library(sdlop_shared SHARED ${SDLop_SOURCES})
 add_dependencies(sdlop_shared sdlop_wayland_protocols)
@@ -288,7 +310,7 @@ target_include_directories(sdlop_shared PRIVATE
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_X11=${SDLop_VIDEO_X11})
 
 # ---------------------------------------------------------------------------
 # Examples
@@ -358,6 +380,14 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(test_wayland PRIVATE src)
   target_compile_options(test_wayland PRIVATE -UNDEBUG)
   add_test(NAME test_wayland COMMAND test_wayland)
+
+  if(SDLop_VIDEO_X11)
+    add_executable(test_x11 tests/test_x11.c)
+    target_link_libraries(test_x11 PRIVATE sdlop)
+    target_include_directories(test_x11 PRIVATE src)
+    target_compile_options(test_x11 PRIVATE -UNDEBUG)
+    add_test(NAME test_x11 COMMAND test_x11)
+  endif()
 
   add_executable(test_kmsdrm tests/test_kmsdrm.c)
   target_link_libraries(test_kmsdrm PRIVATE sdlop)

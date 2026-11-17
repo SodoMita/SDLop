@@ -106,9 +106,18 @@ static bool version_at_least(const char *ver, int major, int minor)
 
 int main(void)
 {
-    if (!getenv("WAYLAND_DISPLAY")) {
-        printf("test_gl_matrix: SKIP (WAYLAND_DISPLAY not set)\n");
+    bool have_wayland = getenv("WAYLAND_DISPLAY") && getenv("WAYLAND_DISPLAY")[0];
+#if SDLop_VIDEO_X11
+    bool have_x11 = getenv("DISPLAY") && getenv("DISPLAY")[0];
+#else
+    bool have_x11 = false;
+#endif
+    if (!have_wayland && !have_x11) {
+        printf("test_gl_matrix: SKIP (neither WAYLAND_DISPLAY nor X11 DISPLAY is set)\n");
         return 0;
+    }
+    if (!have_wayland && have_x11) {
+        setenv("SDL_VIDEODRIVER", "x11", 1);
     }
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
     if (!SDL_Init(SDL_INIT_VIDEO)) {

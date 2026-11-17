@@ -66,13 +66,22 @@ int main(void)
 
     const char *vdrv = getenv("SDL_VIDEODRIVER");
     bool kmsdrm = vdrv && strcasecmp(vdrv, "kmsdrm") == 0;
+#if SDLop_VIDEO_X11
+    bool x11 = getenv("DISPLAY") && getenv("DISPLAY")[0];
+#else
+    bool x11 = false;
+#endif
     if (kmsdrm && !kmsdrm_has_dri()) {
         printf("test_vulkan: SKIP (no /dev/dri cards for SDL_VIDEODRIVER=kmsdrm)\n");
         return 0;
     }
-    if (!getenv("WAYLAND_DISPLAY") && !kmsdrm) {
-        printf("test_vulkan: SKIP (WAYLAND_DISPLAY not set)\n");
+    bool wayland = getenv("WAYLAND_DISPLAY") && getenv("WAYLAND_DISPLAY")[0];
+    if (!wayland && !kmsdrm && !x11) {
+        printf("test_vulkan: SKIP (no Wayland, X11, or KMS display available)\n");
         return 0;
+    }
+    if (!wayland && !kmsdrm && x11) {
+        setenv("SDL_VIDEODRIVER", "x11", 1);
     }
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
 

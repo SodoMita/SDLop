@@ -19,6 +19,9 @@ static SDLop_VideoDevice *const video_drivers[] = {
 #if SDLop_VIDEO_WAYLAND
     &SDLop_wayland_device,
 #endif
+#if SDLop_VIDEO_X11
+    &SDLop_x11_device,
+#endif
 #if SDLop_VIDEO_KMSDRM
     &SDLop_kmsdrm_device,
 #endif
