@@ -68,6 +68,23 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
     event.window.data1 = data1;
     event.window.data2 = data2;
     SDLOP_PushEventInternal(&event);
+
+    /* a window move may change which display the window lives on */
+    if (window && type == SDL_EVENT_WINDOW_MOVED) {
+        SDLOP_UpdateWindowDisplay(window);
+    }
+}
+
+void SDLOP_SendDisplayEvent(SDL_DisplayID displayID, SDL_EventType type, Sint32 data1, Sint32 data2)
+{
+    SDL_Event event;
+    SDL_zero(event);
+    event.display.type = type;
+    event.display.timestamp = SDL_GetTicksNS();
+    event.display.displayID = displayID;
+    event.display.data1 = data1;
+    event.display.data2 = data2;
+    SDLOP_PushEventInternal(&event);
 }
 
 void SDLOP_SendQuitEvent(void)
