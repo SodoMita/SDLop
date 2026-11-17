@@ -32,8 +32,25 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Run X11, EGL, and Vulkan WSI tests in Xvfb
-        run: >-
-          xvfb-run -a -s "-screen 0 1280x800x24"
-          env SDL_VIDEODRIVER=x11
-          ctest --test-dir build --output-on-failure --timeout 90
-          -R "^(test_x11|test_gl|test_gl_matrix|test_vulkan)$"
+        run: |
+          set +e
+          xvfb-run -a -s "-screen 0 1280x800x24" \
+            env SDL_VIDEODRIVER=x11 \
+            ctest --test-dir build --output-on-failure --verbose --timeout 30 \
+            -R "^(test_x11|test_gl|test_gl_matrix|test_vulkan)$" \
+            > /tmp/x11-ctest.log 2>&1
+          status=$?
+          cat /tmp/x11-ctest.log
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### Xvfb test failure (exit $status)"
+              echo '```text'
+              tail -n 80 /tmp/x11-ctest.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -E 'test_x11:|FAIL|timed out|Timeout|The following tests FAILED|tests failed' \
+              /tmp/x11-ctest.log | while IFS= read -r line; do
+                echo "::error title=Xvfb test output::${line//%/%25}"
+              done
+          fi
+          exit "$status"

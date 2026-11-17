@@ -41,11 +41,13 @@ int main(void)
 
     setenv("SDL_VIDEODRIVER", "x11", 1);
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    fprintf(stderr, "test_x11: initializing video\n");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init(x11) failed: %s\n", SDL_GetError());
         return 1;
     }
 
+    fprintf(stderr, "test_x11: video initialized\n");
     CHECK(SDL_GetCurrentVideoDriver() &&
           strcmp(SDL_GetCurrentVideoDriver(), "x11") == 0,
           "selected x11 video driver (got %s)", SDL_GetCurrentVideoDriver());
@@ -63,6 +65,7 @@ int main(void)
         free(displays);
     }
 
+    fprintf(stderr, "test_x11: creating window\n");
     SDL_Window *window = SDL_CreateWindow("SDLop X11 integration", 320, 200,
                                            SDL_WINDOW_RESIZABLE);
     if (!window) {
@@ -70,12 +73,16 @@ int main(void)
         SDL_Quit();
         return 1;
     }
+    fprintf(stderr, "test_x11: pumping after create\n");
     pump_briefly(10);
+    fprintf(stderr, "test_x11: reading title\n");
     const char *title = SDL_GetWindowTitle(window);
     CHECK(title && strcmp(title, "SDLop X11 integration") == 0,
           "window title");
 
+    fprintf(stderr, "test_x11: creating software surface\n");
     SDL_Surface *surface = SDL_GetWindowSurface(window);
+    fprintf(stderr, "test_x11: surface created\n");
     CHECK(surface != NULL, "create XImage-backed window surface: %s", SDL_GetError());
     if (surface) {
         CHECK(surface->w == 320 && surface->h == 200,
@@ -99,6 +106,7 @@ int main(void)
         }
     }
 
+    fprintf(stderr, "test_x11: setting title and size\n");
     CHECK(SDL_SetWindowTitle(window, "SDLop X11 renamed"), "set window title");
     CHECK(SDL_SetWindowSize(window, 400, 240), "resize X11 window: %s", SDL_GetError());
     pump_briefly(10);
@@ -111,16 +119,19 @@ int main(void)
           "window surface follows resize (%dx%d)",
           surface ? surface->w : 0, surface ? surface->h : 0);
 
+    fprintf(stderr, "test_x11: destroying and recreating software surface\n");
     CHECK(SDL_DestroyWindowSurface(window), "destroy X11 window surface");
     CHECK(!SDL_WindowHasSurface(window), "surface is destroyed");
     surface = SDL_GetWindowSurface(window);
     CHECK(surface && surface->w == 400 && surface->h == 240,
           "window surface can be recreated");
 
+    fprintf(stderr, "test_x11: maximize and restore\n");
     CHECK(SDL_MaximizeWindow(window), "maximize X11 window");
     pump_briefly(5);
     CHECK(SDL_RestoreWindow(window), "restore X11 window");
     pump_briefly(5);
+    fprintf(stderr, "test_x11: enter and leave fullscreen\n");
     CHECK(SDL_SetWindowFullscreen(window, true), "enter fullscreen");
     pump_briefly(5);
     CHECK(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN,
@@ -130,6 +141,7 @@ int main(void)
     CHECK(!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN),
           "fullscreen flag after leave");
 
+    fprintf(stderr, "test_x11: relative mouse mode\n");
     /* XGrabPointer can legitimately fail on a headless server with an
      * unmapped/obscured window; on success, verify a clean off transition. */
     if (SDL_SetWindowRelativeMouseMode(window, true)) {
@@ -140,6 +152,7 @@ int main(void)
               "relative mouse flag rolls back after a failed grab");
     }
 
+    fprintf(stderr, "test_x11: hide/show/destroy\n");
     CHECK(SDL_HideWindow(window), "hide X11 window");
     pump_briefly(2);
     CHECK(SDL_ShowWindow(window), "show X11 window");
