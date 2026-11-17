@@ -2,8 +2,8 @@
   SDLop - properties subsystem (see <SDL3/SDL_properties.h>).
 
   Simple linked-list backing store; property IDs are unique nonzero
-  Uint32 counter values. Main-thread owned; threading helpers are
-  API-compatible no-ops.
+  Uint32 counter values. Thread-safe via a global table lock and a
+  per-set rwlock, in the spirit of SDL3's implementation.
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
@@ -14,6 +14,7 @@
 #include <math.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 typedef struct SDLop_Property
 {
@@ -35,22 +36,30 @@ typedef struct SDLop_PropertySet
     SDL_PropertiesID id;
     struct SDLop_PropertySet *next;
     SDLop_Property *props;
+    pthread_rwlock_t lock;      /* guards this set's prop list */
+    int lock_recursion;         /* LockProperties may nest on one thread */
+    pthread_t lock_owner;
 } SDLop_PropertySet;
 
 static SDLop_PropertySet *property_sets;
-static SDL_PropertiesID next_property_id;
+static pthread_rwlock_t property_sets_lock = PTHREAD_RWLOCK_INITIALIZER;
+static SDL_AtomicInt next_property_id;
 
 static SDLop_PropertySet *property_set_by_id(SDL_PropertiesID id)
 {
     if (id == 0) {
         return NULL;
     }
+    SDLop_PropertySet *result = NULL;
+    pthread_rwlock_rdlock(&property_sets_lock);
     for (SDLop_PropertySet *set = property_sets; set; set = set->next) {
         if (set->id == id) {
-            return set;
+            result = set;
+            break;
         }
     }
-    return NULL;
+    pthread_rwlock_unlock(&property_sets_lock);
+    return result;
 }
 
 static void clear_property(SDLop_Property *prop)
@@ -81,12 +90,18 @@ SDL_PropertiesID SDL_CreateProperties(void)
         SDL_OutOfMemory();
         return 0;
     }
-    set->id = ++next_property_id;
-    if (set->id == 0) {
-        set->id = ++next_property_id; /* skip the reserved 0 */
+    if (pthread_rwlock_init(&set->lock, NULL) != 0) {
+        free(set);
+        SDL_OutOfMemory();
+        return 0;
     }
+    do {
+        set->id = (SDL_PropertiesID)(SDL_AddAtomicInt(&next_property_id, 1) + 1);
+    } while (set->id == 0); /* skip the reserved 0 */
+    pthread_rwlock_wrlock(&property_sets_lock);
     set->next = property_sets;
     property_sets = set;
+    pthread_rwlock_unlock(&property_sets_lock);
     return set->id;
 }
 
@@ -96,6 +111,7 @@ void SDL_ClearProperties(SDL_PropertiesID props)
     if (!set) {
         return;
     }
+    pthread_rwlock_wrlock(&set->lock);
     SDLop_Property *prop = set->props;
     while (prop) {
         SDLop_Property *next = prop->next;
@@ -103,36 +119,77 @@ void SDL_ClearProperties(SDL_PropertiesID props)
         prop = next;
     }
     set->props = NULL;
+    pthread_rwlock_unlock(&set->lock);
 }
 
 void SDL_DestroyProperties(SDL_PropertiesID props)
 {
+    SDLop_PropertySet *set = NULL;
+    pthread_rwlock_wrlock(&property_sets_lock);
     for (SDLop_PropertySet **link = &property_sets; *link; link = &(*link)->next) {
-        SDLop_PropertySet *set = *link;
-        if (set->id == props) {
-            SDL_ClearProperties(props);
+        if ((*link)->id == props) {
+            set = *link;
             *link = set->next;
-            free(set);
-            return;
+            break;
         }
     }
+    pthread_rwlock_unlock(&property_sets_lock);
+    if (!set) {
+        return;
+    }
+    /* Free the props directly; the set is already unlinked so
+       SDL_ClearProperties() could no longer find it. */
+    pthread_rwlock_wrlock(&set->lock);
+    SDLop_Property *prop = set->props;
+    while (prop) {
+        SDLop_Property *next = prop->next;
+        clear_property(prop);
+        prop = next;
+    }
+    set->props = NULL;
+    pthread_rwlock_unlock(&set->lock);
+    pthread_rwlock_destroy(&set->lock);
+    free(set);
 }
 
 bool SDL_LockProperties(SDL_PropertiesID props)
 {
-    (void)props;
-    return true; /* main-thread owned */
+    SDLop_PropertySet *set = property_set_by_id(props);
+    if (!set) {
+        return SDL_SetError("Invalid properties ID");
+    }
+    /* Allow recursive locking from the thread that already holds the lock. */
+    if (set->lock_recursion > 0 && pthread_equal(set->lock_owner, pthread_self())) {
+        set->lock_recursion++;
+        return true;
+    }
+    pthread_rwlock_wrlock(&set->lock);
+    set->lock_owner = pthread_self();
+    set->lock_recursion = 1;
+    return true;
 }
 
 void SDL_UnlockProperties(SDL_PropertiesID props)
 {
-    (void)props;
+    SDLop_PropertySet *set = property_set_by_id(props);
+    if (!set) {
+        return;
+    }
+    if (--set->lock_recursion == 0) {
+        pthread_rwlock_unlock(&set->lock);
+    }
 }
 
 bool SDL_HasProperty(SDL_PropertiesID props, const char *name)
 {
     SDLop_PropertySet *set = property_set_by_id(props);
-    return set && name && find_property(set, name) != NULL;
+    if (!set || !name) {
+        return false;
+    }
+    pthread_rwlock_rdlock(&set->lock);
+    bool found = find_property(set, name) != NULL;
+    pthread_rwlock_unlock(&set->lock);
+    return found;
 }
 
 bool SDL_ClearProperty(SDL_PropertiesID props, const char *name)
@@ -144,13 +201,15 @@ bool SDL_ClearProperty(SDL_PropertiesID props, const char *name)
     if (!name) {
         return SDL_SetError("Invalid property name");
     }
+    pthread_rwlock_wrlock(&set->lock);
     SDLop_Property **link = find_property(set, name);
-    if (!link) {
-        return true; /* nothing to clear: success, like SDL3 */
+    if (link) {
+        SDLop_Property *prop = *link;
+        *link = prop->next;
+        clear_property(prop);
     }
-    SDLop_Property *prop = *link;
-    *link = prop->next;
-    clear_property(prop);
+    /* nothing to clear is success, like SDL3 */
+    pthread_rwlock_unlock(&set->lock);
     return true;
 }
 
@@ -160,8 +219,11 @@ SDL_PropertyType SDL_GetPropertyType(SDL_PropertiesID props, const char *name)
     if (!set || !name) {
         return SDL_PROPERTY_TYPE_INVALID;
     }
+    pthread_rwlock_rdlock(&set->lock);
     SDLop_Property **link = find_property(set, name);
-    return link ? (*link)->type : SDL_PROPERTY_TYPE_INVALID;
+    SDL_PropertyType type = link ? (*link)->type : SDL_PROPERTY_TYPE_INVALID;
+    pthread_rwlock_unlock(&set->lock);
+    return type;
 }
 
 bool SDL_EnumerateProperties(SDL_PropertiesID props, SDL_EnumeratePropertiesCallback callback, void *userdata)
@@ -173,9 +235,11 @@ bool SDL_EnumerateProperties(SDL_PropertiesID props, SDL_EnumeratePropertiesCall
     if (!callback) {
         return SDL_SetError("Invalid callback");
     }
+    pthread_rwlock_rdlock(&set->lock);
     for (SDLop_Property *prop = set->props; prop; prop = prop->next) {
         callback(userdata, props, prop->name);
     }
+    pthread_rwlock_unlock(&set->lock);
     return true;
 }
 
@@ -251,7 +315,8 @@ static SDLop_Property *find_any(const SDLop_PropertySet *set, const char *name)
     return link ? *link : NULL;
 }
 
-/* Set a value of an exact type; overwrites any clashing name. */
+/* Set a value of an exact type; overwrites any clashing name in place.
+   Takes the set's write lock for the whole read-modify-write. */
 static bool set_property(SDL_PropertiesID props, const char *name, SDL_PropertyType type,
                          const void *value)
 {
@@ -262,17 +327,30 @@ static bool set_property(SDL_PropertiesID props, const char *name, SDL_PropertyT
     if (!name || !*name) {
         return SDL_SetError("Invalid property name");
     }
-    SDL_ClearProperty(props, name);
-    SDLop_Property *prop = (SDLop_Property *)calloc(1, sizeof(*prop));
-    if (!prop) {
-        return SDL_OutOfMemory();
+    pthread_rwlock_wrlock(&set->lock);
+    SDLop_Property **link = find_property(set, name);
+    SDLop_Property *prop = link ? *link : NULL;
+    if (prop && prop->type == SDL_PROPERTY_TYPE_STRING) {
+        free(prop->value.string);
+        prop->value.string = NULL;
     }
-    prop->name = strdup(name);
-    if (!prop->name) {
-        free(prop);
-        return SDL_OutOfMemory();
+    if (!prop) {
+        prop = (SDLop_Property *)calloc(1, sizeof(*prop));
+        if (!prop) {
+            pthread_rwlock_unlock(&set->lock);
+            return SDL_OutOfMemory();
+        }
+        prop->name = strdup(name);
+        if (!prop->name) {
+            free(prop);
+            pthread_rwlock_unlock(&set->lock);
+            return SDL_OutOfMemory();
+        }
+        prop->next = set->props;
+        set->props = prop;
     }
     prop->type = type;
+    bool ok = true;
     switch (type) {
     case SDL_PROPERTY_TYPE_POINTER:
         prop->value.pointer = *(void *const *)value;
@@ -281,9 +359,8 @@ static bool set_property(SDL_PropertiesID props, const char *name, SDL_PropertyT
         const char *str = *(const char *const *)value;
         prop->value.string = strdup(str ? str : "");
         if (!prop->value.string) {
-            free(prop->name);
-            free(prop);
-            return SDL_OutOfMemory();
+            SDL_OutOfMemory();
+            ok = false;
         }
         break;
     }
@@ -297,13 +374,12 @@ static bool set_property(SDL_PropertiesID props, const char *name, SDL_PropertyT
         prop->value.boolean = *(const bool *)value;
         break;
     default:
-        free(prop->name);
-        free(prop);
-        return SDL_SetError("Invalid property type");
+        SDL_SetError("Invalid property type");
+        ok = false;
+        break;
     }
-    prop->next = set->props;
-    set->props = prop;
-    return true;
+    pthread_rwlock_unlock(&set->lock);
+    return ok;
 }
 
 static SDLop_Property *get_property(SDL_PropertiesID props, const char *name, SDL_PropertyType type)
@@ -312,11 +388,11 @@ static SDLop_Property *get_property(SDL_PropertiesID props, const char *name, SD
     if (!set || !name) {
         return NULL;
     }
+    pthread_rwlock_rdlock(&set->lock);
     SDLop_Property **link = find_property(set, name);
-    if (!link || (*link)->type != type) {
-        return NULL;
-    }
-    return *link;
+    SDLop_Property *prop = (link && (*link)->type == type) ? *link : NULL;
+    pthread_rwlock_unlock(&set->lock);
+    return prop;
 }
 
 bool SDL_SetNumberProperty(SDL_PropertiesID props, const char *name, Sint64 value)
@@ -326,8 +402,15 @@ bool SDL_SetNumberProperty(SDL_PropertiesID props, const char *name, Sint64 valu
 
 Sint64 SDL_GetNumberProperty(SDL_PropertiesID props, const char *name, Sint64 default_value)
 {
-    SDLop_Property *prop = find_any(property_set_by_id(props), name);
-    return prop ? property_as_number(prop, default_value) : default_value;
+    SDLop_PropertySet *set = property_set_by_id(props);
+    if (!set || !name) {
+        return default_value;
+    }
+    pthread_rwlock_rdlock(&set->lock);
+    SDLop_Property *prop = find_any(set, name);
+    Sint64 result = prop ? property_as_number(prop, default_value) : default_value;
+    pthread_rwlock_unlock(&set->lock);
+    return result;
 }
 
 bool SDL_SetFloatProperty(SDL_PropertiesID props, const char *name, float value)
@@ -337,8 +420,15 @@ bool SDL_SetFloatProperty(SDL_PropertiesID props, const char *name, float value)
 
 float SDL_GetFloatProperty(SDL_PropertiesID props, const char *name, float default_value)
 {
-    SDLop_Property *prop = find_any(property_set_by_id(props), name);
-    return prop ? property_as_float(prop, default_value) : default_value;
+    SDLop_PropertySet *set = property_set_by_id(props);
+    if (!set || !name) {
+        return default_value;
+    }
+    pthread_rwlock_rdlock(&set->lock);
+    SDLop_Property *prop = find_any(set, name);
+    float result = prop ? property_as_float(prop, default_value) : default_value;
+    pthread_rwlock_unlock(&set->lock);
+    return result;
 }
 
 bool SDL_SetBooleanProperty(SDL_PropertiesID props, const char *name, bool value)
@@ -348,12 +438,22 @@ bool SDL_SetBooleanProperty(SDL_PropertiesID props, const char *name, bool value
 
 bool SDL_GetBooleanProperty(SDL_PropertiesID props, const char *name, bool default_value)
 {
-    SDLop_Property *prop = find_any(property_set_by_id(props), name);
-    return prop ? property_as_boolean(prop, default_value) : default_value;
+    SDLop_PropertySet *set = property_set_by_id(props);
+    if (!set || !name) {
+        return default_value;
+    }
+    pthread_rwlock_rdlock(&set->lock);
+    SDLop_Property *prop = find_any(set, name);
+    bool result = prop ? property_as_boolean(prop, default_value) : default_value;
+    pthread_rwlock_unlock(&set->lock);
+    return result;
 }
 
 bool SDL_SetStringProperty(SDL_PropertiesID props, const char *name, const char *value)
 {
+    if (!value) {
+        return SDL_ClearProperty(props, name); /* SDL3: NULL deletes the property */
+    }
     return set_property(props, name, SDL_PROPERTY_TYPE_STRING, &value);
 }
 
@@ -384,6 +484,7 @@ bool SDL_CopyProperties(SDL_PropertiesID source, SDL_PropertiesID destination)
     if (!dst) {
         return SDL_SetError("Invalid destination properties ID");
     }
+    pthread_rwlock_rdlock(&src->lock);
     for (SDLop_Property *prop = src->props; prop; prop = prop->next) {
         switch (prop->type) {
         case SDL_PROPERTY_TYPE_POINTER:
@@ -405,5 +506,6 @@ bool SDL_CopyProperties(SDL_PropertiesID source, SDL_PropertiesID destination)
             break;
         }
     }
+    pthread_rwlock_unlock(&src->lock);
     return true;
 }

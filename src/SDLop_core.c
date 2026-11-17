@@ -118,6 +118,8 @@ void SDL_Quit(void)
         close(sdlop.wake_fd);
         sdlop.wake_fd = -1;
     }
+    SDLOP_EnvironmentQuit();
+    SDLOP_ThreadsQuit();
     memset(&sdlop, 0, sizeof(sdlop));
     sdlop.wake_fd = -1;
     sdlop_quitting = false;

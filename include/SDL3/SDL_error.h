@@ -49,4 +49,15 @@ extern bool SDL_ClearError(void);
  */
 extern bool SDL_OutOfMemory(void);
 
+/**
+ * Set an error message stating that a parameter was invalid.
+ *
+ * This is a helper for the common case of `SDL_SetError("Parameter '%s' is
+ * invalid", param)`.
+ *
+ * \param param the name of the invalid parameter.
+ * \returns false.
+ */
+extern bool SDL_InvalidParamError(const char *param);
+
 #endif /* SDL_error_h_ */

@@ -33,6 +33,11 @@ if(EMSCRIPTEN)
     src/SDL_error.c
     src/SDL_log.c
     src/SDL_timer.c
+    src/SDL_atomic.c
+    src/SDL_thread.c
+    src/SDL_stdinc.c
+    src/SDL_getenv.c
+    src/SDL_main.c
     src/SDL_events.c
     src/SDL_properties.c
     src/SDL_keyboard_web.c
@@ -55,7 +60,7 @@ if(EMSCRIPTEN)
 
   if(SDLop_BUILD_TESTS)
     enable_testing()
-    foreach(t test_ring test_events test_surface test_web)
+    foreach(t test_ring test_events test_surface test_web test_stdinc)
       add_executable(${t} tests/${t}.c)
       target_link_libraries(${t} PRIVATE sdlop)
       target_include_directories(${t} PRIVATE src)
@@ -219,6 +224,11 @@ set(SDLop_SOURCES
   src/SDL_error.c
   src/SDL_log.c
   src/SDL_timer.c
+  src/SDL_atomic.c
+  src/SDL_thread.c
+  src/SDL_stdinc.c
+  src/SDL_getenv.c
+  src/SDL_main.c
   src/SDL_events.c
   src/SDL_properties.c
   src/SDL_keyboard.c
@@ -321,7 +331,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_stdinc test_threads test_main_callbacks)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
