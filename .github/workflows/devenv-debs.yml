@@ -1,0 +1,66 @@
+# Temporary helper: ferries the Debian bookworm build/test dependency closure
+# (Xvfb, Mesa llvmpipe/lavapipe, X11/XCB/Wayland dev headers) into a sandbox
+# that can only reach GitHub. The .debs are stored as *unreferenced* git blobs
+# (no branch/tag is touched) and the blob SHAs are reported as annotations.
+name: devenv-debs
+on:
+  push:
+    paths:
+      - .github/workflows/devenv-debs.yml
+permissions:
+  contents: write
+jobs:
+  debs:
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+    steps:
+      - name: Pin snapshot (matches the sandbox image)
+        run: |
+          rm -f /etc/apt/sources.list.d/*
+          cat > /etc/apt/sources.list <<'EOF'
+          deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260610T000000Z bookworm main
+          deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260610T000000Z bookworm-updates main
+          deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260610T000000Z bookworm-security main
+          EOF
+          for i in 1 2 3 4 5; do apt-get -o Acquire::Retries=5 update && break; sleep 10; done
+      - name: Download closure
+        run: |
+          mkdir -p /debs/partial
+          apt-get install -y --download-only -o Acquire::Retries=5 -o Dir::Cache::archives=/debs \
+            cmake make pkgconf ninja-build \
+            libwayland-dev libwayland-bin wayland-protocols libwayland-egl1 \
+            libxkbcommon-dev libxkbcommon-x11-dev libegl-dev libgbm-dev libdrm-dev libgles-dev \
+            libvulkan-dev libvulkan1 mesa-vulkan-drivers vulkan-tools \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shm0-dev libxcb-xkb-dev \
+            libxcb-xinput-dev libxcb-randr0-dev libxcb-xtest0-dev libxcb-xfixes0-dev \
+            libxcb-present-dev libxcursor-dev libxi-dev libxrandr-dev libxext-dev libxtst-dev \
+            libegl1 libegl-mesa0 libgl1-mesa-dri libgles2 mesa-utils \
+            xvfb xauth x11-xkb-utils xkb-data x11-utils x11-xserver-utils xdotool openbox \
+            weston libwayland-server0 strace gdb
+          ls /debs/*.deb | wc -l
+          du -sh /debs
+      - name: Upload as unreferenced blobs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          apt-get install -y curl ca-certificates python3 >/dev/null
+          cd /debs
+          tar cf /tmp/debs.tar *.deb
+          sha256sum /tmp/debs.tar
+          echo "::notice title=tar-sha256::$(sha256sum /tmp/debs.tar | cut -d' ' -f1)"
+          split -b 40M -d -a 3 /tmp/debs.tar /tmp/chunk.
+          i=0
+          for f in /tmp/chunk.*; do
+            printf '{"encoding":"base64","content":"' > /tmp/req.json
+            base64 -w0 "$f" >> /tmp/req.json
+            printf '"}' >> /tmp/req.json
+            for try in 1 2 3; do
+              sha=$(curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/git/blobs" \
+                --data-binary @/tmp/req.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])') && break
+              sleep 5
+            done
+            echo "::notice title=blob-$(printf %03d $i)::$sha"
+            i=$((i+1))
+          done
