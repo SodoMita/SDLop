@@ -3494,6 +3494,9 @@ SDLop_VideoDevice SDLop_x11_device = {
     /* optional hooks */
     .Vulkan_GetPresentationSupport = SDLOP_X11_Vulkan_GetPresentationSupport,
     .supports_popups = true,
+    .EGL_GetDisplay = SDLOP_X11_EGL_GetDisplay,
+    .EGL_GetConfig = SDLOP_X11_EGL_GetConfig,
+    .EGL_GetWindowSurface = SDLOP_X11_EGL_GetWindowSurface,
     .SetWindowMinimumSize = x11_UpdateSizeHints,
     .SetWindowMaximumSize = x11_UpdateSizeHints,
     .SetWindowAspectRatio = x11_UpdateSizeHints,

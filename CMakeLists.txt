@@ -413,6 +413,12 @@ if(SDLop_BUILD_TESTS)
   add_test(NAME test_window_api COMMAND test_window_api dummy)
   # Wayland run: needs a compositor (WAYLAND_DISPLAY), skips otherwise
   add_test(NAME test_window_api_wayland COMMAND test_window_api wayland)
+  # SDL_EGL_* / SDL_GL_ExtensionSupported against Mesa (skips without a
+  # display server; the X11 run is registered with the X11 tests)
+  add_executable(test_egl_api tests/test_egl_api.c)
+  target_link_libraries(test_egl_api PRIVATE sdlop)
+  target_compile_options(test_egl_api PRIVATE -UNDEBUG)
+  add_test(NAME test_egl_api_wayland COMMAND test_egl_api wayland)
   # the generated headers must be valid C++ with C linkage
   include(CheckLanguage)
   check_language(CXX)
@@ -474,6 +480,7 @@ if(SDLop_BUILD_TESTS)
       target_include_directories(test_window_api PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
       add_test(NAME test_window_api_x11 COMMAND test_window_api x11)
       set_tests_properties(test_window_api_x11 PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      add_test(NAME test_egl_api_x11 COMMAND test_egl_api x11)
       # same suite through the xcb_put_image fallback (no MIT-SHM)
       add_test(NAME test_x11_noshm COMMAND test_x11)
       # and with only libxcb itself: no SHM / XKB / XInput2 / RandR, i.e.
@@ -708,8 +715,8 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
   # only - every other test keeps full leak checking
-  foreach(t test_gl test_gl_matrix test_vulkan_compute)
-    if (TARGET ${t})
+  foreach(t test_gl test_gl_matrix test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
+    if (TEST ${t})
       set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endif()
   endforeach()

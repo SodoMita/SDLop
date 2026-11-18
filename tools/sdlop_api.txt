@@ -590,3 +590,9 @@ SDL_ShowMessageBox
 SDL_ShowSimpleMessageBox
 SDL_StringToGUID
 SDL_UnregisterApp
+SDL_EGL_GetCurrentConfig
+SDL_EGL_GetCurrentDisplay
+SDL_EGL_GetProcAddress
+SDL_EGL_GetWindowSurface
+SDL_EGL_SetAttributeCallbacks
+SDL_GL_ExtensionSupported

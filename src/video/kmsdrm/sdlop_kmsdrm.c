@@ -3195,6 +3195,9 @@ SDLop_VideoDevice SDLop_kmsdrm_device = {
     SDLOP_KMSDRM_Vulkan_GetInstanceExtensions,
     /* optional hooks */
     .Vulkan_GetPresentationSupport = NULL,
+    .EGL_GetDisplay = KMSDRM_EGL_GetDisplay,
+    .EGL_GetConfig = KMSDRM_EGL_GetConfig,
+    .EGL_GetWindowSurface = KMSDRM_EGL_GetWindowSurface,
     .CreateCursor = kmsdrm_CreateCursor,
     .FreeCursor = kmsdrm_FreeCursor,
     .ShowCursor = kmsdrm_ShowCursor,

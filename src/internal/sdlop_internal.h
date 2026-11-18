@@ -355,6 +355,8 @@ static inline Uint64 SDLOP_MonoToSDLTicks(Uint64 mono_ns)
 }
 
 /* Window helpers */
+void SDLOP_GetEGLAttributeCallbacks(SDL_EGLAttribArrayCallback *platform, SDL_EGLIntArrayCallback *surface,
+                                    SDL_EGLIntArrayCallback *context, void **userdata); /* SDL_gl.c */
 void SDLOP_AssertionsQuit(void);       /* SDL_misc.c, from SDL_Quit */
 bool SDLOP_WindowValid(SDL_Window *window);   /* in the window list */
 SDL_Window *SDLOP_GetFocusedKeyboardWindow(void);

@@ -120,7 +120,7 @@ static bool ensure_egl_display(void)
 
     if (get_platform_display && allow_xcb && has_extension(client_ext, "EGL_EXT_platform_xcb")) {
         EGLint attribs[] = { EGL_PLATFORM_XCB_SCREEN_EXT, SDLOP_X11_GetScreenNumber(), EGL_NONE };
-        egl_display = get_platform_display(EGL_PLATFORM_XCB_EXT, conn, attribs);
+        egl_display = SDLOP_EGL_PlatformDisplay(EGL_PLATFORM_XCB_EXT, conn, attribs);
         platform = "xcb";
     }
     if (egl_display == EGL_NO_DISPLAY) {
@@ -131,7 +131,7 @@ static bool ensure_egl_display(void)
         if (get_platform_display && (has_extension(client_ext, "EGL_EXT_platform_x11") ||
                                      has_extension(client_ext, "EGL_KHR_platform_x11"))) {
             EGLint attribs[] = { EGL_PLATFORM_X11_SCREEN_EXT, SDLOP_X11_GetScreenNumber(), EGL_NONE };
-            egl_display = get_platform_display(EGL_PLATFORM_X11_EXT, dpy, attribs);
+            egl_display = SDLOP_EGL_PlatformDisplay(EGL_PLATFORM_X11_EXT, dpy, attribs);
             platform = "x11";
         }
         if (egl_display == EGL_NO_DISPLAY) {
@@ -218,7 +218,7 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     if (!pick_config(&config, api)) {
         return NULL;
     }
-    EGLint ctx_attribs[12];
+    EGLint ctx_attribs[64];
     int n = 0;
     if (api == EGL_OPENGL_API) {
         ctx_attribs[n++] = EGL_CONTEXT_MAJOR_VERSION_KHR; ctx_attribs[n++] = sdlop_glattrs.major_version;
@@ -237,7 +237,10 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
         ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
     }
-    ctx_attribs[n++] = EGL_NONE;
+    n = SDLOP_EGL_AppendUserAttribs(true, egl_display, config, ctx_attribs, n, (int)SDL_arraysize(ctx_attribs));
+    if (n < 0) {
+        return NULL;
+    }
 
     EGLContext share = EGL_NO_CONTEXT;
     if (sdlop_glattrs.share_with_current_context) {
@@ -305,7 +308,12 @@ bool SDLOP_X11_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, voi
                 return false;
             }
             /* legacy entry point takes the XID by value on both platforms */
-            *slot = SDLOP_EGL_eglCreateWindowSurface(egl_display, config, (EGLNativeWindowType)xid, NULL);
+            EGLint surf_attribs[64];
+            if (SDLOP_EGL_AppendUserAttribs(false, egl_display, config, surf_attribs, 0,
+                                            (int)SDL_arraysize(surf_attribs)) < 0) {
+                return false;
+            }
+            *slot = SDLOP_EGL_eglCreateWindowSurface(egl_display, config, (EGLNativeWindowType)xid, surf_attribs);
             if (*slot == EGL_NO_SURFACE) {
                 *slot = NULL;
                 return SDL_SetError("eglCreateWindowSurface failed: 0x%x", SDLOP_EGL_eglGetError());
@@ -321,6 +329,31 @@ bool SDLOP_X11_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, voi
         SDLOP_EGL_eglSwapInterval(egl_display, swap_interval);
     }
     return true;
+}
+
+/* SDL_EGL_GetCurrentDisplay / GetCurrentConfig / GetWindowSurface */
+void *SDLOP_X11_EGL_GetDisplay(SDLop_VideoDevice *device)
+{
+    (void)device;
+    return egl_initialized ? (void *)egl_display : NULL;
+}
+
+void *SDLOP_X11_EGL_GetConfig(SDLop_VideoDevice *device)
+{
+    (void)device;
+    X11GLContext *cur = (X11GLContext *)SDLOP_GL_CurrentContext();
+    EGLConfig config;
+    if (!egl_initialized || !cur || !config_for_context(cur, &config)) {
+        return NULL;
+    }
+    return (void *)config;
+}
+
+void *SDLOP_X11_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    void **slot = SDLOP_X11_GetGLSurfaceSlot(window);
+    return slot ? *slot : NULL;
 }
 
 bool SDLOP_X11_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)

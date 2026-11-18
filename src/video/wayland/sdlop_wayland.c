@@ -2326,6 +2326,9 @@ SDLop_VideoDevice SDLop_wayland_device = {
     /* optional hooks */
     .Vulkan_GetPresentationSupport = SDLOP_Wayland_Vulkan_GetPresentationSupport,
     .supports_popups = true,
+    .EGL_GetDisplay = SDLOP_Wayland_EGL_GetDisplay,
+    .EGL_GetConfig = SDLOP_Wayland_EGL_GetConfig,
+    .EGL_GetWindowSurface = SDLOP_Wayland_EGL_GetWindowSurface,
     .SetWindowMinimumSize = wayland_UpdateSizeLimits,
     .SetWindowMaximumSize = wayland_UpdateSizeLimits,
     .SetWindowParent = wayland_SetWindowParent,

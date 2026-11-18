@@ -11,6 +11,10 @@
 SDLOP_GLAttributes sdlop_glattrs;
 static bool glattrs_initialized;
 
+/* current context tracking */
+static SDL_GLContext current_context;
+static SDL_Window *current_window;
+
 static void init_glattrs(void)
 {
     if (glattrs_initialized) {
@@ -39,10 +43,179 @@ static void init_glattrs(void)
     glattrs_initialized = true;
 }
 
+/* SDL_EGL_SetAttributeCallbacks (read by the EGL drivers) */
+static SDL_EGLAttribArrayCallback egl_platform_cb;
+static SDL_EGLIntArrayCallback egl_surface_cb;
+static SDL_EGLIntArrayCallback egl_context_cb;
+static void *egl_cb_userdata;
+
+void SDLOP_GetEGLAttributeCallbacks(SDL_EGLAttribArrayCallback *platform, SDL_EGLIntArrayCallback *surface,
+                                    SDL_EGLIntArrayCallback *context, void **userdata)
+{
+    if (platform) {
+        *platform = egl_platform_cb;
+    }
+    if (surface) {
+        *surface = egl_surface_cb;
+    }
+    if (context) {
+        *context = egl_context_cb;
+    }
+    if (userdata) {
+        *userdata = egl_cb_userdata;
+    }
+}
+
+void SDL_EGL_SetAttributeCallbacks(SDL_EGLAttribArrayCallback platformAttribCallback,
+                                   SDL_EGLIntArrayCallback surfaceAttribCallback,
+                                   SDL_EGLIntArrayCallback contextAttribCallback, void *userdata)
+{
+    if (!sdlop.video) {
+        return; /* stock: ignored before SDL_Init(VIDEO) */
+    }
+    egl_platform_cb = platformAttribCallback;
+    egl_surface_cb = surfaceAttribCallback;
+    egl_context_cb = contextAttribCallback;
+    egl_cb_userdata = userdata;
+}
+
 void SDL_GL_ResetAttributes(void)
 {
+    /* stock also forgets the EGL attribute callbacks here */
+    egl_platform_cb = NULL;
+    egl_surface_cb = NULL;
+    egl_context_cb = NULL;
+    egl_cb_userdata = NULL;
     glattrs_initialized = false;
     init_glattrs();
+}
+
+SDL_EGLDisplay SDL_EGL_GetCurrentDisplay(void)
+{
+    if (!sdlop.video) {
+        SDL_SetError("Video subsystem has not been initialized");
+        return NULL;
+    }
+    void *dpy = sdlop.video->EGL_GetDisplay ? sdlop.video->EGL_GetDisplay(sdlop.video) : NULL;
+    if (!dpy) {
+        SDL_SetError("There is no current EGL display");
+    }
+    return (SDL_EGLDisplay)dpy;
+}
+
+SDL_EGLConfig SDL_EGL_GetCurrentConfig(void)
+{
+    if (!sdlop.video) {
+        SDL_SetError("Video subsystem has not been initialized");
+        return NULL;
+    }
+    if (!sdlop.video->EGL_GetDisplay || !sdlop.video->EGL_GetDisplay(sdlop.video)) {
+        SDL_SetError("There is no current EGL display");
+        return NULL;
+    }
+    return (SDL_EGLConfig)(sdlop.video->EGL_GetConfig ? sdlop.video->EGL_GetConfig(sdlop.video) : NULL);
+}
+
+SDL_EGLSurface SDL_EGL_GetWindowSurface(SDL_Window *window)
+{
+    if (!sdlop.video) {
+        SDL_SetError("Video subsystem has not been initialized");
+        return NULL;
+    }
+    if (!sdlop.video->EGL_GetDisplay || !sdlop.video->EGL_GetDisplay(sdlop.video)) {
+        SDL_SetError("There is no current EGL display");
+        return NULL;
+    }
+    if (!SDLOP_WindowValid(window)) {
+        SDL_SetError("Invalid window");
+        return NULL;
+    }
+    return (SDL_EGLSurface)(sdlop.video->EGL_GetWindowSurface ? sdlop.video->EGL_GetWindowSurface(sdlop.video, window)
+                                                              : NULL);
+}
+
+SDL_FunctionPointer SDL_EGL_GetProcAddress(const char *proc)
+{
+    if (!sdlop.video) {
+        SDL_SetError("Video subsystem has not been initialized");
+        return NULL;
+    }
+    if (!sdlop.video->EGL_GetDisplay || !sdlop.video->EGL_GetDisplay(sdlop.video) ||
+        !sdlop.video->GL_GetProcAddress) {
+        SDL_SetError("No EGL library has been loaded");
+        return NULL;
+    }
+    if (!proc) {
+        SDL_SetError("Parameter '%s' is invalid", "proc");
+        return NULL;
+    }
+    /* the EGL drivers resolve through eglGetProcAddress, then the
+     * process symbol table (where libEGL's own entry points live) */
+    return sdlop.video->GL_GetProcAddress(sdlop.video, proc);
+}
+
+/* SDL_GL_ExtensionSupported: ported from SDL 3.4.20 */
+#define SDLOP_GL_EXTENSIONS 0x1F03
+#define SDLOP_GL_VERSION 0x1F02
+#define SDLOP_GL_NUM_EXTENSIONS 0x821D
+
+bool SDL_GL_ExtensionSupported(const char *extension)
+{
+    typedef const unsigned char *(*PFN_glGetString)(unsigned int);
+    typedef const unsigned char *(*PFN_glGetStringi)(unsigned int, unsigned int);
+    typedef void (*PFN_glGetIntegerv)(unsigned int, int *);
+
+    if (!extension || *extension == '\0' || SDL_strchr(extension, ' ')) {
+        return false; /* extension names have no spaces */
+    }
+    /* a hint/environment variable named after the extension can veto it */
+    const char *override = SDL_GetHint(extension);
+    if (override && *override == '0') {
+        return false;
+    }
+    if (!current_context) {
+        return false; /* glGetString needs a current context */
+    }
+    PFN_glGetString get_string = (PFN_glGetString)SDL_GL_GetProcAddress("glGetString");
+    if (!get_string) {
+        return false;
+    }
+    const char *version = (const char *)get_string(SDLOP_GL_VERSION);
+    /* "OpenGL ES 3.2 Mesa..." has no leading digit: stock's atoi reads 0,
+     * so GLES always takes the GL_EXTENSIONS string path, as here */
+    if (version && SDL_atoi(version) >= 3) {
+        PFN_glGetStringi get_stringi = (PFN_glGetStringi)SDL_GL_GetProcAddress("glGetStringi");
+        PFN_glGetIntegerv get_integerv = (PFN_glGetIntegerv)SDL_GL_GetProcAddress("glGetIntegerv");
+        if (!get_stringi || !get_integerv) {
+            return false;
+        }
+        int num = 0;
+        get_integerv(SDLOP_GL_NUM_EXTENSIONS, &num);
+        for (int i = 0; i < num; i++) {
+            const char *e = (const char *)get_stringi(SDLOP_GL_EXTENSIONS, (unsigned int)i);
+            if (e && SDL_strcmp(e, extension) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    const char *extensions = (const char *)get_string(SDLOP_GL_EXTENSIONS);
+    if (!extensions) {
+        return false;
+    }
+    const size_t len = SDL_strlen(extension);
+    for (const char *start = extensions;;) {
+        const char *where = SDL_strstr(start, extension);
+        if (!where) {
+            break;
+        }
+        const char *terminator = where + len;
+        if ((where == extensions || where[-1] == ' ') && (*terminator == ' ' || *terminator == '\0')) {
+            return true;
+        }
+        start = terminator;
+    }
+    return false;
 }
 
 bool SDL_GL_SetAttribute(SDL_GLAttr attr, int value)
@@ -142,9 +315,6 @@ SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc)
     return NULL;
 }
 
-/* current context tracking */
-static SDL_GLContext current_context;
-static SDL_Window *current_window;
 
 SDL_GLContext SDLOP_GL_CurrentContext(void)
 {

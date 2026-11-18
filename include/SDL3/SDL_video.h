@@ -3161,6 +3161,24 @@ extern SDL_DECLSPEC bool SDLCALL SDL_GL_LoadLibrary(const char *path);
  */
 extern SDL_DECLSPEC SDL_FunctionPointer SDLCALL SDL_GL_GetProcAddress(const char *proc);
 
+/**
+ * Get an EGL library function by name.
+ *
+ * If an EGL library is loaded, this function allows applications to get entry
+ * points for EGL functions. This is useful to provide to an EGL API and
+ * extension loader.
+ *
+ * \param proc the name of an EGL function.
+ * \returns a pointer to the named EGL function. The returned pointer should
+ *          be cast to the appropriate function signature.
+ *
+ * \threadsafety This function should only be called on the main thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_EGL_GetCurrentDisplay
+ */
+extern SDL_DECLSPEC SDL_FunctionPointer SDLCALL SDL_EGL_GetProcAddress(const char *proc);
 
 /**
  * Unload the OpenGL library previously loaded by SDL_GL_LoadLibrary().
@@ -3173,6 +3191,28 @@ extern SDL_DECLSPEC SDL_FunctionPointer SDLCALL SDL_GL_GetProcAddress(const char
  */
 extern SDL_DECLSPEC void SDLCALL SDL_GL_UnloadLibrary(void);
 
+/**
+ * Check if an OpenGL extension is supported for the current context.
+ *
+ * This function operates on the current GL context; you must have created a
+ * context and it must be current before calling this function. Do not assume
+ * that all contexts you create will have the same set of extensions
+ * available, or that recreating an existing context will offer the same
+ * extensions again.
+ *
+ * While it's probably not a massive overhead, this function is not an O(1)
+ * operation. Check the extensions you care about after creating the GL
+ * context and save that information somewhere instead of calling the function
+ * every time you need to know.
+ *
+ * \param extension the name of the extension to check.
+ * \returns true if the extension is supported, false otherwise.
+ *
+ * \threadsafety This function should only be called on the main thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_GL_ExtensionSupported(const char *extension);
 
 /**
  * Reset all previously set OpenGL context attributes to their default values.
@@ -3301,9 +3341,66 @@ extern SDL_DECLSPEC SDL_Window * SDLCALL SDL_GL_GetCurrentWindow(void);
  */
 extern SDL_DECLSPEC SDL_GLContext SDLCALL SDL_GL_GetCurrentContext(void);
 
+/**
+ * Get the currently active EGL display.
+ *
+ * \returns the currently active EGL display or NULL on failure; call
+ *          SDL_GetError() for more information.
+ *
+ * \threadsafety This function should only be called on the main thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC SDL_EGLDisplay SDLCALL SDL_EGL_GetCurrentDisplay(void);
 
+/**
+ * Get the currently active EGL config.
+ *
+ * \returns the currently active EGL config or NULL on failure; call
+ *          SDL_GetError() for more information.
+ *
+ * \threadsafety This function should only be called on the main thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC SDL_EGLConfig SDLCALL SDL_EGL_GetCurrentConfig(void);
 
+/**
+ * Get the EGL surface associated with the window.
+ *
+ * \param window the window to query.
+ * \returns the EGLSurface pointer associated with the window, or NULL on
+ *          failure.
+ *
+ * \threadsafety This function should only be called on the main thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC SDL_EGLSurface SDLCALL SDL_EGL_GetWindowSurface(SDL_Window *window);
 
+/**
+ * Sets the callbacks for defining custom EGLAttrib arrays for EGL
+ * initialization.
+ *
+ * Callbacks that aren't needed can be set to NULL.
+ *
+ * NOTE: These callback pointers will be reset after SDL_GL_ResetAttributes.
+ *
+ * \param platformAttribCallback callback for attributes to pass to
+ *                               eglGetPlatformDisplay. May be NULL.
+ * \param surfaceAttribCallback callback for attributes to pass to
+ *                              eglCreateSurface. May be NULL.
+ * \param contextAttribCallback callback for attributes to pass to
+ *                              eglCreateContext. May be NULL.
+ * \param userdata a pointer that is passed to the callbacks.
+ *
+ * \threadsafety This function should only be called on the main thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC void SDLCALL SDL_EGL_SetAttributeCallbacks(SDL_EGLAttribArrayCallback platformAttribCallback,
+                                                               SDL_EGLIntArrayCallback surfaceAttribCallback,
+                                                               SDL_EGLIntArrayCallback contextAttribCallback, void *userdata);
 
 /**
  * Set the swap interval for the current OpenGL context.
