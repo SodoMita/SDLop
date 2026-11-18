@@ -582,6 +582,12 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
       set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endif()
   endforeach()
+  # test_vulkan keeps leak checking, minus allocations made inside Mesa /
+  # the Vulkan loader (tests/lsan_gpu.supp)
+  if (TARGET test_vulkan)
+    set_tests_properties(test_vulkan PROPERTIES ENVIRONMENT
+      "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
+  endif()
   # test_surface asserts the alloc-failure contract (CreateSurface must
   # return NULL); ASan's allocator aborts on OOM unless allowed to return null
   set_tests_properties(test_surface
