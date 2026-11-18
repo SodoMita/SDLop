@@ -428,14 +428,14 @@ int main(void)
     free(v);
     if (!xi22) {
         printf("test_x11_touch: SKIP (no XInput 2.2)\n");
-        return 0;
+        return getenv("SDLOP_TEST_STRICT") ? 1 : 0;
     }
     xi_opcode = ext->major_opcode;
 
     int n = start_proxy();
     if (n < 0) {
         printf("test_x11_touch: SKIP (no free proxy display)\n");
-        return 0;
+        return getenv("SDLOP_TEST_STRICT") ? 1 : 0;
     }
     char proxy_disp[32];
     snprintf(proxy_disp, sizeof(proxy_disp), ":%d", n);
@@ -448,7 +448,7 @@ int main(void)
     if (!probe_ok) {
         stop_proxy();
         printf("test_x11_touch: SKIP (server refuses the unauthenticated proxy connection)\n");
-        return 0;
+        return getenv("SDLOP_TEST_STRICT") ? 1 : 0;
     }
     printf("test_x11_touch: proxy %s -> %s, XI opcode %u\n", proxy_disp, disp, xi_opcode);
 

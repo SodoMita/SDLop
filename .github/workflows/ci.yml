@@ -64,8 +64,8 @@ jobs:
         env:
           XDG_RUNTIME_DIR: /tmp/xdg
           LIBGL_ALWAYS_SOFTWARE: '1'
-          # layout/compose tests fail instead of skipping without xkb-data,
-          # libx11-data (Compose) or setxkbmap
+          # layout/compose/touch tests fail instead of skipping without
+          # xkb-data, libx11-data (Compose), setxkbmap or XI 2.2
           SDLOP_TEST_STRICT: '1'
         run: |
           mkdir -p -m 700 "$XDG_RUNTIME_DIR"
