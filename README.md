@@ -114,7 +114,7 @@ and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
 
 ## API surface (SDL3-compatible)
 
-566 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+574 SDL3 functions; every one is declared in `include/SDL3/` (generated from
 the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
 with the same signature as SDL3, and checked by the `api_exports` test.
 

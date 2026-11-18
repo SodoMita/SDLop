@@ -30,6 +30,9 @@ struct SDL_Window
     int w, h;           /* requested size */
     SDL_WindowFlags flags;
     bool text_input_active; /* SDL_StartTextInput() gate (stock: text events only while active) */
+    SDL_Rect text_input_rect; /* SDL_SetTextInputArea */
+    int text_input_cursor;
+    SDL_PropertiesID text_input_props; /* SDL_StartTextInputWithProperties copy */
     Uint8 clear_r, clear_g, clear_b;
     float display_scale;    /* output scale the window currently sits on */
     SDL_Surface *surface;   /* software window surface (owned by window) */

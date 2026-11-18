@@ -566,3 +566,11 @@ SDL_ShowWindowSystemMenu
 SDL_SyncWindow
 SDL_WarpMouseGlobal
 SDL_WarpMouseInWindow
+SDL_ClearComposition
+SDL_GetScancodeFromName
+SDL_GetTextInputArea
+SDL_HasScreenKeyboardSupport
+SDL_ScreenKeyboardShown
+SDL_SetScancodeName
+SDL_SetTextInputArea
+SDL_StartTextInputWithProperties

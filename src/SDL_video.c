@@ -916,6 +916,9 @@ void SDL_DestroyWindow(SDL_Window *window)
     }
     SDLOP_RemoveWindow(window);
     SDL_DestroyProperties(window->props);
+    if (window->text_input_props) {
+        SDL_DestroyProperties(window->text_input_props);
+    }
     SDL_DestroySurface(window->icon);
     free(window->title);
     free(window);

@@ -506,6 +506,40 @@ static void test_devices(void)
     CHECK(SDL_GetTouchFingers(12345, &n) == NULL, "unknown touch device: NULL");
 }
 
+static void test_text_input(SDL_Window *w)
+{
+    CHECK(!SDL_TextInputActive(w), "text input off by default");
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_NUMBER);
+    CHECK(SDL_StartTextInputWithProperties(w, props), "start with props: %s", SDL_GetError());
+    SDL_DestroyProperties(props);
+    CHECK(SDL_TextInputActive(w), "text input active");
+    SDL_Rect area = { 10, 20, 100, 30 }, got = { 0, 0, 0, 0 };
+    int cursor = -1;
+    CHECK(SDL_SetTextInputArea(w, &area, 7), "set area: %s", SDL_GetError());
+    CHECK(SDL_GetTextInputArea(w, &got, &cursor), "get area");
+    CHECK(SDL_RectsEqual(&area, &got) && cursor == 7, "area readback %d,%d %dx%d cursor %d", got.x, got.y, got.w,
+          got.h, cursor);
+    CHECK(SDL_SetTextInputArea(w, NULL, 3) && SDL_GetTextInputArea(w, &got, &cursor) && SDL_RectEmpty(&got) &&
+              cursor == 0,
+          "NULL area resets");
+    CHECK(SDL_ClearComposition(w), "clear composition");
+    CHECK(!SDL_HasScreenKeyboardSupport(), "no screen keyboard");
+    CHECK(!SDL_ScreenKeyboardShown(w), "screen keyboard hidden");
+    CHECK(SDL_StopTextInput(w) && !SDL_TextInputActive(w), "stop text input");
+    CHECK(!SDL_StartTextInput(NULL) && !SDL_SetTextInputArea(NULL, NULL, 0), "NULL window rejected");
+
+    CHECK(SDL_GetScancodeFromName("Return") == SDL_SCANCODE_RETURN, "scancode from name");
+    CHECK(SDL_GetScancodeFromName("left shift") == SDL_SCANCODE_LSHIFT, "scancode from name (case)");
+    CHECK(SDL_GetScancodeFromName("NoSuchKey") == SDL_SCANCODE_UNKNOWN, "unknown name");
+    CHECK(SDL_GetScancodeFromName("") == SDL_SCANCODE_UNKNOWN, "empty name");
+    CHECK(SDL_SetScancodeName(SDL_SCANCODE_F13, "Macro 1"), "set scancode name");
+    CHECK(strcmp(SDL_GetScancodeName(SDL_SCANCODE_F13), "Macro 1") == 0, "custom name");
+    CHECK(SDL_GetScancodeFromName("macro 1") == SDL_SCANCODE_F13, "custom name lookup");
+    CHECK(SDL_SetScancodeName(SDL_SCANCODE_F13, "F13"), "restore name");
+    CHECK(!SDL_SetScancodeName(SDL_SCANCODE_COUNT, "x"), "invalid scancode rejected");
+}
+
 static void test_screensaver(void)
 {
     /* stock: the state toggles even when the driver can't act on it, but
@@ -566,6 +600,7 @@ int main(int argc, char **argv)
         test_grabs(w);
         test_cursors(w);
         test_warp(w);
+        test_text_input(w);
         test_parent_popup(w); /* destroys w */
     }
     SDL_Quit();
