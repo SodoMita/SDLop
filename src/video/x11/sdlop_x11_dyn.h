@@ -31,6 +31,7 @@
 #include <xcb/xkb.h>
 #include <xcb/xinput.h>
 #include <xcb/randr.h>
+#include <xcb/render.h>
 #include <xkbcommon/xkbcommon-x11.h>
 
 #ifdef __cplusplus

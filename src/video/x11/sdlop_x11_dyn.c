@@ -35,6 +35,7 @@ static const X11ModuleInfo module_info[SDLOP_X11_MOD_COUNT] = {
     [SDLOP_X11_MOD_XKBX11] = { "SDLOP_LIB_XKBCOMMON_X11", "libxkbcommon-x11.so.0", false },
     [SDLOP_X11_MOD_XINPUT] = { "SDLOP_LIB_XCB_XINPUT", "libxcb-xinput.so.0", false },
     [SDLOP_X11_MOD_RANDR] = { "SDLOP_LIB_XCB_RANDR", "libxcb-randr.so.0", false },
+    [SDLOP_X11_MOD_RENDER] = { "SDLOP_LIB_XCB_RENDER", "libxcb-render.so.0", false },
 };
 
 static void *module_handle[SDLOP_X11_MOD_COUNT];

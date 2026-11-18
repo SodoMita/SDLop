@@ -195,6 +195,7 @@ static void subsystem_quit(SDL_InitFlags flags)
         SDLOP_RawInputQuit();
         SDLOP_VideoQuit();
         SDLOP_KeyboardQuit();
+        SDLOP_DevicesQuit();
     }
 }
 

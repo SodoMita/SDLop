@@ -1135,22 +1135,20 @@ static Uint32 sdlop_device_next_id(void)
 
 static void send_keyboard_device_event(bool added, SDL_KeyboardID which)
 {
-    SDL_Event event;
-    SDL_zero(event);
-    event.kdevice.type = added ? SDL_EVENT_KEYBOARD_ADDED : SDL_EVENT_KEYBOARD_REMOVED;
-    event.kdevice.timestamp = SDL_GetTicksNS();
-    event.kdevice.which = which;
-    SDLOP_PushEventInternal(&event);
+    if (added) {
+        SDLOP_AddKeyboard(which, "Keyboard");
+    } else {
+        SDLOP_RemoveKeyboard(which, true);
+    }
 }
 
 static void send_mouse_device_event(bool added, SDL_MouseID which)
 {
-    SDL_Event event;
-    SDL_zero(event);
-    event.mdevice.type = added ? SDL_EVENT_MOUSE_ADDED : SDL_EVENT_MOUSE_REMOVED;
-    event.mdevice.timestamp = SDL_GetTicksNS();
-    event.mdevice.which = which;
-    SDLOP_PushEventInternal(&event);
+    if (added) {
+        SDLOP_AddMouse(which, "Mouse");
+    } else {
+        SDLOP_RemoveMouse(which, true);
+    }
 }
 
 static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)

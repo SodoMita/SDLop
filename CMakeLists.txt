@@ -50,6 +50,7 @@ if(EMSCRIPTEN)
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
+    src/SDL_devices.c
     src/SDL_video.c
     src/SDL_surface.c
     src/SDL_gl.c
@@ -130,7 +131,7 @@ pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
 option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
 if(SDLOP_VIDEO_X11)
-  pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xkbcommon-x11)
+  pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
   if(NOT X11_XCB_FOUND)
     message(STATUS "xcb headers not found - building without the X11 driver")
     set(SDLOP_VIDEO_X11 OFF)
@@ -260,6 +261,7 @@ set(SDLop_SOURCES
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
+  src/SDL_devices.c
   src/SDL_video.c
   src/SDL_surface.c
   src/SDL_gl.c
@@ -374,6 +376,12 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
+  # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
+  # below, verified from a second xcb connection)
+  add_executable(test_window_api tests/test_window_api.c)
+  target_link_libraries(test_window_api PRIVATE sdlop)
+  target_compile_options(test_window_api PRIVATE -UNDEBUG)
+  add_test(NAME test_window_api COMMAND test_window_api dummy)
   # the generated headers must be valid C++ with C linkage
   include(CheckLanguage)
   check_language(CXX)
@@ -430,6 +438,11 @@ if(SDLop_BUILD_TESTS)
       target_include_directories(test_x11 PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
       target_compile_options(test_x11 PRIVATE -UNDEBUG)
       add_test(NAME test_x11 COMMAND test_x11)
+      target_compile_definitions(test_window_api PRIVATE SDLOP_TEST_HAVE_XCB=1)
+      target_link_libraries(test_window_api PRIVATE ${X11_TEST_DEPS_LIBRARIES})
+      target_include_directories(test_window_api PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      add_test(NAME test_window_api_x11 COMMAND test_window_api x11)
+      set_tests_properties(test_window_api_x11 PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       # same suite through the xcb_put_image fallback (no MIT-SHM)
       add_test(NAME test_x11_noshm COMMAND test_x11)
       # and with only libxcb itself: no SHM / XKB / XInput2 / RandR, i.e.
@@ -439,7 +452,7 @@ if(SDLop_BUILD_TESTS)
       set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
       set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
-        "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none")
+        "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none")
     endif()
     # keyboard layouts end-to-end (setxkbmap + XKB group locking; the test
     # restores the server layout). Skips where the keymap cannot be set.

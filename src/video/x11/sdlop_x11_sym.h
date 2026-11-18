@@ -16,6 +16,7 @@
     XKBX11  libxkbcommon-x11.so.0   optional - server keymap -> xkbcommon
     XINPUT  libxcb-xinput.so.0      optional - XI2 raw motion (relative mouse)
     RANDR   libxcb-randr.so.0       optional - monitors, modes, refresh rates
+    RENDER  libxcb-render.so.0      optional - ARGB cursors
 
   (libX11 is only needed as a fallback for EGL implementations without
   EGL_EXT_platform_xcb; sdlop_x11_gl.c dlopens it on demand.)
@@ -91,6 +92,12 @@ SDLOP_X11_SYM(XCB, xcb_free_colormap)
 SDLOP_X11_SYM(XCB, xcb_clear_area)
 SDLOP_X11_SYM(XCB, xcb_query_pointer)
 SDLOP_X11_SYM(XCB, xcb_query_pointer_reply)
+SDLOP_X11_SYM(XCB, xcb_grab_keyboard)
+SDLOP_X11_SYM(XCB, xcb_grab_keyboard_reply)
+SDLOP_X11_SYM(XCB, xcb_ungrab_keyboard)
+SDLOP_X11_SYM(XCB, xcb_force_screen_saver)
+SDLOP_X11_SYM(XCB, xcb_get_geometry)
+SDLOP_X11_SYM(XCB, xcb_get_geometry_reply)
 
 /* ---------------------------------------------------------------- SHM */
 SDLOP_X11_MODULE(SHM)
@@ -153,3 +160,14 @@ SDLOP_X11_SYM(RANDR, xcb_randr_get_output_info_modes_length)
 SDLOP_X11_SYM(RANDR, xcb_randr_get_crtc_info)
 SDLOP_X11_SYM(RANDR, xcb_randr_get_crtc_info_reply)
 SDLOP_X11_SYM(RANDR, xcb_randr_select_input)
+
+/* ------------------------------------------------------------- RENDER */
+SDLOP_X11_MODULE(RENDER)
+SDLOP_X11_DATA(RENDER, xcb_render_id)
+SDLOP_X11_SYM(RENDER, xcb_render_query_pict_formats)
+SDLOP_X11_SYM(RENDER, xcb_render_query_pict_formats_reply)
+SDLOP_X11_SYM(RENDER, xcb_render_query_pict_formats_formats_iterator)
+SDLOP_X11_SYM(RENDER, xcb_render_pictforminfo_next)
+SDLOP_X11_SYM(RENDER, xcb_render_create_picture)
+SDLOP_X11_SYM(RENDER, xcb_render_free_picture)
+SDLOP_X11_SYM(RENDER, xcb_render_create_cursor)

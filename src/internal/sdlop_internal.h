@@ -38,7 +38,27 @@ struct SDL_Window
     SDL_DisplayID displayID;          /* display the window is currently on */
     bool has_fullscreen_mode;         /* an exclusive fullscreen mode was requested */
     SDL_DisplayMode fullscreen_mode;  /* requested exclusive mode (displayID set) */
+
+    /* SDL 3.4 window state (SDL_video.c; drivers read these in their hooks) */
+    bool undefined_x, undefined_y;    /* created with SDL_WINDOWPOS_UNDEFINED */
+    int min_w, min_h, max_w, max_h;   /* 0 = no limit */
+    float min_aspect, max_aspect;     /* 0 = no limit */
+    float opacity;
+    SDL_Surface *icon;                /* ARGB8888 copy */
+    struct SDL_Window *parent;
+    SDL_Rect mouse_rect;              /* empty = none */
+    SDL_Rect safe_rect;               /* empty = whole window */
+    SDL_PropertiesID props;
+    SDL_HitTest hit_test;
+    void *hit_test_data;
+    SDL_ProgressState progress_state;
+    float progress_value;
+    SDL_WindowFlags pending_flags;    /* grabs requested while hidden */
+    int popup_offset_x, popup_offset_y; /* tooltip / popup menu: offset from parent */
+    bool is_destroying;
 };
+
+#define SDLOP_WINDOW_IS_POPUP(w) ((w) && ((w)->flags & (SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU)) != 0)
 
 /* ------------------------------------------------------------------ */
 /* Video displays                                                      */
@@ -132,7 +152,78 @@ struct SDLop_VideoDevice
     bool (*SetPrimarySelectionText)(SDLop_VideoDevice *device, const char *text);
     char *(*GetPrimarySelectionText)(SDLop_VideoDevice *device);
     bool (*HasPrimarySelectionText)(SDLop_VideoDevice *device);
+
+    /* SDL 3.4 window management (same contracts as SDL_sysvideo.h; NULL =
+     * SDL_Unsupported() where stock SDL3 reports that) */
+    bool supports_popups;            /* SDL_WINDOW_TOOLTIP / SDL_WINDOW_POPUP_MENU */
+    void (*SetWindowMinimumSize)(SDLop_VideoDevice *device, SDL_Window *window);
+    void (*SetWindowMaximumSize)(SDLop_VideoDevice *device, SDL_Window *window);
+    void (*SetWindowAspectRatio)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*GetWindowBordersSize)(SDLop_VideoDevice *device, SDL_Window *window, int *top, int *left, int *bottom, int *right);
+    bool (*SetWindowOpacity)(SDLop_VideoDevice *device, SDL_Window *window, float opacity);
+    bool (*SetWindowParent)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Window *parent);
+    bool (*SetWindowModal)(SDLop_VideoDevice *device, SDL_Window *window, bool modal);
+    void (*SetWindowBordered)(SDLop_VideoDevice *device, SDL_Window *window, bool bordered);
+    void (*SetWindowResizable)(SDLop_VideoDevice *device, SDL_Window *window, bool resizable);
+    void (*SetWindowAlwaysOnTop)(SDLop_VideoDevice *device, SDL_Window *window, bool on_top);
+    bool (*SetWindowIcon)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon);
+    bool (*SetWindowMouseGrab)(SDLop_VideoDevice *device, SDL_Window *window, bool grabbed);
+    bool (*SetWindowKeyboardGrab)(SDLop_VideoDevice *device, SDL_Window *window, bool grabbed);
+    bool (*SetWindowMouseRect)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*FlashWindow)(SDLop_VideoDevice *device, SDL_Window *window, SDL_FlashOperation operation);
+    bool (*SyncWindow)(SDLop_VideoDevice *device, SDL_Window *window);
+    void (*ShowWindowSystemMenu)(SDLop_VideoDevice *device, SDL_Window *window, int x, int y);
+    bool (*SetWindowFocusable)(SDLop_VideoDevice *device, SDL_Window *window, bool focusable);
+    bool (*SetWindowHitTest)(SDLop_VideoDevice *device, SDL_Window *window, bool enabled);
+    bool (*UpdateWindowShape)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *shape);
+    bool (*SuspendScreenSaver)(SDLop_VideoDevice *device);
+    void *(*GetWindowICCProfile)(SDLop_VideoDevice *device, SDL_Window *window, size_t *size);
+    bool (*SetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int vsync);
+    bool (*GetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int *vsync);
+    SDL_SystemTheme (*GetSystemTheme)(SDLop_VideoDevice *device);
+
+    /* EGL handles of the current context (SDL_EGL_*); NULL = not EGL */
+    void *(*EGL_GetDisplay)(SDLop_VideoDevice *device);
+    void *(*EGL_GetConfig)(SDLop_VideoDevice *device);
+    void *(*EGL_GetWindowSurface)(SDLop_VideoDevice *device, SDL_Window *window);
+
+    /* Cursors (SDL_mouse.c). CreateCursor fills cursor->internal from
+     * cursor->surface / cursor->system_id; ShowCursor(NULL) hides. */
+    bool (*CreateCursor)(SDLop_VideoDevice *device, SDL_Cursor *cursor);
+    void (*FreeCursor)(SDLop_VideoDevice *device, SDL_Cursor *cursor);
+    bool (*ShowCursor)(SDLop_VideoDevice *device, SDL_Cursor *cursor);
+    bool (*WarpMouse)(SDLop_VideoDevice *device, SDL_Window *window, float x, float y);
+    bool (*WarpMouseGlobal)(SDLop_VideoDevice *device, float x, float y);
+    bool (*CaptureMouse)(SDLop_VideoDevice *device, SDL_Window *window); /* NULL window = release */
+    SDL_MouseButtonFlags (*GetGlobalMouseState)(SDLop_VideoDevice *device, float *x, float *y);
+
+    /* Text input / IME */
+    bool (*UpdateTextInputArea)(SDLop_VideoDevice *device, SDL_Window *window);
 };
+
+/* Cursor object (SDL_mouse.c) */
+struct SDL_Cursor
+{
+    SDL_SystemCursor system_id;    /* SDL_SYSTEM_CURSOR_COUNT for image cursors */
+    SDL_Surface *surface;          /* ARGB8888 image (first frame), NULL for system cursors */
+    int hot_x, hot_y;
+    struct SDL_Cursor **frames;    /* animated: one image cursor per frame */
+    Uint32 *durations;             /* animated: ms per frame (0 = stop) */
+    int num_frames, current_frame;
+    Uint64 last_update;
+    void *internal;                /* driver data */
+    struct SDL_Cursor *next;
+};
+void SDLOP_MouseQuit(void);
+SDL_Cursor *SDLOP_GetCurrentCursor(void); /* NULL when hidden */
+bool SDLOP_CursorVisible(void);
+void SDLOP_RedrawCursor(void);         /* re-apply SDLOP_GetCurrentCursor() via ShowCursor */
+void SDLOP_UpdateCursorAnimation(void); /* SDL_PumpEvents */
+void SDLOP_UpdateWindowGrab(SDL_Window *window);
+void SDLOP_OnWindowMoved(SDL_Window *window); /* popup offsets; moves child popups */
+/* freedesktop / CSS cursor name for a system cursor (SDL_GetCSSCursorName) */
+const char *SDLOP_GetCSSCursorName(SDL_SystemCursor id, const char **fallback_name);
+void SDLOP_ConstrainMouse(SDL_Window *window, float *x, float *y);
 
 /* Clipboard state shared with drivers (SDL_clipboard.c) */
 void *SDLOP_GetInternalClipboardData(const char *mime_type, size_t *size); /* malloc'd, NUL-padded copy */
@@ -186,6 +277,10 @@ typedef struct SDLop_Globals
     SDL_MouseButtonFlags mouse_buttons;
     SDL_Window *relative_mode_window;
 
+    /* window management */
+    SDL_Window *grabbed_window;
+    bool suspend_screensaver;
+
     /* key repeat emulation (for the raw evdev path) */
     SDL_Scancode repeat_scancode;
     Uint16 repeat_rawcode;
@@ -237,6 +332,16 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
                      float dx, float dy, float pressure, SDL_WindowID windowID,
                      Uint64 timestamp_ns);
 void SDLOP_ResetTouchMouse(void); /* SDL_Init / SDL_Quit */
+
+/* Input device registry (SDL_devices.c): sends *_ADDED / *_REMOVED */
+void SDLOP_AddMouse(SDL_MouseID id, const char *name);
+void SDLOP_RemoveMouse(SDL_MouseID id, bool send_event);
+void SDLOP_AddKeyboard(SDL_KeyboardID id, const char *name);
+void SDLOP_RemoveKeyboard(SDL_KeyboardID id, bool send_event);
+void SDLOP_AddTouch(SDL_TouchID id, SDL_TouchDeviceType type, const char *name);
+void SDLOP_RemoveTouch(SDL_TouchID id);
+void SDLOP_TrackTouch(Uint32 type, SDL_TouchID touchID, SDL_FingerID fingerID, float x, float y, float pressure);
+void SDLOP_DevicesQuit(void);
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns);
 
 /* Timestamp helpers */
@@ -247,6 +352,7 @@ static inline Uint64 SDLOP_MonoToSDLTicks(Uint64 mono_ns)
 }
 
 /* Window helpers */
+bool SDLOP_WindowValid(SDL_Window *window);   /* in the window list */
 SDL_Window *SDLOP_GetFocusedKeyboardWindow(void);
 SDL_WindowID SDLOP_FocusWindowID(void);   /* focused window id or 0 */
 

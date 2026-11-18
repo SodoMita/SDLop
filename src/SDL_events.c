@@ -521,11 +521,22 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
     event.window.windowID = window ? window->id : 0;
     event.window.data1 = data1;
     event.window.data2 = data2;
+    if (window && type == SDL_EVENT_WINDOW_MOVED && SDLOP_WINDOW_IS_POPUP(window) && window->parent) {
+        /* popup positions are reported relative to the parent */
+        event.window.data1 -= window->parent->x;
+        event.window.data2 -= window->parent->y;
+    }
     SDLOP_PushEventInternal(&event);
 
     /* a window move may change which display the window lives on */
     if (window && type == SDL_EVENT_WINDOW_MOVED) {
         SDLOP_UpdateWindowDisplay(window);
+        SDLOP_OnWindowMoved(window);
+    }
+    /* SDL_OnWindowFocusGained/Lost: grabs only hold while focused */
+    if (window && (type == SDL_EVENT_WINDOW_FOCUS_GAINED || type == SDL_EVENT_WINDOW_FOCUS_LOST) &&
+        (window->flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED)) && !window->is_destroying) {
+        SDLOP_UpdateWindowGrab(window);
     }
 }
 
@@ -699,6 +710,7 @@ void SDL_PumpEvents(void)
     /* 2. drain window system (non-blocking) */
     if (sdlop.video) {
         sdlop.video->PumpEvents(sdlop.video, -1);
+        SDLOP_UpdateCursorAnimation();
     }
 
     /* 3. events pushed by other threads */

@@ -19,6 +19,7 @@
 #include "sdlop_x11_internal.h"
 #include "internal/scancode_evdev.h"
 #include "internal/sdlop_xkb_dyn.h"
+#include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -38,11 +39,13 @@
 #define X11_HINT_P_SIZE       (1u << 3)
 #define X11_HINT_P_MIN_SIZE   (1u << 4)
 #define X11_HINT_P_MAX_SIZE   (1u << 5)
+#define X11_HINT_P_ASPECT     (1u << 7)
 #define X11_HINT_P_WIN_GRAVITY (1u << 9)
 
 /* ICCCM WM_HINTS flags / states */
 #define X11_WMHINT_INPUT 1u
 #define X11_WMHINT_STATE 2u
+#define X11_WMHINT_URGENCY (1u << 8)
 #define X11_STATE_WITHDRAWN 0
 #define X11_STATE_NORMAL 1
 #define X11_STATE_ICONIC 3
@@ -83,8 +86,20 @@ typedef union X11Event32
     X(_NET_WM_STATE_MAXIMIZED_HORZ)       \
     X(_NET_WM_STATE_HIDDEN)               \
     X(_NET_WM_STATE_FOCUSED)              \
+    X(_NET_WM_STATE_ABOVE)                \
+    X(_NET_WM_STATE_SKIP_TASKBAR)         \
+    X(_NET_WM_STATE_SKIP_PAGER)           \
+    X(_NET_WM_STATE_MODAL)                \
+    X(_NET_WM_STATE_DEMANDS_ATTENTION)    \
     X(_NET_WM_WINDOW_TYPE)                \
     X(_NET_WM_WINDOW_TYPE_NORMAL)         \
+    X(_NET_WM_WINDOW_TYPE_UTILITY)        \
+    X(_NET_WM_WINDOW_TYPE_TOOLTIP)        \
+    X(_NET_WM_WINDOW_TYPE_POPUP_MENU)     \
+    X(_NET_WM_WINDOW_TYPE_DIALOG)         \
+    X(_NET_WM_WINDOW_OPACITY)             \
+    X(_NET_WM_ICON)                       \
+    X(_NET_FRAME_EXTENTS)                 \
     X(_NET_WM_BYPASS_COMPOSITOR)          \
     X(_NET_SUPPORTED)                     \
     X(_NET_SUPPORTING_WM_CHECK)           \
@@ -136,6 +151,8 @@ typedef struct X11WindowData
     SDL_Rect saved_rect;
 
     bool want_grab;               /* relative mode: pointer grab pending */
+    bool mouse_grab;              /* SDL_SetWindowMouseGrab: confine wanted */
+    bool keyboard_grab;           /* SDL_SetWindowKeyboardGrab: grab wanted */
 } X11WindowData;
 
 typedef struct X11Monitor
@@ -189,6 +206,15 @@ typedef struct X11DeviceData
     float content_scale;
 
     xcb_cursor_t blank_cursor;
+    xcb_cursor_t current_cursor;  /* what SDL wants shown (blank when hidden) */
+    struct sdlop_xcursor_theme *cursor_theme;
+    bool cursor_theme_tried;
+    bool render_checked;
+    xcb_render_pictformat_t argb_format; /* 0 = no ARGB cursors */
+    SDL_Window *confine_window;   /* pointer grabbed by SDL_SetWindowMouseGrab */
+    SDL_Window *capture_window;   /* pointer grabbed by SDL_CaptureMouse */
+    SDL_Window *keyboard_grab_window;
+    Uint64 screensaver_reset_ns;
     SDL_Window *pointer_focus;
     SDL_Window *relative_window;
     bool pointer_grabbed;
@@ -206,6 +232,7 @@ typedef struct X11DeviceData
 static X11DeviceData x11;
 
 static void x11_dispatch(xcb_generic_event_t *ev);
+static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms);
 static void x11_update_displays(bool send_events);
 
 /* ------------------------------------------------------------------ */
@@ -380,6 +407,27 @@ static void set_size_hints(SDL_Window *window, bool lock_size, bool position)
         h[0] |= X11_HINT_P_MIN_SIZE | X11_HINT_P_MAX_SIZE;
         h[5] = h[7] = (uint32_t)window->w;
         h[6] = h[8] = (uint32_t)window->h;
+    } else if (!(window->flags & SDL_WINDOW_FULLSCREEN)) {
+        /* SDL_SetWindowMinimumSize / MaximumSize / AspectRatio */
+        if (window->min_w || window->min_h) {
+            h[0] |= X11_HINT_P_MIN_SIZE;
+            h[5] = (uint32_t)SDL_max(window->min_w, 1);
+            h[6] = (uint32_t)SDL_max(window->min_h, 1);
+        }
+        if (window->max_w || window->max_h) {
+            h[0] |= X11_HINT_P_MAX_SIZE;
+            h[7] = window->max_w ? (uint32_t)window->max_w : 0x7fffu;
+            h[8] = window->max_h ? (uint32_t)window->max_h : 0x7fffu;
+        }
+        if (window->min_aspect > 0.0f || window->max_aspect > 0.0f) {
+            const float lo = window->min_aspect > 0.0f ? window->min_aspect : 1.0f / 10000.0f;
+            const float hi = window->max_aspect > 0.0f ? window->max_aspect : 10000.0f;
+            h[0] |= X11_HINT_P_ASPECT;
+            h[11] = (uint32_t)SDL_lroundf(lo * 10000.0f);
+            h[12] = 10000;
+            h[13] = (uint32_t)SDL_lroundf(SDL_min(hi, 100000.0f) * 10000.0f);
+            h[14] = 10000;
+        }
     }
     h[17] = XCB_GRAVITY_STATIC;
     set_property(wd->xid, XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_WM_SIZE_HINTS, 32, 18, h);
@@ -413,6 +461,24 @@ static void set_title(SDL_Window *window)
     set_property(wd->xid, XCB_ATOM_WM_ICON_NAME, ascii ? XCB_ATOM_STRING : x11.atom.UTF8_STRING, 8, len, title);
 }
 
+/* ICCCM WM_HINTS: input model (SDL_WINDOW_NOT_FOCUSABLE) and urgency
+ * (SDL_FlashWindow) */
+static void set_wm_hints_urgent(SDL_Window *window, bool urgent)
+{
+    X11WindowData *wd = wdata(window);
+    const bool focusable = !(window->flags & (SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_TOOLTIP));
+    uint32_t wm_hints[9] = { X11_WMHINT_INPUT | X11_WMHINT_STATE, focusable ? 1u : 0u, X11_STATE_NORMAL, 0, 0, 0, 0, 0, 0 };
+    if (urgent) {
+        wm_hints[0] |= X11_WMHINT_URGENCY;
+    }
+    set_property(wd->xid, XCB_ATOM_WM_HINTS, XCB_ATOM_WM_HINTS, 32, 9, wm_hints);
+}
+
+static void set_wm_hints(SDL_Window *window)
+{
+    set_wm_hints_urgent(window, false);
+}
+
 static void set_motif_decorations(SDL_Window *window, bool decorated)
 {
     X11WindowData *wd = wdata(window);
@@ -425,10 +491,20 @@ static void set_motif_decorations(SDL_Window *window, bool decorated)
 static void write_initial_net_wm_state(SDL_Window *window)
 {
     X11WindowData *wd = wdata(window);
-    uint32_t atoms[4];
+    uint32_t atoms[8];
     uint32_t n = 0;
     if (window->flags & SDL_WINDOW_FULLSCREEN) {
         atoms[n++] = x11.atom._NET_WM_STATE_FULLSCREEN;
+    }
+    if (window->flags & SDL_WINDOW_ALWAYS_ON_TOP) {
+        atoms[n++] = x11.atom._NET_WM_STATE_ABOVE;
+    }
+    if (window->flags & (SDL_WINDOW_UTILITY | SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU)) {
+        atoms[n++] = x11.atom._NET_WM_STATE_SKIP_TASKBAR;
+        atoms[n++] = x11.atom._NET_WM_STATE_SKIP_PAGER;
+    }
+    if ((window->flags & SDL_WINDOW_MODAL) && window->parent) {
+        atoms[n++] = x11.atom._NET_WM_STATE_MODAL;
     }
     if (window->flags & SDL_WINDOW_MAXIMIZED) {
         atoms[n++] = x11.atom._NET_WM_STATE_MAXIMIZED_VERT;
@@ -1175,6 +1251,17 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
         sdlop.mouse_has_position = true;
         return;
     }
+    if ((window->flags & SDL_WINDOW_INPUT_FOCUS) && !SDL_RectEmpty(&window->mouse_rect) &&
+        !(window->flags & SDL_WINDOW_MOUSE_CAPTURE)) {
+        /* SDL_SetWindowMouseRect: keep the pointer inside (SDL3 X11 uses
+         * XFixes barriers; warping back has the same visible effect) */
+        const SDL_Rect *r = &window->mouse_rect;
+        int cx = SDL_clamp((int)mev->event_x, r->x, r->x + r->w - 1);
+        int cy = SDL_clamp((int)mev->event_y, r->y, r->y + r->h - 1);
+        if (cx != mev->event_x || cy != mev->event_y) {
+            X11_xcb_warp_pointer(x11.conn, XCB_WINDOW_NONE, mev->event, 0, 0, 0, 0, (int16_t)cx, (int16_t)cy);
+        }
+    }
     SDLOP_SendMouseMotion((float)mev->event_x, (float)mev->event_y, 0.0f, 0.0f, ts);
 }
 
@@ -1649,20 +1736,6 @@ static Uint32 x11_device_next_id(void)
     return ++next_id;
 }
 
-static void push_device_event(Uint32 type, Uint32 which)
-{
-    SDL_Event event;
-    SDL_zero(event);
-    event.type = type;
-    event.common.timestamp = SDL_GetTicksNS();
-    if (type == SDL_EVENT_KEYBOARD_ADDED || type == SDL_EVENT_KEYBOARD_REMOVED) {
-        event.kdevice.which = which;
-    } else {
-        event.mdevice.which = which;
-    }
-    SDLOP_PushEventInternal(&event);
-}
-
 static bool find_visual_format(void)
 {
     x11.visual = x11.screen->root_visual;
@@ -1804,9 +1877,9 @@ static bool x11_Init(SDLop_VideoDevice *device)
     X11_xcb_free_pixmap(x11.conn, pm);
 
     x11.keyboard_id = x11_device_next_id();
-    push_device_event(SDL_EVENT_KEYBOARD_ADDED, x11.keyboard_id);
+    SDLOP_AddKeyboard(x11.keyboard_id, NULL);
     x11.mouse_id = x11_device_next_id();
-    push_device_event(SDL_EVENT_MOUSE_ADDED, x11.mouse_id);
+    SDLOP_AddMouse(x11.mouse_id, NULL);
 
     x11_flush();
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
@@ -1831,6 +1904,9 @@ static void x11_Quit(SDLop_VideoDevice *device)
         if (x11.blank_cursor) {
             X11_xcb_free_cursor(x11.conn, x11.blank_cursor);
         }
+        if (x11.cursor_theme) {
+            sdlop_xcursor_theme_destroy(x11.cursor_theme);
+        }
         X11_xcb_flush(x11.conn);
         X11_xcb_disconnect(x11.conn);
     }
@@ -1842,15 +1918,6 @@ static void x11_Quit(SDLop_VideoDevice *device)
 /* windows                                                             */
 /* ------------------------------------------------------------------ */
 
-static void center_on_primary(SDL_Window *window)
-{
-    if (x11.num_monitors > 0) {
-        const SDL_Rect *r = &x11.monitors[0].rect;
-        window->x = r->x + (r->w - window->w) / 2;
-        window->y = r->y + (r->h - window->h) / 2;
-    }
-}
-
 static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -1859,8 +1926,6 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_OutOfMemory();
     }
     window->driverdata = wd;
-    /* SDL3 places SDL_WINDOWPOS_UNDEFINED windows centered */
-    center_on_primary(window);
     window->display_scale = x11.content_scale;
 
     wd->xid = X11_xcb_generate_id(x11.conn);
@@ -1913,10 +1978,36 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (cl > 0 && cl < (int)sizeof(wm_class) - 1) {
         set_property(wd->xid, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, (uint32_t)cl + 1, wm_class);
     }
-    uint32_t wm_hints[9] = { X11_WMHINT_INPUT | X11_WMHINT_STATE, 1, X11_STATE_NORMAL, 0, 0, 0, 0, 0, 0 };
-    set_property(wd->xid, XCB_ATOM_WM_HINTS, XCB_ATOM_WM_HINTS, 32, 9, wm_hints);
+    set_wm_hints(window);
     xcb_atom_t type = x11.atom._NET_WM_WINDOW_TYPE_NORMAL;
+    if (window->flags & SDL_WINDOW_TOOLTIP) {
+        type = x11.atom._NET_WM_WINDOW_TYPE_TOOLTIP;
+    } else if (window->flags & SDL_WINDOW_POPUP_MENU) {
+        type = x11.atom._NET_WM_WINDOW_TYPE_POPUP_MENU;
+    } else if (window->flags & SDL_WINDOW_UTILITY) {
+        type = x11.atom._NET_WM_WINDOW_TYPE_UTILITY;
+    } else if (window->flags & SDL_WINDOW_MODAL) {
+        type = x11.atom._NET_WM_WINDOW_TYPE_DIALOG;
+    }
     set_property(wd->xid, x11.atom._NET_WM_WINDOW_TYPE, XCB_ATOM_ATOM, 32, 1, &type);
+    if (SDLOP_WINDOW_IS_POPUP(window)) {
+        /* SDL3 X11: popups bypass the WM so they land exactly at the
+         * requested offset and never steal the focus */
+        uint32_t on = 1;
+        X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_OVERRIDE_REDIRECT, &on);
+    }
+    if (window->parent && wdata(window->parent)) {
+        set_property(wd->xid, XCB_ATOM_WM_TRANSIENT_FOR, XCB_ATOM_WINDOW, 32, 1, &wdata(window->parent)->xid);
+    }
+    if (x11.current_cursor) {
+        X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &x11.current_cursor);
+    }
+    /* SDL3 window properties (no Xlib Display here: xcb connection only) */
+    if (!window->props) {
+        window->props = SDL_CreateProperties();
+    }
+    SDL_SetNumberProperty(window->props, SDL_PROP_WINDOW_X11_SCREEN_NUMBER, x11.screen_num);
+    SDL_SetNumberProperty(window->props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, (Sint64)wd->xid);
     set_size_hints(window, size_locked(window), false);
     set_title(window);
     if (window->flags & SDL_WINDOW_BORDERLESS) {
@@ -2001,7 +2092,9 @@ static void x11_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
             legacy_set_fullscreen(window, true);
         }
     }
-    activate_window(window);
+    if (!SDLOP_WINDOW_IS_POPUP(window) && !(window->flags & SDL_WINDOW_NOT_FOCUSABLE)) {
+        activate_window(window);
+    }
     if (window->surface && wd->pixels) {
         fb_present(window, NULL, 0);
     }
@@ -2054,6 +2147,14 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     if (x11.pointer_focus == window) {
         x11.pointer_focus = NULL;
+    }
+    if (x11.confine_window == window || x11.capture_window == window) {
+        X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
+        x11.confine_window = x11.capture_window = NULL;
+    }
+    if (x11.keyboard_grab_window == window) {
+        X11_xcb_ungrab_keyboard(x11.conn, XCB_CURRENT_TIME);
+        x11.keyboard_grab_window = NULL;
     }
     cancel_touches(window);
     if (sdlop.mouse_focus == window) {
@@ -2373,6 +2474,7 @@ static bool x11_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Window
             select_raw_motion(true);
         }
         X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &x11.blank_cursor);
+        x11.confine_window = x11.capture_window = NULL; /* replaced by this grab */
         grab_pointer(window); /* retried on focus/click if the WM holds a grab */
         if (x11.warp_relative) {
             warp_to_center(window);
@@ -2393,8 +2495,8 @@ static bool x11_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Window
     wd->want_grab = false;
     x11.relative_window = NULL;
     x11.warp_relative = false;
-    uint32_t none = XCB_CURSOR_NONE;
-    X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &none);
+    uint32_t cur = x11.current_cursor == x11.blank_cursor ? XCB_CURSOR_NONE : x11.current_cursor;
+    X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &cur);
     /* SDL3: put the visible cursor back where the app thinks it is */
     if (sdlop.mouse_has_position && wd->mapped) {
         X11_xcb_warp_pointer(x11.conn, XCB_WINDOW_NONE, wd->xid, 0, 0, 0, 0, (int16_t)sdlop.mouse_x,
@@ -2402,6 +2504,627 @@ static bool x11_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Window
     }
     x11_flush();
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* SDL 3.4 window management                                           */
+/* ------------------------------------------------------------------ */
+
+static void x11_UpdateSizeHints(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    if (!wdata(window)) {
+        return;
+    }
+    set_size_hints(window, size_locked(window), false);
+    x11_flush();
+}
+
+static void x11_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *window, bool resizable)
+{
+    (void)resizable; /* window->flags already updated */
+    x11_UpdateSizeHints(device, window);
+}
+
+static bool x11_GetWindowBordersSize(SDLop_VideoDevice *device, SDL_Window *window, int *top, int *left, int *bottom, int *right)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    uint32_t *ext = NULL;
+    /* _NET_FRAME_EXTENTS: left, right, top, bottom */
+    if (get_property32(wd->xid, x11.atom._NET_FRAME_EXTENTS, XCB_ATOM_CARDINAL, 4, &ext) == 4) {
+        *left = (int)ext[0];
+        *right = (int)ext[1];
+        *top = (int)ext[2];
+        *bottom = (int)ext[3];
+    }
+    free(ext);
+    return true;
+}
+
+static bool x11_SetWindowOpacity(SDLop_VideoDevice *device, SDL_Window *window, float opacity)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (opacity >= 1.0f) {
+        X11_xcb_delete_property(x11.conn, wd->xid, x11.atom._NET_WM_WINDOW_OPACITY);
+    } else {
+        uint32_t alpha = (uint32_t)((double)opacity * 0xFFFFFFFFu);
+        set_property(wd->xid, x11.atom._NET_WM_WINDOW_OPACITY, XCB_ATOM_CARDINAL, 32, 1, &alpha);
+    }
+    x11_flush();
+    return true;
+}
+
+static bool x11_SetWindowParent(SDLop_VideoDevice *device, SDL_Window *window, SDL_Window *parent)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    X11WindowData *pd = wdata(parent);
+    if (pd) {
+        set_property(wd->xid, XCB_ATOM_WM_TRANSIENT_FOR, XCB_ATOM_WINDOW, 32, 1, &pd->xid);
+    } else {
+        X11_xcb_delete_property(x11.conn, wd->xid, XCB_ATOM_WM_TRANSIENT_FOR);
+    }
+    x11_flush();
+    return true;
+}
+
+static bool x11_SetWindowModal(SDLop_VideoDevice *device, SDL_Window *window, bool modal)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return true;
+    }
+    X11WindowData *pd = modal ? wdata(window->parent) : NULL;
+    if (pd) {
+        set_property(wd->xid, XCB_ATOM_WM_TRANSIENT_FOR, XCB_ATOM_WINDOW, 32, 1, &pd->xid);
+    }
+    request_net_wm_state(window, modal, x11.atom._NET_WM_STATE_MODAL, 0);
+    x11_flush();
+    return true;
+}
+
+static void x11_SetWindowBordered(SDLop_VideoDevice *device, SDL_Window *window, bool bordered)
+{
+    (void)device;
+    set_motif_decorations(window, bordered);
+    x11_flush();
+}
+
+static void x11_SetWindowAlwaysOnTop(SDLop_VideoDevice *device, SDL_Window *window, bool on_top)
+{
+    (void)device;
+    request_net_wm_state(window, on_top, x11.atom._NET_WM_STATE_ABOVE, 0);
+    x11_flush();
+}
+
+static bool x11_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    /* _NET_WM_ICON: width, height, then non-premultiplied ARGB rows */
+    const size_t count = 2 + (size_t)icon->w * (size_t)icon->h;
+    if (count * 4 + 64 > x11.max_request_bytes) {
+        return SDL_SetError("Icon too large for the X server request size");
+    }
+    uint32_t *data = (uint32_t *)malloc(count * 4);
+    if (!data) {
+        return SDL_OutOfMemory();
+    }
+    data[0] = (uint32_t)icon->w;
+    data[1] = (uint32_t)icon->h;
+    for (int y = 0; y < icon->h; ++y) {
+        memcpy(&data[2 + (size_t)y * (size_t)icon->w], (const Uint8 *)icon->pixels + (size_t)y * (size_t)icon->pitch,
+               (size_t)icon->w * 4);
+    }
+    set_property(wd->xid, x11.atom._NET_WM_ICON, XCB_ATOM_CARDINAL, 32, (uint32_t)count, data);
+    free(data);
+    x11_flush();
+    return true;
+}
+
+static bool confine_pointer(SDL_Window *window)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd->mapped) {
+        return false;
+    }
+    xcb_grab_pointer_reply_t *r = X11_xcb_grab_pointer_reply(
+        x11.conn,
+        X11_xcb_grab_pointer(x11.conn, 1, wd->xid,
+                             XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
+                                 XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_ENTER_WINDOW |
+                                 XCB_EVENT_MASK_LEAVE_WINDOW,
+                             XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, wd->xid, XCB_CURSOR_NONE, XCB_CURRENT_TIME),
+        NULL);
+    bool ok = r && r->status == XCB_GRAB_STATUS_SUCCESS;
+    free(r);
+    if (ok) {
+        x11.confine_window = window;
+        x11.capture_window = NULL;
+    }
+    return ok;
+}
+
+static bool x11_SetWindowMouseGrab(SDLop_VideoDevice *device, SDL_Window *window, bool grabbed)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return true;
+    }
+    wd->mouse_grab = grabbed && (window->flags & SDL_WINDOW_MOUSE_GRABBED);
+    if (x11.relative_window == window) {
+        return true; /* the relative-mode grab already confines */
+    }
+    if (wd->mouse_grab) {
+        if (x11.confine_window != window) {
+            /* SDL3 retries for a moment: the WM may still hold its grab
+             * right after mapping/focusing */
+            for (int attempt = 0; attempt < 10 && !confine_pointer(window); ++attempt) {
+                SDL_Delay(10);
+            }
+        }
+    } else if (x11.confine_window == window) {
+        X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
+        x11.confine_window = NULL;
+    }
+    x11_flush();
+    return true;
+}
+
+static bool grab_keyboard(SDL_Window *window)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd->mapped) {
+        return false;
+    }
+    xcb_grab_keyboard_reply_t *r = X11_xcb_grab_keyboard_reply(
+        x11.conn,
+        X11_xcb_grab_keyboard(x11.conn, 1, wd->xid, XCB_CURRENT_TIME, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC),
+        NULL);
+    bool ok = r && r->status == XCB_GRAB_STATUS_SUCCESS;
+    free(r);
+    if (ok) {
+        x11.keyboard_grab_window = window;
+    }
+    return ok;
+}
+
+static bool x11_SetWindowKeyboardGrab(SDLop_VideoDevice *device, SDL_Window *window, bool grabbed)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return true;
+    }
+    wd->keyboard_grab = grabbed;
+    if (grabbed) {
+        if (x11.keyboard_grab_window != window) {
+            grab_keyboard(window);
+        }
+    } else if (x11.keyboard_grab_window == window) {
+        X11_xcb_ungrab_keyboard(x11.conn, XCB_CURRENT_TIME);
+        x11.keyboard_grab_window = NULL;
+    }
+    x11_flush();
+    return true;
+}
+
+static bool x11_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    return true; /* enforced in handle_motion */
+}
+
+static bool x11_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL_FlashOperation operation)
+{
+    (void)device;
+    const bool on = operation != SDL_FLASH_CANCEL;
+    set_wm_hints_urgent(window, on);
+    request_net_wm_state(window, on, x11.atom._NET_WM_STATE_DEMANDS_ATTENTION, 0);
+    x11_flush();
+    return true;
+}
+
+static bool x11_SetWindowFocusable(SDLop_VideoDevice *device, SDL_Window *window, bool focusable)
+{
+    (void)device;
+    (void)focusable; /* window->flags already updated */
+    set_wm_hints(window);
+    x11_flush();
+    return true;
+}
+
+static bool x11_SyncWindow(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)window;
+    x11_flush();
+    x11_sync();
+    x11_PumpEvents(device, -1);
+    return true;
+}
+
+static bool x11_SuspendScreenSaver(SDLop_VideoDevice *device)
+{
+    (void)device;
+    if (sdlop.suspend_screensaver && x11.conn) {
+        x11.screensaver_reset_ns = SDLOP_MonotonicNS();
+        X11_xcb_force_screen_saver(x11.conn, XCB_SCREEN_SAVER_RESET);
+        x11_flush();
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* cursors and pointer                                                 */
+/* ------------------------------------------------------------------ */
+
+static void x11_find_argb_format(void)
+{
+    if (x11.render_checked) {
+        return;
+    }
+    x11.render_checked = true;
+    if (!SDLOP_X11_HaveModule(SDLOP_X11_MOD_RENDER) || getenv("SDLOP_X11_NO_RENDER")) {
+        return;
+    }
+    const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_render_id);
+    if (!ext || !ext->present) {
+        return;
+    }
+    xcb_render_query_pict_formats_reply_t *r = X11_xcb_render_query_pict_formats_reply(
+        x11.conn, X11_xcb_render_query_pict_formats(x11.conn), NULL);
+    if (!r) {
+        return;
+    }
+    for (xcb_render_pictforminfo_iterator_t it = X11_xcb_render_query_pict_formats_formats_iterator(r); it.rem;
+         X11_xcb_render_pictforminfo_next(&it)) {
+        const xcb_render_pictforminfo_t *f = it.data;
+        if (f->type == XCB_RENDER_PICT_TYPE_DIRECT && f->depth == 32 && f->direct.alpha_mask == 0xff &&
+            f->direct.alpha_shift == 24 && f->direct.red_mask == 0xff && f->direct.red_shift == 16 &&
+            f->direct.green_mask == 0xff && f->direct.green_shift == 8 && f->direct.blue_mask == 0xff &&
+            f->direct.blue_shift == 0) {
+            x11.argb_format = f->id;
+            break;
+        }
+    }
+    free(r);
+}
+
+/* ARGB cursor through RENDER (premultiplied, as the server expects) */
+static xcb_cursor_t create_argb_cursor(const Uint32 *argb, int w, int h, int pitch_px, int hot_x, int hot_y)
+{
+    x11_find_argb_format();
+    if (!x11.argb_format || (size_t)w * (size_t)h * 4 + 64 > x11.max_request_bytes) {
+        return XCB_CURSOR_NONE;
+    }
+    uint32_t *pm_data = (uint32_t *)malloc((size_t)w * (size_t)h * 4);
+    if (!pm_data) {
+        return XCB_CURSOR_NONE;
+    }
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const Uint32 p = argb[(size_t)y * (size_t)pitch_px + (size_t)x];
+            const Uint32 a = p >> 24;
+            const Uint32 r = ((p >> 16) & 0xff) * a / 255;
+            const Uint32 g = ((p >> 8) & 0xff) * a / 255;
+            const Uint32 b = (p & 0xff) * a / 255;
+            pm_data[(size_t)y * (size_t)w + (size_t)x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+    xcb_pixmap_t pm = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_pixmap(x11.conn, 32, pm, x11.root, (uint16_t)w, (uint16_t)h);
+    xcb_gcontext_t gc = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_gc(x11.conn, gc, pm, 0, NULL);
+    X11_xcb_put_image(x11.conn, XCB_IMAGE_FORMAT_Z_PIXMAP, pm, gc, (uint16_t)w, (uint16_t)h, 0, 0, 0, 32,
+                      (uint32_t)w * (uint32_t)h * 4, (const uint8_t *)pm_data);
+    X11_xcb_free_gc(x11.conn, gc);
+    free(pm_data);
+    xcb_render_picture_t pic = X11_xcb_generate_id(x11.conn);
+    X11_xcb_render_create_picture(x11.conn, pic, pm, x11.argb_format, 0, NULL);
+    xcb_cursor_t cursor = X11_xcb_generate_id(x11.conn);
+    X11_xcb_render_create_cursor(x11.conn, cursor, pic, (uint16_t)hot_x, (uint16_t)hot_y);
+    X11_xcb_render_free_picture(x11.conn, pic);
+    X11_xcb_free_pixmap(x11.conn, pm);
+    return cursor;
+}
+
+/* two-colour fallback (no RENDER): alpha >= 50% is opaque, light pixels
+ * become white, the rest black (SDL3 X11_CreatePixmapCursor) */
+static xcb_cursor_t create_bitmap_cursor(const Uint32 *argb, int w, int h, int pitch_px, int hot_x, int hot_y)
+{
+    const xcb_setup_t *setup = X11_xcb_get_setup(x11.conn);
+    const int pad = setup->bitmap_format_scanline_pad ? setup->bitmap_format_scanline_pad : 32;
+    const bool msb = setup->bitmap_format_bit_order == XCB_IMAGE_ORDER_MSB_FIRST;
+    const size_t stride = (size_t)(((w + pad - 1) / pad) * pad / 8);
+    uint8_t *src = (uint8_t *)calloc(stride * (size_t)h, 1);
+    uint8_t *mask = (uint8_t *)calloc(stride * (size_t)h, 1);
+    if (!src || !mask) {
+        free(src);
+        free(mask);
+        return XCB_CURSOR_NONE;
+    }
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const Uint32 p = argb[(size_t)y * (size_t)pitch_px + (size_t)x];
+            const uint8_t bit = msb ? (uint8_t)(0x80u >> (x & 7)) : (uint8_t)(1u << (x & 7));
+            const size_t i = (size_t)y * stride + (size_t)(x >> 3);
+            if ((p >> 24) >= 0x80) {
+                mask[i] |= bit;
+                const unsigned lum = ((p >> 16) & 0xff) * 30 + ((p >> 8) & 0xff) * 59 + (p & 0xff) * 11;
+                if (lum >= 128 * 100) {
+                    src[i] |= bit;
+                }
+            }
+        }
+    }
+    xcb_pixmap_t pms = X11_xcb_generate_id(x11.conn);
+    xcb_pixmap_t pmm = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_pixmap(x11.conn, 1, pms, x11.root, (uint16_t)w, (uint16_t)h);
+    X11_xcb_create_pixmap(x11.conn, 1, pmm, x11.root, (uint16_t)w, (uint16_t)h);
+    xcb_gcontext_t gc = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_gc(x11.conn, gc, pms, 0, NULL);
+    X11_xcb_put_image(x11.conn, XCB_IMAGE_FORMAT_XY_BITMAP, pms, gc, (uint16_t)w, (uint16_t)h, 0, 0, 0, 1,
+                      (uint32_t)(stride * (size_t)h), src);
+    X11_xcb_put_image(x11.conn, XCB_IMAGE_FORMAT_XY_BITMAP, pmm, gc, (uint16_t)w, (uint16_t)h, 0, 0, 0, 1,
+                      (uint32_t)(stride * (size_t)h), mask);
+    X11_xcb_free_gc(x11.conn, gc);
+    free(src);
+    free(mask);
+    xcb_cursor_t cursor = X11_xcb_generate_id(x11.conn);
+    /* foreground (source bit 1) white, background black */
+    X11_xcb_create_cursor(x11.conn, cursor, pms, pmm, 0xffff, 0xffff, 0xffff, 0, 0, 0, (uint16_t)hot_x, (uint16_t)hot_y);
+    X11_xcb_free_pixmap(x11.conn, pms);
+    X11_xcb_free_pixmap(x11.conn, pmm);
+    return cursor;
+}
+
+static xcb_cursor_t create_image_cursor(const Uint32 *argb, int w, int h, int pitch_px, int hot_x, int hot_y)
+{
+    xcb_cursor_t c = create_argb_cursor(argb, w, h, pitch_px, hot_x, hot_y);
+    if (!c) {
+        c = create_bitmap_cursor(argb, w, h, pitch_px, hot_x, hot_y);
+    }
+    return c;
+}
+
+static struct sdlop_xcursor_theme *x11_cursor_theme(void)
+{
+    if (!x11.cursor_theme_tried) {
+        x11.cursor_theme_tried = true;
+        int size = (int)(24.0f * (x11.content_scale > 0.0f ? x11.content_scale : 1.0f) + 0.5f);
+        const char *ss = getenv("XCURSOR_SIZE");
+        if (ss) {
+            long v = strtol(ss, NULL, 10);
+            if (v >= 8 && v <= 256) {
+                size = (int)v;
+            }
+        }
+        x11.cursor_theme = sdlop_xcursor_theme_load(getenv("XCURSOR_THEME"), size);
+    }
+    return x11.cursor_theme;
+}
+
+/* glyph from the core "cursor" font (X11/cursorfont.h numbering) */
+static unsigned x11_legacy_cursor_shape(SDL_SystemCursor id)
+{
+    switch (id) {
+    case SDL_SYSTEM_CURSOR_TEXT: return 152;        /* XC_xterm */
+    case SDL_SYSTEM_CURSOR_WAIT: return 150;        /* XC_watch */
+    case SDL_SYSTEM_CURSOR_CROSSHAIR: return 130;   /* XC_tcross */
+    case SDL_SYSTEM_CURSOR_PROGRESS: return 150;    /* XC_watch */
+    case SDL_SYSTEM_CURSOR_NWSE_RESIZE: return 134; /* XC_top_left_corner */
+    case SDL_SYSTEM_CURSOR_NESW_RESIZE: return 136; /* XC_top_right_corner */
+    case SDL_SYSTEM_CURSOR_EW_RESIZE: return 108;   /* XC_sb_h_double_arrow */
+    case SDL_SYSTEM_CURSOR_NS_RESIZE: return 116;   /* XC_sb_v_double_arrow */
+    case SDL_SYSTEM_CURSOR_MOVE: return 52;         /* XC_fleur */
+    case SDL_SYSTEM_CURSOR_NOT_ALLOWED: return 88;  /* XC_pirate */
+    case SDL_SYSTEM_CURSOR_POINTER: return 60;      /* XC_hand2 */
+    case SDL_SYSTEM_CURSOR_NW_RESIZE: return 134;   /* XC_top_left_corner */
+    case SDL_SYSTEM_CURSOR_N_RESIZE: return 138;    /* XC_top_side */
+    case SDL_SYSTEM_CURSOR_NE_RESIZE: return 136;   /* XC_top_right_corner */
+    case SDL_SYSTEM_CURSOR_E_RESIZE: return 96;     /* XC_right_side */
+    case SDL_SYSTEM_CURSOR_SE_RESIZE: return 14;    /* XC_bottom_right_corner */
+    case SDL_SYSTEM_CURSOR_S_RESIZE: return 16;     /* XC_bottom_side */
+    case SDL_SYSTEM_CURSOR_SW_RESIZE: return 12;    /* XC_bottom_left_corner */
+    case SDL_SYSTEM_CURSOR_W_RESIZE: return 70;     /* XC_left_side */
+    default: return 68;                             /* XC_left_ptr */
+    }
+}
+
+static const char *x11_legacy_cursor_name(SDL_SystemCursor id)
+{
+    switch (id) {
+    case SDL_SYSTEM_CURSOR_TEXT: return "xterm";
+    case SDL_SYSTEM_CURSOR_WAIT: return "watch";
+    case SDL_SYSTEM_CURSOR_CROSSHAIR: return "tcross";
+    case SDL_SYSTEM_CURSOR_PROGRESS: return "left_ptr_watch";
+    case SDL_SYSTEM_CURSOR_NWSE_RESIZE: return "top_left_corner";
+    case SDL_SYSTEM_CURSOR_NESW_RESIZE: return "top_right_corner";
+    case SDL_SYSTEM_CURSOR_EW_RESIZE: return "sb_h_double_arrow";
+    case SDL_SYSTEM_CURSOR_NS_RESIZE: return "sb_v_double_arrow";
+    case SDL_SYSTEM_CURSOR_MOVE: return "fleur";
+    case SDL_SYSTEM_CURSOR_NOT_ALLOWED: return "crossed_circle";
+    case SDL_SYSTEM_CURSOR_POINTER: return "hand2";
+    case SDL_SYSTEM_CURSOR_NW_RESIZE: return "top_left_corner";
+    case SDL_SYSTEM_CURSOR_N_RESIZE: return "top_side";
+    case SDL_SYSTEM_CURSOR_NE_RESIZE: return "top_right_corner";
+    case SDL_SYSTEM_CURSOR_E_RESIZE: return "right_side";
+    case SDL_SYSTEM_CURSOR_SE_RESIZE: return "bottom_right_corner";
+    case SDL_SYSTEM_CURSOR_S_RESIZE: return "bottom_side";
+    case SDL_SYSTEM_CURSOR_SW_RESIZE: return "bottom_left_corner";
+    case SDL_SYSTEM_CURSOR_W_RESIZE: return "left_side";
+    default: return "left_ptr";
+    }
+}
+
+static xcb_cursor_t create_system_cursor(SDL_SystemCursor id)
+{
+    /* themed first (SDL3: XcursorLibraryLoadCursor with the CSS name,
+     * its fallback, then the legacy X name), core font glyph last */
+    struct sdlop_xcursor_theme *theme = x11_cursor_theme();
+    if (theme) {
+        const char *fallback = NULL;
+        const char *names[3];
+        names[0] = SDLOP_GetCSSCursorName(id, &fallback);
+        names[1] = fallback;
+        names[2] = x11_legacy_cursor_name(id);
+        for (int i = 0; i < 3; ++i) {
+            struct sdlop_xcursor *xc = names[i] ? sdlop_xcursor_theme_get_cursor(theme, names[i]) : NULL;
+            if (xc && xc->image_count > 0) {
+                const struct sdlop_xcursor_image *img = xc->images[0];
+                xcb_cursor_t c = create_argb_cursor((const Uint32 *)img->buffer, (int)img->width, (int)img->height,
+                                                    (int)img->width, (int)SDL_min(img->hotspot_x, img->width - 1),
+                                                    (int)SDL_min(img->hotspot_y, img->height - 1));
+                if (c) {
+                    return c;
+                }
+                break;
+            }
+        }
+    }
+    const unsigned shape = x11_legacy_cursor_shape(id);
+    xcb_font_t font = X11_xcb_generate_id(x11.conn);
+    X11_xcb_open_font(x11.conn, font, 6, "cursor");
+    xcb_cursor_t c = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_glyph_cursor(x11.conn, c, font, font, (uint16_t)shape, (uint16_t)(shape + 1), 0, 0, 0, 0xffff,
+                                0xffff, 0xffff);
+    X11_xcb_close_font(x11.conn, font);
+    return c;
+}
+
+static bool x11_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    xcb_cursor_t c;
+    if (cursor->surface) {
+        SDL_Surface *s = cursor->surface; /* ARGB8888 */
+        c = create_image_cursor((const Uint32 *)s->pixels, s->w, s->h, s->pitch / 4, cursor->hot_x, cursor->hot_y);
+    } else {
+        c = create_system_cursor(cursor->system_id);
+    }
+    if (!c) {
+        return SDL_SetError("Couldn't create X11 cursor");
+    }
+    cursor->internal = (void *)(uintptr_t)c;
+    x11_flush();
+    return true;
+}
+
+static void x11_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    xcb_cursor_t c = (xcb_cursor_t)(uintptr_t)cursor->internal;
+    if (c && x11.conn) {
+        if (x11.current_cursor == c) {
+            x11.current_cursor = XCB_CURSOR_NONE;
+        }
+        X11_xcb_free_cursor(x11.conn, c);
+        x11_flush();
+    }
+    cursor->internal = NULL;
+}
+
+static bool x11_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    xcb_cursor_t c = cursor ? (xcb_cursor_t)(uintptr_t)cursor->internal : x11.blank_cursor;
+    x11.current_cursor = c;
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        X11WindowData *wd = wdata(w);
+        if (!wd) {
+            continue;
+        }
+        uint32_t v = (x11.relative_window == w) ? x11.blank_cursor : c;
+        X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &v);
+    }
+    x11_flush();
+    return true;
+}
+
+static bool x11_WarpMouse(SDLop_VideoDevice *device, SDL_Window *window, float x, float y)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return false;
+    }
+    X11_xcb_warp_pointer(x11.conn, XCB_WINDOW_NONE, wd->xid, 0, 0, 0, 0, (int16_t)SDL_lroundf(x),
+                         (int16_t)SDL_lroundf(y));
+    x11_flush();
+    return true;
+}
+
+static bool x11_WarpMouseGlobal(SDLop_VideoDevice *device, float x, float y)
+{
+    (void)device;
+    X11_xcb_warp_pointer(x11.conn, XCB_WINDOW_NONE, x11.root, 0, 0, 0, 0, (int16_t)SDL_lroundf(x),
+                         (int16_t)SDL_lroundf(y));
+    x11_flush();
+    return true;
+}
+
+static bool x11_CaptureMouse(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    if (window) {
+        X11WindowData *wd = wdata(window);
+        if (!wd || x11.pointer_grabbed || x11.confine_window) {
+            return true; /* an existing grab already delivers everything */
+        }
+        if (x11.capture_window == window) {
+            return true;
+        }
+        xcb_grab_pointer_reply_t *r = X11_xcb_grab_pointer_reply(
+            x11.conn,
+            X11_xcb_grab_pointer(x11.conn, 1, wd->xid,
+                                 XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
+                                     XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_ENTER_WINDOW |
+                                     XCB_EVENT_MASK_LEAVE_WINDOW,
+                                 XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_WINDOW_NONE, XCB_CURSOR_NONE,
+                                 XCB_CURRENT_TIME),
+            NULL);
+        bool ok = r && r->status == XCB_GRAB_STATUS_SUCCESS;
+        free(r);
+        if (!ok) {
+            return SDL_SetError("Failed to capture the mouse");
+        }
+        x11.capture_window = window;
+    } else if (x11.capture_window) {
+        X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
+        x11.capture_window = NULL;
+    }
+    x11_flush();
+    return true;
+}
+
+static SDL_MouseButtonFlags x11_GetGlobalMouseState(SDLop_VideoDevice *device, float *x, float *y)
+{
+    (void)device;
+    SDL_MouseButtonFlags buttons = 0;
+    xcb_query_pointer_reply_t *r =
+        X11_xcb_query_pointer_reply(x11.conn, X11_xcb_query_pointer(x11.conn, x11.root), NULL);
+    if (r) {
+        *x = (float)r->root_x;
+        *y = (float)r->root_y;
+        if (r->mask & XCB_BUTTON_MASK_1) {
+            buttons |= SDL_BUTTON_LMASK;
+        }
+        if (r->mask & XCB_BUTTON_MASK_2) {
+            buttons |= SDL_BUTTON_MMASK;
+        }
+        if (r->mask & XCB_BUTTON_MASK_3) {
+            buttons |= SDL_BUTTON_RMASK;
+        }
+        free(r);
+    }
+    /* X1/X2 are not in the core mask; use what SDL has seen */
+    buttons |= sdlop.mouse_buttons & (SDL_BUTTON_X1MASK | SDL_BUTTON_X2MASK);
+    return buttons;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2556,6 +3279,12 @@ static void x11_dispatch(xcb_generic_event_t *ev)
             if (x11.relative_window == window && !x11.pointer_grabbed && wd->want_grab) {
                 grab_pointer(window);
             }
+            if (wd->mouse_grab && x11.confine_window != window && x11.relative_window != window) {
+                confine_pointer(window);
+            }
+            if (wd->keyboard_grab && x11.keyboard_grab_window != window) {
+                grab_keyboard(window);
+            }
         } else if (sdlop.keyboard_focus == window) {
             set_keyboard_focus(NULL);
         }
@@ -2702,6 +3431,14 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         x11.displays_dirty = false;
         x11_update_displays(true);
     }
+    if (sdlop.suspend_screensaver) {
+        /* SDL3 X11: XResetScreenSaver every 30 s while inhibited */
+        Uint64 now = SDLOP_MonotonicNS();
+        if (now - x11.screensaver_reset_ns >= 30ull * 1000000000ull) {
+            x11.screensaver_reset_ns = now;
+            X11_xcb_force_screen_saver(x11.conn, XCB_SCREEN_SAVER_RESET);
+        }
+    }
     X11_xcb_flush(x11.conn);
     SDLOP_KeyboardProcessRepeats();
 }
@@ -2756,4 +3493,30 @@ SDLop_VideoDevice SDLop_x11_device = {
 
     /* optional hooks */
     .Vulkan_GetPresentationSupport = SDLOP_X11_Vulkan_GetPresentationSupport,
+    .supports_popups = true,
+    .SetWindowMinimumSize = x11_UpdateSizeHints,
+    .SetWindowMaximumSize = x11_UpdateSizeHints,
+    .SetWindowAspectRatio = x11_UpdateSizeHints,
+    .GetWindowBordersSize = x11_GetWindowBordersSize,
+    .SetWindowOpacity = x11_SetWindowOpacity,
+    .SetWindowParent = x11_SetWindowParent,
+    .SetWindowModal = x11_SetWindowModal,
+    .SetWindowBordered = x11_SetWindowBordered,
+    .SetWindowResizable = x11_SetWindowResizable,
+    .SetWindowAlwaysOnTop = x11_SetWindowAlwaysOnTop,
+    .SetWindowIcon = x11_SetWindowIcon,
+    .SetWindowMouseGrab = x11_SetWindowMouseGrab,
+    .SetWindowKeyboardGrab = x11_SetWindowKeyboardGrab,
+    .SetWindowMouseRect = x11_SetWindowMouseRect,
+    .FlashWindow = x11_FlashWindow,
+    .SyncWindow = x11_SyncWindow,
+    .SetWindowFocusable = x11_SetWindowFocusable,
+    .SuspendScreenSaver = x11_SuspendScreenSaver,
+    .CreateCursor = x11_CreateCursor,
+    .FreeCursor = x11_FreeCursor,
+    .ShowCursor = x11_ShowCursor,
+    .WarpMouse = x11_WarpMouse,
+    .WarpMouseGlobal = x11_WarpMouseGlobal,
+    .CaptureMouse = x11_CaptureMouse,
+    .GetGlobalMouseState = x11_GetGlobalMouseState,
 };
