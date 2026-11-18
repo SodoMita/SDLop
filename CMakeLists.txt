@@ -343,7 +343,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
@@ -405,6 +405,17 @@ if(SDLop_BUILD_TESTS)
       set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
       set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
         "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none")
+    endif()
+    # keyboard layouts end-to-end (setxkbmap + XKB group locking; the test
+    # restores the server layout). Skips where the keymap cannot be set.
+    pkg_check_modules(X11_LAYOUT_DEPS xcb xcb-xtest xcb-xkb)
+    if(X11_LAYOUT_DEPS_FOUND)
+      add_executable(test_x11_layout tests/test_x11_layout.c)
+      target_link_libraries(test_x11_layout PRIVATE sdlop ${X11_LAYOUT_DEPS_LIBRARIES})
+      target_include_directories(test_x11_layout PRIVATE ${X11_LAYOUT_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_layout PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_layout COMMAND test_x11_layout)
+      set_tests_properties(test_x11_layout PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
     endif()
   endif()
 

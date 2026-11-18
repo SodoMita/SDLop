@@ -33,6 +33,7 @@ jobs:
             libvulkan-dev mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri \
             libxcb1-dev libxcb-shm0-dev libxcb-xkb-dev libxcb-xinput-dev \
             libxcb-randr0-dev libxcb-xtest0-dev libx11-6 \
+            xkb-data libx11-data x11-xkb-utils \
             xvfb xauth openbox
 
       - name: Fetch SDL 3.2.10 reference headers (abi_check)
@@ -63,6 +64,9 @@ jobs:
         env:
           XDG_RUNTIME_DIR: /tmp/xdg
           LIBGL_ALWAYS_SOFTWARE: '1'
+          # layout/compose tests fail instead of skipping without xkb-data,
+          # libx11-data (Compose) or setxkbmap
+          SDLOP_TEST_STRICT: '1'
         run: |
           mkdir -p -m 700 "$XDG_RUNTIME_DIR"
           Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp +extension RANDR +extension MIT-SHM &

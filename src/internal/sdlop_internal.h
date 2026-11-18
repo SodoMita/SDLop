@@ -236,6 +236,8 @@ void SDLOP_KeyboardProcessRepeats(void);
 void SDLOP_KeyboardQuit(void);
 /* Resolve scancode (evdev raw code) -> SDL_Keycode + text using xkb.
  * Returns the keycode; fills text_utf8 (may write "") when non-NULL. */
+/* SDL_GetKeyName helper: the printed (capital) form of a keycode */
+SDL_Keycode SDLOP_KeyboardKeyNameCapital(SDL_Keycode key);
 SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out);
 
 /* Raw input worker (evdev), implemented in sdlop_evdev.c */

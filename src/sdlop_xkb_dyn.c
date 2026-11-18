@@ -13,6 +13,7 @@
 
 #define SDLOP_XKB_SYM(rc, fn, params) SDLOP_DYNXKB_##fn SDLOP_XKB_##fn = NULL;
 #include "internal/sdlop_xkb_sym.h"
+#include "internal/sdlop_xkb_opt_sym.h"
 #undef SDLOP_XKB_SYM
 
 static void *xkb_lib = NULL;
@@ -51,11 +52,17 @@ bool SDLOP_Xkb_LoadSymbols(void)
         /* leave no pointers into the closed library */
 #define SDLOP_XKB_SYM(rc, fn, params) SDLOP_XKB_##fn = NULL;
 #include "internal/sdlop_xkb_sym.h"
+#include "internal/sdlop_xkb_opt_sym.h"
 #undef SDLOP_XKB_SYM
         dlclose(xkb_lib);
         xkb_lib = NULL;
         return false; /* error already set: first missing symbol */
     }
+    /* optional symbols: each may be missing */
+#define SDLOP_XKB_SYM(rc, fn, params) \
+    SDLOP_XKB_##fn = (SDLOP_DYNXKB_##fn)(uintptr_t)dlsym(xkb_lib, #fn);
+#include "internal/sdlop_xkb_opt_sym.h"
+#undef SDLOP_XKB_SYM
     xkb_load_refcount = 1;
     return true;
 }
@@ -68,7 +75,16 @@ void SDLOP_Xkb_UnloadSymbols(void)
     xkb_load_refcount = 0;
 #define SDLOP_XKB_SYM(rc, fn, params) SDLOP_XKB_##fn = NULL;
 #include "internal/sdlop_xkb_sym.h"
+#include "internal/sdlop_xkb_opt_sym.h"
 #undef SDLOP_XKB_SYM
     dlclose(xkb_lib);
     xkb_lib = NULL;
+}
+
+bool SDLOP_Xkb_HaveCompose(void)
+{
+    return SDLOP_XKB_xkb_compose_table_new_from_locale && SDLOP_XKB_xkb_compose_table_unref &&
+           SDLOP_XKB_xkb_compose_state_new && SDLOP_XKB_xkb_compose_state_unref &&
+           SDLOP_XKB_xkb_compose_state_feed && SDLOP_XKB_xkb_compose_state_reset &&
+           SDLOP_XKB_xkb_compose_state_get_status && SDLOP_XKB_xkb_compose_state_get_utf8;
 }

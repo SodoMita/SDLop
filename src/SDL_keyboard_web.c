@@ -311,6 +311,12 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
     return resolve(scancode, modstate, key_event, NULL, 0);
 }
 
+/* static US keymap: only ASCII letters have capitals */
+SDL_Keycode SDLOP_KeyboardKeyNameCapital(SDL_Keycode key)
+{
+    return (key >= 'a' && key <= 'z') ? key - 'a' + 'A' : key;
+}
+
 SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
 {
     if (modstate) {
@@ -333,7 +339,7 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
             const struct keyent *e = &key_table[i];
             if (e->base && (e->base == ch || e->shifted == ch)) {
                 if (modstate && e->shifted == ch && e->base != ch) {
-                    *modstate = SDL_KMOD_LSHIFT;
+                    *modstate = SDL_KMOD_SHIFT; /* SDL3 default keymap */
                 }
                 return e->sc;
             }

@@ -301,8 +301,19 @@ Highlights:
   Content scale follows `SDL_VIDEO_X11_SCALING_FACTOR`, `Xft.dpi`, then
   `GDK_SCALE`. GL goes through EGL (`EGL_PLATFORM_XCB_EXT`, else
   `EGL_PLATFORM_X11_EXT` on a private Xlib connection; GLX is not used).
-  `SDLOP_X11_NO_SHM=1` disables MIT-SHM. No IME/XIM yet (text comes from
-  xkbcommon).
+  `SDLOP_X11_NO_SHM=1` disables MIT-SHM. Layout switches (`setxkbmap`, XKB
+  group changes) are followed live and reported as
+  `SDL_EVENT_KEYMAP_CHANGED`; without libxcb-xkb only full keymap changes
+  are seen, not group switches.
+- Keyboard layouts (Wayland, X11, evdev): keycodes follow the active xkb
+  layout with SDL3's rules: `SDL_EVENT_KEY_DOWN` carries the unshifted key,
+  non-Latin layouts (ru, el, ...) keep the US-QWERTY letter keycodes, and
+  AZERTY keeps `SDLK_1`... on the number row while
+  `SDL_GetKeyFromScancode(..., false)` reports the layout's symbol
+  (`й`, `&`, `é`...). Dead keys and the Compose key are composed into text via
+  xkbcommon's compose tables (locale from `LC_ALL`, `LC_CTYPE`, `LANG`, else
+  `C`; needs libxkbcommon >= 0.5 and the X11 Compose data, otherwise text is
+  emitted uncomposed). No IME (XIM / text-input-v3) yet.
 - Relative mouse mode uses real pointer lock (`zwp_pointer_constraints` +
   `zwp_relative_pointer`) on Wayland when the compositor has a seat/pointer,
   and raw evdev deltas when the worker thread is active; the window-system

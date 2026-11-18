@@ -94,7 +94,7 @@ static void test_keymap_table(void)
           "escape -> SDLK_ESCAPE");
     CHECK(SDL_GetScancodeFromKey(SDLK_W, NULL) == SDL_SCANCODE_W, "key -> scancode");
     SDL_Keymod m = SDL_KMOD_NONE;
-    CHECK(SDL_GetScancodeFromKey(SDLK_AT, &m) == SDL_SCANCODE_2 && m == SDL_KMOD_LSHIFT,
+    CHECK(SDL_GetScancodeFromKey(SDLK_AT, &m) == SDL_SCANCODE_2 && m == SDL_KMOD_SHIFT,
           "@ -> 2 + shift");
 
     /* names */

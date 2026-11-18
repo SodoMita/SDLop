@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-compose.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,8 +25,12 @@ extern void SDLOP_Xkb_UnloadSymbols(void);
     extern SDLOP_DYNXKB_##fn SDLOP_XKB_##fn;
 
 #include "sdlop_xkb_sym.h"
+#include "sdlop_xkb_opt_sym.h" /* optional: may stay NULL */
 
 #undef SDLOP_XKB_SYM
+
+/* true when the optional compose API was found */
+extern bool SDLOP_Xkb_HaveCompose(void);
 
 #ifdef __cplusplus
 }

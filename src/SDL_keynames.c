@@ -154,11 +154,8 @@ const char *SDL_GetKeyName(SDL_Keycode key)
     }
 
     /* a keycode is the unshifted key; the NAME is the printed letter, usually
-       the shifted capital (stock SDL_GetKeyName). ASCII case here; non-ASCII
-       capitalization would need the active keymap, which stock consults. */
-    if (key >= 'a' && key <= 'z') {
-        key += 'A' - 'a';
-    }
+       the shifted capital, looked up on the active keymap (stock) */
+    key = SDLOP_KeyboardKeyNameCapital(key);
     if (key > 0 && key < 0x110000) {
         char name[8];
         ucs4_to_utf8((Uint32)key, name);
