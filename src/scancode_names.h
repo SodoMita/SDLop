@@ -1,4 +1,4 @@
-/* Generated from libSDL3 3.2.10 - exact SDL3 scancode names. */
+/* Generated from libSDL3 3.2.10 (unchanged in 3.4.20) - exact SDL3 scancode names. */
 #ifndef scancode_names_h_
 #define scancode_names_h_
 

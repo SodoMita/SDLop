@@ -231,10 +231,13 @@ bool SDL_GL_SwapWindow(SDL_Window *window)
     return true;
 }
 
-void SDL_GL_DestroyContext(SDL_GLContext context)
+bool SDL_GL_DestroyContext(SDL_GLContext context)
 {
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem has not been initialized");
+    }
     if (!context) {
-        return;
+        return SDL_InvalidParamError("context");
     }
     if (current_context == context) {
         current_context = NULL;
@@ -243,4 +246,5 @@ void SDL_GL_DestroyContext(SDL_GLContext context)
     if (sdlop.video && sdlop.video->GL_DeleteContext) {
         sdlop.video->GL_DeleteContext(sdlop.video, context);
     }
+    return true;
 }

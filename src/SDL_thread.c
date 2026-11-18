@@ -1,0 +1,803 @@
+/*
+  SDLop - atomics, mutexes, threads and thread-local storage
+  (SDL_atomic.h, SDL_mutex.h, SDL_thread.h).
+
+  Thin POSIX/C11 implementations with SDL 3.4.20 semantics (ported from
+  SDL3's src/thread/pthread and src/atomic):
+    - SDL_Mutex is recursive; every lock/unlock accepts NULL as a no-op;
+    - timeouts are in milliseconds, < 0 waits forever, 0 polls;
+    - SDL_SetTLS() IDs are allocated lazily from a global counter and
+      destructors run when the thread exits (any thread, not only SDL ones)
+      or on SDL_CleanupTLS();
+    - SDL_SetCurrentThreadPriority() maps to nice values (19/0/-10/-20) or
+      SCHED_RR when SDL_HINT_THREAD_FORCE_REALTIME_TIME_CRITICAL is set.
+      There is no RealtimeKit fallback.
+
+  Copyright (C) 1997-2026 Sam Lantinga (SDL3 parts), zlib license.
+
+  This software is provided 'as-is', without any express or implied
+  warranty (zlib license, see LICENSE).
+*/
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include "internal/sdlop_internal.h"
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ------------------------------------------------------------------ */
+/* Atomics                                                             */
+/* ------------------------------------------------------------------ */
+
+/* SDL_AtomicInt/U32 are { int value; } / { Uint32 value; }: operate on
+ * the member through the GCC/Clang __atomic builtins (seq_cst, like SDL3) */
+
+bool SDL_CompareAndSwapAtomicInt(SDL_AtomicInt *a, int oldval, int newval)
+{
+    return __atomic_compare_exchange_n(&a->value, &oldval, newval, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+int SDL_SetAtomicInt(SDL_AtomicInt *a, int v)
+{
+    return __atomic_exchange_n(&a->value, v, __ATOMIC_SEQ_CST);
+}
+
+int SDL_GetAtomicInt(SDL_AtomicInt *a)
+{
+    return __atomic_load_n(&a->value, __ATOMIC_SEQ_CST);
+}
+
+int SDL_AddAtomicInt(SDL_AtomicInt *a, int v)
+{
+    return __atomic_fetch_add(&a->value, v, __ATOMIC_SEQ_CST);
+}
+
+bool SDL_CompareAndSwapAtomicU32(SDL_AtomicU32 *a, Uint32 oldval, Uint32 newval)
+{
+    return __atomic_compare_exchange_n(&a->value, &oldval, newval, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+Uint32 SDL_SetAtomicU32(SDL_AtomicU32 *a, Uint32 v)
+{
+    return __atomic_exchange_n(&a->value, v, __ATOMIC_SEQ_CST);
+}
+
+Uint32 SDL_GetAtomicU32(SDL_AtomicU32 *a)
+{
+    return __atomic_load_n(&a->value, __ATOMIC_SEQ_CST);
+}
+
+Uint32 SDL_AddAtomicU32(SDL_AtomicU32 *a, int v)
+{
+    return __atomic_fetch_add(&a->value, (Uint32)v, __ATOMIC_SEQ_CST);
+}
+
+bool SDL_CompareAndSwapAtomicPointer(void **a, void *oldval, void *newval)
+{
+    return __atomic_compare_exchange_n(a, &oldval, newval, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+void *SDL_SetAtomicPointer(void **a, void *v)
+{
+    return __atomic_exchange_n(a, v, __ATOMIC_SEQ_CST);
+}
+
+void *SDL_GetAtomicPointer(void **a)
+{
+    return __atomic_load_n(a, __ATOMIC_SEQ_CST);
+}
+
+void SDL_MemoryBarrierReleaseFunction(void)
+{
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+void SDL_MemoryBarrierAcquireFunction(void)
+{
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+}
+
+bool SDL_TryLockSpinlock(SDL_SpinLock *lock)
+{
+    return __atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE) == 0;
+}
+
+void SDL_LockSpinlock(SDL_SpinLock *lock)
+{
+    int iterations = 0;
+    while (!SDL_TryLockSpinlock(lock)) {
+        if (iterations < 32) {
+            iterations++;
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+        } else {
+            sched_yield(); /* give the owner a chance to run */
+        }
+    }
+}
+
+void SDL_UnlockSpinlock(SDL_SpinLock *lock)
+{
+    __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+}
+
+/* ------------------------------------------------------------------ */
+/* Mutex / RW lock / semaphore / condition                             */
+/* ------------------------------------------------------------------ */
+
+struct SDL_Mutex
+{
+    pthread_mutex_t id;
+};
+
+struct SDL_RWLock
+{
+    pthread_rwlock_t id;
+};
+
+struct SDL_Semaphore
+{
+    sem_t sem;
+};
+
+struct SDL_Condition
+{
+    pthread_cond_t cond;
+};
+
+SDL_Mutex *SDL_CreateMutex(void)
+{
+    SDL_Mutex *mutex = (SDL_Mutex *)SDL_calloc(1, sizeof(*mutex));
+    if (!mutex) {
+        return NULL;
+    }
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    if (pthread_mutex_init(&mutex->id, &attr) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        SDL_SetError("pthread_mutex_init() failed");
+        SDL_free(mutex);
+        return NULL;
+    }
+    pthread_mutexattr_destroy(&attr);
+    return mutex;
+}
+
+void SDL_DestroyMutex(SDL_Mutex *mutex)
+{
+    if (mutex) {
+        pthread_mutex_destroy(&mutex->id);
+        SDL_free(mutex);
+    }
+}
+
+void SDL_LockMutex(SDL_Mutex *mutex)
+{
+    if (mutex) {
+        pthread_mutex_lock(&mutex->id);
+    }
+}
+
+bool SDL_TryLockMutex(SDL_Mutex *mutex)
+{
+    if (!mutex) {
+        return true;
+    }
+    return pthread_mutex_trylock(&mutex->id) == 0;
+}
+
+void SDL_UnlockMutex(SDL_Mutex *mutex)
+{
+    if (mutex) {
+        pthread_mutex_unlock(&mutex->id);
+    }
+}
+
+SDL_RWLock *SDL_CreateRWLock(void)
+{
+    SDL_RWLock *rw = (SDL_RWLock *)SDL_calloc(1, sizeof(*rw));
+    if (!rw) {
+        return NULL;
+    }
+    if (pthread_rwlock_init(&rw->id, NULL) != 0) {
+        SDL_SetError("pthread_rwlock_init() failed");
+        SDL_free(rw);
+        return NULL;
+    }
+    return rw;
+}
+
+void SDL_DestroyRWLock(SDL_RWLock *rwlock)
+{
+    if (rwlock) {
+        pthread_rwlock_destroy(&rwlock->id);
+        SDL_free(rwlock);
+    }
+}
+
+void SDL_LockRWLockForReading(SDL_RWLock *rwlock)
+{
+    if (rwlock) {
+        pthread_rwlock_rdlock(&rwlock->id);
+    }
+}
+
+void SDL_LockRWLockForWriting(SDL_RWLock *rwlock)
+{
+    if (rwlock) {
+        pthread_rwlock_wrlock(&rwlock->id);
+    }
+}
+
+bool SDL_TryLockRWLockForReading(SDL_RWLock *rwlock)
+{
+    return !rwlock || pthread_rwlock_tryrdlock(&rwlock->id) == 0;
+}
+
+bool SDL_TryLockRWLockForWriting(SDL_RWLock *rwlock)
+{
+    return !rwlock || pthread_rwlock_trywrlock(&rwlock->id) == 0;
+}
+
+void SDL_UnlockRWLock(SDL_RWLock *rwlock)
+{
+    if (rwlock) {
+        pthread_rwlock_unlock(&rwlock->id);
+    }
+}
+
+SDL_Semaphore *SDL_CreateSemaphore(Uint32 initial_value)
+{
+    SDL_Semaphore *sem = (SDL_Semaphore *)SDL_malloc(sizeof(*sem));
+    if (!sem) {
+        return NULL;
+    }
+    if (sem_init(&sem->sem, 0, initial_value) < 0) {
+        SDL_SetError("sem_init() failed");
+        SDL_free(sem);
+        return NULL;
+    }
+    return sem;
+}
+
+void SDL_DestroySemaphore(SDL_Semaphore *sem)
+{
+    if (sem) {
+        sem_destroy(&sem->sem);
+        SDL_free(sem);
+    }
+}
+
+static void abs_timeout(clockid_t clock, Sint64 timeout_ns, struct timespec *ts)
+{
+    clock_gettime(clock, ts);
+    ts->tv_sec += (time_t)(timeout_ns / 1000000000);
+    ts->tv_nsec += (long)(timeout_ns % 1000000000);
+    while (ts->tv_nsec >= 1000000000) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= 1000000000;
+    }
+}
+
+bool SDL_WaitSemaphoreTimeout(SDL_Semaphore *sem, Sint32 timeoutMS)
+{
+    if (!sem) {
+        return true;
+    }
+    if (timeoutMS == 0) {
+        return sem_trywait(&sem->sem) == 0;
+    }
+    int rc;
+    if (timeoutMS < 0) {
+        do {
+            rc = sem_wait(&sem->sem);
+        } while (rc < 0 && errno == EINTR);
+        return rc == 0;
+    }
+    struct timespec ts;
+    abs_timeout(CLOCK_MONOTONIC, (Sint64)timeoutMS * 1000000, &ts);
+    do {
+        rc = sem_clockwait(&sem->sem, CLOCK_MONOTONIC, &ts);
+    } while (rc < 0 && errno == EINTR);
+    return rc == 0;
+}
+
+void SDL_WaitSemaphore(SDL_Semaphore *sem)
+{
+    SDL_WaitSemaphoreTimeout(sem, -1);
+}
+
+bool SDL_TryWaitSemaphore(SDL_Semaphore *sem)
+{
+    return SDL_WaitSemaphoreTimeout(sem, 0);
+}
+
+void SDL_SignalSemaphore(SDL_Semaphore *sem)
+{
+    if (sem) {
+        sem_post(&sem->sem);
+    }
+}
+
+Uint32 SDL_GetSemaphoreValue(SDL_Semaphore *sem)
+{
+    int value = 0;
+    if (sem) {
+        sem_getvalue(&sem->sem, &value);
+    }
+    return value < 0 ? 0 : (Uint32)value;
+}
+
+SDL_Condition *SDL_CreateCondition(void)
+{
+    SDL_Condition *cond = (SDL_Condition *)SDL_calloc(1, sizeof(*cond));
+    if (!cond) {
+        return NULL;
+    }
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (pthread_cond_init(&cond->cond, &attr) != 0) {
+        pthread_condattr_destroy(&attr);
+        SDL_SetError("pthread_cond_init() failed");
+        SDL_free(cond);
+        return NULL;
+    }
+    pthread_condattr_destroy(&attr);
+    return cond;
+}
+
+void SDL_DestroyCondition(SDL_Condition *cond)
+{
+    if (cond) {
+        pthread_cond_destroy(&cond->cond);
+        SDL_free(cond);
+    }
+}
+
+void SDL_SignalCondition(SDL_Condition *cond)
+{
+    if (cond) {
+        pthread_cond_signal(&cond->cond);
+    }
+}
+
+void SDL_BroadcastCondition(SDL_Condition *cond)
+{
+    if (cond) {
+        pthread_cond_broadcast(&cond->cond);
+    }
+}
+
+bool SDL_WaitConditionTimeout(SDL_Condition *cond, SDL_Mutex *mutex, Sint32 timeoutMS)
+{
+    if (!cond || !mutex) {
+        return true;
+    }
+    if (timeoutMS < 0) {
+        return pthread_cond_wait(&cond->cond, &mutex->id) == 0;
+    }
+    struct timespec ts;
+    abs_timeout(CLOCK_MONOTONIC, (Sint64)timeoutMS * 1000000, &ts);
+    int rc;
+    do {
+        rc = pthread_cond_timedwait(&cond->cond, &mutex->id, &ts);
+    } while (rc == EINTR);
+    return rc != ETIMEDOUT;
+}
+
+void SDL_WaitCondition(SDL_Condition *cond, SDL_Mutex *mutex)
+{
+    SDL_WaitConditionTimeout(cond, mutex, -1);
+}
+
+/* ------------------------------------------------------------------ */
+/* SDL_InitState                                                       */
+/* ------------------------------------------------------------------ */
+
+bool SDL_ShouldInit(SDL_InitState *state)
+{
+    while (SDL_GetAtomicInt(&state->status) != SDL_INIT_STATUS_INITIALIZED) {
+        if (SDL_CompareAndSwapAtomicInt(&state->status, SDL_INIT_STATUS_UNINITIALIZED, SDL_INIT_STATUS_INITIALIZING)) {
+            state->thread = SDL_GetCurrentThreadID();
+            return true;
+        }
+        SDL_Delay(1); /* another thread is mid-transition */
+    }
+    return false;
+}
+
+bool SDL_ShouldQuit(SDL_InitState *state)
+{
+    while (SDL_GetAtomicInt(&state->status) != SDL_INIT_STATUS_UNINITIALIZED) {
+        if (SDL_CompareAndSwapAtomicInt(&state->status, SDL_INIT_STATUS_INITIALIZED, SDL_INIT_STATUS_UNINITIALIZING)) {
+            state->thread = SDL_GetCurrentThreadID();
+            return true;
+        }
+        SDL_Delay(1);
+    }
+    return false;
+}
+
+void SDL_SetInitialized(SDL_InitState *state, bool initialized)
+{
+    SDL_SetAtomicInt(&state->status, initialized ? SDL_INIT_STATUS_INITIALIZED : SDL_INIT_STATUS_UNINITIALIZED);
+}
+
+/* ------------------------------------------------------------------ */
+/* Thread-local storage                                                */
+/* ------------------------------------------------------------------ */
+
+typedef struct TLSEntry
+{
+    void *data;
+    SDL_TLSDestructorCallback destructor;
+} TLSEntry;
+
+typedef struct TLSData
+{
+    int limit;
+    TLSEntry array[];
+} TLSData;
+
+#define TLS_ALLOC_CHUNKSIZE 4
+
+static SDL_AtomicInt tls_next_id;
+static pthread_key_t tls_key;
+static pthread_once_t tls_once = PTHREAD_ONCE_INIT;
+
+static void tls_run_destructors(TLSData *storage)
+{
+    /* destructors may set TLS again: loop like pthreads does */
+    for (int round = 0; storage && round < 4; round++) {
+        bool any = false;
+        for (int i = 0; i < storage->limit; ++i) {
+            TLSEntry *e = &storage->array[i];
+            if (e->destructor && e->data) {
+                void *data = e->data;
+                SDL_TLSDestructorCallback dtor = e->destructor;
+                e->data = NULL;
+                e->destructor = NULL;
+                dtor(data);
+                any = true;
+            }
+        }
+        if (!any) {
+            break;
+        }
+        storage = (TLSData *)pthread_getspecific(tls_key);
+    }
+}
+
+static void tls_thread_exit(void *ptr)
+{
+    TLSData *storage = (TLSData *)ptr;
+    pthread_setspecific(tls_key, storage); /* destructors may call SDL_GetTLS */
+    tls_run_destructors(storage);
+    storage = (TLSData *)pthread_getspecific(tls_key);
+    pthread_setspecific(tls_key, NULL);
+    SDL_free(storage);
+}
+
+static void tls_init(void)
+{
+    pthread_key_create(&tls_key, tls_thread_exit);
+}
+
+void *SDL_GetTLS(SDL_TLSID *id)
+{
+    if (!id) {
+        SDL_InvalidParamError("id");
+        return NULL;
+    }
+    pthread_once(&tls_once, tls_init);
+    int index = SDL_GetAtomicInt(id) - 1;
+    TLSData *storage = (TLSData *)pthread_getspecific(tls_key);
+    if (!storage || index < 0 || index >= storage->limit) {
+        return NULL;
+    }
+    return storage->array[index].data;
+}
+
+bool SDL_SetTLS(SDL_TLSID *id, const void *value, SDL_TLSDestructorCallback destructor)
+{
+    if (!id) {
+        return SDL_InvalidParamError("id");
+    }
+    pthread_once(&tls_once, tls_init);
+
+    int index = SDL_GetAtomicInt(id) - 1;
+    if (index < 0) {
+        int new_id = SDL_AddAtomicInt(&tls_next_id, 1) + 1;
+        SDL_CompareAndSwapAtomicInt(id, 0, new_id); /* a lost race wastes an ID */
+        index = SDL_GetAtomicInt(id) - 1;
+    } else {
+        int next = SDL_GetAtomicInt(&tls_next_id);
+        while (index >= next) {
+            if (SDL_CompareAndSwapAtomicInt(&tls_next_id, next, index + 1)) {
+                break;
+            }
+            next = SDL_GetAtomicInt(&tls_next_id);
+        }
+    }
+
+    TLSData *storage = (TLSData *)pthread_getspecific(tls_key);
+    if (!storage || index >= storage->limit) {
+        int oldlimit = storage ? storage->limit : 0;
+        int newlimit = index + TLS_ALLOC_CHUNKSIZE;
+        TLSData *grown = (TLSData *)SDL_realloc(storage, sizeof(*storage) + (size_t)newlimit * sizeof(TLSEntry));
+        if (!grown) {
+            return false;
+        }
+        storage = grown;
+        storage->limit = newlimit;
+        for (int i = oldlimit; i < newlimit; ++i) {
+            storage->array[i].data = NULL;
+            storage->array[i].destructor = NULL;
+        }
+        if (pthread_setspecific(tls_key, storage) != 0) {
+            SDL_free(storage);
+            return SDL_SetError("pthread_setspecific() failed");
+        }
+    }
+    storage->array[index].data = (void *)value;
+    storage->array[index].destructor = destructor;
+    return true;
+}
+
+void SDL_CleanupTLS(void)
+{
+    pthread_once(&tls_once, tls_init);
+    TLSData *storage = (TLSData *)pthread_getspecific(tls_key);
+    if (storage) {
+        tls_run_destructors(storage);
+        storage = (TLSData *)pthread_getspecific(tls_key);
+        pthread_setspecific(tls_key, NULL);
+        SDL_free(storage);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Threads                                                             */
+/* ------------------------------------------------------------------ */
+
+#define SDLOP_THREAD_MAGIC 0x54485244u /* 'THRD' */
+
+struct SDL_Thread
+{
+    Uint32 magic;
+    SDL_ThreadID threadid;
+    pthread_t handle;
+    int status;
+    SDL_AtomicInt state; /* SDL_ThreadState */
+    char *name;
+    size_t stacksize;
+    SDL_ThreadFunction userfunc;
+    void *userdata;
+    SDL_Semaphore *started; /* creator waits until the name/id are set */
+};
+
+static bool thread_valid(SDL_Thread *thread)
+{
+    if (!thread || thread->magic != SDLOP_THREAD_MAGIC) {
+        SDL_InvalidParamError("thread");
+        return false;
+    }
+    return true;
+}
+
+SDL_ThreadID SDL_GetCurrentThreadID(void)
+{
+    return (SDL_ThreadID)pthread_self();
+}
+
+static void free_thread(SDL_Thread *thread)
+{
+    thread->magic = 0;
+    SDL_free(thread->name);
+    SDL_free(thread);
+}
+
+static void *run_thread(void *arg)
+{
+    SDL_Thread *thread = (SDL_Thread *)arg;
+
+    /* Linux limits names to 15 chars + NUL; SDL3 truncates likewise */
+    if (thread->name) {
+        char name[16];
+        SDL_strlcpy(name, thread->name, sizeof(name));
+        pthread_setname_np(pthread_self(), name);
+    }
+    /* SDL3: SDL threads don't receive asynchronous signals */
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGHUP);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGQUIT);
+    sigaddset(&mask, SIGPIPE);
+    sigaddset(&mask, SIGALRM);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGCHLD);
+    sigaddset(&mask, SIGWINCH);
+    sigaddset(&mask, SIGVTALRM);
+    sigaddset(&mask, SIGPROF);
+    pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+    thread->threadid = SDL_GetCurrentThreadID();
+    SDL_SignalSemaphore(thread->started);
+
+    int status = thread->userfunc(thread->userdata);
+    thread->status = status;
+
+    SDL_CleanupTLS();
+
+    if (!SDL_CompareAndSwapAtomicInt(&thread->state, SDL_THREAD_ALIVE, SDL_THREAD_COMPLETE)) {
+        if (SDL_GetAtomicInt(&thread->state) == SDL_THREAD_DETACHED) {
+            free_thread(thread);
+        }
+    }
+    return NULL;
+}
+
+SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_FunctionPointer pfnBeginThread,
+                                                  SDL_FunctionPointer pfnEndThread)
+{
+    if (pfnBeginThread || pfnEndThread) {
+        SDL_SetError("_beginthreadex/_endthreadex not supported on this platform");
+        return NULL;
+    }
+    SDL_ThreadFunction fn = (SDL_ThreadFunction)SDL_GetPointerProperty(props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER, NULL);
+    const char *name = SDL_GetStringProperty(props, SDL_PROP_THREAD_CREATE_NAME_STRING, NULL);
+    const size_t stacksize = (size_t)SDL_GetNumberProperty(props, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER, 0);
+    void *userdata = SDL_GetPointerProperty(props, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, NULL);
+    if (!fn) {
+        SDL_SetError("Thread entry function is NULL");
+        return NULL;
+    }
+
+    SDL_Thread *thread = (SDL_Thread *)SDL_calloc(1, sizeof(*thread));
+    if (!thread) {
+        return NULL;
+    }
+    thread->magic = SDLOP_THREAD_MAGIC;
+    thread->status = -1;
+    SDL_SetAtomicInt(&thread->state, SDL_THREAD_ALIVE);
+    if (name) {
+        thread->name = SDL_strdup(name);
+        if (!thread->name) {
+            SDL_free(thread);
+            return NULL;
+        }
+    }
+    thread->userfunc = fn;
+    thread->userdata = userdata;
+    thread->stacksize = stacksize;
+    thread->started = SDL_CreateSemaphore(0);
+    if (!thread->started) {
+        free_thread(thread);
+        return NULL;
+    }
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    if (stacksize) {
+        pthread_attr_setstacksize(&attr, stacksize);
+    }
+    SDL_Semaphore *started = thread->started;
+    if (pthread_create(&thread->handle, &attr, run_thread, thread) != 0) {
+        pthread_attr_destroy(&attr);
+        SDL_DestroySemaphore(started);
+        free_thread(thread);
+        SDL_SetError("Not enough resources to create thread");
+        return NULL;
+    }
+    pthread_attr_destroy(&attr);
+    SDL_WaitSemaphore(started); /* threadid valid from here on */
+    thread->started = NULL;
+    SDL_DestroySemaphore(started);
+    return thread;
+}
+
+SDL_Thread *SDL_CreateThreadRuntime(SDL_ThreadFunction fn, const char *name, void *data,
+                                    SDL_FunctionPointer pfnBeginThread, SDL_FunctionPointer pfnEndThread)
+{
+    const SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER, (void *)fn);
+    SDL_SetStringProperty(props, SDL_PROP_THREAD_CREATE_NAME_STRING, name);
+    SDL_SetPointerProperty(props, SDL_PROP_THREAD_CREATE_USERDATA_POINTER, data);
+    SDL_Thread *thread = SDL_CreateThreadWithPropertiesRuntime(props, pfnBeginThread, pfnEndThread);
+    SDL_DestroyProperties(props);
+    return thread;
+}
+
+const char *SDL_GetThreadName(SDL_Thread *thread)
+{
+    return thread_valid(thread) ? thread->name : NULL;
+}
+
+SDL_ThreadID SDL_GetThreadID(SDL_Thread *thread)
+{
+    return thread ? thread->threadid : SDL_GetCurrentThreadID();
+}
+
+SDL_ThreadState SDL_GetThreadState(SDL_Thread *thread)
+{
+    if (!thread_valid(thread)) {
+        return SDL_THREAD_UNKNOWN;
+    }
+    return (SDL_ThreadState)SDL_GetAtomicInt(&thread->state);
+}
+
+void SDL_WaitThread(SDL_Thread *thread, int *status)
+{
+    if (!thread || thread->magic != SDLOP_THREAD_MAGIC) {
+        if (status) {
+            *status = -1;
+        }
+        return;
+    }
+    pthread_join(thread->handle, NULL);
+    if (status) {
+        *status = thread->status;
+    }
+    free_thread(thread);
+}
+
+void SDL_DetachThread(SDL_Thread *thread)
+{
+    if (!thread || thread->magic != SDLOP_THREAD_MAGIC) {
+        return;
+    }
+    if (SDL_CompareAndSwapAtomicInt(&thread->state, SDL_THREAD_ALIVE, SDL_THREAD_DETACHED)) {
+        pthread_detach(thread->handle); /* run_thread frees it */
+    } else if (SDL_GetAtomicInt(&thread->state) == SDL_THREAD_COMPLETE) {
+        SDL_WaitThread(thread, NULL);
+    }
+}
+
+bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority priority)
+{
+    const bool realtime = SDL_GetHintBoolean(SDL_HINT_THREAD_FORCE_REALTIME_TIME_CRITICAL, false);
+    if (realtime && priority == SDL_THREAD_PRIORITY_TIME_CRITICAL) {
+        struct sched_param sp;
+        SDL_zero(sp);
+        sp.sched_priority = sched_get_priority_max(SCHED_RR);
+        if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0) {
+            return true;
+        }
+        return SDL_SetError("pthread_setschedparam() failed");
+    }
+    int nice_value;
+    switch (priority) {
+    case SDL_THREAD_PRIORITY_LOW:
+        nice_value = 19;
+        break;
+    case SDL_THREAD_PRIORITY_HIGH:
+        nice_value = -10;
+        break;
+    case SDL_THREAD_PRIORITY_TIME_CRITICAL:
+        nice_value = -20;
+        break;
+    default:
+        nice_value = 0;
+        break;
+    }
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    if (setpriority(PRIO_PROCESS, (id_t)tid, nice_value) == 0) {
+        return true;
+    }
+    return SDL_SetError("setpriority() failed");
+}

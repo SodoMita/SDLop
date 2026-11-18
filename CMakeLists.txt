@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.13)
 option(SDLOP_SANITIZERS "Build with ASan+UBSan and tune leak checks for GPU tests" OFF)
 
-project(SDLop VERSION 0.1.0 LANGUAGES C)
+project(SDLop VERSION 0.2.0 LANGUAGES C)
 
 if (SDLOP_SANITIZERS)
   string(APPEND CMAKE_C_FLAGS " -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer")
@@ -30,11 +30,21 @@ add_compile_options(-Wall -Wextra)
 if(EMSCRIPTEN)
   set(SDLop_WEB_SOURCES
     src/SDLop_core.c
+    src/SDL_stdlib.c
     src/SDL_error.c
     src/SDL_log.c
     src/SDL_timer.c
     src/SDL_events.c
     src/SDL_properties.c
+    src/SDL_hints.c
+    src/SDL_events_desc.c
+    src/SDL_events_categories.c
+    src/SDL_clipboard.c
+  src/SDL_thread.c
+  src/SDL_main.c
+    src/SDL_thread.c
+  src/SDL_main.c
+    src/SDL_main.c
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
@@ -228,11 +238,18 @@ add_custom_target(sdlop_wayland_protocols
 # ---------------------------------------------------------------------------
 set(SDLop_SOURCES
   src/SDLop_core.c
+  src/SDL_stdlib.c
   src/SDL_error.c
   src/SDL_log.c
   src/SDL_timer.c
   src/SDL_events.c
   src/SDL_properties.c
+  src/SDL_hints.c
+  src/SDL_events_desc.c
+  src/SDL_events_categories.c
+  src/SDL_clipboard.c
+  src/SDL_thread.c
+  src/SDL_main.c
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
@@ -343,13 +360,24 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
+  # the generated headers must be valid C++ with C linkage
+  include(CheckLanguage)
+  check_language(CXX)
+  if(CMAKE_CXX_COMPILER)
+    enable_language(CXX)
+    add_executable(test_cxx_link tests/test_cxx_link.cpp)
+    target_link_libraries(test_cxx_link PRIVATE sdlop)
+    set_target_properties(test_cxx_link PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED ON)
+    target_compile_options(test_cxx_link PRIVATE -Wall -Wextra -pedantic -Werror -UNDEBUG)
+    add_test(NAME test_cxx_link COMMAND test_cxx_link)
+  endif()
   # same keycode checks through the built-in US table (no libxkbcommon)
   add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
   set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
@@ -585,6 +613,14 @@ if (NOT EMSCRIPTEN AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND)
   add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
   target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
   target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+endif()
+
+# Export gate: every function declared in include/SDL3 is exported by the
+# shared library and nothing undeclared is exported.
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_test(NAME api_exports_check
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_exports_check.sh
+                   $<TARGET_FILE:sdlop_shared> ${CMAKE_CURRENT_SOURCE_DIR}/include)
 endif()
 
 # API subset gate: every SDL_* symbol exported by SDLop must also be exported

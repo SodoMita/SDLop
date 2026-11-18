@@ -34,5 +34,7 @@ void SDLOP_X11_GL_Quit(void);
 bool SDLOP_X11_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window, void *instance,
                                     const void *allocator, Uint64 *surface);
 const char *const *SDLOP_X11_Vulkan_GetInstanceExtensions(SDLop_VideoDevice *device, Uint32 *count);
+bool SDLOP_X11_Vulkan_GetPresentationSupport(SDLop_VideoDevice *device, void *instance,
+                                             void *physical_device, Uint32 queue_family);
 
 #endif /* sdlop_x11_internal_h_ */

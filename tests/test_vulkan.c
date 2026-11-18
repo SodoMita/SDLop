@@ -150,7 +150,7 @@ int main(void)
         }
     }
     CHECK(qf != UINT32_MAX, "no graphics+present queue");
-    CHECK(SDL_Vulkan_GetPresentationSupport(instance, qf), "presentation support");
+    CHECK(SDL_Vulkan_GetPresentationSupport(instance, gpu, qf), "presentation support");
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo dq = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = qf, .queueCount = 1, .pQueuePriorities = &prio };

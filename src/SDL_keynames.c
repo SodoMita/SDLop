@@ -2,7 +2,7 @@
   SDLop - scancode/key names, key-name lookups, text-input gating.
 
   Shared by the native (xkb) and web (DOM) keyboard backends. Semantics
-  follow stock SDL3 3.2.10: names resolve through the scancode table,
+  follow stock SDL3 (3.2.10 - 3.4.20): names resolve through the scancode table,
   the extended-key table and UCS4->UTF-8 with stable interned pointers,
   and TEXT_INPUT is only delivered while SDL_StartTextInput() is active.
 

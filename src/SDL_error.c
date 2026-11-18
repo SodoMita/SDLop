@@ -16,10 +16,20 @@ static _Thread_local char sdlop_error[SDLOP_ERROR_SIZE] = "";
 
 bool SDL_SetError(const char *fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(sdlop_error, sizeof(sdlop_error), fmt, ap);
-    va_end(ap);
+    if (fmt) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(sdlop_error, sizeof(sdlop_error), fmt, ap);
+        va_end(ap);
+    }
+    return false;
+}
+
+bool SDL_SetErrorV(const char *fmt, va_list ap)
+{
+    if (fmt) {
+        vsnprintf(sdlop_error, sizeof(sdlop_error), fmt, ap);
+    }
     return false;
 }
 

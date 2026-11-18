@@ -116,7 +116,31 @@ struct SDLop_VideoDevice
      * Optional: when NULL, SDL_Vulkan_GetInstanceExtensions() returns the
      * default (VK_KHR_surface + VK_KHR_wayland_surface). */
     const char *const *(*Vulkan_GetInstanceExtensions)(SDLop_VideoDevice *device, Uint32 *count);
+
+    /* ---- everything below is optional (NULL = generic behaviour) ---- */
+
+    /* vkGetPhysicalDevice*PresentationSupportKHR; NULL = always supported */
+    bool (*Vulkan_GetPresentationSupport)(SDLop_VideoDevice *device, void *instance, void *physical_device, Uint32 queue_family);
+
+    /* Clipboard (SDL3 SDL_VideoDevice layout). The app's offer lives in
+     * SDL_clipboard.c; drivers read it via SDLOP_GetInternalClipboardData().
+     * NULL = in-process clipboard only. */
+    bool (*SetClipboardData)(SDLop_VideoDevice *device);
+    void *(*GetClipboardData)(SDLop_VideoDevice *device, const char *mime_type, size_t *size);
+    bool (*HasClipboardData)(SDLop_VideoDevice *device, const char *mime_type);
+    const char *const *(*GetTextMimeTypes)(SDLop_VideoDevice *device, size_t *num_mime_types);
+    bool (*SetPrimarySelectionText)(SDLop_VideoDevice *device, const char *text);
+    char *(*GetPrimarySelectionText)(SDLop_VideoDevice *device);
+    bool (*HasPrimarySelectionText)(SDLop_VideoDevice *device);
 };
+
+/* Clipboard state shared with drivers (SDL_clipboard.c) */
+void *SDLOP_GetInternalClipboardData(const char *mime_type, size_t *size); /* malloc'd, NUL-padded copy */
+bool SDLOP_HasInternalClipboardData(const char *mime_type);
+const char *const *SDLOP_GetClipboardOfferMimeTypes(size_t *count);
+/* a foreign owner took the selection (owner=false) or our own offer changed */
+void SDLOP_SendClipboardUpdate(bool owner, char **mime_types, size_t num_mime_types);
+const void *SDLCALL SDLOP_ClipboardTextCallback(void *userdata, const char *mime_type, size_t *size);
 
 /* Provided by backends */
 extern SDLop_VideoDevice SDLop_emscripten_device;
@@ -294,5 +318,26 @@ int SDLOP_BytesPerPixel(SDL_PixelFormat format);
 
 /* Logging of subsystem state */
 extern bool sdlop_quitting;
+
+/* Core services (SDLop_core.c, SDL_hints.c, ...) */
+bool SDLOP_IsMainThread(void);
+void SDLOP_InitMainThread(void);
+bool SDLOP_GetStringBoolean(const char *value, bool default_value); /* SDL3's SDL_GetStringBoolean */
+void SDLOP_SendSimpleEvent(SDL_EventType type);  /* type + timestamp only */
+const char *SDLOP_GetExeName(void);  /* basename of /proc/self/exe or NULL */
+const char *SDLOP_GetAppID(void);    /* SDL3 SDL_GetAppID() for WM_CLASS / xdg app_id */
+
+/* SDL3 "temporary memory": freed at the next SDL_PumpEvents() on this
+ * thread, or handed over with the event that references it */
+void *SDLOP_AllocateTemporaryMemory(size_t size);
+void SDLOP_FreeTemporaryMemory(void);
+
+/* SDL_Quit() teardown, in call order */
+void SDLOP_QuitTimers(void);
+void SDLOP_QuitEvents(void);
+void SDLOP_QuitClipboard(void);
+void SDLOP_QuitLog(void);
+void SDLOP_QuitHints(void);
+void SDLOP_QuitProperties(void);
 
 #endif /* sdlop_internal_h_ */

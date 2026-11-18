@@ -39,5 +39,6 @@ void SDLOP_Wayland_GL_WindowResized(SDL_Window *window);
 
 /* Vulkan module (sdlop_wayland_vulkan.c) - vtable entry point */
 bool SDLOP_Wayland_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface);
+bool SDLOP_Wayland_Vulkan_GetPresentationSupport(SDLop_VideoDevice *device, void *instance, void *physical_device, Uint32 queue_family);
 
 #endif /* sdlop_wayland_internal_h_ */

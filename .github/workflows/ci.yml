@@ -36,9 +36,9 @@ jobs:
             xkb-data libx11-data x11-xkb-utils \
             xvfb xauth openbox
 
-      - name: Fetch SDL 3.2.10 reference headers (abi_check)
+      - name: Fetch SDL 3.4.20 reference headers (abi_check)
         run: |
-          git clone -q --depth 1 --branch release-3.2.10 --filter=blob:none --sparse \
+          git clone -q --depth 1 --branch release-3.4.20 --filter=blob:none --sparse \
             https://github.com/libsdl-org/SDL /tmp/sdl3-ref
           git -C /tmp/sdl3-ref sparse-checkout set include
 

@@ -1353,7 +1353,7 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
 static float x11_global_content_scale(void)
 {
     /* SDL3 order: explicit override, Xft.dpi, GDK_SCALE */
-    const char *env = getenv("SDL_VIDEO_X11_SCALING_FACTOR");
+    const char *env = SDL_GetHint(SDL_HINT_VIDEO_X11_SCALING_FACTOR);
     if (env && *env) {
         float f = strtof(env, NULL);
         if (f >= 1.0f && f <= 10.0f) {
@@ -1728,7 +1728,7 @@ static bool x11_Init(SDLop_VideoDevice *device)
 {
     memset(&x11, 0, sizeof(x11));
     const char *display_name = getenv("DISPLAY");
-    if ((!display_name || !*display_name) && !getenv("SDL_VIDEODRIVER")) {
+    if ((!display_name || !*display_name) && !SDL_GetHint(SDL_HINT_VIDEO_DRIVER)) {
         /* probing: no X session */
         return SDL_SetError("DISPLAY not set");
     }
@@ -1902,13 +1902,14 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         host[sizeof(host) - 1] = '\0';
         set_property(wd->xid, x11.atom.WM_CLIENT_MACHINE, XCB_ATOM_STRING, 8, (uint32_t)strlen(host), host);
     }
-    const char *app = getenv("SDL_APP_ID");
-    if (!app || !*app) {
-        app = "SDLop";
+    /* WM_CLASS = instance\0class\0 (SDL3: exe name, app id) */
+    const char *app = SDLOP_GetAppID();
+    const char *inst = SDLOP_GetExeName();
+    if (!inst) {
+        inst = app;
     }
-    /* WM_CLASS = instance\0class\0 */
     char wm_class[256];
-    int cl = snprintf(wm_class, sizeof(wm_class) - 1, "%s%c%s", app, '\0', app);
+    int cl = snprintf(wm_class, sizeof(wm_class) - 1, "%s%c%s", inst, '\0', app);
     if (cl > 0 && cl < (int)sizeof(wm_class) - 1) {
         set_property(wd->xid, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, (uint32_t)cl + 1, wm_class);
     }
@@ -2752,4 +2753,7 @@ SDLop_VideoDevice SDLop_x11_device = {
     /* Vulkan (VK_KHR_xcb_surface) */
     SDLOP_X11_Vulkan_CreateSurface,
     SDLOP_X11_Vulkan_GetInstanceExtensions,
+
+    /* optional hooks */
+    .Vulkan_GetPresentationSupport = SDLOP_X11_Vulkan_GetPresentationSupport,
 };

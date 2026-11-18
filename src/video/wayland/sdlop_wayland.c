@@ -1278,7 +1278,7 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     memset(&wl_data, 0, sizeof(wl_data));
 
     const char *display_name = getenv("WAYLAND_DISPLAY");
-    if (!display_name && !getenv("SDL_VIDEODRIVER")) {
+    if (!display_name && !SDL_GetHint(SDL_HINT_VIDEO_DRIVER)) {
         /* don't fail hard when probing: no wayland session */
         return SDL_SetError("WAYLAND_DISPLAY not set");
     }
@@ -1385,7 +1385,7 @@ static bool wayland_create_role_objects(SDL_Window *window)
     }
     xdg_toplevel_add_listener(wd->toplevel, &toplevel_listener, window);
     xdg_toplevel_set_title(wd->toplevel, window->title ? window->title : "SDLop");
-    xdg_toplevel_set_app_id(wd->toplevel, "SDLop");
+    xdg_toplevel_set_app_id(wd->toplevel, SDLOP_GetAppID());
     if (window->flags & SDL_WINDOW_FULLSCREEN) {
         xdg_toplevel_set_fullscreen(wd->toplevel, NULL);
     }
@@ -1787,4 +1787,7 @@ SDLop_VideoDevice SDLop_wayland_device = {
     /* Vulkan (lavapipe) - implemented in sdlop_wayland_vulkan.c */
     SDLOP_Wayland_Vulkan_CreateSurface,
     NULL, /* Vulkan_GetInstanceExtensions: default (VK_KHR_surface + VK_KHR_wayland_surface) */
+
+    /* optional hooks */
+    .Vulkan_GetPresentationSupport = SDLOP_Wayland_Vulkan_GetPresentationSupport,
 };

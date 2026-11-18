@@ -155,11 +155,7 @@ static struct
 
 static bool touch_mouse_enabled(void)
 {
-    const char *v = getenv(SDL_HINT_TOUCH_MOUSE_EVENTS);
-    if (!v || !*v) {
-        return true;
-    }
-    return !(strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0);
+    return SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_TOUCH_MOUSE_EVENTS), true);
 }
 
 static void touch_mouse_event(Uint32 type, SDL_Window *window, float x, float y, Uint64 timestamp_ns)

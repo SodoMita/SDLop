@@ -3034,4 +3034,6 @@ SDLop_VideoDevice SDLop_kmsdrm_device = {
     /* Vulkan (VK_KHR_surface + VK_KHR_display) - sdlop_kmsdrm_vulkan.c */
     SDLOP_KMSDRM_Vulkan_CreateSurface,
     SDLOP_KMSDRM_Vulkan_GetInstanceExtensions,
+    /* optional hooks */
+    .Vulkan_GetPresentationSupport = NULL,
 };

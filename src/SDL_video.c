@@ -32,7 +32,7 @@ static SDLop_VideoDevice *const video_drivers[] = {
 
 static const char *default_driver_order(void)
 {
-    const char *hint = getenv("SDL_VIDEODRIVER");
+    const char *hint = SDL_GetHint(SDL_HINT_VIDEO_DRIVER);
     return hint;
 }
 
