@@ -190,6 +190,32 @@ add_custom_command(
           ${WL_GEN_DIR}/relative-pointer-protocol.c
   DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
 
+# optional window-management protocols (bound when the compositor offers
+# them): server-side decorations, idle inhibit, keyboard-shortcuts inhibit,
+# activation/attention
+set(SDLOP_WL_EXTRA_PROTOCOLS
+  "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
+  "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
+  "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
+  "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml")
+set(SDLOP_WL_EXTRA_OUTPUTS)
+foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
+  string(REPLACE "|" ";" parts "${entry}")
+  list(GET parts 0 proto_name)
+  list(GET parts 1 proto_xml)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+            ${WL_GEN_DIR}/${proto_name}-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+            ${WL_GEN_DIR}/${proto_name}-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/${proto_xml})
+  list(APPEND SDLOP_WL_EXTRA_OUTPUTS
+    ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c)
+endforeach()
+
 # server-side codegen (used only by tests/test_pointer_lock's mini compositor)
 add_custom_command(
   OUTPUT ${WL_GEN_DIR}/xdg-shell-server-protocol.h ${WL_GEN_DIR}/xdg-shell-server-protocol.c
@@ -234,7 +260,8 @@ add_custom_target(sdlop_wayland_protocols
           ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
           ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
           ${WL_GEN_DIR}/relative-pointer-server-protocol.h
-          ${WL_GEN_DIR}/relative-pointer-server-protocol.c)
+          ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+          ${SDLOP_WL_EXTRA_OUTPUTS})
 
 # ---------------------------------------------------------------------------
 # Library
@@ -382,6 +409,8 @@ if(SDLop_BUILD_TESTS)
   target_link_libraries(test_window_api PRIVATE sdlop)
   target_compile_options(test_window_api PRIVATE -UNDEBUG)
   add_test(NAME test_window_api COMMAND test_window_api dummy)
+  # Wayland run: needs a compositor (WAYLAND_DISPLAY), skips otherwise
+  add_test(NAME test_window_api_wayland COMMAND test_window_api wayland)
   # the generated headers must be valid C++ with C linkage
   include(CheckLanguage)
   check_language(CXX)

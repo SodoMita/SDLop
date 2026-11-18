@@ -34,6 +34,19 @@ static int failures = 0;
     } while (0)
 
 static bool is_x11 = false;
+static bool is_wayland = false;
+
+/* Wayland has no protocol for some requests; stock SDL3 reports
+ * SDL_Unsupported() there and so does SDLop */
+#define CHECK_OR_UNSUPPORTED(expr, ...)                                              \
+    do {                                                                             \
+        if (is_wayland) {                                                            \
+            bool r_ = (expr);                                                        \
+            CHECK(!r_ && strstr(SDL_GetError(), "not supported"), __VA_ARGS__);      \
+        } else {                                                                     \
+            CHECK((expr), __VA_ARGS__);                                              \
+        }                                                                            \
+    } while (0)
 
 /* ------------------------------------------------------------------ */
 /* X11 observer                                                        */
@@ -222,26 +235,32 @@ static void test_state(SDL_Window *w)
     CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_RESIZABLE), "not resizable");
     CHECK(SDL_SetWindowResizable(w, true), "resizable");
 
-    CHECK(SDL_SetWindowAlwaysOnTop(w, true), "on top: %s", SDL_GetError());
-    CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_ALWAYS_ON_TOP, "on-top flag");
+    CHECK_OR_UNSUPPORTED(SDL_SetWindowAlwaysOnTop(w, true), "on top: %s", SDL_GetError());
+    if (!is_wayland) {
+        CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_ALWAYS_ON_TOP, "on-top flag");
+    }
 
-    CHECK(SDL_SetWindowOpacity(w, 0.5f), "opacity: %s", SDL_GetError());
-    CHECK(SDL_fabsf(SDL_GetWindowOpacity(w) - 0.5f) < 0.01f, "opacity readback %f", SDL_GetWindowOpacity(w));
+    CHECK_OR_UNSUPPORTED(SDL_SetWindowOpacity(w, 0.5f), "opacity: %s", SDL_GetError());
+    if (!is_wayland) {
+        CHECK(SDL_fabsf(SDL_GetWindowOpacity(w) - 0.5f) < 0.01f, "opacity readback %f", SDL_GetWindowOpacity(w));
+    }
 
     SDL_Surface *icon = SDL_CreateSurface(16, 16, SDL_PIXELFORMAT_RGBA32);
     SDL_FillSurfaceRect(icon, NULL, SDL_MapSurfaceRGBA(icon, 255, 0, 0, 255));
-    CHECK(SDL_SetWindowIcon(w, icon), "icon: %s", SDL_GetError());
+    CHECK_OR_UNSUPPORTED(SDL_SetWindowIcon(w, icon), "icon: %s", SDL_GetError());
     SDL_DestroySurface(icon);
 
     int t = -1, l = -1, b = -1, r = -1;
-    CHECK(SDL_GetWindowBordersSize(w, &t, &l, &b, &r), "borders: %s", SDL_GetError());
+    CHECK_OR_UNSUPPORTED(SDL_GetWindowBordersSize(w, &t, &l, &b, &r), "borders: %s", SDL_GetError());
     CHECK(t >= 0 && l >= 0 && b >= 0 && r >= 0, "borders non-negative");
 
     CHECK(SDL_FlashWindow(w, SDL_FLASH_BRIEFLY), "flash: %s", SDL_GetError());
     CHECK(SDL_FlashWindow(w, SDL_FLASH_CANCEL), "flash cancel");
 
     CHECK(SDL_SetWindowFocusable(w, false), "focusable: %s", SDL_GetError());
-    CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_NOT_FOCUSABLE, "not-focusable flag");
+    if (!is_wayland) { /* no protocol: the flag stays (stock) */
+        CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_NOT_FOCUSABLE, "not-focusable flag");
+    }
     CHECK(SDL_SetWindowFocusable(w, true), "focusable");
 
 #ifdef SDLOP_TEST_HAVE_XCB
@@ -302,8 +321,10 @@ static void test_parent_popup(SDL_Window *w)
     CHECK(!SDL_SetWindowParent(child, child), "self parent rejected");
     CHECK(SDL_SetWindowParent(child, w), "set parent: %s", SDL_GetError());
     CHECK(SDL_GetWindowParent(child) == w, "parent readback");
-    CHECK(SDL_SetWindowModal(child, true), "modal: %s", SDL_GetError());
-    CHECK(SDL_GetWindowFlags(child) & SDL_WINDOW_MODAL, "modal flag");
+    CHECK_OR_UNSUPPORTED(SDL_SetWindowModal(child, true), "modal: %s", SDL_GetError()); /* xdg-dialog */
+    if (!is_wayland) {
+        CHECK(SDL_GetWindowFlags(child) & SDL_WINDOW_MODAL, "modal flag");
+    }
 #ifdef SDLOP_TEST_HAVE_XCB
     if (is_x11) {
         SDL_ShowWindow(child);
@@ -343,8 +364,10 @@ static void test_grabs(SDL_Window *w)
         CHECK(pointer_grabbable(), "X pointer released");
     }
 #endif
-    CHECK(SDL_SetWindowKeyboardGrab(w, true), "keyboard grab: %s", SDL_GetError());
-    if (focused) {
+    bool kg = SDL_SetWindowKeyboardGrab(w, true);
+    CHECK(kg || (is_wayland && strstr(SDL_GetError(), "keyboard-shortcuts-inhibit")), "keyboard grab: %s",
+          SDL_GetError());
+    if (focused && kg) {
         CHECK(SDL_GetWindowKeyboardGrab(w), "keyboard grab readback");
     }
     CHECK(SDL_SetWindowKeyboardGrab(w, false), "keyboard ungrab");
@@ -384,7 +407,7 @@ static void test_cursors(SDL_Window *w)
     CHECK(!SDL_CreateAnimatedCursor(bad, 2, 0, 0), "mismatched frame sizes rejected");
 
     SDL_Cursor *sys = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
-    if (is_x11) {
+    if (is_x11 || is_wayland) {
         CHECK(sys, "system cursor: %s", SDL_GetError());
         for (int i = 0; i < SDL_SYSTEM_CURSOR_COUNT; ++i) {
             SDL_Cursor *c = SDL_CreateSystemCursor((SDL_SystemCursor)i);
@@ -455,8 +478,8 @@ static void test_warp(SDL_Window *w)
     }
 #endif
     if (!is_x11) {
-        CHECK(!SDL_WarpMouseGlobal(1.0f, 1.0f), "dummy: global warp unsupported");
-        CHECK(!SDL_CaptureMouse(true), "dummy: capture unsupported");
+        CHECK(!SDL_WarpMouseGlobal(1.0f, 1.0f), "global warp unsupported");
+        CHECK(!SDL_CaptureMouse(true), "capture unsupported");
     }
 }
 
@@ -489,10 +512,10 @@ static void test_screensaver(void)
      * then the call reports SDL_Unsupported() (dummy) */
     CHECK(!SDL_ScreenSaverEnabled(), "screensaver inhibited by default (stock)");
     bool ok = SDL_EnableScreenSaver();
-    CHECK(ok == is_x11, "enable returns %d", ok);
+    CHECK(ok == is_x11 || is_wayland /* needs idle-inhibit */, "enable returns %d", ok);
     CHECK(SDL_ScreenSaverEnabled(), "enabled");
     ok = SDL_DisableScreenSaver();
-    CHECK(ok == is_x11, "disable returns %d", ok);
+    CHECK(ok == is_x11 || is_wayland, "disable returns %d", ok);
     CHECK(!SDL_ScreenSaverEnabled(), "disabled");
 }
 
@@ -516,6 +539,11 @@ int main(int argc, char **argv)
         printf("test_window_api: SKIP (built without xcb)\n");
         return 0;
 #endif
+    }
+    is_wayland = strcmp(driver, "wayland") == 0;
+    if (is_wayland && !getenv("WAYLAND_DISPLAY")) {
+        printf("test_window_api: SKIP (WAYLAND_DISPLAY not set)\n");
+        return 0;
     }
     SDL_setenv_unsafe("SDL_VIDEODRIVER", driver, 1);
     if (!SDL_Init(SDL_INIT_VIDEO)) {
