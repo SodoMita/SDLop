@@ -177,6 +177,33 @@ bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
     return set_keymap(km);
 }
 
+bool SDLOP_KeyboardSetKeymapNames(const char *rules, const char *model, const char *layout,
+                                  const char *variant, const char *options)
+{
+    if (!SDLOP_Xkb_LoadSymbols()) {
+        return false;
+    }
+    if (!xkb_ctx) {
+        xkb_ctx = SDLOP_XKB_xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        if (!xkb_ctx) {
+            return SDL_SetError("SDLOP_XKB_xkb_context_new() failed");
+        }
+    }
+    struct xkb_rule_names names = {
+        .rules = rules,
+        .model = model,
+        .layout = layout,
+        .variant = variant,
+        .options = options,
+    };
+    struct xkb_keymap *km = SDLOP_XKB_xkb_keymap_new_from_names(xkb_ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!km) {
+        return SDL_SetError("Could not create xkb keymap from RMLVO (%s/%s/%s)",
+                            rules ? rules : "-", model ? model : "-", layout ? layout : "-");
+    }
+    return set_keymap(km);
+}
+
 bool SDLOP_KeyboardSetDefaultKeymap(void)
 {
     if (!SDLOP_Xkb_LoadSymbols()) {

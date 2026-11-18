@@ -37,6 +37,7 @@ int main(void) {
 | Platform | State |
 |---|---|
 | Linux / Wayland (wl_compositor + xdg-shell, wl_seat fallback input) | ✅ done, tested against Weston 14 + sway 1.10 (pixman) |
+| Linux / X11 (Xlib via `dlopen`, GLX, `VK_KHR_xlib_surface`) | ✅ done, tested against Xvfb + the in-repo mini X server |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
 | Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
 | OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
@@ -199,6 +200,26 @@ are all `dlopen`-ed on demand — nothing optional is linked
 into libc). Missing libs degrade gracefully: no wayland-client -> dummy
 video driver; no xkbcommon -> windowing still works. Override probe names
 with `SDLOP_LIB_WAYLAND` / `SDLOP_LIB_XKB` / `SDLOP_LIB_EGL`.
+
+### X11 driver
+
+The X11 driver (`src/video/x11/`) is tried after Wayland and before
+KMSDRM/dummy (or force it with `SDL_VIDEODRIVER=x11`). It is **header-free**:
+it compiles against a frozen Xlib ABI subset declared in-repo
+(`sdlop_x11_defs.h`) and `dlopen`s `libX11.so.6` at run time, so building it
+needs no X11 packages at all and the library keeps its NEEDED: libc+libm
+footprint. `SDLOP_LIB_X11` overrides the probe path. GLX (`libGL.so.1`)
+provides OpenGL, `VK_KHR_xlib_surface` provides Vulkan WSI, and keyboard
+handling follows `_XKB_RULES_NAMES` through xkbcommon like the Wayland
+driver. No DISPLAY / no libX11 / an unreachable server all fail with a
+proper SDL error and let the next driver take over.
+
+Testing without a real X server: `tests/run_x11_test.sh` starts Xvfb when
+available and otherwise falls back to `tests/mini_xserver.py`, a pure-python
+minimal X11 server (in the spirit of `tests/mini_compositor.c`) that also
+injects a deterministic input script the test asserts on.
+`tests/test_x11_nodisplay.c` covers the graceful-failure paths and needs no
+server at all.
 
 Tests that need privileges/compositor skip cleanly:
 

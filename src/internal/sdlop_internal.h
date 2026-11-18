@@ -121,6 +121,7 @@ struct SDLop_VideoDevice
 /* Provided by backends */
 extern SDLop_VideoDevice SDLop_emscripten_device;
 extern SDLop_VideoDevice SDLop_wayland_device;
+extern SDLop_VideoDevice SDLop_x11_device;
 extern SDLop_VideoDevice SDLop_kmsdrm_device;
 extern SDLop_VideoDevice SDLop_dummy_device;
 
@@ -226,6 +227,8 @@ SDL_WindowID SDLOP_FocusWindowID(void);   /* focused window id or 0 */
 
 /* Keymap (xkb) management, implemented in SDL_keyboard.c */
 bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length); /* wayland */
+bool SDLOP_KeyboardSetKeymapNames(const char *rules, const char *model, const char *layout,
+                                  const char *variant, const char *options); /* x11: _XKB_RULES_NAMES */
 bool SDLOP_KeyboardSetDefaultKeymap(void);
 void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked);
 bool SDLOP_KeyboardKeyRepeats(SDL_Scancode sc);

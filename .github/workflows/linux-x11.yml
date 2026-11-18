@@ -1,0 +1,97 @@
+name: Linux (X11)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  x11:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + X11 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config python3 \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libgbm-dev libdrm-dev \
+            xvfb libx11-6 libxkbcommon0 libgl1 libglx-mesa0
+
+      - name: Configure (all drivers)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Verify runtime-only linking (no X11/XCB/xkb deps)
+        run: |
+          set -e
+          for f in build/libSDLop.so; do
+            echo "== $f"
+            readelf -d "$f" | grep NEEDED
+            if readelf -d "$f" | grep NEEDED | grep -Ei 'libX11|libxcb|libXext|libxkbcommon|libGL|libEGL|libwayland|libdrm|libgbm'; then
+              echo "ERROR: link-time dependency on a runtime-loaded library"
+              exit 1
+            fi
+          done
+          if ldd build/libSDLop.so | grep -Ei 'libX11|libxcb|libxkbcommon'; then
+            echo "ERROR: ldd shows X11-related linkage"
+            exit 1
+          fi
+          echo "runtime-only linking OK"
+
+      - name: Run full test suite (Xvfb-backed)
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &
+          XVFB_PID=$!
+          trap 'kill $XVFB_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
+          cd build && ctest --output-on-failure
+
+      - name: Scripted-input X11 test (mini server, no Xvfb dependency)
+        run: env -u DISPLAY X11_TEST_FORCE_MINI=1 sh tests/run_x11_test.sh
+        env:
+          TEST_X11_BIN: ${{ github.workspace }}/build/test_x11
+
+      - name: Graceful-failure test (no display)
+        run: env -u DISPLAY ./build/test_x11_nodisplay
+
+  # Minimal configuration: X11 driver only, with NO X11/wayland/xkbcommon
+  # build-time headers (exercises the in-repo frozen ABI subsets + the
+  # vendored xkbcommon header). Also proves the driver needs nothing but a
+  # C compiler at build time.
+  x11-header-free:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bare minimum (compiler + cmake + libX11 runtime)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake python3 libx11-6
+
+      - name: Configure (X11 only)
+        run: |
+          cmake -B build \
+            -DSDLop_VIDEO_WAYLAND=OFF -DSDLop_VIDEO_KMSDRM=OFF \
+            -DSDLop_BUILD_BENCHMARKS=OFF -DSDLop_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Verify no X11 linkage
+        run: |
+          ! (readelf -d build/libSDLop.so | grep NEEDED | grep -Ei 'libX11|libxcb|libxkbcommon')
+
+      - name: Scripted-input test against the mini X server
+        run: env -u DISPLAY X11_TEST_FORCE_MINI=1 sh tests/run_x11_test.sh
+        env:
+          TEST_X11_BIN: ${{ github.workspace }}/build/test_x11
+
+      - name: Graceful-failure test (no display)
+        run: env -u DISPLAY ./build/test_x11_nodisplay
