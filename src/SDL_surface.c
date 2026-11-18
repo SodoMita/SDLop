@@ -133,6 +133,11 @@ static bool SDL_CalculateSurfaceSize(SDL_PixelFormat format, int width, int heig
         }
     }
 
+    /* SDLop: SDL_Surface::pitch is an int; stock SDL3 would truncate it */
+    if (p > (size_t)SDL_MAX_SINT32) {
+        return SDL_SetError("width * bpp would overflow the surface pitch");
+    }
+
     if (size) {
         *size = sz;
     }
