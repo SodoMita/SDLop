@@ -195,71 +195,6 @@ static void dummy_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     }
 }
 
-static bool dummy_NotSupportedGL(void)
-{
-    return SDL_SetError("The dummy video driver does not support OpenGL/Vulkan");
-}
-
-static void *dummy_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
-{
-    (void)device;
-    (void)window;
-    dummy_NotSupportedGL();
-    return NULL;
-}
-
-static bool dummy_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, void *context)
-{
-    (void)device;
-    (void)window;
-    (void)context;
-    return dummy_NotSupportedGL();
-}
-
-static bool dummy_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
-{
-    (void)device;
-    (void)window;
-    return dummy_NotSupportedGL();
-}
-
-static void dummy_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
-{
-    (void)device;
-    (void)context;
-}
-
-static SDL_FunctionPointer dummy_GL_GetProcAddress(SDLop_VideoDevice *device, const char *proc)
-{
-    (void)device;
-    (void)proc;
-    return NULL;
-}
-
-static bool dummy_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval)
-{
-    (void)device;
-    (void)interval;
-    return true;
-}
-
-static bool dummy_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval)
-{
-    (void)device;
-    *interval = 0;
-    return true;
-}
-
-static bool dummy_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface)
-{
-    (void)device;
-    (void)window;
-    (void)instance;
-    (void)allocator;
-    (void)surface;
-    return dummy_NotSupportedGL();
-}
-
 SDLop_VideoDevice SDLop_dummy_device = {
     "dummy",
     dummy_Init,
@@ -283,13 +218,13 @@ SDLop_VideoDevice SDLop_dummy_device = {
     dummy_CreateWindowFramebuffer,
     dummy_UpdateWindowFramebuffer,
     dummy_DestroyWindowFramebuffer,
-    dummy_GL_CreateContext,
-    dummy_GL_MakeCurrent,
-    dummy_GL_SwapBuffers,
-    dummy_GL_DeleteContext,
-    dummy_GL_GetProcAddress,
-    dummy_GL_SetSwapInterval,
-    dummy_GL_GetSwapInterval,
-    dummy_Vulkan_CreateSurface,
-    NULL, /* Vulkan_GetInstanceExtensions: not supported */
+    NULL, /* GL_CreateContext: generic GL offload in SDL_gl.c when hardware GPU available */
+    NULL, /* GL_MakeCurrent */
+    NULL, /* GL_SwapBuffers */
+    NULL, /* GL_DeleteContext */
+    NULL, /* GL_GetProcAddress */
+    NULL, /* GL_SetSwapInterval */
+    NULL, /* GL_GetSwapInterval */
+    NULL, /* Vulkan_CreateSurface: generic VK_EXT_headless_surface offload in SDL_vulkan.c */
+    NULL, /* Vulkan_GetInstanceExtensions */
 };

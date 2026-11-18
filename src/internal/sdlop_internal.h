@@ -283,6 +283,12 @@ typedef struct SDLOP_GLAttributes
 
 extern SDLOP_GLAttributes sdlop_glattrs;
 SDL_GLContext SDLOP_GL_CurrentContext(void);
+void SDLOP_GL_NotifyWindowDestroyed(SDL_Window *window);
+void SDLOP_GL_Quit(void);
+
+/* Vulkan offload cleanup hooks (SDL_vulkan.c) */
+void SDLOP_Vulkan_NotifyWindowDestroyed(SDL_Window *window);
+void SDLOP_Vulkan_Quit(void);
 
 /* Surface helpers (SDL_surface.c) */
 int SDLOP_BytesPerPixel(SDL_PixelFormat format);

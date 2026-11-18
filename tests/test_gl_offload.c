@@ -28,7 +28,16 @@ static int failures = 0;
 static void test_policy(void)
 {
     unsetenv("SDLOP_GL_OFFLOAD");
+    unsetenv("SDLOP_OFFLOAD");
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_AUTO, "unset -> AUTO");
+
+    setenv("SDLOP_OFFLOAD", "0", 1);
+    CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "SDLOP_OFFLOAD=0 -> NEVER");
+    setenv("SDLOP_OFFLOAD", "1", 1);
+    CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "SDLOP_OFFLOAD=1 -> FORCE");
+    setenv("SDLOP_GL_OFFLOAD", "0", 1);
+    CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "SDLOP_GL_OFFLOAD overrides SDLOP_OFFLOAD");
+    unsetenv("SDLOP_OFFLOAD");
 
     setenv("SDLOP_GL_OFFLOAD", "auto", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_AUTO, "auto -> AUTO");
@@ -192,12 +201,31 @@ static void test_live_backend(void)
     unsetenv("SDLOP_GL_OFFLOAD");
 }
 
+static void test_dummy_opt_out(void)
+{
+    setenv("SDL_VIDEODRIVER", "dummy", 1);
+    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    setenv("SDLOP_GL_OFFLOAD", "0", 1);
+    if (SDL_Init(SDL_INIT_VIDEO)) {
+        SDL_Window *w = SDL_CreateWindow("dummy no offload", 64, 64, SDL_WINDOW_OPENGL);
+        CHECK(w != NULL, "dummy window created");
+        if (w) {
+            CHECK(SDL_GL_CreateContext(w) == NULL, "dummy GL fails when SDLOP_GL_OFFLOAD=0");
+            SDL_DestroyWindow(w);
+        }
+        SDL_Quit();
+    }
+    unsetenv("SDLOP_GL_OFFLOAD");
+    unsetenv("SDL_VIDEODRIVER");
+}
+
 int main(void)
 {
     test_policy();
     test_software_renderer_detection();
     test_flip_copy();
     test_gl_attrs();
+    test_dummy_opt_out();
     test_live_backend();
 
     if (failures) {

@@ -42,7 +42,7 @@ void SDLOP_GLOffload_SetPreferGBM(bool prefer);
 /* True when the active offload backend uses a GBM render node (PRIME-capable). */
 bool SDLOP_GLOffload_HasGBM(void);
 
-/* Read SDLOP_GL_OFFLOAD env var. */
+/* Read SDLOP_GL_OFFLOAD (falling back to SDLOP_OFFLOAD) env var. */
 SDLOP_GLOffloadPolicy SDLOP_GLOffload_GetPolicy(void);
 
 /* Case-insensitive check for software GL_RENDERER strings
@@ -62,6 +62,8 @@ const char *SDLOP_GLOffload_GetGPUDescription(void);
 /* Offload context lifecycle (egl_api is EGL_OPENGL_API or EGL_OPENGL_ES_API). */
 SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContext(uint32_t egl_api,
                                                       SDLOP_GLOffloadContext *share_ctx);
+/* Pick API from sdlop_glattrs (with ES fallback when desktop GL fails). */
+SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContextAuto(SDLOP_GLOffloadContext *share_ctx);
 void SDLOP_GLOffload_DeleteContext(SDLOP_GLOffloadContext *ctx);
 
 /* Offscreen GPU surface lifecycle. */

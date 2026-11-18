@@ -47,6 +47,7 @@
 
 #include "sdlop_kmsdrm.h"
 #include "sdlop_xcursor.h"
+#include "../sdlop_vk_offload.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -2852,11 +2853,25 @@ static bool kmsdrm_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     if (!windata || !dd) {
         return SDL_SetError("Invalid window");
     }
-    if (window->flags & SDL_WINDOW_VULKAN) {
+    if ((window->flags & SDL_WINDOW_VULKAN) && !SDLOP_VulkanOffload_IsActive()) {
         return SDL_SetError("Vulkan is active: window surface is not presentable");
     }
     if (windata->gl_active) {
         return SDL_SetError("OpenGL is active: window surface is not presentable");
+    }
+    if ((window->flags & SDL_WINDOW_VULKAN) && !windata->sw_active) {
+        if (!kmsdrm_ensure_master(&kmsdrm)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: cannot re-acquire DRM master on %s; modesetting will fail",
+                        kmsdrm.devpath);
+        }
+        bool fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
+        dd->mode = kmsdrm_select_mode_for_window(window, dd, fullscreen);
+        if (!KMSDRM_EnsureSwScanout(window)) {
+            return false;
+        }
+        window->w = (int)dd->mode.hdisplay;
+        window->h = (int)dd->mode.vdisplay;
     }
     if (!windata->sw_active) {
         return SDL_SetError("Software framebuffer is not available");
@@ -2881,7 +2896,7 @@ static bool kmsdrm_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     if (!windata) {
         return SDL_SetError("Invalid window");
     }
-    if (window->flags & SDL_WINDOW_VULKAN) {
+    if ((window->flags & SDL_WINDOW_VULKAN) && !SDLOP_VulkanOffload_IsActive()) {
         return SDL_SetError("Vulkan is active: window surface is not presentable");
     }
     if (windata->gl_active) {
@@ -2893,6 +2908,10 @@ static bool kmsdrm_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
 static void kmsdrm_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
+    if (window->surface) {
+        SDL_DestroySurface(window->surface);
+        window->surface = NULL;
+    }
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
     if (windata) {
         kmsdrm_destroy_dumb(&kmsdrm, windata);

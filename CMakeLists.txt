@@ -231,9 +231,10 @@ set(SDLop_SOURCES
   src/internal/sdlop_evdev.c
   src/sdlop_xkb_dyn.c
   src/video/sdlop_gl_offload.c
+  src/video/sdlop_vk_offload.c
+  src/video/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland.c
   src/video/wayland/sdlop_wayland_dyn.c
-  src/video/wayland/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
   src/video/wayland/sdlop_wayland_protos.c
@@ -371,6 +372,12 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(test_gl_offload PRIVATE src)
   target_compile_options(test_gl_offload PRIVATE -UNDEBUG)
   add_test(NAME test_gl_offload COMMAND test_gl_offload)
+
+  add_executable(test_vk_offload tests/test_vk_offload.c)
+  target_link_libraries(test_vk_offload PRIVATE sdlop)
+  target_include_directories(test_vk_offload PRIVATE src)
+  target_compile_options(test_vk_offload PRIVATE -UNDEBUG)
+  add_test(NAME test_vk_offload COMMAND test_vk_offload)
 
   # KMS present-path benchmark (not a ctest gate; skips without KMS)
   add_executable(bench_kmsdrm tests/bench_kmsdrm.c)

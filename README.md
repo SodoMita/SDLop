@@ -283,6 +283,15 @@ Highlights:
 - Software surfaces are XRGB8888 wl_shm buffers (zero copy); the GL and
   Vulkan paths were validated against Mesa's software rasterizers
   (llvmpipe/lavapipe) but work with any EGL/Vulkan driver.
+- Hardware GPU offload (OpenGL via EGL surfaceless/pbuffer on a hardware
+  DRM render node; Vulkan via `VK_EXT_headless_surface` with hardware GPU
+  prioritization) activates automatically when the display backend lacks
+  native hardware presentation (e.g. `dummy`, `wl_shm`-only Wayland, or
+  displayless KMSDRM), presenting frames back through the window
+  framebuffer (`wl_shm`, DRM dumb buffers, or `SDL_GetWindowSurface`).
+  Configure via `SDLOP_OFFLOAD` (global default: `auto`, `0`/`off`/`false`/`no`,
+  or `1`/`on`/`true`/`yes`/`force`), overridden per API by
+  `SDLOP_GL_OFFLOAD` and `SDLOP_VULKAN_OFFLOAD` (or `SDLOP_VK_OFFLOAD`).
 - `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
   content yet.
 - Web: the static keymap is US-layout only (browser text input events are

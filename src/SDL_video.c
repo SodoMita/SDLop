@@ -66,6 +66,8 @@ void SDLOP_VideoQuit(void)
     while (sdlop.windows) {
         SDL_DestroyWindow(sdlop.windows);
     }
+    SDLOP_GL_Quit();
+    SDLOP_Vulkan_Quit();
     if (sdlop.video) {
         sdlop.video->Quit(sdlop.video);
         sdlop.video = NULL;
@@ -678,6 +680,8 @@ void SDL_DestroyWindow(SDL_Window *window)
         return;
     }
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DESTROYED, 0, 0);
+    SDLOP_GL_NotifyWindowDestroyed(window);
+    SDLOP_Vulkan_NotifyWindowDestroyed(window);
     if (window->surface) {
         /* drivers that own the pixel storage null this out themselves;
          * otherwise (dummy RAM buffers) free it here */

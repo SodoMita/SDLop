@@ -9,7 +9,7 @@
 #include "sdlop_egl_dyn.h"
 
 #ifdef SDLop_VIDEO_KMSDRM
-#include "sdlop_kmsdrm_dyn.h"
+#include "kmsdrm/sdlop_kmsdrm_dyn.h"
 #include <gbm.h>
 #endif
 
@@ -165,6 +165,9 @@ static struct
 SDLOP_GLOffloadPolicy SDLOP_GLOffload_GetPolicy(void)
 {
     const char *v = getenv("SDLOP_GL_OFFLOAD");
+    if (!v || !*v) {
+        v = getenv("SDLOP_OFFLOAD");
+    }
     if (!v || !*v || strcasecmp(v, "auto") == 0) {
         return SDLOP_GL_OFFLOAD_AUTO;
     }
@@ -878,6 +881,18 @@ SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContext(uint32_t egl_api,
         sdlop_glattrs.stencil_size = val;
     }
     sdlop_glattrs.accelerated_visual = 1;
+    return ctx;
+}
+
+SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContextAuto(SDLOP_GLOffloadContext *share_ctx)
+{
+    if (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) {
+        return SDLOP_GLOffload_CreateContext(EGL_OPENGL_ES_API, share_ctx);
+    }
+    SDLOP_GLOffloadContext *ctx = SDLOP_GLOffload_CreateContext(EGL_OPENGL_API, share_ctx);
+    if (!ctx && sdlop_glattrs.profile_mask == 0) {
+        ctx = SDLOP_GLOffload_CreateContext(EGL_OPENGL_ES_API, share_ctx);
+    }
     return ctx;
 }
 

@@ -12,8 +12,8 @@
 
 #include "sdlop_kmsdrm.h"
 
-#include "../../video/wayland/sdlop_egl_dyn.h"
-#include "../../video/sdlop_gl_offload.h"
+#include "../sdlop_egl_dyn.h"
+#include "../sdlop_gl_offload.h"
 
 #include <errno.h>
 #include <string.h>

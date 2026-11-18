@@ -10,7 +10,7 @@
 
 #include "sdlop_wayland_internal.h"
 
-#include "sdlop_egl_dyn.h"
+#include "../sdlop_egl_dyn.h"
 #include "../sdlop_gl_offload.h"
 #include <dlfcn.h>
 #include <string.h>

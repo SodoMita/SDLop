@@ -18,7 +18,7 @@
  * *-client-protocol.h include (their inlines compile against the
  * SDLOP_WL_* pointers) */
 #include "sdlop_wayland_dyn.h"
-#include "sdlop_egl_dyn.h"
+#include "../sdlop_egl_dyn.h"
 
 #include "pointer-constraints-client-protocol.h"
 #include "relative-pointer-client-protocol.h"
