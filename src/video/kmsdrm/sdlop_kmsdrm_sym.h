@@ -101,6 +101,7 @@ SDLOP_GBM_SYM(int, gbm_bo_get_plane_count, (struct gbm_bo *bo))
 SDLOP_GBM_SYM(uint32_t, gbm_bo_get_offset, (struct gbm_bo *bo, int plane))
 SDLOP_GBM_SYM(uint32_t, gbm_bo_get_stride_for_plane, (struct gbm_bo *bo, int plane))
 SDLOP_GBM_SYM(union gbm_bo_handle, gbm_bo_get_handle_for_plane, (struct gbm_bo *bo, int plane))
+SDLOP_GBM_SYM(int, gbm_bo_get_fd, (struct gbm_bo *bo))
 
 
 /* optional: atomic modesetting support. Left out of SDLOP_DRM_SYM so that a
@@ -123,6 +124,15 @@ SDLOP_DRM_ATOMIC_SYM(drmModePlanePtr, drmModeGetPlane, (int fd, uint32_t plane_i
 SDLOP_DRM_ATOMIC_SYM(void, drmModeFreePlane, (drmModePlanePtr ptr))
 SDLOP_DRM_ATOMIC_SYM(drmModePlaneResPtr, drmModeGetPlaneResources, (int fd))
 SDLOP_DRM_ATOMIC_SYM(void, drmModeFreePlaneResources, (drmModePlaneResPtr ptr))
+
+/* optional libdrm PRIME symbols (checked individually for NULL before use) */
+#ifndef SDLOP_DRM_OPT_SYM
+#define SDLOP_DRM_OPT_SYM(...)
+#endif
+SDLOP_DRM_OPT_SYM(int, drmPrimeFDToHandle, (int fd, int prime_fd, uint32_t *handle))
+SDLOP_DRM_OPT_SYM(int, drmCloseBufferHandle, (int fd, uint32_t handle))
+
+#undef SDLOP_DRM_OPT_SYM
 #undef SDLOP_DRM_ATOMIC_SYM
 #undef SDLOP_DRM_SYM
 #undef SDLOP_GBM_SYM

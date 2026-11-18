@@ -278,6 +278,7 @@ typedef struct SDLOP_GLAttributes
     int share_with_current_context;
     int framebuffer_srgb_capable;
     int floatbuffers;
+    int accelerated_visual; /* -1 = unset/auto, 0 = software, 1 = hardware */
 } SDLOP_GLAttributes;
 
 extern SDLOP_GLAttributes sdlop_glattrs;

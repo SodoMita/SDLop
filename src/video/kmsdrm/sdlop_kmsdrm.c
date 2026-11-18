@@ -1980,6 +1980,29 @@ static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
     return ok;
 }
 
+bool KMSDRM_EnsureSwScanout(SDL_Window *window)
+{
+    KMSDRM_WindowData *windata = window ? (KMSDRM_WindowData *)window->driverdata : NULL;
+    if (!windata || !windata->display) {
+        return SDL_SetError("Invalid window");
+    }
+    if (windata->sw_active) {
+        return true;
+    }
+    KMSDRM_DisplayData *dd = windata->display;
+    if (!kmsdrm_create_dumb(&kmsdrm, windata, dd->mode.hdisplay, dd->mode.vdisplay)) {
+        return false;
+    }
+    kmsdrm_fill_sw(windata, dd->mode.hdisplay, dd->mode.vdisplay, windata->clear_color);
+    windata->crtc_programmed = false;
+    return true;
+}
+
+bool KMSDRM_PresentSw(KMSDRM_DeviceData *vid, SDL_Window *window)
+{
+    return kmsdrm_present_sw(vid ? vid : &kmsdrm, window);
+}
+
 static void kmsdrm_destroy_surfaces(KMSDRM_DeviceData *vid, SDL_Window *window)
 {
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
@@ -1992,7 +2015,7 @@ static void kmsdrm_destroy_surfaces(KMSDRM_DeviceData *vid, SDL_Window *window)
     }
 
     /* GL side */
-    if (windata->gs) {
+    if (windata->gs || windata->gl_offload_active) {
         KMSDRM_DestroyGLSurfaces(windata);
     }
 
@@ -2027,6 +2050,26 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window,
     uint32_t w = mode->hdisplay, h = mode->vdisplay;
 
     if (windata->gl_active) {
+        if (windata->gl_offload_active) {
+            if (windata->gl_offload_prime) {
+                void *saved_ctx = windata->gl_offload_ctx;
+                KMSDRM_DestroyGLSurfaces(windata);
+                windata->gl_active = true;
+                windata->gl_offload_active = true;
+                windata->gl_offload_prime = true;
+                windata->gl_offload_ctx = saved_ctx;
+                windata->egl_surface_dirty = true;
+                KMSDRM_DeferEvent(window, KMSDRM_DEFER_SIZE);
+                return true;
+            }
+            if (!kmsdrm_create_dumb(vid, windata, w, h)) {
+                return false;
+            }
+            windata->crtc_programmed = false;
+            windata->egl_surface_dirty = true;
+            KMSDRM_DeferEvent(window, KMSDRM_DEFER_SIZE);
+            return true;
+        }
         /* mode-sized GBM/EGL scanout is stale; drop it and let the GL
          * swap path recreate it at the new size */
         if (windata->waiting_for_flip) {

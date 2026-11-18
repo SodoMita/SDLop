@@ -52,9 +52,11 @@ typedef struct WaylandWindowData
     int pending_w, pending_h;
 
     /* GL presentation state (managed by sdlop_wayland_gl.c) */
-    void *gl_surface; /* EGLSurface */
+    void *gl_surface; /* EGLSurface or SDLOP_GLOffloadSurface* */
     void *gl_egl_window; /* wl_egl_window backing the EGLSurface */
+    void *gl_offload_ctx; /* SDLOP_GLOffloadContext* last bound */
     bool gl_active;
+    bool gl_offload_active;
 } WaylandWindowData;
 
 typedef struct WaylandDeviceData
@@ -90,6 +92,8 @@ typedef struct WaylandDeviceData
     struct xdg_wm_base *wm_base;
     uint32_t compositor_version;
     uint32_t seat_version;
+    bool has_dmabuf;
+    bool has_wl_drm;
 
     SDL_Window *pointer_focus;
     SDL_Window *touch_focus;
@@ -194,8 +198,8 @@ static void window_commit(SDL_Window *window)
     if (!wd || !wd->configured || !wd->buffer) {
         return;
     }
-    if (wd->gl_active) {
-        return; /* EGL owns buffer management for this window now */
+    if (wd->gl_active && !wd->gl_offload_active) {
+        return; /* native Wayland EGL owns buffer management for this window */
     }
     wl_surface_attach(wd->surface, wd->buffer, 0, 0);
     wl_surface_damage_buffer(wd->surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -297,6 +301,77 @@ void *SDLOP_Wayland_GetGLEGLWindowSlot(SDL_Window *window)
 {
     WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
     return wd ? &wd->gl_egl_window : NULL;
+}
+
+void SDLOP_Wayland_SetGLOffloadActive(SDL_Window *window, bool active)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    if (wd) {
+        wd->gl_offload_active = active;
+    }
+}
+
+bool SDLOP_Wayland_IsGLOffloadActive(SDL_Window *window)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    return wd ? wd->gl_offload_active : false;
+}
+
+void *SDLOP_Wayland_GetGLOffloadContextSlot(SDL_Window *window)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    return wd ? &wd->gl_offload_ctx : NULL;
+}
+
+bool SDLOP_Wayland_CompositorHasHardwareBuffers(void)
+{
+    return wl_data.has_dmabuf || wl_data.has_wl_drm;
+}
+
+bool SDLOP_Wayland_AcquireOffloadShm(SDL_Window *window, void **pixels_out, int *pitch_out, int *w_out, int *h_out)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    if (!wd) {
+        return SDL_SetError("Invalid window");
+    }
+    int w = window->w > 0 ? window->w : 1;
+    int h = window->h > 0 ? window->h : 1;
+    if (!wd->buffer || wd->buffer_w != w || wd->buffer_h != h) {
+        if (!window_create_buffer(window, w, h)) {
+            return false;
+        }
+    }
+    if (pixels_out) {
+        *pixels_out = wd->shm_map;
+    }
+    if (pitch_out) {
+        *pitch_out = wd->buffer_w * 4;
+    }
+    if (w_out) {
+        *w_out = wd->buffer_w;
+    }
+    if (h_out) {
+        *h_out = wd->buffer_h;
+    }
+    return true;
+}
+
+bool SDLOP_Wayland_PresentOffloadShm(SDL_Window *window)
+{
+    WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
+    if (!wd || !wd->buffer) {
+        return SDL_SetError("Window has no shm buffer");
+    }
+    if (!wd->configured) {
+        /* xsurface_configure will commit once the configure handshake arrives */
+        return true;
+    }
+    wl_surface_attach(wd->surface, wd->buffer, 0, 0);
+    wl_surface_damage_buffer(wd->surface, 0, 0, wd->buffer_w, wd->buffer_h);
+    wl_surface_commit(wd->surface);
+    wl_display_flush(wl_data.display);
+    wd->mapped = true;
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1225,6 +1300,10 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         d->pointer_constraints = wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, 1);
     } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0 && !d->relative_manager) {
         d->relative_manager = wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, 1);
+    } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
+        d->has_dmabuf = true;
+    } else if (strcmp(interface, "wl_drm") == 0) {
+        d->has_wl_drm = true;
     }
 }
 
@@ -1306,7 +1385,7 @@ static bool wayland_Init(SDLop_VideoDevice *device)
 static void wayland_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
-    SDLOP_EGL_UnloadSymbols();
+    SDLOP_Wayland_GL_Deinit();
     wayland_release_pointer_lock();
     if (wl_data.pointer_constraints) {
         zwp_pointer_constraints_v1_destroy(wl_data.pointer_constraints);

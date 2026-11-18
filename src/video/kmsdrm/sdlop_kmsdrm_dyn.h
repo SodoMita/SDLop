@@ -47,6 +47,16 @@ bool SDLOP_DRM_ATOMIC_Available(void); /* true iff the atomic syms resolved */
     extern SDLOP_DYNADRM_##fn SDLOP_DRM_ATOMIC_##fn;
 #include "sdlop_kmsdrm_sym.h"
 #undef SDLOP_DRM_ATOMIC_SYM
+#undef SDLOP_DRM_OPT_SYM
+#undef SDLOP_GBM_SYM
+#undef SDLOP_DRM_SYM
+
+#define SDLOP_DRM_OPT_SYM(rc, fn, params) \
+    typedef rc(*SDLOP_DYNODRM_##fn) params; \
+    extern SDLOP_DYNODRM_##fn SDLOP_DRM_OPT_##fn;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_OPT_SYM
+#undef SDLOP_DRM_ATOMIC_SYM
 #undef SDLOP_GBM_SYM
 #undef SDLOP_DRM_SYM
 
