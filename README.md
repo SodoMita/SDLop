@@ -17,7 +17,7 @@ int main(void) {
 ```
 
 - **Drop-in API**: names, signatures, struct layouts, enum values and event
-  semantics match SDL3 3.2 (verified field-by-field against the real headers —
+  semantics match SDL3 3.4.20 (verified field-by-field against the real headers —
   `sizeof(SDL_Event) == 128`, identical member offsets, identical constants).
 - **Fast** (measured on this repo's benchmarks, see below):
   - event queue: **~4.6× faster** push+poll than SDL3 (10.4 ns vs 48.6 ns)
@@ -25,7 +25,8 @@ int main(void) {
   - raw input: **~5–9 µs** kernel-timestamp → your code, via a dedicated
     worker thread (asyncinput-style)
 - **Lean**: windowing + input only. No audio, renderer, GPU, joystick, HID,
-  camera, filesystem, iostream, … ~5k lines of C total.
+  camera, filesystem, iostream, … (~39k lines of C including the X11,
+  Wayland, KMSDRM and web drivers; the SDL surface/blit code is ported).
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
   rings and fires your callback *on the worker thread*. Native evdev codes,
@@ -43,6 +44,7 @@ int main(void) {
 | OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
 | Vulkan WSI (`SDL_Vulkan_*`, lavapipe) | ✅ done, verified by swapchain read-back |
 | Pointer lock (`zwp_pointer_constraints` + `zwp_relative_pointer`) | ✅ done, tested against a mini compositor |
+| Linux / KMSDRM (dumb buffers, GBM/EGL, VK_KHR_display, hardware cursor) | ✅ done (no DRM device in CI; build-tested) |
 | `dummy` (offscreen) driver | ✅ done, used for headless CI (incl. RAM-framebuffer surfaces) |
 | Web (Emscripten): canvas windows, DOM input, WebGL1/2 | ✅ done, tested in node + headless Chromium 153 |
 | Windows / Win32, macOS / Cocoa | 🔜 after web |
@@ -79,7 +81,8 @@ int main(void) {
 
 ## Benchmarks (this sandbox, x86-64, RelWithDebInfo)
 
-Event queue — identical source compiled against SDLop and SDL3 3.2.10,
+Event queue — identical source compiled against SDLop and SDL3 3.2.10 (measured
+before the 3.4 update),
 dummy video driver, 1M events, push+drain pattern:
 
 | | SDLop | SDL3 | speedup |
@@ -111,21 +114,30 @@ and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
 
 ## API surface (SDL3-compatible)
 
-Init/quit · `SDL_Init` `SDL_InitSubSystem` `SDL_QuitSubSystem` `SDL_WasInit` `SDL_Quit`
-Error · `SDL_SetError` `SDL_GetError` `SDL_ClearError` `SDL_OutOfMemory`
-Timer · `SDL_GetTicks` `SDL_GetTicksNS` `SDL_GetPerformanceCounter` `SDL_GetPerformanceFrequency` `SDL_Delay` `SDL_DelayNS`
-Video · `SDL_CreateWindow` `SDL_DestroyWindow` `SDL_ShowWindow` `SDL_HideWindow` `SDL_SetWindowTitle` `SDL_GetWindowTitle` `SDL_SetWindowSize` `SDL_GetWindowSize` `SDL_SetWindowPosition` `SDL_GetWindowPosition` `SDL_MinimizeWindow` `SDL_MaximizeWindow` `SDL_RestoreWindow` `SDL_SetWindowFullscreen` `SDL_RaiseWindow` `SDL_GetWindowID` `SDL_GetWindowFromID` `SDL_GetWindowFlags` `SDL_GetCurrentVideoDriver` `SDL_GetNumVideoDrivers` `SDL_GetVideoDriver` `SDL_GetWindowDisplayScale`
-Events · `SDL_PumpEvents` `SDL_PollEvent` `SDL_WaitEvent` `SDL_WaitEventTimeout` `SDL_PushEvent` `SDL_HasEvent` `SDL_HasEvents` `SDL_FlushEvent` `SDL_FlushEvents` `SDL_RegisterEvents` `SDL_GetWindowFromEvent`
-Keyboard · `SDL_GetKeyboardState` `SDL_ResetKeyboard` `SDL_GetModState` `SDL_SetModState` `SDL_GetKeyboardFocus` `SDL_GetKeyFromScancode` `SDL_GetScancodeFromKey` `SDL_GetScancodeName` `SDL_GetKeyName` `SDL_GetKeyFromName`
-Mouse · `SDL_GetMouseState` `SDL_GetRelativeMouseState` `SDL_GetMouseFocus` `SDL_SetWindowRelativeMouseMode` `SDL_GetWindowRelativeMouseMode`
-Surfaces · `SDL_CreateSurface` `SDL_CreateSurfaceFrom` `SDL_DestroySurface` `SDL_GetWindowSurface` `SDL_UpdateWindowSurface` `SDL_UpdateWindowSurfaceRects` `SDL_DestroyWindowSurface` `SDL_WindowHasSurface` `SDL_FillSurfaceRect` `SDL_FillSurfaceRects` `SDL_ReadSurfacePixel` `SDL_LockSurface` `SDL_UnlockSurface` `SDL_MapSurfaceRGB` `SDL_MapSurfaceRGBA` `SDL_MapRGB` `SDL_MapRGBA`
-OpenGL · `SDL_GL_SetAttribute` `SDL_GL_GetAttribute` `SDL_GL_CreateContext` `SDL_GL_DestroyContext` `SDL_GL_MakeCurrent` `SDL_GL_GetCurrentContext` `SDL_GL_GetCurrentWindow` `SDL_GL_SwapWindow` `SDL_GL_SetSwapInterval` `SDL_GL_GetSwapInterval` `SDL_GL_GetProcAddress` `SDL_GL_ResetAttributes`
-Vulkan · `SDL_Vulkan_LoadLibrary` `SDL_Vulkan_GetVkGetInstanceProcAddr` `SDL_Vulkan_GetInstanceExtensions` `SDL_Vulkan_CreateSurface` `SDL_Vulkan_DestroySurface` `SDL_Vulkan_GetPresentationSupport` `SDL_Vulkan_UnloadLibrary`
-Log · `SDL_Log` `SDL_LogMessage` `SDL_LogVerbose` `SDL_LogDebug` `SDL_LogInfo` `SDL_LogWarn` `SDL_LogError`
-Types · `SDL_Event` (128 B, same layout) · `SDL_Scancode` (full SDL3 list) · `SDL_Keycode`/`SDLK_*` · `SDL_Keymod` · `SDL_WindowFlags` · `SDL_MouseWheelDirection` · `SDL_Surface` (48 B, same layout) · `SDL_PixelFormat`/`SDL_PIXELFORMAT_*` · `SDL_BlendMode` · `SDL_Rect`/`SDL_FRect` · `SDL_GLAttr`/`SDL_GLProfile`
+566 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
+with the same signature as SDL3, and checked by the `api_exports` test.
 
-`struct`/enum/constant ABI is byte-identical to SDL3 3.2.10 (verified by an
-offset/value harness compiled against both header sets).
+| Area | Coverage |
+|---|---|
+| Init / hints / properties / log / error / timers / stdlib | `SDL_Init*`, `SDL_*Hint*`, `SDL_*Property*`, `SDL_Log*`, `SDL_GetTicks*`, `SDL_AddTimer`, `SDL_malloc`…`SDL_vsnprintf`, `SDL_iconv*`, atomics, `SDL_main` + main callbacks (`SDL_AppInit`/`AppIterate`/`AppEvent`/`AppQuit`) |
+| Video | displays + modes, content scale, window create (incl. `WithProperties`), popups/tooltips (parent-relative), min/max size, aspect ratio, bordered / resizable / always-on-top / focusable / modal / parent, opacity, icon, borders size, flash, sync, safe area, fullscreen modes, `SDL_GetWindows`, screensaver |
+| Grabs & mouse | relative mode, mouse/keyboard grab, mouse rect, `SDL_CaptureMouse`, warp (window + global), global mouse state, cursors (`SDL_CreateCursor`, color + animated cursors, system cursors from the XCursor theme, show/hide), device lists (`SDL_GetMice`/`GetKeyboards`/`GetTouchDevices` + names) |
+| Events | queue, `SDL_PeepEvents`, filters + watches, `SDL_WaitEvent*`, user events, `SDL_GetEventDescription` |
+| Keyboard / text | keymaps with xkb layouts, key names, text input start/stop, compose |
+| Surfaces | create/convert/duplicate/scale/flip/rotate, palettes, colorspaces, blend modes, color keys, `SDL_BlitSurface*` incl. scaled/tiled/9-grid, float/HDR (PQ, 10-bit) conversions, premultiplied alpha, rects |
+| OpenGL / Vulkan | EGL contexts (`SDL_GL_*`), Vulkan WSI (`SDL_Vulkan_*`) |
+
+Unsupported with an SDL error (like a stock SDL3 build without that feature):
+FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).
+Out of scope by design: audio, renderer, GPU, joystick/gamepad, haptics,
+sensors, camera, filesystem, iostream.
+
+`struct`/enum/constant ABI is byte-identical to SDL3 3.4.20 (verified by an
+offset/value harness compiled against both header sets), and SDLop's exported
+symbols are a strict subset of `libSDL3.so` 3.4.20 (`tools/api_subset_check.sh`).
+Surface pixel output is diffed against the reference library
+(`tests/run_surface_diff.sh`).
 
 ### SDLop extensions (`<SDL3/SDLop.h>`) — the asyncinput-style API
 
@@ -162,7 +174,7 @@ cmake --build build -j
 ctest --test-dir build            # headless tests
 
 # Optional: compare public layouts and every SDLK_*/SDL_KMOD_*/SDL_SCANCODE_*
-# constant with stock SDL3 3.2.10 headers (CI runs this)
+# constant with stock SDL3 3.4.20 headers (CI runs this)
 cmake -S . -B build-abi \
   -DSDL3_REFERENCE_INCLUDE=/path/to/SDL3/include
 cmake --build build-abi -j
@@ -291,7 +303,15 @@ Highlights:
 - Raw evdev input needs read access to `/dev/input` (root or `input` group);
   otherwise SDLop silently uses Wayland seat input. Like asyncinput, the raw
   path bypasses compositor keyboard focus/layout.
-- Wayland cannot position windows: `SDL_SetWindowPosition` returns false.
+- Wayland cannot position toplevel windows: `SDL_SetWindowPosition` returns
+  false for them. Popup and tooltip windows are `xdg_popup`s placed relative
+  to their parent (menus grab input and close on outside clicks). Requests
+  without a Wayland protocol (always-on-top, opacity, icon, modal, borders
+  size) report "That operation is not supported", as in SDL3. Optional
+  protocols used when the compositor offers them: xdg-decoration (server-side
+  borders), xdg-activation (raise/flash), idle-inhibit (screensaver),
+  keyboard-shortcuts-inhibit (keyboard grab), pointer constraints (mouse grab,
+  mouse rect, relative mode).
 - X11 specifics: EWMH (`_NET_WM_STATE`) is used for fullscreen/maximize when a
   WM advertises it; without a WM SDLop emulates both (borderless
   display-sized window, like SDL3's legacy path). Key repeat is detected via
@@ -326,7 +346,10 @@ Highlights:
   `zwp_relative_pointer`) on Wayland when the compositor has a seat/pointer,
   and raw evdev deltas when the worker thread is active; the window-system
   fallback streams deltas from the relative-pointer protocol.
-- `SDL_WINDOW_BORDERLESS` is inherent (no client-side decorations yet).
+- Window decorations: X11 uses `_MOTIF_WM_HINTS`; Wayland asks for
+  server-side decorations via xdg-decoration (borderless windows request
+  client-side mode, and SDLop draws none). Compositors without
+  xdg-decoration (e.g. GNOME) show no title bar.
 - Software surfaces are XRGB8888 wl_shm buffers (zero copy); the GL and
   Vulkan paths were validated against Mesa's software rasterizers
   (llvmpipe/lavapipe) but work with any EGL/Vulkan driver.
