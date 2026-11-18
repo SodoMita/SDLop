@@ -35,8 +35,17 @@ jobs:
             libxcb-randr0-dev libxcb-xtest0-dev libx11-6 \
             xvfb xauth openbox
 
+      - name: Fetch SDL 3.2.10 reference headers (abi_check)
+        run: |
+          git clone -q --depth 1 --branch release-3.2.10 --filter=blob:none --sparse \
+            https://github.com/libsdl-org/SDL /tmp/sdl3-ref
+          git -C /tmp/sdl3-ref sparse-checkout set include
+
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSDLOP_SANITIZERS=${{ matrix.sanitizers }}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSDLOP_SANITIZERS=${{ matrix.sanitizers }} \
+            -DSDL3_REFERENCE_INCLUDE=/tmp/sdl3-ref/include
 
       - name: Build
         run: cmake --build build -j"$(nproc)"

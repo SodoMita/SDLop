@@ -144,7 +144,7 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
     SDL_Event event;
     SDL_zero(event);
     event.tfinger.type = type;
-    event.tfinger.timestamp = timestamp_ns;
+    event.tfinger.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
     event.tfinger.touchID = touchID;
     event.tfinger.fingerID = fingerID;
     event.tfinger.x = x;

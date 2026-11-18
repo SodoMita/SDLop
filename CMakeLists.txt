@@ -343,13 +343,16 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
+  # same keycode checks through the built-in US table (no libxkbcommon)
+  add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
+  set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
 
   # Manual, externally driven trace tool. It is intentionally not registered
   # with CTest: it waits for a compositor-side input script after READY-INPUT.

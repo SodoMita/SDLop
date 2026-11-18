@@ -76,15 +76,20 @@ static bool in_browser = false;
 
 static void test_keymap_table(void)
 {
-    /* base + shifted key resolution (SDL3 semantics) */
-    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_W, SDL_KMOD_NONE, true) == SDLK_w,
-          "W base -> SDLK_w");
+    /* SDL3 semantics: SDLK_W == 'w'; key_event=true ignores modifiers (the
+     * keycode of a key event), key_event=false applies them */
+    CHECK(SDLK_W == 'w' && SDLK_A == 0x61u && SDLK_Z == 0x7au, "SDLK_A..Z are lowercase like SDL3");
+    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_W, SDL_KMOD_NONE, true) == SDLK_W,
+          "W base -> SDLK_W");
     CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_W, SDL_KMOD_LSHIFT, true) == SDLK_W,
-          "shift+W -> SDLK_W");
-    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_W, SDL_KMOD_LSHIFT, false) == SDLK_w,
-          "polled shift+W -> base");
-    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_2, SDL_KMOD_LSHIFT, true) == SDLK_AT,
+          "key-event shift+W -> SDLK_W (modifiers ignored)");
+    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_W, SDL_KMOD_LSHIFT, false) == 'W',
+          "shift+W with modifiers applied -> 'W'");
+    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_W, SDL_KMOD_CAPS, false) == 'W', "caps+W -> 'W'");
+    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_2, SDL_KMOD_LSHIFT, false) == SDLK_AT,
           "shift+2 -> @");
+    CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_2, SDL_KMOD_LSHIFT, true) == SDLK_2,
+          "key-event shift+2 -> 2");
     CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_ESCAPE, SDL_KMOD_NONE, true) == SDLK_ESCAPE,
           "escape -> SDLK_ESCAPE");
     CHECK(SDL_GetScancodeFromKey(SDLK_W, NULL) == SDL_SCANCODE_W, "key -> scancode");
@@ -96,7 +101,9 @@ static void test_keymap_table(void)
     CHECK(strcmp(SDL_GetScancodeName(SDL_SCANCODE_RETURN), "Return") == 0,
           "name of RETURN is '%s'", SDL_GetScancodeName(SDL_SCANCODE_RETURN));
     /* stock SDL3 names a letter key by its printed (capital) letter */
-  CHECK(strcmp(SDL_GetKeyName(SDLK_w), "W") == 0, "name of SDLK_w");
+    CHECK(strcmp(SDL_GetKeyName(SDLK_W), "W") == 0, "name of SDLK_W");
+    CHECK(SDL_GetKeyFromName("W") == SDLK_W && SDL_GetKeyFromName("w") == SDLK_W, "key from name 'W'");
+    CHECK(SDL_GetKeyFromName("Space") == SDLK_SPACE, "key from name 'Space'");
     CHECK(strcmp(SDL_GetKeyName(SDLK_ESCAPE), "Escape") == 0, "name of ESCAPE");
 }
 
@@ -173,9 +180,11 @@ static void test_browser_driver(void)
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_W) {
             saw_shifted = (e.key.key == SDLK_W) && (e.key.mod & SDL_KMOD_LSHIFT) != 0;
+        } else if (e.type == SDL_EVENT_TEXT_INPUT) {
+            CHECK(strcmp(e.text.text, "W") == 0, "shift+W types 'W' (got %s)", e.text.text);
         }
     }
-    CHECK(saw_shifted, "shift+W gives SDLK_W + LSHIFT");
+    CHECK(saw_shifted, "shift+W gives SDLK_W ('w', unmodified like SDL3) + LSHIFT");
     dispatch_js("window.dispatchEvent(new KeyboardEvent('keyup', {code:'KeyW', key:'w', shiftKey:true, bubbles:true}))");
     dispatch_js("window.dispatchEvent(new KeyboardEvent('keyup', {code:'ShiftLeft', key:'Shift', location:2, bubbles:true}))");
     SDL_PumpEvents();

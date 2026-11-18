@@ -161,7 +161,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ctest --test-dir build            # headless tests
 
-# Optional: compare public layouts/constants with stock SDL3 3.2.10 headers
+# Optional: compare public layouts and every SDLK_*/SDL_KMOD_*/SDL_SCANCODE_*
+# constant with stock SDL3 3.2.10 headers (CI runs this)
 cmake -S . -B build-abi \
   -DSDL3_REFERENCE_INCLUDE=/path/to/SDL3/include
 cmake --build build-abi -j

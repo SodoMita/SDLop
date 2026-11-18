@@ -106,7 +106,7 @@ static void build_symtab(void)
         xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)evdev + 8);
         if (sym != XKB_KEY_NoSymbol) {
             symtab_put(sym, sc);
-            /* also index unshifted letters (a-z) so SDLK_a finds A key */
+            /* also index lowercase letters so SDLK_A (== 'a') finds the A key */
             if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z) {
                 symtab_put(sym - XKB_KEY_A + XKB_KEY_a, sc);
             }
@@ -260,7 +260,7 @@ void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 l
 static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
 {
     /* Latin-1 range maps directly to the unicode value (SDL3 semantics:
-     * base-layout letters are lowercase: SDLK_a == 'a') */
+     * base-layout letters are lowercase: SDLK_A == 'a') */
     if (sym >= XKB_KEY_a && sym <= XKB_KEY_z) {
         return (SDL_Keycode)sym;
     }
@@ -349,6 +349,44 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
     return SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_UNKNOWN);
 }
 
+/* SDL3's built-in US layout (SDL_GetDefaultKeyFromScancode): used when no
+ * xkb keymap is available (no libxkbcommon), so keycodes stay meaningful */
+static SDL_Keycode default_key_from_scancode(SDL_Scancode sc, SDL_Keymod mod)
+{
+    const bool shift = (mod & SDL_KMOD_SHIFT) != 0;
+    const bool caps = (mod & SDL_KMOD_CAPS) != 0;
+    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z) {
+        return (SDL_Keycode)((shift != caps ? 'A' : 'a') + (sc - SDL_SCANCODE_A));
+    }
+    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_0) {
+        static const char base[] = "1234567890", shifted[] = "!@#$%^&*()";
+        return (SDL_Keycode)(shift ? shifted : base)[sc - SDL_SCANCODE_1];
+    }
+    static const struct { SDL_Scancode sc; char base, shifted; } punct[] = {
+        { SDL_SCANCODE_SPACE, ' ', ' ' }, { SDL_SCANCODE_MINUS, '-', '_' },
+        { SDL_SCANCODE_EQUALS, '=', '+' }, { SDL_SCANCODE_LEFTBRACKET, '[', '{' },
+        { SDL_SCANCODE_RIGHTBRACKET, ']', '}' }, { SDL_SCANCODE_BACKSLASH, '\\', '|' },
+        { SDL_SCANCODE_NONUSHASH, '#', '~' }, { SDL_SCANCODE_SEMICOLON, ';', ':' },
+        { SDL_SCANCODE_APOSTROPHE, '\'', '"' }, { SDL_SCANCODE_GRAVE, '`', '~' },
+        { SDL_SCANCODE_COMMA, ',', '<' }, { SDL_SCANCODE_PERIOD, '.', '>' },
+        { SDL_SCANCODE_SLASH, '/', '?' }, { SDL_SCANCODE_NONUSBACKSLASH, '<', '>' },
+    };
+    for (size_t i = 0; i < SDL_arraysize(punct); i++) {
+        if (punct[i].sc == sc) {
+            return (SDL_Keycode)(unsigned char)(shift ? punct[i].shifted : punct[i].base);
+        }
+    }
+    switch (sc) {
+    case SDL_SCANCODE_RETURN:    return SDLK_RETURN;
+    case SDL_SCANCODE_ESCAPE:    return SDLK_ESCAPE;
+    case SDL_SCANCODE_BACKSPACE: return SDLK_BACKSPACE;
+    case SDL_SCANCODE_TAB:       return SDLK_TAB;
+    case SDL_SCANCODE_DELETE:    return SDLK_DELETE;
+    default: break;
+    }
+    return SDL_SCANCODE_TO_KEYCODE(sc);
+}
+
 SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out)
 {
     if (text_utf8 && text_size) {
@@ -357,8 +395,11 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
     if (repeats_out) {
         *repeats_out = false;
     }
-    if (!xkb_st || rawcode == 0) {
+    if (rawcode == 0 || rawcode > SDLOP_EVDEV_KEY_MAX) {
         return SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_UNKNOWN);
+    }
+    if (!xkb_st) {
+        return default_key_from_scancode((SDL_Scancode)sdlop_evdev_to_scancode[rawcode], SDL_KMOD_NONE);
     }
     xkb_keycode_t xk = (xkb_keycode_t)rawcode + 8; /* evdev -> xkb offset */
 
@@ -555,23 +596,41 @@ SDL_Window *SDL_GetKeyboardFocus(void)
 
 SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, bool key_event)
 {
-    Uint16 raw = evdev_from_scancode(scancode);
-    /* SDL3 applies the *passed* modifiers when key_event is set */
-    if (key_event && keymap &&
-        (modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT | SDL_KMOD_CAPS))) {
-        xkb_mod_mask_t mask = 0;
-        if (modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT)) {
-            mask |= (xkb_mod_mask_t)1 << mod_shift;
-        }
-        if (modstate & SDL_KMOD_CAPS) {
-            mask |= (xkb_mod_mask_t)1 << mod_caps;
-        }
-        SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, mask, 0, 0, 0, 0, 0);
-        xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)raw + 8);
-        SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, 0, 0, 0, 0, 0, 0);
-        return keysym_to_keycode(sym);
+    /* SDL3 semantics:
+     *  - key_event = true: the keycode a key event would carry - modifiers
+     *    are ignored (letters stay lowercase, shift+2 is '2');
+     *  - key_event = false: the passed modifiers select the shift level
+     *    (shift/caps, AltGr = SDL_KMOD_MODE, SDL_KMOD_LEVEL5). */
+    if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
+        return SDLK_UNKNOWN;
     }
-    return SDLOP_KeyboardTranslateKey(raw, key_event, NULL, 0, NULL);
+    if (key_event) {
+        modstate = SDL_KMOD_NONE;
+    }
+    Uint16 raw = evdev_from_scancode(scancode);
+    if (!keymap || !raw) {
+        return raw ? default_key_from_scancode(scancode, modstate) : SDL_SCANCODE_TO_KEYCODE(scancode);
+    }
+    xkb_mod_mask_t mask = 0;
+    if ((modstate & SDL_KMOD_SHIFT) && mod_shift != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_shift;
+    }
+    if ((modstate & SDL_KMOD_CAPS) && mod_caps != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_caps;
+    }
+    if ((modstate & SDL_KMOD_MODE) && mod_altgr != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_altgr;
+    }
+    if ((modstate & SDL_KMOD_LEVEL5) && mod_level5 != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_level5;
+    }
+    if (!mask) {
+        return SDLOP_KeyboardTranslateKey(raw, false, NULL, 0, NULL);
+    }
+    SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, mask, 0, 0, 0, 0, 0);
+    xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)raw + 8);
+    SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, 0, 0, 0, 0, 0, 0);
+    return keysym_to_keycode(sym);
 }
 
 SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
@@ -595,30 +654,21 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
     if (sc != SDL_SCANCODE_UNKNOWN) {
         return sc;
     }
-    /* shifted printables (SDL3: SDLK_W resolves to SDL_SCANCODE_W) */
-    static const struct { char ch; SDL_Scancode sc; } shifted_us[] = {
-        { '!', SDL_SCANCODE_1 }, { '@', SDL_SCANCODE_2 }, { '#', SDL_SCANCODE_3 },
-        { '$', SDL_SCANCODE_4 }, { '%', SDL_SCANCODE_5 }, { '^', SDL_SCANCODE_6 },
-        { '&', SDL_SCANCODE_7 }, { '*', SDL_SCANCODE_8 }, { '(', SDL_SCANCODE_9 },
-        { ')', SDL_SCANCODE_0 }, { '_', SDL_SCANCODE_MINUS }, { '+', SDL_SCANCODE_EQUALS },
-        { '{', SDL_SCANCODE_LEFTBRACKET }, { '}', SDL_SCANCODE_RIGHTBRACKET },
-        { '|', SDL_SCANCODE_BACKSLASH }, { ':', SDL_SCANCODE_SEMICOLON },
-        { '"', SDL_SCANCODE_APOSTROPHE }, { '~', SDL_SCANCODE_GRAVE },
-        { '<', SDL_SCANCODE_COMMA }, { '>', SDL_SCANCODE_PERIOD },
-        { '?', SDL_SCANCODE_SLASH },
-    };
-    if (key >= 'A' && key <= 'Z') {
-        if (modstate) {
-            *modstate = SDL_KMOD_LSHIFT;
-        }
-        return (SDL_Scancode)(SDL_SCANCODE_A + (key - 'A'));
-    }
-    for (size_t i = 0; i < SDL_arraysize(shifted_us); i++) {
-        if (shifted_us[i].ch == (char)key) {
-            if (modstate) {
-                *modstate = SDL_KMOD_LSHIFT;
+    /* not on the active layout (or no keymap): SDL3's default US table,
+     * unshifted first, then shifted ('A' -> A + shift, '@' -> 2 + shift).
+     * The ISO-only keys are skipped so '~'/'<' resolve to the US keys. */
+    for (int pass = 0; pass < 2; pass++) {
+        const SDL_Keymod m = pass ? SDL_KMOD_LSHIFT : SDL_KMOD_NONE;
+        for (int i = SDL_SCANCODE_A; i < SDL_SCANCODE_CAPSLOCK; i++) {
+            if (i == SDL_SCANCODE_NONUSHASH) {
+                continue;
             }
-            return shifted_us[i].sc;
+            if (default_key_from_scancode((SDL_Scancode)i, m) == key) {
+                if (modstate) {
+                    *modstate = m;
+                }
+                return (SDL_Scancode)i;
+            }
         }
     }
     return SDL_SCANCODE_UNKNOWN;

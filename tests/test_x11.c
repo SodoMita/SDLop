@@ -257,9 +257,20 @@ static void pump_ms(int ms)
     }
 }
 
+/* Discard everything caused by earlier steps. A plain pump+flush races
+ * with input still in flight (XTest requests not yet processed, or events
+ * not yet read by SDLop), which then leaks into the next step. So: round-trip
+ * the observer connection (the server has processed all injected input and
+ * queued the resulting events for SDLop), let SDLop read them, then flush. */
+static void sync_input(void)
+{
+    free(xcb_get_input_focus_reply(obs, xcb_get_input_focus(obs), NULL));
+    pump_ms(30);
+}
+
 static void drain(void)
 {
-    SDL_PumpEvents();
+    sync_input();
     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
 }
 
@@ -477,7 +488,7 @@ int main(void)
         drain();
         fake_key(38, true);
         fake_key(38, false);
-        CHECK(wait_type(SDL_EVENT_KEY_DOWN, 500, &e) && e.key.scancode == SDL_SCANCODE_A && e.key.key == 'a' &&
+        CHECK(wait_type(SDL_EVENT_KEY_DOWN, 500, &e) && e.key.scancode == SDL_SCANCODE_A && e.key.key == SDLK_A &&
                   !e.key.repeat,
               "key A down (sc %d key 0x%x rep %d)", (int)e.key.scancode, (unsigned)e.key.key, (int)e.key.repeat);
         CHECK(wait_type(SDL_EVENT_KEY_UP, 500, &e) && e.key.scancode == SDL_SCANCODE_A, "key A up");
@@ -489,7 +500,7 @@ int main(void)
               "shift+A carries KMOD_SHIFT (mod 0x%x)", (unsigned)e.key.mod);
         fake_key(38, false);
         fake_key(50, false);
-        pump_ms(50);
+        drain();
         CHECK(!(SDL_GetModState() & SDL_KMOD_SHIFT), "shift released");
 
         /* text input */
@@ -498,10 +509,12 @@ int main(void)
         fake_key(38, true);
         fake_key(38, false);
         CHECK(wait_type(SDL_EVENT_TEXT_INPUT, 500, &e) && strcmp(e.text.text, "a") == 0, "TEXT_INPUT 'a'");
+        CHECK(wait_type(SDL_EVENT_KEY_UP, 500, &e) && e.key.scancode == SDL_SCANCODE_A, "key A up after text");
         SDL_StopTextInput(w);
 
         /* held key: server autorepeat must not leak; SDLop repeats itself */
         drain();
+        const Uint64 t_hold = SDL_GetTicksNS();
         fake_key(38, true);
         int downs = 0, repeats = 0;
         Uint64 end = SDL_GetTicks() + 900;
@@ -515,7 +528,8 @@ int main(void)
                         downs++;
                     }
                 }
-                CHECK(e.type != SDL_EVENT_KEY_UP, "no KEY_UP while the key is held");
+                CHECK(e.type != SDL_EVENT_KEY_UP, "no KEY_UP while the key is held (scancode %d, %.1f ms in)",
+                      (int)e.key.scancode, (double)(e.key.timestamp - t_hold) / 1e6);
             }
             SDL_Delay(5);
         }
@@ -672,6 +686,7 @@ int main(void)
             fake_motion_rel(7, -3);
             pump_ms(20);
         }
+        sync_input(); /* every injected motion has reached SDLop */
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_MOUSE_MOTION) {

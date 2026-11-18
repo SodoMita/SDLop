@@ -275,7 +275,7 @@ int main(void)
     wl_display_flush(c.dpy);
     expect kd = { .type = SDL_EVENT_KEY_DOWN, .field_i = SDL_SCANCODE_W };
     CHECK(pump_until(pred_generic, &kd, 3000), "no KEY_DOWN for W (scancode W)");
-    CHECK(kd.got_type == SDLK_w, "keycode 0x%X != SDLK_w", kd.got_type);
+    CHECK(kd.got_type == SDLK_W, "keycode 0x%X != SDLK_W", kd.got_type);
 
     zwp_virtual_keyboard_v1_key(c.vkb, now_ms(), KEY_W, WL_KEYBOARD_KEY_STATE_RELEASED);
     wl_display_flush(c.dpy);

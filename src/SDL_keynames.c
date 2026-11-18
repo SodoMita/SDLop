@@ -204,6 +204,15 @@ SDL_Keycode SDL_GetKeyFromName(const char *name)
         key = 0;
     }
     if (key) {
+        /* SDL3: a keycode is the unshifted key, but a name is the symbol
+         * printed on the key - usually the shifted one ("A" names 'a'). So a
+         * single character that needs shift/caps on the current layout maps
+         * back to the unmodified keycode of that key. */
+        SDL_Keymod mod = SDL_KMOD_NONE;
+        SDL_Scancode sc = SDL_GetScancodeFromKey((SDL_Keycode)key, &mod);
+        if (sc != SDL_SCANCODE_UNKNOWN && (mod & (SDL_KMOD_SHIFT | SDL_KMOD_CAPS))) {
+            return SDL_GetKeyFromScancode(sc, SDL_KMOD_NONE, false);
+        }
         return (SDL_Keycode)key;
     }
 
@@ -216,7 +225,9 @@ SDL_Keycode SDL_GetKeyFromName(const char *name)
     for (int i = 0; i < SDL_SCANCODE_COUNT; i++) {
         const char *sc_name = SDL_GetScancodeName((SDL_Scancode)i);
         if (*sc_name && *sc_name == *name && strcasecmp(name, sc_name) == 0) {
-            return (SDL_Keycode)i | SDLK_SCANCODE_MASK;
+            /* SDL3: the key that scancode produces ("Space" -> ' ',
+             * "Return" -> '\r'); non-character keys stay scancode-masked */
+            return SDL_GetKeyFromScancode((SDL_Scancode)i, SDL_KMOD_NONE, false);
         }
     }
 
