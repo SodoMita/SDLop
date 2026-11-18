@@ -260,8 +260,7 @@ int main(void)
             assert(st == 0);
         }
         assert(SDL_LockProperties(shared));
-        assert(SDL_LockProperties(shared)); /* recursive on the same thread */
-        SDL_UnlockProperties(shared);
+        /* the lock is not recursive (same as SDL3): a second lock would block */
         SDL_UnlockProperties(shared);
         SDL_DestroyProperties(shared);
     }

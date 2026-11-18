@@ -38,8 +38,3 @@ bool SDL_OutOfMemory(void)
 {
     return SDL_SetError("Out of memory");
 }
-
-bool SDL_InvalidParamError(const char *param)
-{
-    return SDL_SetError("Parameter '%s' is invalid", param);
-}

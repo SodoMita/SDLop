@@ -53,11 +53,12 @@ extern bool SDL_OutOfMemory(void);
  * Set an error message stating that a parameter was invalid.
  *
  * This is a helper for the common case of `SDL_SetError("Parameter '%s' is
- * invalid", param)`.
+ * invalid", param)`. It is a macro, like stock SDL3 (which does not export a
+ * function by this name).
  *
  * \param param the name of the invalid parameter.
  * \returns false.
  */
-extern bool SDL_InvalidParamError(const char *param);
+#define SDL_InvalidParamError(param) SDL_SetError("Parameter '%s' is invalid", (param))
 
 #endif /* SDL_error_h_ */

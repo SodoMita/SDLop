@@ -124,7 +124,7 @@ static void sdlop_make_tls_key(void)
     sdlop_tls_key_valid = (pthread_key_create(&sdlop_tls_key, NULL) == 0);
 }
 
-void SDL_InitTLSData(void)
+static void sdlop_init_tls_data(void)
 {
     pthread_once(&sdlop_tls_once, sdlop_make_tls_key);
 }
@@ -173,7 +173,7 @@ bool SDL_SetTLS(SDL_TLSID *id, const void *value, SDL_TLSDestructorCallback dest
      * There's a race condition here if you are calling this from non-SDL threads
      * and haven't called SDL_Init() on your main thread, but such is life.
      * (SDL3 notes the same race.) */
-    SDL_InitTLSData();
+    sdlop_init_tls_data();
 
     /* Get the storage index associated with the ID in a thread-safe way */
     int storage_index = SDL_GetAtomicInt(id) - 1;
@@ -621,12 +621,18 @@ void SDL_DetachThread(SDL_Thread *thread)
         return;
     }
 
+    /* Capture the handle now: the object can only be freed by the thread
+       itself once it observes DETACHED, and only we can set DETACHED here,
+       so reading it before the CAS is race-free. */
+    const pthread_t handle = thread->handle;
+
     /* The thread may vanish at any time, it's no longer valid */
     thread_unregister(thread);
 
     /* Grab dibs if the state is alive+joinable. */
     if (SDL_CompareAndSwapAtomicInt(&thread->state, SDL_THREAD_ALIVE, SDL_THREAD_DETACHED)) {
-        pthread_detach(thread->handle);
+        /* After this point the thread may self-free; don't touch `thread`. */
+        pthread_detach(handle);
     } else {
         /* all other states are pretty final, see where we landed. */
         SDL_ThreadState thread_state = (SDL_ThreadState)SDL_GetAtomicInt(&thread->state);
@@ -634,7 +640,7 @@ void SDL_DetachThread(SDL_Thread *thread)
             return; /* already detached (you shouldn't call this twice!) */
         } else if (thread_state == SDL_THREAD_COMPLETE) {
             /* already done, clean it up (thread->status already final). */
-            pthread_join(thread->handle, 0);
+            pthread_join(handle, 0);
             SDL_free(thread->name);
             SDL_free(thread);
         }

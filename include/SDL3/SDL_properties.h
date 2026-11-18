@@ -50,7 +50,6 @@ extern void *SDL_GetPointerProperty(SDL_PropertiesID props, const char *name, vo
 extern bool SDL_HasProperty(SDL_PropertiesID props, const char *name);
 extern SDL_PropertyType SDL_GetPropertyType(SDL_PropertiesID props, const char *name);
 extern bool SDL_ClearProperty(SDL_PropertiesID props, const char *name);
-extern void SDL_ClearProperties(SDL_PropertiesID props);
 
 /** Callback for SDL_EnumerateProperties(); props is the group being enumerated. */
 typedef void (*SDL_EnumeratePropertiesCallback)(void *userdata, SDL_PropertiesID props, const char *name);
