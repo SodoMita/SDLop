@@ -78,7 +78,9 @@ jobs:
             # check-runs API / PR UI without downloading logs)
             {
               echo "failed: $(cut -d: -f2 Testing/Temporary/LastTestsFailed.log | tr '\n' ' ')"
-              grep -hE 'FAIL|ERROR|Assertion|Sanitizer|SUMMARY|timeout' Testing/Temporary/LastTest.log | head -40
+              grep -hE 'FAIL|Assertion|timeout' Testing/Temporary/LastTest.log | grep -v Sanitizer | head -30
+              # sanitizer reports: the frames are what matters
+              awk '/ERROR: (Leak|Address|Undefined)Sanitizer|runtime error/{p=1} p&&/^ *#[0-9]+ /{n++; if(n<=24) print} /SUMMARY:/{if(p) print; p=0; n=0}' Testing/Temporary/LastTest.log | head -60
             } | sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}' > /tmp/annot
             echo "::error title=ctest failures::$(cat /tmp/annot)"
             exit 1
