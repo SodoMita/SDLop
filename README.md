@@ -114,7 +114,7 @@ and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
 
 ## API surface (SDL3-compatible)
 
-574 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+590 SDL3 functions; every one is declared in `include/SDL3/` (generated from
 the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
 with the same signature as SDL3, and checked by the `api_exports` test.
 
@@ -127,6 +127,7 @@ with the same signature as SDL3, and checked by the `api_exports` test.
 | Keyboard / text | keymaps with xkb layouts, key names, text input start/stop, compose |
 | Surfaces | create/convert/duplicate/scale/flip/rotate, palettes, colorspaces, blend modes, color keys, `SDL_BlitSurface*` incl. scaled/tiled/9-grid, float/HDR (PQ, 10-bit) conversions, premultiplied alpha, rects |
 | OpenGL / Vulkan | EGL contexts (`SDL_GL_*`), Vulkan WSI (`SDL_Vulkan_*`) |
+| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings |
 
 Unsupported with an SDL error (like a stock SDL3 build without that feature):
 FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).

@@ -273,6 +273,7 @@ void SDL_Quit(void)
     memset(&sdlop, 0, sizeof(sdlop));
     sdlop.wake_fd = -1;
     SDLOP_ResetTouchMouse();
+    SDLOP_AssertionsQuit(); /* report uses the log */
     SDLOP_QuitLog();
     SDLOP_QuitHints();
     SDLOP_QuitProperties();

@@ -41,6 +41,7 @@ if(EMSCRIPTEN)
     src/SDL_events_categories.c
     src/SDL_clipboard.c
     src/SDL_thread.c
+    src/SDL_misc.c
     src/SDL_main.c
     src/SDL_rect.c
     src/SDL_pixels.c
@@ -279,6 +280,7 @@ set(SDLop_SOURCES
   src/SDL_events_categories.c
   src/SDL_clipboard.c
   src/SDL_thread.c
+  src/SDL_misc.c
   src/SDL_main.c
   src/SDL_rect.c
   src/SDL_pixels.c
@@ -396,7 +398,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
