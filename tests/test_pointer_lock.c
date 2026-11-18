@@ -133,6 +133,9 @@ int main(int argc, char *argv[])
     setenv("WAYLAND_DISPLAY", "wayland-mini", 1);
     setenv("SDL_VIDEODRIVER", "wayland", 1); /* never fall back to x11 */
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    /* the mini compositor also plays a touch script; keep it from driving
+     * the pointer under test (SDL3 SDL_HINT_TOUCH_MOUSE_EVENTS opt-out) */
+    setenv(SDL_HINT_TOUCH_MOUSE_EVENTS, "0", 1);
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());

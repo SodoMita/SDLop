@@ -169,6 +169,16 @@ typedef struct X11DeviceData
     bool detectable_repeat;
     bool has_xi2;
     uint8_t xi_opcode;
+    /* XI2.2 touch sequences: per-finger last position for dx/dy, and
+     * the window the sequence started on (SDL3 semantics) */
+    struct
+    {
+        bool active;
+        uint16_t source; /* slave device = SDL_TouchID */
+        uint32_t detail; /* touch id = SDL_FingerID */
+        SDL_Window *window;
+        float nx, ny;
+    } fingers[16];
     bool has_randr;
     uint8_t randr_event_base;
     bool randr_monitors;          /* RandR >= 1.5 */
@@ -1106,6 +1116,27 @@ static void select_raw_motion(bool on)
     free(X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, x11.root, 1, &em.head)));
 }
 
+/* XI2.2 multitouch on our windows (SDL3 xinput2_select_touch). With a
+ * touch selection the server stops emulating the pointer for these
+ * sequences; the core synthesizes the SDL_TOUCH_MOUSEID mouse instead. */
+static void select_touch(xcb_window_t xid)
+{
+    if (!x11.has_xi2 || getenv("SDLOP_X11_NO_TOUCH")) {
+        return;
+    }
+    struct {
+        xcb_input_event_mask_t head;
+        uint32_t mask;
+    } em;
+    em.head.deviceid = X11_XI_ALL_MASTER_DEVICES;
+    em.head.mask_len = 1;
+    em.mask = XCB_INPUT_XI_EVENT_MASK_TOUCH_BEGIN | XCB_INPUT_XI_EVENT_MASK_TOUCH_UPDATE |
+              XCB_INPUT_XI_EVENT_MASK_TOUCH_END;
+    /* BadAccess if another client holds the touch selection: then the
+     * pointer emulation simply keeps working */
+    free(X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, xid, 1, &em.head)));
+}
+
 static void warp_to_center(SDL_Window *window)
 {
     X11WindowData *wd = wdata(window);
@@ -1189,8 +1220,105 @@ static double fp3232(xcb_input_fp3232_t v)
     return (double)v.integral + (double)v.frac / 4294967296.0;
 }
 
+static float fp1616(xcb_input_fp1616_t v)
+{
+    return (float)v / 65536.0f;
+}
+
+static int touch_slot(uint16_t source, uint32_t detail)
+{
+    for (int i = 0; i < (int)SDL_arraysize(x11.fingers); i++) {
+        if (x11.fingers[i].active && x11.fingers[i].source == source && x11.fingers[i].detail == detail) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void handle_touch(xcb_input_touch_begin_event_t *te)
+{
+    int slot = touch_slot(te->sourceid, te->detail);
+    SDL_Window *window;
+    if (te->event_type == XCB_INPUT_TOUCH_BEGIN) {
+        window = window_from_xid(te->event);
+        if (!window || slot >= 0) {
+            return;
+        }
+        for (int i = 0; i < (int)SDL_arraysize(x11.fingers); i++) {
+            if (!x11.fingers[i].active) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            return; /* more simultaneous touches than we track */
+        }
+    } else {
+        if (slot < 0) {
+            return; /* began before the window existed / slot overflow */
+        }
+        window = x11.fingers[slot].window;
+    }
+    if (window->w <= 0 || window->h <= 0) {
+        return;
+    }
+    /* SDL3 X11: event-window pixel coordinates normalized by the window
+     * size, clamped to 0..1 */
+    float nx = SDL_max(0.0f, SDL_min(fp1616(te->event_x) / (float)window->w, 1.0f));
+    float ny = SDL_max(0.0f, SDL_min(fp1616(te->event_y) / (float)window->h, 1.0f));
+    SDL_TouchID touch = (SDL_TouchID)te->sourceid;
+    SDL_FingerID finger = (SDL_FingerID)te->detail;
+    Uint64 now = SDLOP_MonotonicNS();
+    switch (te->event_type) {
+    case XCB_INPUT_TOUCH_BEGIN:
+        x11.fingers[slot].active = true;
+        x11.fingers[slot].source = te->sourceid;
+        x11.fingers[slot].detail = te->detail;
+        x11.fingers[slot].window = window;
+        x11.fingers[slot].nx = nx;
+        x11.fingers[slot].ny = ny;
+        SDLOP_SendTouch(SDL_EVENT_FINGER_DOWN, touch, finger, nx, ny, 0.0f, 0.0f, 1.0f, window->id, now);
+        break;
+    case XCB_INPUT_TOUCH_UPDATE: {
+        float dx = nx - x11.fingers[slot].nx;
+        float dy = ny - x11.fingers[slot].ny;
+        if (dx == 0.0f && dy == 0.0f) {
+            break;
+        }
+        x11.fingers[slot].nx = nx;
+        x11.fingers[slot].ny = ny;
+        SDLOP_SendTouch(SDL_EVENT_FINGER_MOTION, touch, finger, nx, ny, dx, dy, 1.0f, window->id, now);
+        break;
+    }
+    case XCB_INPUT_TOUCH_END:
+        x11.fingers[slot].active = false;
+        SDLOP_SendTouch(SDL_EVENT_FINGER_UP, touch, finger, nx, ny, 0.0f, 0.0f, 0.0f, window->id, now);
+        break;
+    default:
+        break;
+    }
+}
+
+/* window going away mid-sequence: its fingers are canceled */
+static void cancel_touches(SDL_Window *window)
+{
+    for (int i = 0; i < (int)SDL_arraysize(x11.fingers); i++) {
+        if (x11.fingers[i].active && (!window || x11.fingers[i].window == window)) {
+            x11.fingers[i].active = false;
+            SDLOP_SendTouch(SDL_EVENT_FINGER_CANCELED, x11.fingers[i].source, x11.fingers[i].detail,
+                            x11.fingers[i].nx, x11.fingers[i].ny, 0.0f, 0.0f, 0.0f, x11.fingers[i].window->id,
+                            SDLOP_MonotonicNS());
+        }
+    }
+}
+
 static void handle_xi_event(xcb_ge_generic_event_t *ge)
 {
+    if (ge->event_type == XCB_INPUT_TOUCH_BEGIN || ge->event_type == XCB_INPUT_TOUCH_UPDATE ||
+        ge->event_type == XCB_INPUT_TOUCH_END) {
+        handle_touch((xcb_input_touch_begin_event_t *)ge);
+        return;
+    }
     if (ge->event_type != XCB_INPUT_RAW_MOTION || !x11.relative_window) {
         return;
     }
@@ -1798,6 +1926,7 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     wd->gc = X11_xcb_generate_id(x11.conn);
     uint32_t gcv = 0;
     X11_xcb_create_gc(x11.conn, wd->gc, wd->xid, XCB_GC_GRAPHICS_EXPOSURES, &gcv);
+    select_touch(wd->xid);
 
     wd->cfg_x = window->x;
     wd->cfg_y = window->y;
@@ -1925,6 +2054,7 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (x11.pointer_focus == window) {
         x11.pointer_focus = NULL;
     }
+    cancel_touches(window);
     if (sdlop.mouse_focus == window) {
         sdlop.mouse_focus = NULL;
     }

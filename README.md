@@ -314,6 +314,14 @@ Highlights:
   xkbcommon's compose tables (locale from `LC_ALL`, `LC_CTYPE`, `LANG`, else
   `C`; needs libxkbcommon >= 0.5 and the X11 Compose data, otherwise text is
   emitted uncomposed). No IME (XIM / text-input-v3) yet.
+- Touch: `wl_touch` on Wayland and XInput 2.2 multitouch on X11 deliver
+  `SDL_EVENT_FINGER_*` (x/y/dx/dy normalized to the window, pressure 1 while
+  down; on X11 touchID = source device, fingerID = touch id). Like SDL3, the
+  first finger also drives a left-button mouse with
+  `which == SDL_TOUCH_MOUSEID` (the window systems stop emulating the pointer
+  once a client takes touch events); `SDL_TOUCH_MOUSE_EVENTS=0` in the
+  environment turns that off. `SDLOP_X11_NO_TOUCH=1` leaves the touch
+  selection (and thus the server's own pointer emulation) to X11.
 - Relative mouse mode uses real pointer lock (`zwp_pointer_constraints` +
   `zwp_relative_pointer`) on Wayland when the compositor has a seat/pointer,
   and raw evdev deltas when the worker thread is active; the window-system

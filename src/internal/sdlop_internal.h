@@ -212,6 +212,7 @@ void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 tim
 void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, float y,
                      float dx, float dy, float pressure, SDL_WindowID windowID,
                      Uint64 timestamp_ns);
+void SDLOP_ResetTouchMouse(void); /* SDL_Init / SDL_Quit */
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns);
 
 /* Timestamp helpers */

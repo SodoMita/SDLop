@@ -30,6 +30,10 @@ typedef Uint32 SDL_MouseID;
 typedef Uint32 SDL_KeyboardID;
 typedef Uint64 SDL_TouchID;  /* SDL3: SDL_touch.h - Uint64 */
 typedef Uint64 SDL_FingerID; /* SDL3: SDL_touch.h - Uint64 */
+/* SDL3 SDL_touch.h: `which` of mouse events synthesized from touch, and the
+ * touch id of touch events synthesized from the mouse */
+#define SDL_TOUCH_MOUSEID ((SDL_MouseID)-1)
+#define SDL_MOUSE_TOUCHID ((SDL_TouchID)-1)
 typedef Uint32 SDL_PropertiesID;
 typedef Uint32 SDL_MouseButtonFlags;
 typedef Uint32 SDL_InitFlags;

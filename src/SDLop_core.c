@@ -120,5 +120,6 @@ void SDL_Quit(void)
     }
     memset(&sdlop, 0, sizeof(sdlop));
     sdlop.wake_fd = -1;
+    SDLOP_ResetTouchMouse();
     sdlop_quitting = false;
 }
