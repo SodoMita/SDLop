@@ -1175,16 +1175,265 @@ typedef struct SDL_PixelFormatDetails
     Uint8 Ashift;
 } SDL_PixelFormatDetails;
 
+/**
+ * Get the human readable name of a pixel format.
+ *
+ * \param format the pixel format to query.
+ * \returns the human readable name of the specified pixel format or
+ *          "SDL_PIXELFORMAT_UNKNOWN" if the format isn't recognized.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC const char * SDLCALL SDL_GetPixelFormatName(SDL_PixelFormat format);
 
+/**
+ * Convert one of the enumerated pixel formats to a bpp value and RGBA masks.
+ *
+ * \param format one of the SDL_PixelFormat values.
+ * \param bpp a bits per pixel value; usually 15, 16, or 32.
+ * \param Rmask a pointer filled in with the red mask for the format.
+ * \param Gmask a pointer filled in with the green mask for the format.
+ * \param Bmask a pointer filled in with the blue mask for the format.
+ * \param Amask a pointer filled in with the alpha mask for the format.
+ * \returns true on success or false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_GetPixelFormatForMasks
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_GetMasksForPixelFormat(SDL_PixelFormat format, int *bpp, Uint32 *Rmask, Uint32 *Gmask, Uint32 *Bmask, Uint32 *Amask);
 
+/**
+ * Convert a bpp value and RGBA masks to an enumerated pixel format.
+ *
+ * This will return `SDL_PIXELFORMAT_UNKNOWN` if the conversion wasn't
+ * possible.
+ *
+ * \param bpp a bits per pixel value; usually 15, 16, or 32.
+ * \param Rmask the red mask for the format.
+ * \param Gmask the green mask for the format.
+ * \param Bmask the blue mask for the format.
+ * \param Amask the alpha mask for the format.
+ * \returns the SDL_PixelFormat value corresponding to the format masks, or
+ *          SDL_PIXELFORMAT_UNKNOWN if there isn't a match.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_GetMasksForPixelFormat
+ */
+extern SDL_DECLSPEC SDL_PixelFormat SDLCALL SDL_GetPixelFormatForMasks(int bpp, Uint32 Rmask, Uint32 Gmask, Uint32 Bmask, Uint32 Amask);
 
+/**
+ * Create an SDL_PixelFormatDetails structure corresponding to a pixel format.
+ *
+ * Returned structure may come from a shared global cache (i.e. not newly
+ * allocated), and hence should not be modified, especially the palette. Weird
+ * errors such as `Blit combination not supported` may occur.
+ *
+ * \param format one of the SDL_PixelFormat values.
+ * \returns a pointer to a SDL_PixelFormatDetails structure or NULL on
+ *          failure; call SDL_GetError() for more information.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC const SDL_PixelFormatDetails * SDLCALL SDL_GetPixelFormatDetails(SDL_PixelFormat format);
 
+/**
+ * Create a palette structure with the specified number of color entries.
+ *
+ * The palette entries are initialized to white.
+ *
+ * \param ncolors represents the number of color entries in the color palette.
+ * \returns a new SDL_Palette structure on success or NULL on failure (e.g. if
+ *          there wasn't enough memory); call SDL_GetError() for more
+ *          information.
+ *
+ * \threadsafety It is safe to call this function from any thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_DestroyPalette
+ * \sa SDL_SetPaletteColors
+ * \sa SDL_SetSurfacePalette
+ */
+extern SDL_DECLSPEC SDL_Palette * SDLCALL SDL_CreatePalette(int ncolors);
 
+/**
+ * Set a range of colors in a palette.
+ *
+ * \param palette the SDL_Palette structure to modify.
+ * \param colors an array of SDL_Color structures to copy into the palette.
+ * \param firstcolor the index of the first palette entry to modify.
+ * \param ncolors the number of entries to modify.
+ * \returns true on success or false on failure; call SDL_GetError() for more
+ *          information.
+ *
+ * \threadsafety It is safe to call this function from any thread, as long as
+ *               the palette is not modified or destroyed in another thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_SetPaletteColors(SDL_Palette *palette, const SDL_Color *colors, int firstcolor, int ncolors);
 
+/**
+ * Free a palette created with SDL_CreatePalette().
+ *
+ * \param palette the SDL_Palette structure to be freed.
+ *
+ * \threadsafety It is safe to call this function from any thread, as long as
+ *               the palette is not modified or destroyed in another thread.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_CreatePalette
+ */
+extern SDL_DECLSPEC void SDLCALL SDL_DestroyPalette(SDL_Palette *palette);
 
+/**
+ * Map an RGB triple to an opaque pixel value for a given pixel format.
+ *
+ * This function maps the RGB color value to the specified pixel format and
+ * returns the pixel value best approximating the given RGB color value for
+ * the given pixel format.
+ *
+ * If the format has a palette (8-bit) the index of the closest matching color
+ * in the palette will be returned.
+ *
+ * If the specified pixel format has an alpha component it will be returned as
+ * all 1 bits (fully opaque).
+ *
+ * If the pixel format bpp (color depth) is less than 32-bpp then the unused
+ * upper bits of the return value can safely be ignored (e.g., with a 16-bpp
+ * format the return value can be assigned to a Uint16, and similarly a Uint8
+ * for an 8-bpp format).
+ *
+ * \param format a pointer to SDL_PixelFormatDetails describing the pixel
+ *               format.
+ * \param palette an optional palette for indexed formats, may be NULL.
+ * \param r the red component of the pixel in the range 0-255.
+ * \param g the green component of the pixel in the range 0-255.
+ * \param b the blue component of the pixel in the range 0-255.
+ * \returns a pixel value.
+ *
+ * \threadsafety It is safe to call this function from any thread, as long as
+ *               the palette is not modified.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_GetPixelFormatDetails
+ * \sa SDL_GetRGB
+ * \sa SDL_MapRGBA
+ * \sa SDL_MapSurfaceRGB
+ */
+extern SDL_DECLSPEC Uint32 SDLCALL SDL_MapRGB(const SDL_PixelFormatDetails *format, const SDL_Palette *palette, Uint8 r, Uint8 g, Uint8 b);
 
+/**
+ * Map an RGBA quadruple to a pixel value for a given pixel format.
+ *
+ * This function maps the RGBA color value to the specified pixel format and
+ * returns the pixel value best approximating the given RGBA color value for
+ * the given pixel format.
+ *
+ * If the specified pixel format has no alpha component the alpha value will
+ * be ignored (as it will be in formats with a palette).
+ *
+ * If the format has a palette (8-bit) the index of the closest matching color
+ * in the palette will be returned.
+ *
+ * If the pixel format bpp (color depth) is less than 32-bpp then the unused
+ * upper bits of the return value can safely be ignored (e.g., with a 16-bpp
+ * format the return value can be assigned to a Uint16, and similarly a Uint8
+ * for an 8-bpp format).
+ *
+ * \param format a pointer to SDL_PixelFormatDetails describing the pixel
+ *               format.
+ * \param palette an optional palette for indexed formats, may be NULL.
+ * \param r the red component of the pixel in the range 0-255.
+ * \param g the green component of the pixel in the range 0-255.
+ * \param b the blue component of the pixel in the range 0-255.
+ * \param a the alpha component of the pixel in the range 0-255.
+ * \returns a pixel value.
+ *
+ * \threadsafety It is safe to call this function from any thread, as long as
+ *               the palette is not modified.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_GetPixelFormatDetails
+ * \sa SDL_GetRGBA
+ * \sa SDL_MapRGB
+ * \sa SDL_MapSurfaceRGBA
+ */
+extern SDL_DECLSPEC Uint32 SDLCALL SDL_MapRGBA(const SDL_PixelFormatDetails *format, const SDL_Palette *palette, Uint8 r, Uint8 g, Uint8 b, Uint8 a);
 
+/**
+ * Get RGB values from a pixel in the specified format.
+ *
+ * This function uses the entire 8-bit [0..255] range when converting color
+ * components from pixel formats with less than 8-bits per RGB component
+ * (e.g., a completely white pixel in 16-bit RGB565 format would return [0xff,
+ * 0xff, 0xff] not [0xf8, 0xfc, 0xf8]).
+ *
+ * \param pixelvalue a pixel value.
+ * \param format a pointer to SDL_PixelFormatDetails describing the pixel
+ *               format.
+ * \param palette an optional palette for indexed formats, may be NULL.
+ * \param r a pointer filled in with the red component, may be NULL.
+ * \param g a pointer filled in with the green component, may be NULL.
+ * \param b a pointer filled in with the blue component, may be NULL.
+ *
+ * \threadsafety It is safe to call this function from any thread, as long as
+ *               the palette is not modified.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_GetPixelFormatDetails
+ * \sa SDL_GetRGBA
+ * \sa SDL_MapRGB
+ * \sa SDL_MapRGBA
+ */
+extern SDL_DECLSPEC void SDLCALL SDL_GetRGB(Uint32 pixelvalue, const SDL_PixelFormatDetails *format, const SDL_Palette *palette, Uint8 *r, Uint8 *g, Uint8 *b);
 
+/**
+ * Get RGBA values from a pixel in the specified format.
+ *
+ * This function uses the entire 8-bit [0..255] range when converting color
+ * components from pixel formats with less than 8-bits per RGB component
+ * (e.g., a completely white pixel in 16-bit RGB565 format would return [0xff,
+ * 0xff, 0xff] not [0xf8, 0xfc, 0xf8]).
+ *
+ * If the surface has no alpha component, the alpha will be returned as 0xff
+ * (100% opaque).
+ *
+ * \param pixelvalue a pixel value.
+ * \param format a pointer to SDL_PixelFormatDetails describing the pixel
+ *               format.
+ * \param palette an optional palette for indexed formats, may be NULL.
+ * \param r a pointer filled in with the red component, may be NULL.
+ * \param g a pointer filled in with the green component, may be NULL.
+ * \param b a pointer filled in with the blue component, may be NULL.
+ * \param a a pointer filled in with the alpha component, may be NULL.
+ *
+ * \threadsafety It is safe to call this function from any thread, as long as
+ *               the palette is not modified.
+ *
+ * \since This function is available since SDL 3.2.0.
+ *
+ * \sa SDL_GetPixelFormatDetails
+ * \sa SDL_GetRGB
+ * \sa SDL_MapRGB
+ * \sa SDL_MapRGBA
+ */
+extern SDL_DECLSPEC void SDLCALL SDL_GetRGBA(Uint32 pixelvalue, const SDL_PixelFormatDetails *format, const SDL_Palette *palette, Uint8 *r, Uint8 *g, Uint8 *b, Uint8 *a);
 
 
 /* Ends C function definitions when using C++ */

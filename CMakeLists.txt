@@ -40,11 +40,13 @@ if(EMSCRIPTEN)
     src/SDL_events_desc.c
     src/SDL_events_categories.c
     src/SDL_clipboard.c
-  src/SDL_thread.c
-  src/SDL_main.c
     src/SDL_thread.c
-  src/SDL_main.c
     src/SDL_main.c
+    src/SDL_rect.c
+    src/SDL_pixels.c
+    src/SDL_blit.c
+    src/SDL_blit_float.c
+    src/SDL_rotate.c
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
@@ -250,6 +252,11 @@ set(SDLop_SOURCES
   src/SDL_clipboard.c
   src/SDL_thread.c
   src/SDL_main.c
+  src/SDL_rect.c
+  src/SDL_pixels.c
+  src/SDL_blit.c
+  src/SDL_blit_float.c
+  src/SDL_rotate.c
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
@@ -621,6 +628,28 @@ if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
   add_test(NAME api_exports_check
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_exports_check.sh
                    $<TARGET_FILE:sdlop_shared> ${CMAKE_CURRENT_SOURCE_DIR}/include)
+endif()
+
+# Surface differential test: tests/surface_diff.c hashes the result of every
+# blit / conversion / fill / transform case. Built against stock SDL3 as well
+# when both -DSDL3_REFERENCE_INCLUDE and -DSDL3_REFERENCE_LIB are given, the
+# outputs must match exactly; otherwise it runs as a smoke test.
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_executable(surface_diff tests/surface_diff.c)
+  target_link_libraries(surface_diff PRIVATE sdlop)
+  if (SDL3_REFERENCE_INCLUDE AND SDL3_REFERENCE_LIB)
+    add_executable(surface_diff_ref tests/surface_diff.c)
+    target_include_directories(surface_diff_ref BEFORE PRIVATE ${SDL3_REFERENCE_INCLUDE})
+    target_link_libraries(surface_diff_ref PRIVATE ${SDL3_REFERENCE_LIB})
+    get_filename_component(_sdl3_ref_dir ${SDL3_REFERENCE_LIB} DIRECTORY)
+    set_target_properties(surface_diff_ref PROPERTIES BUILD_RPATH ${_sdl3_ref_dir})
+    add_test(NAME surface_diff
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh
+                     $<TARGET_FILE:surface_diff> $<TARGET_FILE:surface_diff_ref>)
+  else()
+    add_test(NAME surface_diff
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh $<TARGET_FILE:surface_diff>)
+  endif()
 endif()
 
 # API subset gate: every SDL_* symbol exported by SDLop must also be exported

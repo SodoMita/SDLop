@@ -36,17 +36,28 @@ jobs:
             xkb-data libx11-data x11-xkb-utils \
             xvfb xauth openbox
 
-      - name: Fetch SDL 3.4.20 reference headers (abi_check)
+      - name: Build SDL 3.4.20 reference (abi_check, api_subset_check, surface_diff)
         run: |
-          git clone -q --depth 1 --branch release-3.4.20 --filter=blob:none --sparse \
-            https://github.com/libsdl-org/SDL /tmp/sdl3-ref
-          git -C /tmp/sdl3-ref sparse-checkout set include
+          git clone -q --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL /tmp/sdl3-ref
+          # headless core library only: pixels/surfaces/blitters are what the
+          # differential test compares; every optional subsystem is off
+          off=""
+          for o in TEST_LIBRARY TESTS EXAMPLES AUDIO X11 WAYLAND KMSDRM OPENGL OPENGLES VULKAN GPU RENDER \
+                   CAMERA JOYSTICK HAPTIC HIDAPI SENSOR POWER DIALOG TRAY DBUS IBUS PIPEWIRE PULSEAUDIO \
+                   ALSA JACK SNDIO LIBUDEV; do
+            off="$off -DSDL_$o=OFF"
+          done
+          cmake -S /tmp/sdl3-ref -B /tmp/sdl3-ref-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_SHARED=ON -DSDL_STATIC=OFF $off > /tmp/sdl3-ref-cfg.log \
+            || { tail -n 40 /tmp/sdl3-ref-cfg.log; exit 1; }
+          cmake --build /tmp/sdl3-ref-build -j"$(nproc)"
 
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DSDLOP_SANITIZERS=${{ matrix.sanitizers }} \
-            -DSDL3_REFERENCE_INCLUDE=/tmp/sdl3-ref/include
+            -DSDL3_REFERENCE_INCLUDE=/tmp/sdl3-ref/include \
+            -DSDL3_REFERENCE_LIB=/tmp/sdl3-ref-build/libSDL3.so
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
