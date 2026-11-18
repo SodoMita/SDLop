@@ -1347,11 +1347,13 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         (void)poll(&pfd, 1, timeout_ms);
         pending = SDLOP_X11_XPending(x11.display);
     }
-    while (pending-- > 0) {
+    while (pending > 0) {
         XEvent event;
         SDLOP_X11_XNextEvent(x11.display, &event);
         x11_handle_event(&event);
-        pending += SDLOP_X11_XPending(x11.display);
+        /* XPending reports the queue's total size; do not add it to the
+         * previous count or the loop will overrun the queue and block. */
+        pending = SDLOP_X11_XPending(x11.display);
     }
     SDLOP_KeyboardProcessRepeats();
 }
