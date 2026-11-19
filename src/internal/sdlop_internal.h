@@ -241,6 +241,7 @@ extern SDLop_VideoDevice SDLop_emscripten_device;
 extern SDLop_VideoDevice SDLop_wayland_device;
 extern SDLop_VideoDevice SDLop_x11_device;
 extern SDLop_VideoDevice SDLop_kmsdrm_device;
+extern SDLop_VideoDevice SDLop_fbdev_device;
 extern SDLop_VideoDevice SDLop_dummy_device;
 
 /* ------------------------------------------------------------------ */

@@ -309,9 +309,10 @@ set(SDLop_SOURCES
   src/video/kmsdrm/sdlop_kmsdrm_gl.c
   src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
   src/video/kmsdrm/sdlop_xcursor.c
+  src/video/fbdev/sdlop_fbdev.c
   src/video/dummy/sdlop_dummy.c
 )
-set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
 if(SDLOP_VIDEO_X11)
   list(APPEND SDLop_SOURCES
     src/video/x11/sdlop_x11.c
@@ -515,6 +516,17 @@ if(SDLop_BUILD_TESTS)
       set_tests_properties(test_x11_touch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
     endif()
   endif()
+
+  # framebuffer (fbdev) driver: needs no device - SDLOP_FBDEV_DUMP makes the
+  # driver render into RAM and dump each presented frame as a PPM we check
+  add_executable(test_fbdev tests/test_fbdev.c)
+  target_link_libraries(test_fbdev PRIVATE sdlop)
+  target_include_directories(test_fbdev PRIVATE src)
+  target_compile_options(test_fbdev PRIVATE -UNDEBUG)
+  add_test(NAME test_fbdev COMMAND test_fbdev)
+  set_tests_properties(test_fbdev PROPERTIES
+    ENVIRONMENT "SDLOP_DISABLE_RAW_INPUT=1;SDLOP_TEST_STRICT=1;SDLOP_FBDEV_SIZE=320x240;SDLOP_FBDEV_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test_fbdev_frame.ppm"
+    TIMEOUT 60)
 
   add_executable(test_kmsdrm tests/test_kmsdrm.c)
   target_link_libraries(test_kmsdrm PRIVATE sdlop)
