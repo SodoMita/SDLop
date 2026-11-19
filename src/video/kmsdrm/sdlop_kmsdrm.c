@@ -2161,34 +2161,37 @@ void KMSDRM_XCursorQuit(void)
     kmsdrm_cursor_theme_tried = false;
 }
 
-static bool kmsdrm_ensure_cursor_bo(KMSDRM_DisplayData *dd)
+static void kmsdrm_cursor_state_reset(void);
+
+/* SDL cursor image for the hardware cursor (premultiplied ARGB8888,
+ * packed rows). kmsdrm_current_cursor NULL = default arrow. */
+typedef struct KMSDRM_Cursor
 {
-    KMSDRM_DeviceData *vid = &kmsdrm;
+    uint32_t *pixels;
+    int w, h, hot_x, hot_y;
+} KMSDRM_Cursor;
 
-    if (dd->cursor_bo) {
-        return true;
-    }
-    if (!kmsdrm_ensure_gbm()) {
+static KMSDRM_Cursor *kmsdrm_current_cursor = NULL;
+static bool kmsdrm_cursor_hidden = false; /* SDL_HideCursor() */
+
+static void kmsdrm_cursor_state_reset(void)
+{
+    kmsdrm_current_cursor = NULL; /* owned by its SDL_Cursor */
+    kmsdrm_cursor_hidden = false;
+}
+
+/* fill the cursor bo of a display with the current SDL cursor (or the
+ * default arrow: XCursor theme when it fits, else the built-in one) */
+static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
+{
+    const uint64_t cw = dd->cursor_w, ch = dd->cursor_h;
+    uint32_t *buf = calloc((size_t)cw * ch, sizeof(uint32_t));
+    if (!buf) {
         return false;
     }
-
-    uint64_t cw = 0, ch = 0;
-    if (SDLOP_DRM_drmGetCap(vid->drm_fd, DRM_CAP_CURSOR_WIDTH, &cw) != 0 || cw == 0 || cw > 256) {
-        cw = 64;
-    }
-    if (SDLOP_DRM_drmGetCap(vid->drm_fd, DRM_CAP_CURSOR_HEIGHT, &ch) != 0 || ch == 0 || ch > 256) {
-        ch = 64;
-    }
-
-    if (!SDLOP_GBM_gbm_device_is_format_supported(vid->gbm_dev, GBM_FORMAT_ARGB8888,
-                                                  GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE)) {
-        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: GBM cursor format not supported");
-        return false;
-    }
-
-    /* prefer the system's XCursor theme arrow when it fits the hardware
-     * cursor size (swa behavior); otherwise draw the built-in 16x16 arrow */
-    struct sdlop_xcursor *theme_cursor = kmsdrm_theme_arrow();
+    int32_t hot_x = 0, hot_y = 0;
+    const KMSDRM_Cursor *cur = kmsdrm_current_cursor;
+    struct sdlop_xcursor *theme_cursor = cur ? NULL : kmsdrm_theme_arrow();
     struct sdlop_xcursor_image *theme_image = NULL;
     if (theme_cursor && theme_cursor->image_count > 0) {
         theme_image = theme_cursor->images[0];
@@ -2202,21 +2205,17 @@ static bool kmsdrm_ensure_cursor_bo(KMSDRM_DisplayData *dd)
             theme_image = NULL;
         }
     }
-
-    struct gbm_bo *bo = SDLOP_GBM_gbm_bo_create(vid->gbm_dev, (uint32_t)cw, (uint32_t)ch,
-                                                GBM_FORMAT_ARGB8888,
-                                                GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE | GBM_BO_USE_LINEAR);
-    if (!bo) {
-        return false;
-    }
-
-    uint32_t *buf = calloc((size_t)cw * ch, sizeof(uint32_t));
-    if (!buf) {
-        SDLOP_GBM_gbm_bo_destroy(bo);
-        return false;
-    }
-    int32_t hot_x = 0, hot_y = 0;
-    if (theme_image) {
+    if (cur) {
+        /* larger images are clipped to the hardware cursor size (stock
+         * SDL3 rejects them; a clipped cursor beats none) */
+        const int w = cur->w < (int)cw ? cur->w : (int)cw;
+        const int h = cur->h < (int)ch ? cur->h : (int)ch;
+        for (int y = 0; y < h; y++) {
+            memcpy(buf + (size_t)y * cw, cur->pixels + (size_t)y * cur->w, (size_t)w * 4);
+        }
+        hot_x = cur->hot_x < w ? cur->hot_x : w - 1;
+        hot_y = cur->hot_y < h ? cur->hot_y : h - 1;
+    } else if (theme_image) {
         /* XCursor pixels are ARGB8888 in memory on little-endian hosts,
          * which is exactly GBM_FORMAT_ARGB8888; rows are packed */
         for (uint32_t y = 0; y < theme_image->height; y++) {
@@ -2242,19 +2241,56 @@ static bool kmsdrm_ensure_cursor_bo(KMSDRM_DisplayData *dd)
             }
         }
     }
-    int ret = SDLOP_GBM_gbm_bo_write(bo, buf, (size_t)cw * ch * 4);
+    int ret = SDLOP_GBM_gbm_bo_write(dd->cursor_bo, buf, (size_t)cw * ch * 4);
     free(buf);
     if (ret != 0) {
-        SDLOP_GBM_gbm_bo_destroy(bo);
+        return false;
+    }
+    dd->cursor_hot_x = hot_x;
+    dd->cursor_hot_y = hot_y;
+    return true;
+}
+
+static bool kmsdrm_ensure_cursor_bo(KMSDRM_DisplayData *dd)
+{
+    KMSDRM_DeviceData *vid = &kmsdrm;
+
+    if (dd->cursor_bo) {
+        return true;
+    }
+    if (!kmsdrm_ensure_gbm()) {
         return false;
     }
 
+    uint64_t cw = 0, ch = 0;
+    if (SDLOP_DRM_drmGetCap(vid->drm_fd, DRM_CAP_CURSOR_WIDTH, &cw) != 0 || cw == 0 || cw > 256) {
+        cw = 64;
+    }
+    if (SDLOP_DRM_drmGetCap(vid->drm_fd, DRM_CAP_CURSOR_HEIGHT, &ch) != 0 || ch == 0 || ch > 256) {
+        ch = 64;
+    }
+
+    if (!SDLOP_GBM_gbm_device_is_format_supported(vid->gbm_dev, GBM_FORMAT_ARGB8888,
+                                                  GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE)) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: GBM cursor format not supported");
+        return false;
+    }
+
+    struct gbm_bo *bo = SDLOP_GBM_gbm_bo_create(vid->gbm_dev, (uint32_t)cw, (uint32_t)ch,
+                                                GBM_FORMAT_ARGB8888,
+                                                GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE | GBM_BO_USE_LINEAR);
+    if (!bo) {
+        return false;
+    }
     dd->cursor_bo = bo;
     dd->cursor_w = cw;
     dd->cursor_h = ch;
-    dd->cursor_hot_x = hot_x;
-    dd->cursor_hot_y = hot_y;
     dd->cursor_visible = false;
+    if (!kmsdrm_fill_cursor_bo(dd)) {
+        SDLOP_GBM_gbm_bo_destroy(bo);
+        dd->cursor_bo = NULL;
+        return false;
+    }
     return true;
 }
 
@@ -2262,7 +2298,7 @@ static void kmsdrm_show_cursor(KMSDRM_DisplayData *dd)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
 
-    if (dd->cursor_visible) {
+    if (dd->cursor_visible || kmsdrm_cursor_hidden) {
         return;
     }
     if (!dd->connected) {
@@ -2331,6 +2367,128 @@ static void kmsdrm_move_cursor(KMSDRM_DisplayData *dd, float x, float y)
         return;
     }
     SDLOP_DRM_drmModeMoveCursor(vid->drm_fd, dd->crtc->crtc_id, ix, iy);
+}
+
+/* ------------------------------------------------------------------ */
+/* SDL cursors on the hardware cursor plane                            */
+/* ------------------------------------------------------------------ */
+
+static bool kmsdrm_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    KMSDRM_Cursor *kc = (KMSDRM_Cursor *)calloc(1, sizeof(*kc));
+    if (!kc) {
+        return SDL_OutOfMemory();
+    }
+    if (cursor->surface) {
+        SDL_Surface *s = cursor->surface; /* ARGB8888, straight alpha */
+        kc->pixels = (uint32_t *)malloc((size_t)s->w * (size_t)s->h * 4);
+        if (!kc->pixels) {
+            free(kc);
+            return SDL_OutOfMemory();
+        }
+        /* cursor planes blend premultiplied (as stock SDL3 uploads) */
+        if (!SDL_PremultiplyAlpha(s->w, s->h, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch,
+                                  SDL_PIXELFORMAT_ARGB8888, kc->pixels, s->w * 4, false)) {
+            free(kc->pixels);
+            free(kc);
+            return false;
+        }
+        kc->w = s->w;
+        kc->h = s->h;
+        kc->hot_x = cursor->hot_x;
+        kc->hot_y = cursor->hot_y;
+    } else {
+        /* system cursor: theme image by CSS name / fallback name; the
+         * default arrow (kc->pixels NULL) when the theme lacks it */
+        struct sdlop_xcursor_theme *t = kmsdrm_cursor_theme_load_once();
+        const char *fallback = NULL;
+        const char *names[2] = { SDLOP_GetCSSCursorName(cursor->system_id, &fallback), NULL };
+        names[1] = fallback;
+        for (int i = 0; t && i < 2 && !kc->pixels; ++i) {
+            struct sdlop_xcursor *xc = names[i] ? sdlop_xcursor_theme_get_cursor(t, names[i]) : NULL;
+            if (xc && xc->image_count > 0 && xc->images[0]->width > 0 && xc->images[0]->height > 0) {
+                const struct sdlop_xcursor_image *img = xc->images[0];
+                const size_t n = (size_t)img->width * img->height;
+                kc->pixels = (uint32_t *)malloc(n * 4);
+                if (kc->pixels) {
+                    memcpy(kc->pixels, img->buffer, n * 4); /* already premultiplied */
+                    kc->w = (int)img->width;
+                    kc->h = (int)img->height;
+                    kc->hot_x = (int)img->hotspot_x;
+                    kc->hot_y = (int)img->hotspot_y;
+                }
+            }
+        }
+    }
+    cursor->internal = kc;
+    return true;
+}
+
+/* re-upload the current image to every display's cursor plane */
+static void kmsdrm_refresh_cursors(void)
+{
+    KMSDRM_DeviceData *vid = &kmsdrm;
+    for (int i = 0; i < vid->num_displays; ++i) {
+        KMSDRM_DisplayData *dd = &vid->displays[i];
+        if (!dd->cursor_bo) {
+            continue;
+        }
+        const bool was_visible = dd->cursor_visible;
+        if (was_visible) {
+            kmsdrm_hide_cursor(dd);
+        }
+        kmsdrm_fill_cursor_bo(dd);
+        if (was_visible || (!kmsdrm_cursor_hidden && dd->connected && sdlop.mouse_focus &&
+                            !sdlop.relative_mode_window)) {
+            kmsdrm_show_cursor(dd);
+            kmsdrm_move_cursor(dd, sdlop.mouse_x, sdlop.mouse_y);
+        }
+    }
+}
+
+static void kmsdrm_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    KMSDRM_Cursor *kc = (KMSDRM_Cursor *)cursor->internal;
+    if (kc) {
+        if (kmsdrm_current_cursor == kc) {
+            kmsdrm_current_cursor = NULL;
+            kmsdrm_refresh_cursors();
+        }
+        free(kc->pixels);
+        free(kc);
+        cursor->internal = NULL;
+    }
+}
+
+static bool kmsdrm_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    KMSDRM_DeviceData *vid = &kmsdrm;
+    if (!cursor) {
+        kmsdrm_cursor_hidden = true;
+        for (int i = 0; i < vid->num_displays; ++i) {
+            kmsdrm_hide_cursor(&vid->displays[i]);
+        }
+        return true;
+    }
+    KMSDRM_Cursor *kc = (KMSDRM_Cursor *)cursor->internal;
+    KMSDRM_Cursor *want = (kc && kc->pixels) ? kc : NULL;
+    const bool changed = want != kmsdrm_current_cursor;
+    kmsdrm_current_cursor = want;
+    kmsdrm_cursor_hidden = false;
+    if (changed) {
+        kmsdrm_refresh_cursors();
+    } else if (!sdlop.relative_mode_window) {
+        SDL_Window *focus = sdlop.mouse_focus;
+        KMSDRM_WindowData *windata = focus ? (KMSDRM_WindowData *)focus->driverdata : NULL;
+        if (windata && windata->display) {
+            kmsdrm_show_cursor(windata->display);
+            kmsdrm_move_cursor(windata->display, sdlop.mouse_x, sdlop.mouse_y);
+        }
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2980,6 +3138,7 @@ static void kmsdrm_Quit(SDLop_VideoDevice *device)
     /* windows are destroyed by the core before this runs */
     kmsdrm_deinit_displays();      /* restores the CRTC, destroys cursor bo */
     KMSDRM_XCursorQuit();          /* drop the cached XCursor theme */
+    kmsdrm_cursor_state_reset();
     kmsdrm_vt_shutdown();          /* restore VT_AUTO mode on /dev/tty */
     if (vid->gbm_dev) {
         SDLOP_GBM_gbm_device_destroy(vid->gbm_dev);
@@ -3034,4 +3193,12 @@ SDLop_VideoDevice SDLop_kmsdrm_device = {
     /* Vulkan (VK_KHR_surface + VK_KHR_display) - sdlop_kmsdrm_vulkan.c */
     SDLOP_KMSDRM_Vulkan_CreateSurface,
     SDLOP_KMSDRM_Vulkan_GetInstanceExtensions,
+    /* optional hooks */
+    .Vulkan_GetPresentationSupport = NULL,
+    .EGL_GetDisplay = KMSDRM_EGL_GetDisplay,
+    .EGL_GetConfig = KMSDRM_EGL_GetConfig,
+    .EGL_GetWindowSurface = KMSDRM_EGL_GetWindowSurface,
+    .CreateCursor = kmsdrm_CreateCursor,
+    .FreeCursor = kmsdrm_FreeCursor,
+    .ShowCursor = kmsdrm_ShowCursor,
 };

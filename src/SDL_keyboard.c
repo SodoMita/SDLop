@@ -56,31 +56,60 @@ static struct xkb_state *xkb_st;
 static struct xkb_state *xkb_st_clean; /* no modifiers, for key resolution */
 static xkb_mod_index_t mod_shift, mod_ctrl, mod_alt, mod_super, mod_caps, mod_num, mod_altgr, mod_level5;
 
-/* sym -> scancode lookup for SDL_GetScancodeFromKey (open addressing) */
-#define SYMTAB_SIZE 1024
-static struct { xkb_keysym_t sym; SDL_Scancode sc; } symtab[SYMTAB_SIZE];
+/* Active layout (xkb group) and the SDL3 keymap-layout flags derived from
+ * it (SDL_DetermineKeymapLayout): with the default SDL3 keycode options
+ * ("french_numbers,latin_letters"), key events on a non-Latin layout carry
+ * the US QWERTY keycodes, and a French number row reports digits. */
+static xkb_layout_index_t cur_layout;
+static bool suppress_layout_event;
+static Uint32 layout_flags;
+#define LAYOUT_FRENCH_NUMBERS 0x01
+#define LAYOUT_LATIN_LETTERS  0x02
+#define LAYOUT_THAI           0x04
 
-static void symtab_put(xkb_keysym_t sym, SDL_Scancode sc)
-{
-    uint32_t h = (uint32_t)sym & (SYMTAB_SIZE - 1);
-    while (symtab[h].sym != 0 && symtab[h].sym != sym) {
-        h = (h + 1) & (SYMTAB_SIZE - 1);
-    }
-    symtab[h].sym = sym;
-    symtab[h].sc = sc;
-}
+/* dead-key / Compose-key composition (libxkbcommon compose, locale table) */
+static struct xkb_compose_table *compose_table;
+static struct xkb_compose_state *compose_st;
+static bool compose_tried;
 
-static SDL_Scancode symtab_get(xkb_keysym_t sym)
+/* keycode -> (scancode, modstate) for SDL_GetScancodeFromKey, filled from
+ * the active layout level by level (none, shift, AltGr, AltGr+shift) so the
+ * first, least-modified match wins - like SDL3's keymap (open addressing) */
+#define REVTAB_SIZE 2048
+static struct { SDL_Keycode key; Uint16 sc; Uint16 mod; } revtab[REVTAB_SIZE];
+
+static void revtab_put(SDL_Keycode key, SDL_Scancode sc, SDL_Keymod mod)
 {
-    uint32_t h = (uint32_t)sym & (SYMTAB_SIZE - 1);
-    while (symtab[h].sym != 0) {
-        if (symtab[h].sym == sym) {
-            return symtab[h].sc;
+    uint32_t h = ((uint32_t)key * 2654435761u) & (REVTAB_SIZE - 1);
+    for (int n = 0; n < REVTAB_SIZE && revtab[h].key != 0; n++) {
+        if (revtab[h].key == key) {
+            return; /* first (least modified) entry wins */
         }
-        h = (h + 1) & (SYMTAB_SIZE - 1);
+        h = (h + 1) & (REVTAB_SIZE - 1);
     }
-    return SDL_SCANCODE_UNKNOWN;
+    if (revtab[h].key == 0) {
+        revtab[h].key = key;
+        revtab[h].sc = (Uint16)sc;
+        revtab[h].mod = (Uint16)mod;
+    }
 }
+
+static bool revtab_get(SDL_Keycode key, SDL_Scancode *sc, SDL_Keymod *mod)
+{
+    uint32_t h = ((uint32_t)key * 2654435761u) & (REVTAB_SIZE - 1);
+    for (int n = 0; n < REVTAB_SIZE && revtab[h].key != 0; n++) {
+        if (revtab[h].key == key) {
+            *sc = (SDL_Scancode)revtab[h].sc;
+            *mod = (SDL_Keymod)revtab[h].mod;
+            return true;
+        }
+        h = (h + 1) & (REVTAB_SIZE - 1);
+    }
+    return false;
+}
+
+static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym);
+static SDL_Keycode default_key_from_scancode(SDL_Scancode sc, SDL_Keymod mod);
 
 static void find_mod_indices(void)
 {
@@ -94,23 +123,188 @@ static void find_mod_indices(void)
     mod_level5 = SDLOP_XKB_xkb_keymap_mod_get_index(keymap, "Mod3");               /* ISO_Level5_Shift */
 }
 
-/* Build sym->scancode map and remember key names from the base layout */
-static void build_symtab(void)
+static xkb_mod_mask_t xkb_mask_for(SDL_Keymod modstate)
 {
-    memset(symtab, 0, sizeof(symtab));
-    for (uint16_t evdev = 1; evdev <= SDLOP_EVDEV_KEY_MAX; evdev++) {
-        SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[evdev];
-        if (sc == SDL_SCANCODE_UNKNOWN) {
-            continue;
+    xkb_mod_mask_t mask = 0;
+    if ((modstate & SDL_KMOD_SHIFT) && mod_shift != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_shift;
+    }
+    if ((modstate & SDL_KMOD_CAPS) && mod_caps != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_caps;
+    }
+    if ((modstate & SDL_KMOD_MODE) && mod_altgr != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_altgr;
+    }
+    if ((modstate & SDL_KMOD_LEVEL5) && mod_level5 != XKB_MOD_INVALID) {
+        mask |= (xkb_mod_mask_t)1 << mod_level5;
+    }
+    return mask;
+}
+
+/* the clean state carries no modifiers, only the active layout */
+static void clean_state_set(SDL_Keymod modstate)
+{
+    SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, xkb_mask_for(modstate), 0, 0, 0, 0, cur_layout);
+}
+
+/* keysym of a key on the active layout at the given shift level */
+static xkb_keysym_t layout_keysym(Uint16 evdev, SDL_Keymod modstate)
+{
+    if (modstate) {
+        clean_state_set(modstate);
+    }
+    xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)evdev + 8);
+    if (modstate) {
+        clean_state_set(SDL_KMOD_NONE);
+    }
+    return sym;
+}
+
+static SDL_Keycode keycode_from_sym(xkb_keysym_t sym, SDL_Scancode sc)
+{
+    SDL_Keycode key = keysym_to_keycode(sym);
+    if (key == SDLK_UNKNOWN && sc != SDL_SCANCODE_UNKNOWN) {
+        /* no symbol / no unicode (XF86 keys ...): the scancode keycode */
+        key = SDL_SCANCODE_TO_KEYCODE(sc);
+    }
+    return key;
+}
+
+/* SDL3 SDL_GetKeymapKeycode(keyboard->keymap, ...): the active layout */
+static SDL_Keycode layout_keycode(SDL_Scancode sc, SDL_Keymod modstate)
+{
+    Uint16 evdev = evdev_from_scancode(sc);
+    if (!evdev) {
+        return SDL_SCANCODE_TO_KEYCODE(sc);
+    }
+    if (!keymap) {
+        return default_key_from_scancode(sc, modstate);
+    }
+    return keycode_from_sym(layout_keysym(evdev, modstate), sc);
+}
+
+/* SDL3 key_event semantics: SDL_GetCurrentKeymap(false) is the default US
+ * keymap for non-Latin / Thai layouts; modifiers are ignored except that a
+ * French number row is looked up shifted (digits) */
+static SDL_Keycode event_keycode(SDL_Scancode sc)
+{
+    if (!keymap || !(layout_flags & LAYOUT_LATIN_LETTERS) || (layout_flags & LAYOUT_THAI)) {
+        return default_key_from_scancode(sc, SDL_KMOD_NONE);
+    }
+    SDL_Keymod mod = SDL_KMOD_NONE;
+    if ((layout_flags & LAYOUT_FRENCH_NUMBERS) && sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_0) {
+        mod = SDL_KMOD_SHIFT;
+    }
+    return layout_keycode(sc, mod);
+}
+
+static bool is_ascii_digit(SDL_Keycode k)
+{
+    return k >= '0' && k <= '9';
+}
+
+/* port of SDL_DetermineKeymapLayout + the keycode->scancode table */
+static void build_layout_tables(void)
+{
+    clean_state_set(SDL_KMOD_NONE);
+
+    layout_flags = LAYOUT_FRENCH_NUMBERS;
+    for (int i = SDL_SCANCODE_1; i <= SDL_SCANCODE_0; i++) {
+        if (is_ascii_digit(layout_keycode((SDL_Scancode)i, SDL_KMOD_NONE)) ||
+            !is_ascii_digit(layout_keycode((SDL_Scancode)i, SDL_KMOD_SHIFT))) {
+            layout_flags &= ~LAYOUT_FRENCH_NUMBERS;
+            break;
         }
-        xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)evdev + 8);
-        if (sym != XKB_KEY_NoSymbol) {
-            symtab_put(sym, sc);
-            /* also index unshifted letters (a-z) so SDLK_a finds A key */
-            if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z) {
-                symtab_put(sym - XKB_KEY_A + XKB_KEY_a, sc);
+    }
+    for (int i = SDL_SCANCODE_A; i <= SDL_SCANCODE_D; i++) {
+        const SDL_Keycode key = layout_keycode((SDL_Scancode)i, SDL_KMOD_NONE);
+        if (key <= 0xFF) {
+            layout_flags |= LAYOUT_LATIN_LETTERS;
+            break;
+        }
+        if (key >= 0x0E00 && key <= 0x0E7F) {
+            layout_flags |= LAYOUT_THAI;
+            break;
+        }
+    }
+
+    static const SDL_Keymod levels[] = {
+        SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDL_KMOD_MODE, SDL_KMOD_MODE | SDL_KMOD_SHIFT
+    };
+    memset(revtab, 0, sizeof(revtab));
+    for (size_t l = 0; l < SDL_arraysize(levels); l++) {
+        clean_state_set(levels[l]);
+        for (uint16_t evdev = 1; evdev <= SDLOP_EVDEV_KEY_MAX; evdev++) {
+            SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[evdev];
+            if (sc == SDL_SCANCODE_UNKNOWN || evdev_from_scancode(sc) != evdev) {
+                continue;
+            }
+            xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)evdev + 8);
+            if (sym == XKB_KEY_NoSymbol) {
+                continue;
+            }
+            SDL_Keycode key = keysym_to_keycode(sym);
+            if (key != SDLK_UNKNOWN && !(key & SDLK_SCANCODE_MASK)) {
+                revtab_put(key, sc, levels[l]);
             }
         }
+    }
+    clean_state_set(SDL_KMOD_NONE);
+}
+
+/* follow the live state's layout group (multi-layout keymaps: us,ru ...);
+ * a switch rebuilds the tables and is reported like SDL3 (KEYMAP_CHANGED) */
+static void check_layout_change(void)
+{
+    if (!xkb_st) {
+        return;
+    }
+    xkb_layout_index_t layout = SDLOP_XKB_xkb_state_serialize_layout(xkb_st, XKB_STATE_LAYOUT_EFFECTIVE);
+    bool suppress = suppress_layout_event;
+    suppress_layout_event = false;
+    if (layout == cur_layout) {
+        return;
+    }
+    cur_layout = layout;
+    build_layout_tables();
+    if (!suppress) {
+        SDL_Event event;
+        SDL_zero(event);
+        event.type = SDL_EVENT_KEYMAP_CHANGED;
+        event.common.timestamp = SDL_GetTicksNS();
+        SDLOP_PushEventInternal(&event);
+    }
+}
+
+static void compose_init(void)
+{
+    if (compose_tried || !xkb_ctx || !SDLOP_Xkb_HaveCompose()) {
+        return;
+    }
+    compose_tried = true;
+    /* SDL3 order; xkbcommon maps C/POSIX to en_US.UTF-8 and honours
+     * XCOMPOSEFILE / ~/.XCompose */
+    const char *locale = NULL;
+    static const char *const vars[] = { "LC_ALL", "LC_CTYPE", "LANG" };
+    for (size_t i = 0; i < SDL_arraysize(vars) && !locale; i++) {
+        const char *v = getenv(vars[i]);
+        if (v && *v) {
+            locale = v;
+        }
+    }
+    if (!locale) {
+        locale = "C";
+    }
+    compose_table = SDLOP_XKB_xkb_compose_table_new_from_locale(xkb_ctx, locale, XKB_COMPOSE_COMPILE_NO_FLAGS);
+    if (compose_table) {
+        compose_st = SDLOP_XKB_xkb_compose_state_new(compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
+    }
+}
+
+static void compose_reset(void)
+{
+    if (compose_st) {
+        SDLOP_XKB_xkb_compose_state_reset(compose_st);
     }
 }
 
@@ -137,8 +331,13 @@ static bool set_keymap(struct xkb_keymap *new_keymap)
     keymap = new_keymap;
     xkb_st = new_state;
     xkb_st_clean = new_clean;
+    cur_layout = 0;
     find_mod_indices();
-    build_symtab();
+    build_layout_tables();
+    /* the state sync that follows a new keymap is part of setting it */
+    suppress_layout_event = true;
+    compose_init();
+    compose_reset();
     if (replacing) {
         SDL_Event event;
         SDL_zero(event);
@@ -235,26 +434,52 @@ static void sdlop_sync_mods_from_xkb(void)
     sdlop.modstate = mod;
 }
 
-void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
+void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locked,
+                                  Uint32 base_group, Uint32 latched_group, Uint32 locked_group)
 {
     if (!xkb_st) {
         return;
     }
-    SDLOP_XKB_xkb_state_update_mask(xkb_st, depressed, latched, locked, 0, 0, 0);
+    /* the layout group matters for multi-layout setups (us,ru ...): key
+     * text and keycodes follow the active group */
+    SDLOP_XKB_xkb_state_update_mask(xkb_st, depressed, latched, locked,
+                                    base_group, latched_group, locked_group);
     sdlop_sync_mods_from_xkb();
+    check_layout_change();
+}
+
+void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
+{
+    SDLOP_KeyboardUpdateXkbState(depressed, latched, locked, 0, 0, 0);
 }
 
 /* ------------------------------------------------------------------ */
 /* keysym -> SDL_Keycode                                               */
 /* ------------------------------------------------------------------ */
 
+/* SDL3 SDL_GetKeyCodeFromKeySym: unicode for printable keysyms, the
+ * spacing character for dead keys, a few extended keycodes, and
+ * scancode-mask keycodes for everything else. Returns SDLK_UNKNOWN when the
+ * keysym has no keycode of its own (the caller uses the scancode). */
+static const Uint16 dead_key_symbols_fe50_fe6f[] = {
+    0x0060, 0x00b4, 0x005e, 0x1fc0, 0x00af, 0x02d8, 0x02d9, 0x00a8, /* grave .. diaeresis */
+    0x02da, 0x02dd, 0x02c7, 0x00b8, 0x02db, 0x037a, 0x309b, 0x309c, /* abovering .. semivoiced */
+    0x0323, 0x0309, 0x031b, 0x002f, 0x02bc, 0x02bd, 0x02f5, 0x02f3, /* belowdot .. belowring */
+    0x005f, 0x005e, 0x02f7, 0x032e, 0x0324, 0x0311, 0x0326, 0x00a4, /* belowmacron .. currency */
+};
+static const Uint16 dead_key_symbols_fe80_fe93[] = {
+    0x0061, 0x0041, 0x0065, 0x0045, 0x0069, 0x0049, 0x006f, 0x004f, /* dead_a .. dead_O */
+    0x0075, 0x0055, 0x0259, 0x018f, 0x0000, 0x0621, 0x0000, 0x0000, /* dead_u .. */
+    0x005f, 0x02c8, 0x02cc, 0x002f,                                 /* lowline .. longsolidus */
+};
+
 static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
 {
-    /* Latin-1 range maps directly to the unicode value (SDL3 semantics:
-     * base-layout letters are lowercase: SDLK_a == 'a') */
-    if (sym >= XKB_KEY_a && sym <= XKB_KEY_z) {
-        return (SDL_Keycode)sym;
+    if (sym == XKB_KEY_NoSymbol) {
+        return SDLK_UNKNOWN;
     }
+    /* Latin-1 range maps directly to the unicode value (SDL3 semantics:
+     * base-layout letters are lowercase: SDLK_A == 'a') */
     if (sym >= 0x20 && sym < 0x100 && sym != 0x7f) {
         return (SDL_Keycode)sym; /* space (0x20) == SDLK_SPACE */
     }
@@ -269,7 +494,7 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
     if (sym == XKB_KEY_BackSpace) {
         return SDLK_BACKSPACE;
     }
-    if (sym == XKB_KEY_Tab || sym == XKB_KEY_ISO_Left_Tab || sym == XKB_KEY_KP_Tab) {
+    if (sym == XKB_KEY_Tab || sym == XKB_KEY_KP_Tab) {
         return SDLK_TAB;
     }
     if (sym == XKB_KEY_Delete) {
@@ -282,7 +507,6 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
         { XKB_KEY_Return, SDL_SCANCODE_RETURN },
         { XKB_KEY_KP_Enter, SDL_SCANCODE_KP_ENTER },
         { XKB_KEY_Tab, SDL_SCANCODE_TAB },
-        { XKB_KEY_ISO_Left_Tab, SDL_SCANCODE_TAB },
         { XKB_KEY_BackSpace, SDL_SCANCODE_BACKSPACE },
         { XKB_KEY_Delete, SDL_SCANCODE_DELETE },
         { XKB_KEY_Insert, SDL_SCANCODE_INSERT },
@@ -337,7 +561,122 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
     if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F24) {
         return SDL_SCANCODE_TO_KEYCODE((SDL_Scancode)(SDL_SCANCODE_F1 + (sym - XKB_KEY_F1)));
     }
-    return SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_UNKNOWN);
+    /* remaining keypad keysyms keep their scancode keycode (SDL3's
+     * keysym->UCS table has no keypad range) */
+    if (sym >= XKB_KEY_KP_Space && sym <= XKB_KEY_KP_Equal) {
+        return SDLK_UNKNOWN;
+    }
+    /* any other printable keysym: its unicode value (Cyrillic, Greek, ...) */
+    uint32_t cp = SDLOP_XKB_xkb_keysym_to_utf32(sym);
+    if (cp >= 0x20 && cp != 0x7f && !(cp >= 0x80 && cp < 0xa0)) {
+        return (SDL_Keycode)cp;
+    }
+    if (sym >= 0xfe50 && sym <= 0xfe6f) {
+        return dead_key_symbols_fe50_fe6f[sym - 0xfe50];
+    }
+    if (sym >= 0xfe80 && sym <= 0xfe93 && dead_key_symbols_fe80_fe93[sym - 0xfe80]) {
+        return dead_key_symbols_fe80_fe93[sym - 0xfe80];
+    }
+    switch (sym) {
+    case XKB_KEY_ISO_Level3_Shift: return SDLK_MODE;
+    case XKB_KEY_ISO_Level5_Shift: return SDLK_LEVEL5_SHIFT;
+    case XKB_KEY_ISO_Left_Tab:     return SDLK_LEFT_TAB;
+    case XKB_KEY_Multi_key:        return SDLK_MULTI_KEY_COMPOSE;
+    case XKB_KEY_Meta_L:           return SDLK_LMETA;
+    case XKB_KEY_Meta_R:           return SDLK_RMETA;
+    case XKB_KEY_Hyper_L:          return SDLK_LHYPER;
+    case XKB_KEY_Hyper_R:          return SDLK_RHYPER;
+    default: break;
+    }
+    return SDLK_UNKNOWN;
+}
+
+/* SDL3's built-in US layout (SDL_GetDefaultKeyFromScancode): used when no
+ * xkb keymap is available (no libxkbcommon), so keycodes stay meaningful */
+static SDL_Keycode default_key_from_scancode(SDL_Scancode sc, SDL_Keymod mod)
+{
+    const bool shift = (mod & SDL_KMOD_SHIFT) != 0;
+    const bool caps = (mod & SDL_KMOD_CAPS) != 0;
+    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z) {
+        return (SDL_Keycode)((shift != caps ? 'A' : 'a') + (sc - SDL_SCANCODE_A));
+    }
+    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_0) {
+        static const char base[] = "1234567890", shifted[] = "!@#$%^&*()";
+        return (SDL_Keycode)(shift ? shifted : base)[sc - SDL_SCANCODE_1];
+    }
+    static const struct { SDL_Scancode sc; char base, shifted; } punct[] = {
+        { SDL_SCANCODE_SPACE, ' ', ' ' }, { SDL_SCANCODE_MINUS, '-', '_' },
+        { SDL_SCANCODE_EQUALS, '=', '+' }, { SDL_SCANCODE_LEFTBRACKET, '[', '{' },
+        { SDL_SCANCODE_RIGHTBRACKET, ']', '}' }, { SDL_SCANCODE_BACKSLASH, '\\', '|' },
+        { SDL_SCANCODE_NONUSHASH, '#', '~' }, { SDL_SCANCODE_SEMICOLON, ';', ':' },
+        { SDL_SCANCODE_APOSTROPHE, '\'', '"' }, { SDL_SCANCODE_GRAVE, '`', '~' },
+        { SDL_SCANCODE_COMMA, ',', '<' }, { SDL_SCANCODE_PERIOD, '.', '>' },
+        { SDL_SCANCODE_SLASH, '/', '?' }, { SDL_SCANCODE_NONUSBACKSLASH, '<', '>' },
+    };
+    for (size_t i = 0; i < SDL_arraysize(punct); i++) {
+        if (punct[i].sc == sc) {
+            return (SDL_Keycode)(unsigned char)(shift ? punct[i].shifted : punct[i].base);
+        }
+    }
+    switch (sc) {
+    case SDL_SCANCODE_RETURN:    return SDLK_RETURN;
+    case SDL_SCANCODE_ESCAPE:    return SDLK_ESCAPE;
+    case SDL_SCANCODE_BACKSPACE: return SDLK_BACKSPACE;
+    case SDL_SCANCODE_TAB:       return SDLK_TAB;
+    case SDL_SCANCODE_DELETE:    return SDLK_DELETE;
+    default: break;
+    }
+    return SDL_SCANCODE_TO_KEYCODE(sc);
+}
+
+/* SDL convention: no text for ctrl/alt combos (AltGr = MODE is fine), and
+ * no control characters */
+static void filter_text(char *text_utf8)
+{
+    SDL_Keymod mod = sdlop.modstate;
+    if (mod & SDL_KMOD_MODE) {
+        mod &= ~(SDL_KMOD_RALT | SDL_KMOD_LALT);
+    }
+    if (mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT)) {
+        text_utf8[0] = '\0';
+    }
+    if (text_utf8[0] && (unsigned char)text_utf8[0] < 0x20 && text_utf8[0] != '\t') {
+        text_utf8[0] = '\0';
+    }
+}
+
+/* Feed a key press to the compose state. Returns true when composition
+ * consumed the key (text_utf8 then holds the composed text, or nothing
+ * while a sequence is in progress / was cancelled). */
+static bool compose_key(xkb_keycode_t xk, char *text_utf8, size_t text_size)
+{
+    if (!compose_st) {
+        return false;
+    }
+    xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st, xk);
+    if (sym == XKB_KEY_NoSymbol ||
+        SDLOP_XKB_xkb_compose_state_feed(compose_st, sym) != XKB_COMPOSE_FEED_ACCEPTED) {
+        return false; /* modifiers are ignored by compose */
+    }
+    switch (SDLOP_XKB_xkb_compose_state_get_status(compose_st)) {
+    case XKB_COMPOSE_COMPOSING:
+        return true; /* dead key / Multi_key: no text yet */
+    case XKB_COMPOSE_COMPOSED: {
+        int len = SDLOP_XKB_xkb_compose_state_get_utf8(compose_st, text_utf8, text_size);
+        if (len <= 0 || len >= (int)text_size) {
+            text_utf8[0] = '\0';
+        }
+        SDLOP_XKB_xkb_compose_state_reset(compose_st);
+        filter_text(text_utf8);
+        return true;
+    }
+    case XKB_COMPOSE_CANCELLED:
+        SDLOP_XKB_xkb_compose_state_reset(compose_st);
+        return true; /* the cancelling key produces no text (SDL3, XIM) */
+    case XKB_COMPOSE_NOTHING:
+    default:
+        return false;
+    }
 }
 
 SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out)
@@ -348,8 +687,12 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
     if (repeats_out) {
         *repeats_out = false;
     }
-    if (!xkb_st || rawcode == 0) {
+    if (rawcode == 0 || rawcode > SDLOP_EVDEV_KEY_MAX) {
         return SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_UNKNOWN);
+    }
+    SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[rawcode];
+    if (!xkb_st) {
+        return default_key_from_scancode(sc, SDL_KMOD_NONE);
     }
     xkb_keycode_t xk = (xkb_keycode_t)rawcode + 8; /* evdev -> xkb offset */
 
@@ -359,30 +702,27 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
         *repeats_out = repeats;
     }
 
-    /* key code: resolved on the base layout (clean state) like SDL3 */
-    xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, xk);
-    SDL_Keycode key = keysym_to_keycode(sym);
+    /* keycode: SDL3 key-event semantics (see event_keycode); for raw codes
+     * without an SDL scancode, the base-layout keysym */
+    SDL_Keycode key;
+    if (sc != SDL_SCANCODE_UNKNOWN) {
+        key = key_event ? event_keycode(sc) : layout_keycode(sc, SDL_KMOD_NONE);
+    } else {
+        key = keysym_to_keycode(SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, xk));
+    }
 
-    /* text: from the live state, respecting modifiers */
-    if (key_event && text_utf8 && repeats) {
-        {
+    /* text: from the live state (modifiers, active layout), through
+     * compose for dead keys / the Compose key */
+    if (key_event && text_utf8 && text_size) {
+        if (compose_key(xk, text_utf8, text_size)) {
+            return key;
+        }
+        if (repeats) {
             int len = SDLOP_XKB_xkb_state_key_get_utf8(xkb_st, xk, text_utf8, text_size);
             if (len <= 0 || len >= (int)text_size) {
                 text_utf8[0] = '\0';
             } else {
-                /* don't emit text for ctrl/alt combos (SDL convention),
-                 * but allow AltGr (MODE) */
-                SDL_Keymod mod = sdlop.modstate;
-                if (mod & SDL_KMOD_MODE) {
-                    mod &= ~(SDL_KMOD_RALT | SDL_KMOD_LALT);
-                }
-                if (mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT)) {
-                    text_utf8[0] = '\0';
-                }
-                /* filter control characters */
-                if (text_utf8[0] && (unsigned char)text_utf8[0] < 0x20 && text_utf8[0] != '\t') {
-                    text_utf8[0] = '\0';
-                }
+                filter_text(text_utf8);
             }
         }
     }
@@ -455,6 +795,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
         SDLOP_XKB_xkb_state_update_key(xkb_st, (xkb_keycode_t)xkb_raw + 8,
                                        down ? XKB_KEY_DOWN : XKB_KEY_UP);
         sdlop_sync_mods_from_xkb();
+        check_layout_change();
         mod = sdlop.modstate;
     }
 
@@ -527,6 +868,7 @@ void SDL_ResetKeyboard(void)
         }
     }
     sdlop.repeat_active = false;
+    compose_reset(); /* focus loss abandons a pending dead key */
 }
 
 SDL_Keymod SDL_GetModState(void)
@@ -546,23 +888,50 @@ SDL_Window *SDL_GetKeyboardFocus(void)
 
 SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, bool key_event)
 {
-    Uint16 raw = evdev_from_scancode(scancode);
-    /* SDL3 applies the *passed* modifiers when key_event is set */
-    if (key_event && keymap &&
-        (modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT | SDL_KMOD_CAPS))) {
-        xkb_mod_mask_t mask = 0;
-        if (modstate & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT)) {
-            mask |= (xkb_mod_mask_t)1 << mod_shift;
-        }
-        if (modstate & SDL_KMOD_CAPS) {
-            mask |= (xkb_mod_mask_t)1 << mod_caps;
-        }
-        SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, mask, 0, 0, 0, 0, 0);
-        xkb_keysym_t sym = SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st_clean, (xkb_keycode_t)raw + 8);
-        SDLOP_XKB_xkb_state_update_mask(xkb_st_clean, 0, 0, 0, 0, 0, 0);
-        return keysym_to_keycode(sym);
+    /* SDL3 semantics:
+     *  - key_event = true: the keycode a key event would carry - modifiers
+     *    are ignored (letters stay lowercase, shift+2 is '2');
+     *  - key_event = false: the passed modifiers select the shift level
+     *    (shift/caps, AltGr = SDL_KMOD_MODE, SDL_KMOD_LEVEL5). */
+    if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
+        return SDLK_UNKNOWN;
     }
-    return SDLOP_KeyboardTranslateKey(raw, key_event, NULL, 0, NULL);
+    if (key_event) {
+        return event_keycode(scancode);
+    }
+    return layout_keycode(scancode, modstate);
+}
+
+/* SDL_GetKeyName: a keycode is the unshifted key, its name the letter
+ * printed on it - usually the shifted capital (SDL3: shift lookup on the
+ * current keymap, accepted only if it case-folds back to the key; Latin-1
+ * symbols 0x80-0xBF, x and / are never shifted) */
+SDL_Keycode SDLOP_KeyboardKeyNameCapital(SDL_Keycode key)
+{
+    if (!((key >= 'a' && key <= 'z') || (key > 0xBF && key != 0xD7 && key != 0xF7))) {
+        return key;
+    }
+    SDL_Scancode sc;
+    SDL_Keymod mod;
+    const bool layout_keymap = keymap && (layout_flags & LAYOUT_LATIN_LETTERS) && !(layout_flags & LAYOUT_THAI);
+    if (!layout_keymap || !revtab_get(key, &sc, &mod)) {
+        /* default (US) keymap */
+        return (key >= 'a' && key <= 'z') ? key - 'a' + 'A' : key;
+    }
+    if (mod & (SDL_KMOD_SHIFT | SDL_KMOD_LEVEL5)) {
+        return key;
+    }
+    Uint16 evdev = evdev_from_scancode(sc);
+    xkb_keysym_t base = layout_keysym(evdev, mod & SDL_KMOD_MODE);
+    xkb_keysym_t shifted = layout_keysym(evdev, SDL_KMOD_SHIFT | (mod & SDL_KMOD_MODE));
+    SDL_Keycode capital = keycode_from_sym(shifted, sc);
+    if (capital == key || capital == SDLK_UNKNOWN || (capital & (SDLK_SCANCODE_MASK | SDLK_EXTENDED_MASK))) {
+        return key;
+    }
+    if (SDLOP_XKB_xkb_keysym_to_lower) {
+        return SDLOP_XKB_xkb_keysym_to_lower(shifted) == base ? capital : key;
+    }
+    return (key >= 'a' && key <= 'z' && capital == key - 'a' + 'A') ? capital : key;
 }
 
 SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
@@ -581,35 +950,31 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
     case SDLK_DELETE:    return SDL_SCANCODE_DELETE;
     default: break;
     }
-    /* printable: look up the base-layout keysym */
-    SDL_Scancode sc = symtab_get((xkb_keysym_t)key);
-    if (sc != SDL_SCANCODE_UNKNOWN) {
+    /* printable: the active layout, least-modified level first (SDL3
+     * searches keyboard->keymap, then the default keymap) */
+    SDL_Scancode sc;
+    SDL_Keymod found_mod;
+    if (keymap && revtab_get(key, &sc, &found_mod)) {
+        if (modstate) {
+            *modstate = found_mod;
+        }
         return sc;
     }
-    /* shifted printables (SDL3: SDLK_W resolves to SDL_SCANCODE_W) */
-    static const struct { char ch; SDL_Scancode sc; } shifted_us[] = {
-        { '!', SDL_SCANCODE_1 }, { '@', SDL_SCANCODE_2 }, { '#', SDL_SCANCODE_3 },
-        { '$', SDL_SCANCODE_4 }, { '%', SDL_SCANCODE_5 }, { '^', SDL_SCANCODE_6 },
-        { '&', SDL_SCANCODE_7 }, { '*', SDL_SCANCODE_8 }, { '(', SDL_SCANCODE_9 },
-        { ')', SDL_SCANCODE_0 }, { '_', SDL_SCANCODE_MINUS }, { '+', SDL_SCANCODE_EQUALS },
-        { '{', SDL_SCANCODE_LEFTBRACKET }, { '}', SDL_SCANCODE_RIGHTBRACKET },
-        { '|', SDL_SCANCODE_BACKSLASH }, { ':', SDL_SCANCODE_SEMICOLON },
-        { '"', SDL_SCANCODE_APOSTROPHE }, { '~', SDL_SCANCODE_GRAVE },
-        { '<', SDL_SCANCODE_COMMA }, { '>', SDL_SCANCODE_PERIOD },
-        { '?', SDL_SCANCODE_SLASH },
-    };
-    if (key >= 'A' && key <= 'Z') {
-        if (modstate) {
-            *modstate = SDL_KMOD_LSHIFT;
-        }
-        return (SDL_Scancode)(SDL_SCANCODE_A + (key - 'A'));
-    }
-    for (size_t i = 0; i < SDL_arraysize(shifted_us); i++) {
-        if (shifted_us[i].ch == (char)key) {
-            if (modstate) {
-                *modstate = SDL_KMOD_LSHIFT;
+    /* not on the active layout (or no keymap): SDL3's default US table,
+     * unshifted first, then shifted ('A' -> A + shift, '@' -> 2 + shift).
+     * The ISO-only keys are skipped so '~'/'<' resolve to the US keys. */
+    for (int pass = 0; pass < 2; pass++) {
+        const SDL_Keymod m = pass ? SDL_KMOD_SHIFT : SDL_KMOD_NONE;
+        for (int i = SDL_SCANCODE_A; i < SDL_SCANCODE_CAPSLOCK; i++) {
+            if (i == SDL_SCANCODE_NONUSHASH) {
+                continue;
             }
-            return shifted_us[i].sc;
+            if (default_key_from_scancode((SDL_Scancode)i, m) == key) {
+                if (modstate) {
+                    *modstate = m;
+                }
+                return (SDL_Scancode)i;
+            }
         }
     }
     return SDL_SCANCODE_UNKNOWN;
@@ -617,6 +982,18 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
 
 void SDLOP_KeyboardQuit(void)
 {
+    if (compose_st) {
+        SDLOP_XKB_xkb_compose_state_unref(compose_st);
+        compose_st = NULL;
+    }
+    if (compose_table) {
+        SDLOP_XKB_xkb_compose_table_unref(compose_table);
+        compose_table = NULL;
+    }
+    compose_tried = false;
+    cur_layout = 0;
+    layout_flags = 0;
+    memset(revtab, 0, sizeof(revtab));
     if (xkb_st) {
         SDLOP_XKB_xkb_state_unref(xkb_st);
         xkb_st = NULL;

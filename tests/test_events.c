@@ -319,9 +319,15 @@ int main(void)
     assert(SDL_GetKeyFromName("\xc3\xa9") == 0x00E9); /* UTF-8 char is the keycode itself */
     assert(SDL_GetKeyFromName(NULL) == SDLK_UNKNOWN);
     assert(SDL_GetKeyFromName("DefinitelyNotAKey") == SDLK_UNKNOWN);
-    for (SDL_Keycode k = 'a'; k <= 'z'; k++) {
-        assert(SDL_GetKeyFromName(SDL_GetKeyName(k)) == (k - 'a' + 'A'));
+    /* SDL3: SDLK_A..Z are 'a'..'z', named by the printed capital, and the
+     * name maps back to the unshifted keycode */
+    for (SDL_Keycode k = SDLK_A; k <= SDLK_Z; k++) {
+        const char *name = SDL_GetKeyName(k);
+        assert(name[0] == (char)(k - 'a' + 'A') && name[1] == '\0');
+        assert(SDL_GetKeyFromName(name) == k);
     }
+    assert(SDL_GetKeyFromName("Space") == SDLK_SPACE);
+    assert(SDL_GetKeyFromName("Return") == SDLK_RETURN);
 
 #ifndef __EMSCRIPTEN__ /* the web backend has no xkb keymaps */
     /* --- stock parity: KEYMAP_CHANGED fires for a replaced keymap --- */

@@ -74,7 +74,6 @@ extern void SDLOP_Wayland_UnloadSymbols(void);
 #define wl_display_get_error            (*SDLOP_WL_wl_display_get_error)
 #define wl_display_get_protocol_error   (*SDLOP_WL_wl_display_get_protocol_error)
 #define wl_display_create_queue         (*SDLOP_WL_wl_display_create_queue)
-#define wl_display_create_queue_with_name (*SDLOP_WL_wl_display_create_queue_with_name)
 #define wl_event_queue_destroy          (*SDLOP_WL_wl_event_queue_destroy)
 
 #define wl_proxy_marshal                     (*SDLOP_WL_wl_proxy_marshal)

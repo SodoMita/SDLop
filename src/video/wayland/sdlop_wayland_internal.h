@@ -35,9 +35,13 @@ SDL_FunctionPointer SDLOP_Wayland_GL_GetProcAddressThunk(SDLop_VideoDevice *devi
 bool SDLOP_Wayland_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval);
 bool SDLOP_Wayland_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval);
 void SDLOP_Wayland_GL_WindowDestroyed(SDL_Window *window);
+void *SDLOP_Wayland_EGL_GetDisplay(SDLop_VideoDevice *device);
+void *SDLOP_Wayland_EGL_GetConfig(SDLop_VideoDevice *device);
+void *SDLOP_Wayland_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window);
 void SDLOP_Wayland_GL_WindowResized(SDL_Window *window);
 
 /* Vulkan module (sdlop_wayland_vulkan.c) - vtable entry point */
 bool SDLOP_Wayland_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface);
+bool SDLOP_Wayland_Vulkan_GetPresentationSupport(SDLop_VideoDevice *device, void *instance, void *physical_device, Uint32 queue_family);
 
 #endif /* sdlop_wayland_internal_h_ */

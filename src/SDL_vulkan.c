@@ -104,18 +104,24 @@ void SDL_Vulkan_DestroySurface(VkInstance instance, VkSurfaceKHR surface, const 
     }
 }
 
-bool SDL_Vulkan_GetPresentationSupport(VkInstance instance, Uint32 queueFamilyIndex)
+bool SDL_Vulkan_GetPresentationSupport(VkInstance instance, VkPhysicalDevice physicalDevice, Uint32 queueFamilyIndex)
 {
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem has not been initialized");
+    }
     if (!instance) {
-        SDL_SetError("Invalid VkInstance");
-        return false;
+        return SDL_InvalidParamError("instance");
+    }
+    if (!physicalDevice) {
+        return SDL_InvalidParamError("physicalDevice");
     }
     if (!vulkan_handle && !SDL_Vulkan_LoadLibrary(NULL)) {
         return false;
     }
-    (void)queueFamilyIndex;
-    /* Requires a physical device in real use; SDL3 callers pass one via the
-     * instance proc - keep semantics: presence of the WSI entry point and a
-     * live wayland display is enough for our single-GPU lean case. */
-    return vk_get_instance_proc_addr != NULL;
+    if (sdlop.video->Vulkan_GetPresentationSupport) {
+        return sdlop.video->Vulkan_GetPresentationSupport(sdlop.video, instance, physicalDevice, queueFamilyIndex);
+    }
+    /* SDL3: a backend without a WSI query (KMSDRM's display surfaces) always
+     * supports presentation */
+    return true;
 }

@@ -1,0 +1,12 @@
+# LeakSanitizer suppressions for GPU-backed tests under SDLOP_SANITIZERS.
+# Only allocations whose stack passes through the software rasterizer /
+# Vulkan loader stack are ignored; leaks allocated by SDLop itself are
+# still reported. Seen intermittently with Ubuntu 24.04's lavapipe (one
+# 128-byte block at exit, not reproducible with Debian 12's Mesa 22).
+leak:libvulkan_lvp.so
+leak:libvulkan.so
+leak:libLLVM
+leak:libgallium
+leak:libEGL_mesa.so
+leak:libGLX_mesa.so
+leak:swrast_dri.so

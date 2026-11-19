@@ -30,6 +30,9 @@ struct SDL_Window
     int w, h;           /* requested size */
     SDL_WindowFlags flags;
     bool text_input_active; /* SDL_StartTextInput() gate (stock: text events only while active) */
+    SDL_Rect text_input_rect; /* SDL_SetTextInputArea */
+    int text_input_cursor;
+    SDL_PropertiesID text_input_props; /* SDL_StartTextInputWithProperties copy */
     Uint8 clear_r, clear_g, clear_b;
     float display_scale;    /* output scale the window currently sits on */
     SDL_Surface *surface;   /* software window surface (owned by window) */
@@ -38,7 +41,27 @@ struct SDL_Window
     SDL_DisplayID displayID;          /* display the window is currently on */
     bool has_fullscreen_mode;         /* an exclusive fullscreen mode was requested */
     SDL_DisplayMode fullscreen_mode;  /* requested exclusive mode (displayID set) */
+
+    /* SDL 3.4 window state (SDL_video.c; drivers read these in their hooks) */
+    bool undefined_x, undefined_y;    /* created with SDL_WINDOWPOS_UNDEFINED */
+    int min_w, min_h, max_w, max_h;   /* 0 = no limit */
+    float min_aspect, max_aspect;     /* 0 = no limit */
+    float opacity;
+    SDL_Surface *icon;                /* ARGB8888 copy */
+    struct SDL_Window *parent;
+    SDL_Rect mouse_rect;              /* empty = none */
+    SDL_Rect safe_rect;               /* empty = whole window */
+    SDL_PropertiesID props;
+    SDL_HitTest hit_test;
+    void *hit_test_data;
+    SDL_ProgressState progress_state;
+    float progress_value;
+    SDL_WindowFlags pending_flags;    /* grabs requested while hidden */
+    int popup_offset_x, popup_offset_y; /* tooltip / popup menu: offset from parent */
+    bool is_destroying;
 };
+
+#define SDLOP_WINDOW_IS_POPUP(w) ((w) && ((w)->flags & (SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU)) != 0)
 
 /* ------------------------------------------------------------------ */
 /* Video displays                                                      */
@@ -116,11 +139,107 @@ struct SDLop_VideoDevice
      * Optional: when NULL, SDL_Vulkan_GetInstanceExtensions() returns the
      * default (VK_KHR_surface + VK_KHR_wayland_surface). */
     const char *const *(*Vulkan_GetInstanceExtensions)(SDLop_VideoDevice *device, Uint32 *count);
+
+    /* ---- everything below is optional (NULL = generic behaviour) ---- */
+
+    /* vkGetPhysicalDevice*PresentationSupportKHR; NULL = always supported */
+    bool (*Vulkan_GetPresentationSupport)(SDLop_VideoDevice *device, void *instance, void *physical_device, Uint32 queue_family);
+
+    /* Clipboard (SDL3 SDL_VideoDevice layout). The app's offer lives in
+     * SDL_clipboard.c; drivers read it via SDLOP_GetInternalClipboardData().
+     * NULL = in-process clipboard only. */
+    bool (*SetClipboardData)(SDLop_VideoDevice *device);
+    void *(*GetClipboardData)(SDLop_VideoDevice *device, const char *mime_type, size_t *size);
+    bool (*HasClipboardData)(SDLop_VideoDevice *device, const char *mime_type);
+    const char *const *(*GetTextMimeTypes)(SDLop_VideoDevice *device, size_t *num_mime_types);
+    bool (*SetPrimarySelectionText)(SDLop_VideoDevice *device, const char *text);
+    char *(*GetPrimarySelectionText)(SDLop_VideoDevice *device);
+    bool (*HasPrimarySelectionText)(SDLop_VideoDevice *device);
+
+    /* SDL 3.4 window management (same contracts as SDL_sysvideo.h; NULL =
+     * SDL_Unsupported() where stock SDL3 reports that) */
+    bool supports_popups;            /* SDL_WINDOW_TOOLTIP / SDL_WINDOW_POPUP_MENU */
+    void (*SetWindowMinimumSize)(SDLop_VideoDevice *device, SDL_Window *window);
+    void (*SetWindowMaximumSize)(SDLop_VideoDevice *device, SDL_Window *window);
+    void (*SetWindowAspectRatio)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*GetWindowBordersSize)(SDLop_VideoDevice *device, SDL_Window *window, int *top, int *left, int *bottom, int *right);
+    bool (*SetWindowOpacity)(SDLop_VideoDevice *device, SDL_Window *window, float opacity);
+    bool (*SetWindowParent)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Window *parent);
+    bool (*SetWindowModal)(SDLop_VideoDevice *device, SDL_Window *window, bool modal);
+    void (*SetWindowBordered)(SDLop_VideoDevice *device, SDL_Window *window, bool bordered);
+    void (*SetWindowResizable)(SDLop_VideoDevice *device, SDL_Window *window, bool resizable);
+    void (*SetWindowAlwaysOnTop)(SDLop_VideoDevice *device, SDL_Window *window, bool on_top);
+    bool (*SetWindowIcon)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon);
+    bool (*SetWindowMouseGrab)(SDLop_VideoDevice *device, SDL_Window *window, bool grabbed);
+    bool (*SetWindowKeyboardGrab)(SDLop_VideoDevice *device, SDL_Window *window, bool grabbed);
+    bool (*SetWindowMouseRect)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*FlashWindow)(SDLop_VideoDevice *device, SDL_Window *window, SDL_FlashOperation operation);
+    bool (*SyncWindow)(SDLop_VideoDevice *device, SDL_Window *window);
+    void (*ShowWindowSystemMenu)(SDLop_VideoDevice *device, SDL_Window *window, int x, int y);
+    bool (*SetWindowFocusable)(SDLop_VideoDevice *device, SDL_Window *window, bool focusable);
+    bool (*SetWindowHitTest)(SDLop_VideoDevice *device, SDL_Window *window, bool enabled);
+    bool (*UpdateWindowShape)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *shape);
+    bool (*SuspendScreenSaver)(SDLop_VideoDevice *device);
+    void *(*GetWindowICCProfile)(SDLop_VideoDevice *device, SDL_Window *window, size_t *size);
+    bool (*SetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int vsync);
+    bool (*GetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int *vsync);
+    SDL_SystemTheme (*GetSystemTheme)(SDLop_VideoDevice *device);
+
+    /* EGL handles of the current context (SDL_EGL_*); NULL = not EGL */
+    void *(*EGL_GetDisplay)(SDLop_VideoDevice *device);
+    void *(*EGL_GetConfig)(SDLop_VideoDevice *device);
+    void *(*EGL_GetWindowSurface)(SDLop_VideoDevice *device, SDL_Window *window);
+
+    /* Cursors (SDL_mouse.c). CreateCursor fills cursor->internal from
+     * cursor->surface / cursor->system_id; ShowCursor(NULL) hides. */
+    bool (*CreateCursor)(SDLop_VideoDevice *device, SDL_Cursor *cursor);
+    void (*FreeCursor)(SDLop_VideoDevice *device, SDL_Cursor *cursor);
+    bool (*ShowCursor)(SDLop_VideoDevice *device, SDL_Cursor *cursor);
+    bool (*WarpMouse)(SDLop_VideoDevice *device, SDL_Window *window, float x, float y);
+    bool (*WarpMouseGlobal)(SDLop_VideoDevice *device, float x, float y);
+    bool (*CaptureMouse)(SDLop_VideoDevice *device, SDL_Window *window); /* NULL window = release */
+    SDL_MouseButtonFlags (*GetGlobalMouseState)(SDLop_VideoDevice *device, float *x, float *y);
+
+    /* Text input / IME */
+    bool (*UpdateTextInputArea)(SDLop_VideoDevice *device, SDL_Window *window);
 };
+
+/* Cursor object (SDL_mouse.c) */
+struct SDL_Cursor
+{
+    SDL_SystemCursor system_id;    /* SDL_SYSTEM_CURSOR_COUNT for image cursors */
+    SDL_Surface *surface;          /* ARGB8888 image (first frame), NULL for system cursors */
+    int hot_x, hot_y;
+    struct SDL_Cursor **frames;    /* animated: one image cursor per frame */
+    Uint32 *durations;             /* animated: ms per frame (0 = stop) */
+    int num_frames, current_frame;
+    Uint64 last_update;
+    void *internal;                /* driver data */
+    struct SDL_Cursor *next;
+};
+void SDLOP_MouseQuit(void);
+SDL_Cursor *SDLOP_GetCurrentCursor(void); /* NULL when hidden */
+bool SDLOP_CursorVisible(void);
+void SDLOP_RedrawCursor(void);         /* re-apply SDLOP_GetCurrentCursor() via ShowCursor */
+void SDLOP_UpdateCursorAnimation(void); /* SDL_PumpEvents */
+void SDLOP_UpdateWindowGrab(SDL_Window *window);
+void SDLOP_OnWindowMoved(SDL_Window *window); /* popup offsets; moves child popups */
+/* freedesktop / CSS cursor name for a system cursor (SDL_GetCSSCursorName) */
+const char *SDLOP_GetCSSCursorName(SDL_SystemCursor id, const char **fallback_name);
+void SDLOP_ConstrainMouse(SDL_Window *window, float *x, float *y);
+
+/* Clipboard state shared with drivers (SDL_clipboard.c) */
+void *SDLOP_GetInternalClipboardData(const char *mime_type, size_t *size); /* malloc'd, NUL-padded copy */
+bool SDLOP_HasInternalClipboardData(const char *mime_type);
+const char *const *SDLOP_GetClipboardOfferMimeTypes(size_t *count);
+/* a foreign owner took the selection (owner=false) or our own offer changed */
+void SDLOP_SendClipboardUpdate(bool owner, char **mime_types, size_t num_mime_types);
+const void *SDLCALL SDLOP_ClipboardTextCallback(void *userdata, const char *mime_type, size_t *size);
 
 /* Provided by backends */
 extern SDLop_VideoDevice SDLop_emscripten_device;
 extern SDLop_VideoDevice SDLop_wayland_device;
+extern SDLop_VideoDevice SDLop_x11_device;
 extern SDLop_VideoDevice SDLop_kmsdrm_device;
 extern SDLop_VideoDevice SDLop_dummy_device;
 
@@ -160,6 +279,10 @@ typedef struct SDLop_Globals
     float mouse_xrel_acc, mouse_yrel_acc; /* accumulators for GetRelativeMouseState */
     SDL_MouseButtonFlags mouse_buttons;
     SDL_Window *relative_mode_window;
+
+    /* window management */
+    SDL_Window *grabbed_window;
+    bool suspend_screensaver;
 
     /* key repeat emulation (for the raw evdev path) */
     SDL_Scancode repeat_scancode;
@@ -211,6 +334,17 @@ void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 tim
 void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, float y,
                      float dx, float dy, float pressure, SDL_WindowID windowID,
                      Uint64 timestamp_ns);
+void SDLOP_ResetTouchMouse(void); /* SDL_Init / SDL_Quit */
+
+/* Input device registry (SDL_devices.c): sends *_ADDED / *_REMOVED */
+void SDLOP_AddMouse(SDL_MouseID id, const char *name);
+void SDLOP_RemoveMouse(SDL_MouseID id, bool send_event);
+void SDLOP_AddKeyboard(SDL_KeyboardID id, const char *name);
+void SDLOP_RemoveKeyboard(SDL_KeyboardID id, bool send_event);
+void SDLOP_AddTouch(SDL_TouchID id, SDL_TouchDeviceType type, const char *name);
+void SDLOP_RemoveTouch(SDL_TouchID id);
+void SDLOP_TrackTouch(Uint32 type, SDL_TouchID touchID, SDL_FingerID fingerID, float x, float y, float pressure);
+void SDLOP_DevicesQuit(void);
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns);
 
 /* Timestamp helpers */
@@ -221,6 +355,10 @@ static inline Uint64 SDLOP_MonoToSDLTicks(Uint64 mono_ns)
 }
 
 /* Window helpers */
+void SDLOP_GetEGLAttributeCallbacks(SDL_EGLAttribArrayCallback *platform, SDL_EGLIntArrayCallback *surface,
+                                    SDL_EGLIntArrayCallback *context, void **userdata); /* SDL_gl.c */
+void SDLOP_AssertionsQuit(void);       /* SDL_misc.c, from SDL_Quit */
+bool SDLOP_WindowValid(SDL_Window *window);   /* in the window list */
 SDL_Window *SDLOP_GetFocusedKeyboardWindow(void);
 SDL_WindowID SDLOP_FocusWindowID(void);   /* focused window id or 0 */
 
@@ -228,11 +366,15 @@ SDL_WindowID SDLOP_FocusWindowID(void);   /* focused window id or 0 */
 bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length); /* wayland */
 bool SDLOP_KeyboardSetDefaultKeymap(void);
 void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked);
+void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locked,
+                                  Uint32 base_group, Uint32 latched_group, Uint32 locked_group); /* x11/wayland */
 bool SDLOP_KeyboardKeyRepeats(SDL_Scancode sc);
 void SDLOP_KeyboardProcessRepeats(void);
 void SDLOP_KeyboardQuit(void);
 /* Resolve scancode (evdev raw code) -> SDL_Keycode + text using xkb.
  * Returns the keycode; fills text_utf8 (may write "") when non-NULL. */
+/* SDL_GetKeyName helper: the printed (capital) form of a keycode */
+SDL_Keycode SDLOP_KeyboardKeyNameCapital(SDL_Keycode key);
 SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out);
 
 /* Raw input worker (evdev), implemented in sdlop_evdev.c */
@@ -288,5 +430,26 @@ int SDLOP_BytesPerPixel(SDL_PixelFormat format);
 
 /* Logging of subsystem state */
 extern bool sdlop_quitting;
+
+/* Core services (SDLop_core.c, SDL_hints.c, ...) */
+bool SDLOP_IsMainThread(void);
+void SDLOP_InitMainThread(void);
+bool SDLOP_GetStringBoolean(const char *value, bool default_value); /* SDL3's SDL_GetStringBoolean */
+void SDLOP_SendSimpleEvent(SDL_EventType type);  /* type + timestamp only */
+const char *SDLOP_GetExeName(void);  /* basename of /proc/self/exe or NULL */
+const char *SDLOP_GetAppID(void);    /* SDL3 SDL_GetAppID() for WM_CLASS / xdg app_id */
+
+/* SDL3 "temporary memory": freed at the next SDL_PumpEvents() on this
+ * thread, or handed over with the event that references it */
+void *SDLOP_AllocateTemporaryMemory(size_t size);
+void SDLOP_FreeTemporaryMemory(void);
+
+/* SDL_Quit() teardown, in call order */
+void SDLOP_QuitTimers(void);
+void SDLOP_QuitEvents(void);
+void SDLOP_QuitClipboard(void);
+void SDLOP_QuitLog(void);
+void SDLOP_QuitHints(void);
+void SDLOP_QuitProperties(void);
 
 #endif /* sdlop_internal_h_ */

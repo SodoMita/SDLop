@@ -15,8 +15,8 @@
 
 int main(void)
 {
-    if (!getenv("WAYLAND_DISPLAY")) {
-        printf("smoke_relative_mode: SKIP (WAYLAND_DISPLAY not set)\n");
+    if (!getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY")) {
+        printf("smoke_relative_mode: SKIP (neither WAYLAND_DISPLAY nor DISPLAY set)\n");
         return 0;
     }
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);

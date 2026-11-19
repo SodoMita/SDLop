@@ -32,6 +32,15 @@ typedef void (*SDLOP_EGLProc)(void);
 
 #undef SDLOP_EGL_SYM
 
+/* eglGetPlatformDisplay(EXT) honoring SDL_EGL_SetAttributeCallbacks:
+ * sdl_attribs (EGL_NONE-terminated, may be NULL) plus the app's
+ * platform attributes. EGL_NO_DISPLAY when unavailable or on error. */
+extern EGLDisplay SDLOP_EGL_PlatformDisplay(EGLenum platform, void *native, const EGLint *sdl_attribs);
+/* append the app's surface (context=false) or context attributes to
+ * attribs[0..n) and terminate it; returns the new n, -1 on error (set) */
+extern int SDLOP_EGL_AppendUserAttribs(bool context, EGLDisplay display, EGLConfig config, EGLint *attribs, int n,
+                                       int max);
+
 #ifdef __cplusplus
 }
 #endif
