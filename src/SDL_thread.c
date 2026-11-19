@@ -574,6 +574,13 @@ void SDL_CleanupTLS(void)
 
 #define SDLOP_THREAD_MAGIC 0x54485244u /* 'THRD' */
 
+/* Live-thread registry: `SDL_Thread *` handles are opaque to callers and a
+ * joined/detached object is freed, so a magic field alone would be a
+ * use-after-free read (the memory can be handed out again). Validity is
+ * therefore "is this pointer still registered". (utils b0e7d28) */
+static pthread_mutex_t thread_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDL_Thread *thread_registry;
+
 struct SDL_Thread
 {
     Uint32 magic;
@@ -586,15 +593,66 @@ struct SDL_Thread
     SDL_ThreadFunction userfunc;
     void *userdata;
     SDL_Semaphore *started; /* creator waits until the name/id are set */
+    struct SDL_Thread *registry_next;
 };
+
+static void thread_register(SDL_Thread *thread)
+{
+    pthread_mutex_lock(&thread_registry_lock);
+    thread->registry_next = thread_registry;
+    thread_registry = thread;
+    pthread_mutex_unlock(&thread_registry_lock);
+}
+
+static void thread_unregister(SDL_Thread *thread)
+{
+    pthread_mutex_lock(&thread_registry_lock);
+    SDL_Thread **link = &thread_registry;
+    while (*link) {
+        if (*link == thread) {
+            *link = thread->registry_next;
+            break;
+        }
+        link = &(*link)->registry_next;
+    }
+    pthread_mutex_unlock(&thread_registry_lock);
+}
 
 static bool thread_valid(SDL_Thread *thread)
 {
-    if (!thread || thread->magic != SDLOP_THREAD_MAGIC) {
+    if (!thread) {
         SDL_InvalidParamError("thread");
         return false;
     }
-    return true;
+
+    bool found = false;
+    pthread_mutex_lock(&thread_registry_lock);
+    for (SDL_Thread *t = thread_registry; t; t = t->registry_next) {
+        if (t == thread) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thread_registry_lock);
+
+    if (!found) {
+        SDL_InvalidParamError("thread");
+    }
+    return found;
+}
+
+/* Queries report "unknown" without touching the error string, and treat NULL
+ * as "the calling thread" where stock SDL3 does. */
+static bool thread_queryable(SDL_Thread *thread)
+{
+    return !thread || thread_valid(thread);
+}
+
+/* SDL_Quit() hook: drop this thread's TLS storage so a later SDL_Init()
+ * starts from a clean state (utils b0e7d28) */
+void SDLOP_ThreadsQuit(void)
+{
+    SDL_CleanupTLS();
 }
 
 SDL_ThreadID SDL_GetCurrentThreadID(void)
@@ -673,6 +731,7 @@ SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_Fu
     }
     thread->magic = SDLOP_THREAD_MAGIC;
     thread->status = -1;
+    thread_register(thread);
     SDL_SetAtomicInt(&thread->state, SDL_THREAD_ALIVE);
     if (name) {
         thread->name = SDL_strdup(name);
@@ -725,17 +784,22 @@ SDL_Thread *SDL_CreateThreadRuntime(SDL_ThreadFunction fn, const char *name, voi
 
 const char *SDL_GetThreadName(SDL_Thread *thread)
 {
-    return thread_valid(thread) ? thread->name : NULL;
+    return thread_queryable(thread) && thread ? thread->name : NULL;
 }
 
 SDL_ThreadID SDL_GetThreadID(SDL_Thread *thread)
 {
-    return thread ? thread->threadid : SDL_GetCurrentThreadID();
+    /* NULL means "the calling thread" (stock SDL3); a joined/detached thread
+       object yields 0 instead of reading freed memory */
+    if (!thread) {
+        return SDL_GetCurrentThreadID();
+    }
+    return thread_queryable(thread) ? thread->threadid : 0;
 }
 
 SDL_ThreadState SDL_GetThreadState(SDL_Thread *thread)
 {
-    if (!thread_valid(thread)) {
+    if (!thread || !thread_queryable(thread)) {
         return SDL_THREAD_UNKNOWN;
     }
     return (SDL_ThreadState)SDL_GetAtomicInt(&thread->state);
@@ -743,7 +807,7 @@ SDL_ThreadState SDL_GetThreadState(SDL_Thread *thread)
 
 void SDL_WaitThread(SDL_Thread *thread, int *status)
 {
-    if (!thread || thread->magic != SDLOP_THREAD_MAGIC) {
+    if (!thread || !thread_valid(thread)) {
         if (status) {
             *status = -1;
         }
@@ -753,18 +817,38 @@ void SDL_WaitThread(SDL_Thread *thread, int *status)
     if (status) {
         *status = thread->status;
     }
+    thread_unregister(thread); /* the handle stops being valid now */
     free_thread(thread);
 }
 
 void SDL_DetachThread(SDL_Thread *thread)
 {
-    if (!thread || thread->magic != SDLOP_THREAD_MAGIC) {
+    if (!thread || !thread_valid(thread)) {
         return;
     }
+
+    /* Capture the handle now: the object can only be freed by the thread
+       itself once it observes DETACHED, and only we can set DETACHED here,
+       so reading it before the CAS is race-free. (utils b0e7d28) */
+    const pthread_t handle = thread->handle;
+
+    /* The thread may vanish at any time once detached: the handle stops being
+       valid for the caller from here on. */
+    thread_unregister(thread);
+
+    /* Ownership passes to the child in the ALIVE case: it frees the object
+       once it observes DETACHED. */
     if (SDL_CompareAndSwapAtomicInt(&thread->state, SDL_THREAD_ALIVE, SDL_THREAD_DETACHED)) {
-        pthread_detach(thread->handle); /* run_thread frees it */
+        /* After this point the thread may self-free; don't touch `thread`. */
+        pthread_detach(handle);
+    } else if (SDL_GetAtomicInt(&thread->state) == SDL_THREAD_DETACHED) {
+        /* already detached (calling twice is a no-op) */
+        return;
     } else if (SDL_GetAtomicInt(&thread->state) == SDL_THREAD_COMPLETE) {
-        SDL_WaitThread(thread, NULL);
+        /* the child has already exited, so it is not going to free anything:
+           reap the pthread and drop the object here */
+        pthread_join(handle, NULL);
+        free_thread(thread);
     }
 }
 
