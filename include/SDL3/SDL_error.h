@@ -227,4 +227,16 @@ extern SDL_DECLSPEC bool SDLCALL SDL_ClearError(void);
 #endif
 #include <SDL3/SDL_close_code.h>
 
+/**
+ * Set an error message stating that a parameter was invalid.
+ *
+ * This is a helper for the common case of `SDL_SetError("Parameter '%s' is
+ * invalid", param)`. It is a macro, like stock SDL3 (which does not export a
+ * function by this name).
+ *
+ * \param param the name of the invalid parameter.
+ * \returns false.
+ */
+#define SDL_InvalidParamError(param) SDL_SetError("Parameter '%s' is invalid", (param))
+
 #endif /* SDL_error_h_ */

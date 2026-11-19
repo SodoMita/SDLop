@@ -428,6 +428,13 @@ SDL_GLContext SDLOP_GL_CurrentContext(void);
 /* Surface helpers (SDL_surface.c) */
 int SDLOP_BytesPerPixel(SDL_PixelFormat format);
 
+/* Threads (SDL_thread.c) */
+void SDLOP_ThreadsQuit(void);                       /* SDL_Quit() hook: TLS teardown */
+const char *SDLOP_GetPersistentString(const char *string); /* per-thread intern pool */
+
+/* Environment (SDL_stdlib.c) */
+void SDLOP_EnvironmentQuit(void);                   /* SDL_Quit() hook */
+
 /* Logging of subsystem state */
 extern bool sdlop_quitting;
 

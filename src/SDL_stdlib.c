@@ -1497,6 +1497,28 @@ void SDL_DestroyEnvironment(SDL_Environment *env)
     SDL_free(env);
 }
 
+/* SDL_Quit() hook: rebuild the process-wide environment block on the next
+ * SDL_Init() so it re-snapshots the real environment (utils b0e7d28 moved
+ * this to SDL_getenv.c; PR4 keeps the environment in SDL_stdlib.c). */
+void SDLOP_EnvironmentQuit(void)
+{
+    SDL_Environment *env = SDL_environment;
+
+    if (env) {
+        SDL_environment = NULL;
+        /* SDL_DestroyEnvironment refuses to destroy the global env (it
+           compares against the global pointer), so tear it down by hand. */
+        for (int i = 0; i < env->count; i++) {
+            SDL_free(env->vars[i]);
+        }
+        SDL_free(env->vars);
+        pthread_mutex_destroy(&env->lock);
+        SDL_free(env);
+    }
+
+    env_once = (pthread_once_t)PTHREAD_ONCE_INIT;
+}
+
 const char *SDL_getenv(const char *name)
 {
     return SDL_GetEnvironmentVariable(SDL_GetEnvironment(), name);
