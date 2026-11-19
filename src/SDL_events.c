@@ -72,6 +72,8 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
     /* a window move may change which display the window lives on */
     if (window && type == SDL_EVENT_WINDOW_MOVED) {
         SDLOP_UpdateWindowDisplay(window);
+    } else if (window && type == SDL_EVENT_WINDOW_RESIZED) {
+        SDLOP_GL_NotifyWindowResized(window);
     }
 }
 

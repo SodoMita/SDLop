@@ -448,8 +448,14 @@ if(SDLop_BUILD_TESTS)
     target_include_directories(test_vulkan_compute PRIVATE src tests)
     target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
     add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
+
+    add_executable(test_vk_offload_live tests/test_vk_offload_live.c)
+    target_link_libraries(test_vk_offload_live PRIVATE sdlop Vulkan::Vulkan)
+    target_include_directories(test_vk_offload_live PRIVATE src)
+    target_compile_options(test_vk_offload_live PRIVATE -UNDEBUG)
+    add_test(NAME test_vk_offload_live COMMAND test_vk_offload_live)
   else()
-    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute")
+    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute, test_vk_offload_live")
   endif()
 
   # wlr virtual-input protocols (vendored XMLs) for the sway end-to-end test

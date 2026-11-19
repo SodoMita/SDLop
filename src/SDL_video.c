@@ -748,10 +748,14 @@ bool SDL_SetWindowSize(SDL_Window *window, int w, int h)
     }
     window->w = w;
     window->h = h;
+    bool ok = true;
     if (sdlop.video && sdlop.video->SetWindowSize) {
-        return sdlop.video->SetWindowSize(sdlop.video, window);
+        ok = sdlop.video->SetWindowSize(sdlop.video, window);
     }
-    return true;
+    if (ok) {
+        SDLOP_GL_NotifyWindowResized(window);
+    }
+    return ok;
 }
 
 bool SDL_GetWindowSize(SDL_Window *window, int *w, int *h)

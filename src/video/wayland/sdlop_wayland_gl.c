@@ -471,7 +471,9 @@ bool SDLOP_Wayland_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
         int sw = 0, sh = 0;
         SDLOP_GLOffload_GetSurfaceSize((SDLOP_GLOffloadSurface *)*slot, &sw, &sh);
         if (sw != cur_w || sh != cur_h) {
-            SDLOP_GLOffload_ResizeSurface(octx, (SDLOP_GLOffloadSurface **)slot, cur_w, cur_h);
+            if (!SDLOP_GLOffload_ResizeSurface(octx, (SDLOP_GLOffloadSurface **)slot, cur_w, cur_h)) {
+                return false;
+            }
         }
         return true;
     }
@@ -546,8 +548,25 @@ void SDLOP_Wayland_GL_WindowDestroyed(SDL_Window *window)
 void SDLOP_Wayland_GL_WindowResized(SDL_Window *window)
 {
     if (SDLOP_Wayland_IsGLOffloadActive(window)) {
-        /* Surface resize is deferred to MakeCurrent / post-swap so any in-progress
-         * frame still reads cleanly before resizing for the next frame. */
+        void **slot = SDLOP_Wayland_GetGLSurfaceSlot(window);
+        void **octx_slot = SDLOP_Wayland_GetGLOffloadContextSlot(window);
+        WaylandGLContext *cur = (WaylandGLContext *)SDLOP_GL_CurrentContext();
+        SDLOP_GLOffloadContext *octx = (cur && cur->is_offload)
+            ? cur->offload_ctx
+            : (octx_slot ? (SDLOP_GLOffloadContext *)*octx_slot : NULL);
+        if (octx && slot && *slot) {
+            int w = window->w > 0 ? window->w : 1;
+            int h = window->h > 0 ? window->h : 1;
+            int sw = 0, sh = 0;
+            SDLOP_GLOffload_GetSurfaceSize((SDLOP_GLOffloadSurface *)*slot, &sw, &sh);
+            if (sw != w || sh != h) {
+                if (!SDLOP_GLOffload_ResizeSurface(octx, (SDLOP_GLOffloadSurface **)slot, w, h)) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                                "Wayland/Offload: failed to resize GL surface to %dx%d: %s",
+                                w, h, SDL_GetError());
+                }
+            }
+        }
         return;
     }
     void **eglwin_slot = SDLOP_Wayland_GetGLEGLWindowSlot(window);

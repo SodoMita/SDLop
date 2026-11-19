@@ -1320,7 +1320,9 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
                 if (cur && cur->is_offload) {
                     SDLOP_GLOffload_MakeCurrent(octx, (SDLOP_GLOffloadSurface *)windata->gl_offload_surface);
                 }
-                (void)salvaged;
+                if (!salvaged) {
+                    return false;
+                }
                 return KMSDRM_PresentSw(dev, window);
             }
         }
@@ -1334,6 +1336,7 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
             if (!windata->gl_offload_surface) {
                 return false;
             }
+            windata->egl_surface_dirty = false;
         }
         if (windata->waiting_for_flip && !KMSDRM_WaitPageflip(dev, windata, 1500)) {
             return SDL_SetError("Wait for previous pageflip failed");
@@ -1350,10 +1353,12 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
             return false;
         }
         if (windata->egl_surface_dirty) {
-            SDLOP_GLOffload_ResizeSurface(
-                octx,
-                (SDLOP_GLOffloadSurface **)&windata->gl_offload_surface,
-                (int)dd->mode.hdisplay, (int)dd->mode.vdisplay);
+            if (!SDLOP_GLOffload_ResizeSurface(
+                    octx,
+                    (SDLOP_GLOffloadSurface **)&windata->gl_offload_surface,
+                    (int)dd->mode.hdisplay, (int)dd->mode.vdisplay)) {
+                return false;
+            }
             windata->egl_surface_dirty = false;
         }
         return true;

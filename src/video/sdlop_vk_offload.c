@@ -393,9 +393,17 @@ typedef struct TrackedSurface
     struct TrackedSurface *next;
 } TrackedSurface;
 
+typedef struct TrackedPhysicalDevice
+{
+    VkPhysicalDevice_ gpu;
+    VkInstance_ instance;
+    struct TrackedPhysicalDevice *next;
+} TrackedPhysicalDevice;
+
 typedef struct TrackedDevice
 {
     VkDevice_ device;
+    VkInstance_ instance;
     VkPhysicalDevice_ gpu;
     uint32_t queue_family;
 
@@ -459,6 +467,7 @@ typedef struct TrackedSwapchain
 static struct
 {
     PFN_vkGetInstanceProcAddr_ real_gipa;
+    VkInstance_ instance;
     bool active;
     bool probed;
     SDLOP_VulkanOffloadPolicy cached_policy;
@@ -466,9 +475,54 @@ static struct
     bool cached_decision;
 
     TrackedSurface *surfaces;
+    TrackedPhysicalDevice *gpus;
     TrackedDevice *devices;
     TrackedSwapchain *swapchains;
 } vk_offload;
+
+static void track_gpu_instance(VkPhysicalDevice_ gpu, VkInstance_ instance)
+{
+    if (!gpu || !instance) {
+        return;
+    }
+    for (TrackedPhysicalDevice *g = vk_offload.gpus; g; g = g->next) {
+        if (g->gpu == gpu) {
+            g->instance = instance;
+            return;
+        }
+    }
+    TrackedPhysicalDevice *g = (TrackedPhysicalDevice *)calloc(1, sizeof(*g));
+    if (g) {
+        g->gpu = gpu;
+        g->instance = instance;
+        g->next = vk_offload.gpus;
+        vk_offload.gpus = g;
+    }
+}
+
+static VkInstance_ resolve_instance_for_gpu(VkPhysicalDevice_ gpu)
+{
+    for (TrackedPhysicalDevice *g = vk_offload.gpus; g; g = g->next) {
+        if (g->gpu == gpu && g->instance) {
+            return g->instance;
+        }
+    }
+    return vk_offload.instance;
+}
+
+static void untrack_gpus_for_instance(VkInstance_ instance)
+{
+    TrackedPhysicalDevice **pp = &vk_offload.gpus;
+    while (*pp) {
+        TrackedPhysicalDevice *g = *pp;
+        if (g->instance == instance) {
+            *pp = g->next;
+            free(g);
+        } else {
+            pp = &g->next;
+        }
+    }
+}
 
 static const char *const vk_offload_extensions[] = {
     "VK_KHR_surface",
@@ -845,6 +899,7 @@ bool SDLOP_VulkanOffload_CreateSurface(SDL_FunctionPointer real_gipa,
     }
 
     vk_offload.active = true;
+    vk_offload.instance = (VkInstance_)instance;
     *surface = (Uint64)s;
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
                 "SDLop: Vulkan offload active on %s via VK_EXT_headless_surface",
@@ -889,11 +944,12 @@ void SDLOP_VulkanOffload_NotifyWindowDestroyed(SDL_Window *window)
 
 static int find_host_mem_type(TrackedDevice *dev, uint32_t type_bits)
 {
-    if (!vk_offload.real_gipa || !dev->gpu) {
+    VkInstance_ inst = dev->instance ? dev->instance : resolve_instance_for_gpu(dev->gpu);
+    if (!vk_offload.real_gipa || !dev->gpu || !inst) {
         return -1;
     }
     PFN_vkGetPhysicalDeviceMemoryProperties_ p_memprops =
-        VK_CAST(PFN_vkGetPhysicalDeviceMemoryProperties_, vk_offload.real_gipa(NULL, "vkGetPhysicalDeviceMemoryProperties"));
+        VK_CAST(PFN_vkGetPhysicalDeviceMemoryProperties_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceMemoryProperties"));
     if (!p_memprops) {
         return -1;
     }
@@ -1182,13 +1238,22 @@ static VkResult_ wrap_vkEnumeratePhysicalDevices(VkInstance_ instance,
     if (!vk_offload.real_gipa) {
         return -1;
     }
+    if (instance) {
+        vk_offload.instance = instance;
+    }
     PFN_vkEnumeratePhysicalDevices_ p_real =
         VK_CAST(PFN_vkEnumeratePhysicalDevices_, vk_offload.real_gipa(instance, "vkEnumeratePhysicalDevices"));
     if (!p_real) {
         return -1;
     }
     VkResult_ res = p_real(instance, pPhysicalDeviceCount, pPhysicalDevices);
-    if (res != VK_SUCCESS || !pPhysicalDevices || !pPhysicalDeviceCount || *pPhysicalDeviceCount <= 1) {
+    if (res != VK_SUCCESS || !pPhysicalDevices || !pPhysicalDeviceCount || *pPhysicalDeviceCount == 0) {
+        return res;
+    }
+    for (uint32_t i = 0; i < *pPhysicalDeviceCount; i++) {
+        track_gpu_instance(pPhysicalDevices[i], instance);
+    }
+    if (*pPhysicalDeviceCount <= 1) {
         return res;
     }
 
@@ -1220,8 +1285,9 @@ static VkResult_ wrap_vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice_ gpu
                                                              VkSurfaceKHR_ surface,
                                                              VkBool32_ *pSupported)
 {
-    PFN_vkGetPhysicalDeviceSurfaceSupportKHR_ p_real = vk_offload.real_gipa ?
-        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceSupportKHR_, vk_offload.real_gipa(NULL, "vkGetPhysicalDeviceSurfaceSupportKHR")) : NULL;
+    VkInstance_ inst = resolve_instance_for_gpu(gpu);
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR_ p_real = (vk_offload.real_gipa && inst) ?
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceSupportKHR_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceSupportKHR")) : NULL;
     if (p_real) {
         VkResult_ res = p_real(gpu, queueFamilyIndex, surface, pSupported);
         if (res == VK_SUCCESS) {
@@ -1239,8 +1305,9 @@ static VkResult_ wrap_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice
                                                                   VkSurfaceKHR_ surface,
                                                                   VkSurfaceCapabilitiesKHR_ *pCapabilities)
 {
-    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_real = vk_offload.real_gipa ?
-        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_, vk_offload.real_gipa(NULL, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) : NULL;
+    VkInstance_ inst = resolve_instance_for_gpu(gpu);
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_real = (vk_offload.real_gipa && inst) ?
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) : NULL;
     if (!p_real) {
         return -1;
     }
@@ -1265,8 +1332,9 @@ static VkResult_ wrap_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice_ gpu
                                                              uint32_t *pSurfaceFormatCount,
                                                              VkSurfaceFormatKHR_ *pSurfaceFormats)
 {
-    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_ p_real = vk_offload.real_gipa ?
-        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_, vk_offload.real_gipa(NULL, "vkGetPhysicalDeviceSurfaceFormatsKHR")) : NULL;
+    VkInstance_ inst = resolve_instance_for_gpu(gpu);
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_ p_real = (vk_offload.real_gipa && inst) ?
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceFormatsKHR")) : NULL;
     if (!p_real) {
         return -1;
     }
@@ -1442,7 +1510,8 @@ static PFN_vkVoid_ wrap_vkGetDeviceProcAddr(VkDevice_ device, const char *pName)
     }
     TrackedDevice *td = find_device(device);
     if (!td || !td->real_gdpa) {
-        return vk_offload.real_gipa ? vk_offload.real_gipa(NULL, pName) : NULL;
+        VkInstance_ inst = (td && td->instance) ? td->instance : vk_offload.instance;
+        return (vk_offload.real_gipa && inst) ? vk_offload.real_gipa(inst, pName) : NULL;
     }
     if (vk_offload.active) {
         if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
@@ -1464,16 +1533,51 @@ static PFN_vkVoid_ wrap_vkGetDeviceProcAddr(VkDevice_ device, const char *pName)
     return td->real_gdpa(device, pName);
 }
 
+static VkResult_ wrap_vkCreateInstance(const void *pCreateInfo,
+                                       const void *pAllocator,
+                                       VkInstance_ *pInstance)
+{
+    if (!vk_offload.real_gipa) {
+        return -1;
+    }
+    PFN_vkCreateInstance_ p_real =
+        VK_CAST(PFN_vkCreateInstance_, vk_offload.real_gipa(NULL, "vkCreateInstance"));
+    if (!p_real) {
+        return -1;
+    }
+    VkResult_ res = p_real(pCreateInfo, pAllocator, pInstance);
+    if (res == VK_SUCCESS && pInstance && *pInstance) {
+        vk_offload.instance = *pInstance;
+    }
+    return res;
+}
+
+static void wrap_vkDestroyInstance(VkInstance_ instance, const void *pAllocator)
+{
+    if (vk_offload.real_gipa && instance) {
+        PFN_vkDestroyInstance_ p_real =
+            VK_CAST(PFN_vkDestroyInstance_, vk_offload.real_gipa(instance, "vkDestroyInstance"));
+        if (p_real) {
+            p_real(instance, pAllocator);
+        }
+    }
+    untrack_gpus_for_instance(instance);
+    if (vk_offload.instance == instance) {
+        vk_offload.instance = NULL;
+    }
+}
+
 static VkResult_ wrap_vkCreateDevice(VkPhysicalDevice_ physicalDevice,
                                      const VkDeviceCreateInfo_ *pCreateInfo,
                                      const void *pAllocator,
                                      VkDevice_ *pDevice)
 {
-    if (!vk_offload.real_gipa) {
+    VkInstance_ inst = resolve_instance_for_gpu(physicalDevice);
+    if (!vk_offload.real_gipa || !inst) {
         return -1;
     }
     PFN_vkCreateDevice_ p_real =
-        VK_CAST(PFN_vkCreateDevice_, vk_offload.real_gipa(NULL, "vkCreateDevice"));
+        VK_CAST(PFN_vkCreateDevice_, vk_offload.real_gipa(inst, "vkCreateDevice"));
     if (!p_real) {
         return -1;
     }
@@ -1487,11 +1591,12 @@ static VkResult_ wrap_vkCreateDevice(VkPhysicalDevice_ physicalDevice,
         return res;
     }
     td->device = *pDevice;
+    td->instance = inst;
     td->gpu = physicalDevice;
     td->queue_family = (pCreateInfo && pCreateInfo->queueCreateInfoCount > 0 && pCreateInfo->pQueueCreateInfos)
         ? pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex : 0u;
 
-    td->real_gdpa = VK_CAST(PFN_vkGetDeviceProcAddr_, vk_offload.real_gipa(NULL, "vkGetDeviceProcAddr"));
+    td->real_gdpa = VK_CAST(PFN_vkGetDeviceProcAddr_, vk_offload.real_gipa(inst, "vkGetDeviceProcAddr"));
     PFN_vkGetDeviceProcAddr_ gdpa = td->real_gdpa;
     if (gdpa) {
         td->real_destroy_device = VK_CAST(PFN_vkDestroyDevice_, gdpa(*pDevice, "vkDestroyDevice"));
@@ -1533,7 +1638,16 @@ static PFN_vkVoid_ wrapped_vkGetInstanceProcAddr(VkInstance_ instance, const cha
     if (!vk_offload.real_gipa || !pName) {
         return NULL;
     }
+    if (instance) {
+        vk_offload.instance = instance;
+    }
     if (vk_offload.active) {
+        if (!instance && strcmp(pName, "vkCreateInstance") == 0) {
+            return VK_VOID(wrap_vkCreateInstance);
+        }
+        if (strcmp(pName, "vkDestroyInstance") == 0) {
+            return VK_VOID(wrap_vkDestroyInstance);
+        }
         if (strcmp(pName, "vkEnumeratePhysicalDevices") == 0) {
             return VK_VOID(wrap_vkEnumeratePhysicalDevices);
         }
@@ -1592,11 +1706,17 @@ void SDLOP_VulkanOffload_Shutdown(void)
         vk_offload.devices = td->next;
         free(td);
     }
+    while (vk_offload.gpus) {
+        TrackedPhysicalDevice *g = vk_offload.gpus;
+        vk_offload.gpus = g->next;
+        free(g);
+    }
     while (vk_offload.surfaces) {
         TrackedSurface *ts = vk_offload.surfaces;
         vk_offload.surfaces = ts->next;
         free(ts);
     }
+    vk_offload.instance = NULL;
     vk_offload.active = false;
     vk_offload.probed = false;
     vk_offload.cached_policy = SDLOP_VK_OFFLOAD_AUTO;

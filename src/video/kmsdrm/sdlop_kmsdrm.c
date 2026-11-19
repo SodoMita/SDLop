@@ -47,6 +47,7 @@
 
 #include "sdlop_kmsdrm.h"
 #include "sdlop_xcursor.h"
+#include "../sdlop_gl_offload.h"
 #include "../sdlop_vk_offload.h"
 
 #include <dirent.h>
@@ -2067,7 +2068,17 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window,
                 return false;
             }
             windata->crtc_programmed = false;
-            windata->egl_surface_dirty = true;
+            if (windata->gl_offload_surface && windata->gl_offload_ctx) {
+                if (!SDLOP_GLOffload_ResizeSurface(
+                        (SDLOP_GLOffloadContext *)windata->gl_offload_ctx,
+                        (SDLOP_GLOffloadSurface **)&windata->gl_offload_surface,
+                        (int)w, (int)h)) {
+                    return false;
+                }
+                windata->egl_surface_dirty = false;
+            } else {
+                windata->egl_surface_dirty = true;
+            }
             KMSDRM_DeferEvent(window, KMSDRM_DEFER_SIZE);
             return true;
         }

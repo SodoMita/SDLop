@@ -214,6 +214,7 @@ static SDLOP_GenericGLWin *ensure_generic_win(SDLOP_GenericGLCtx *gctx, SDL_Wind
 static bool can_use_generic_gl_offload(void)
 {
     if (!sdlop.video ||
+        sdlop.video->GL_CreateContext ||
         !sdlop.video->CreateWindowFramebuffer ||
         !sdlop.video->UpdateWindowFramebuffer) {
         return false;
@@ -289,6 +290,39 @@ SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc)
 SDL_GLContext SDLOP_GL_CurrentContext(void)
 {
     return current_context;
+}
+
+void SDLOP_GL_NotifyWindowResized(SDL_Window *window)
+{
+#ifndef __EMSCRIPTEN__
+    if (!window) {
+        return;
+    }
+    SDLOP_GenericGLWin *gw = find_generic_win(window);
+    if (!gw || !gw->surf) {
+        return;
+    }
+    SDLOP_GenericGLCtx *gctx = current_context ? find_generic_ctx(current_context) : NULL;
+    if (!gctx) {
+        gctx = gw->last_ctx;
+    }
+    if (!gctx || !gctx->offload_ctx) {
+        return;
+    }
+    int w = window->w > 0 ? window->w : 1;
+    int h = window->h > 0 ? window->h : 1;
+    int sw = 0, sh = 0;
+    SDLOP_GLOffload_GetSurfaceSize(gw->surf, &sw, &sh);
+    if (sw != w || sh != h) {
+        if (!SDLOP_GLOffload_ResizeSurface(gctx->offload_ctx, &gw->surf, w, h)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "SDLop: failed to resize GL offload surface to %dx%d: %s",
+                        w, h, SDL_GetError());
+        }
+    }
+#else
+    (void)window;
+#endif
 }
 
 void SDLOP_GL_NotifyWindowDestroyed(SDL_Window *window)
@@ -525,7 +559,13 @@ bool SDL_GL_SwapWindow(SDL_Window *window)
             !sdlop.video->UpdateWindowFramebuffer(sdlop.video, window, &rect, 1)) {
             return false;
         }
-        SDLOP_GLOffload_ResizeSurface(gctx->offload_ctx, &gw->surf, ww, wh);
+        int sw = 0, sh = 0;
+        SDLOP_GLOffload_GetSurfaceSize(gw->surf, &sw, &sh);
+        if (sw != ww || sh != wh) {
+            if (!SDLOP_GLOffload_ResizeSurface(gctx->offload_ctx, &gw->surf, ww, wh)) {
+                return false;
+            }
+        }
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
         return true;
     }
