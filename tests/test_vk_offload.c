@@ -90,8 +90,6 @@ static void test_dummy_opt_out(void)
 
     unsetenv("SDLOP_VULKAN_OFFLOAD");
     unsetenv("SDL_VIDEODRIVER");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDLOP_VULKAN_OFFLOAD");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDL_VIDEODRIVER");
 }
 
 /* ------------------------------------------------------------------ */
@@ -690,8 +688,6 @@ cleanup:
     SDL_Quit();
     unsetenv("SDLOP_VULKAN_OFFLOAD");
     unsetenv("SDL_VIDEODRIVER");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDLOP_VULKAN_OFFLOAD");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDL_VIDEODRIVER");
 }
 
 static void test_mock_vulkan_offload(void)

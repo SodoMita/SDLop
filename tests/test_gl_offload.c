@@ -418,8 +418,6 @@ static void test_context_flags_offload(void)
 done:
     unsetenv("SDLOP_GL_OFFLOAD");
     unsetenv("SDL_VIDEODRIVER");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDLOP_GL_OFFLOAD");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDL_VIDEODRIVER");
 }
 
 static void test_dummy_opt_out(void)
@@ -437,8 +435,6 @@ static void test_dummy_opt_out(void)
     }
     unsetenv("SDLOP_GL_OFFLOAD");
     unsetenv("SDL_VIDEODRIVER");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDLOP_GL_OFFLOAD");
-    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDL_VIDEODRIVER");
 }
 
 int main(void)
