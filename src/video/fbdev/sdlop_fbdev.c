@@ -810,8 +810,17 @@ static void fbdev_vt_drop_signals(void)
    keyboard handler stay out of the way while we own the VT. */
 static void fbdev_console_take(void)
 {
-    if (fbdev.vt.fd < 0 || fbdev.vt.graphics) {
+    if (fbdev.vt.fd < 0) {
         return;
+    }
+    /* a VT switch while we were away switches the console back to text, so
+       do not trust our own flag here */
+    {
+        int mode = -1;
+        if (ioctl(fbdev.vt.fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS) {
+            fbdev.vt.graphics = true;
+            return;
+        }
     }
     if (fbdev.vt.saved_kbmode < 0) {
         int kbmode = 0;
@@ -827,6 +836,12 @@ static void fbdev_console_take(void)
         return;
     }
     fbdev.vt.graphics = true;
+    {
+        int mode = -1;
+        if (ioctl(fbdev.vt.fd, KDGETMODE, &mode) == 0 && mode != KD_GRAPHICS) {
+            fbdev_log("VT %d reports mode %d right after KD_GRAPHICS", fbdev.vt.num, mode);
+        }
+    }
 }
 
 /* Give the console back in text mode with its keyboard handler restored. */
@@ -894,12 +909,37 @@ static bool fbdev_vt_onscreen(int fd, int num)
     return state.v_active == (unsigned short)num;
 }
 
-/* Find the VT we were started on. $TTYNO names one, otherwise fall back to
-   the controlling terminal and then to the first console device. Nothing is
-   activated here. */
+/* Open a console device only if it really is a virtual terminal: the VT
+   ioctls are the test (a serial port has a kbd type but no VT). */
+static int fbdev_open_vt(const char *path, int *vt_num)
+{
+    const int fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    struct vt_mode mode;
+    struct vt_stat state;
+
+    if (fd < 0) {
+        return -1;
+    }
+    memset(&mode, 0, sizeof(mode));
+    if (ioctl(fd, VT_GETMODE, &mode) != 0) {
+        close(fd);
+        return -1; /* not a VT (e.g. /dev/tty bound to a serial console) */
+    }
+    if (vt_num) {
+        memset(&state, 0, sizeof(state));
+        *vt_num = (ioctl(fd, VT_GETSTATE, &state) == 0) ? (int)state.v_active : 0;
+    }
+    return fd;
+}
+
+/* Which VT to own. $TTYNO names one, otherwise we adopt the VT the user is
+   looking at, otherwise the first usable console, otherwise a free one from
+   VT_OPENQRY. Nothing here activates a VT: the picture appears where the user
+   already is, which is the whole point of not being kmsdrm's VT_ACTIVATE. */
 static bool fbdev_vt_open_target(void)
 {
     const char *ttyno = SDL_getenv("TTYNO");
+    char path[32];
 
     if (ttyno && *ttyno) {
         char *end = NULL;
@@ -907,32 +947,73 @@ static bool fbdev_vt_open_target(void)
         if (wanted == 0 || !end || *end != '\0' || wanted > 63) {
             fbdev_log("invalid $TTYNO '%s'; ignoring", ttyno);
         } else {
-            char path[32];
             SDL_snprintf(path, sizeof(path), "/dev/tty%lu", wanted);
-            const int fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC);
-            if (fd >= 0) {
-                fbdev.vt.fd = fd;
+            fbdev.vt.fd = fbdev_open_vt(path, NULL);
+            if (fbdev.vt.fd >= 0) {
                 fbdev.vt.num = (int)wanted;
                 return true;
             }
-            fbdev_log("cannot open $TTYNO console %s: %s", path, strerror(errno));
+            fbdev_log("$TTYNO console %s is not usable: %s", path, strerror(errno));
         }
     }
 
-    int fd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
-    if (fd >= 0) {
-        fbdev.vt.fd = fd;
+    /* the active VT, as the kernel reports it through /dev/tty0 */
+    int active = 0;
+    const int tty0 = open("/dev/tty0", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (tty0 >= 0) {
+        struct vt_stat state;
+        memset(&state, 0, sizeof(state));
+        if (ioctl(tty0, VT_GETSTATE, &state) == 0) {
+            active = (int)state.v_active;
+        } else {
+            fbdev_log("VT_GETSTATE on /dev/tty0 failed: %s", strerror(errno));
+        }
+    }
+    if (active > 0) {
+        char path_active[32];
+        SDL_snprintf(path_active, sizeof(path_active), "/dev/tty%d", active);
+        fbdev.vt.fd = fbdev_open_vt(path_active, NULL);
+        if (fbdev.vt.fd >= 0) {
+            fbdev.vt.num = active;
+        } else {
+            fbdev_log("cannot open the active VT %s: %s", path_active, strerror(errno));
+        }
+    }
+    if (fbdev.vt.fd < 0 && tty0 >= 0) {
+        /* /dev/tty0 works for the takeover even when the numbered node does
+           not exist yet; the VT number is the one we just read */
+        fbdev.vt.fd = tty0;
+        fbdev.vt.num = active;
+    } else if (tty0 >= 0) {
+        close(tty0);
+    }
+    if (fbdev.vt.fd >= 0) {
         return true;
     }
+
     for (int n = 1; n <= 63; n++) {
-        char path[32];
         SDL_snprintf(path, sizeof(path), "/dev/tty%d", n);
-        fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC);
-        if (fd >= 0) {
-            fbdev.vt.fd = fd;
+        fbdev.vt.fd = fbdev_open_vt(path, NULL);
+        if (fbdev.vt.fd >= 0) {
             fbdev.vt.num = n;
             return true;
         }
+    }
+
+    /* last resort: ask the kernel for an unused VT (still no activation) */
+    const int tty0b = open("/dev/tty0", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (tty0b >= 0) {
+        int free_vt = 0;
+        if (ioctl(tty0b, VT_OPENQRY, &free_vt) == 0 && free_vt > 0 && free_vt <= 63) {
+            SDL_snprintf(path, sizeof(path), "/dev/tty%d", free_vt);
+            fbdev.vt.fd = fbdev_open_vt(path, NULL);
+            if (fbdev.vt.fd >= 0) {
+                fbdev.vt.num = free_vt;
+                close(tty0b);
+                return true;
+            }
+        }
+        close(tty0b);
     }
     return false;
 }
@@ -1027,9 +1108,11 @@ static void fbdev_vt_setup(void)
             fbdev_log("VT_ACTIVATE(%d) failed: %s", fbdev.vt.num, strerror(errno));
         }
     }
-    fbdev_log("console on VT %d (relsig=%d acqsig=%d%s)", fbdev.vt.num,
-              fbdev.vt.rel_sig, fbdev.vt.acq_sig,
-              fbdev.vt.active ? "" : ", not on screen");
+    if (!fbdev.vt.active) {
+        fbdev_log("VT %d is not the one on screen; the picture appears when it is", fbdev.vt.num);
+    }
+    fbdev_log("console on VT %d (relsig=%d acqsig=%d)", fbdev.vt.num,
+              fbdev.vt.rel_sig, fbdev.vt.acq_sig);
 }
 
 /* Undo everything fbdev_vt_setup did: text mode, keyboard back, VT_AUTO. */
