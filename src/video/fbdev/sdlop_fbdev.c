@@ -1,20 +1,33 @@
 /*
   SDLop - fbdev (Linux framebuffer) video driver.
 
-  Talks to /dev/fbNN with ioctl() + mmap() only: no library and no extra
-  header is required (linux/fb.h comes with the kernel headers). The core
-  library therefore keeps its "dlopen everything optional" promise and fbdev
-  needs no pkg-config probe at build time.
+  Talks to /dev/fbNN with ioctl() + mmap() only: no library and no header
+  beyond the kernel uapi ones, so the core keeps its "dlopen everything
+  optional" promise and nothing is added to the build probes.
 
-  Console semantics: an fbdev display has exactly one mode, the one the
-  kernel already programmed, so every window request snaps back to it.
+  Console semantics (what makes fbdev a console driver instead of a picture
+  on top of someone else's terminal):
 
-  Headless verification: when SDLOP_FBDEV_DUMP<name> is set (e.g.
-  SDLOP_FBDEV_DUMP=/tmp/frame.ppm) the driver opens no device at all and
-  keeps the scanout in a RAM buffer of SDLOP_FBDEV_SIZE (default 1024x768),
-  dumping each presented frame to `name` as a binary P6 PPM. That is what
-  tests/test_fbdev.c runs in CI; SDLOP_FBDEV_PATH can point the driver at a
-  different device node for real hardware.
+    - the framebuffer has exactly one mode, the one the kernel programmed, so
+      every window request snaps back to it;
+    - the driver owns the VT it was started on: KD_GRAPHICS + K_OFF, so fbcon
+      and the console keyboard handler do not draw over the picture and
+      Ctrl-C does not reach a shell underneath;
+    - switching away (Ctrl+Alt+Fn) puts KD_TEXT, the previous keyboard mode
+      and no leftover cursor back, then hands the VT to the kernel;
+      switching back retakes the console and asks the app to repaint;
+    - quitting restores KD_TEXT, the keyboard mode and VT_AUTO.
+
+  It never activates a VT on its own: rendering happens where the user already
+  is. SDLOP_FBDEV_VT_SWITCH=1 (or $TTYNO=<n>) opts into activating a VT.
+  SDLOP_FBDEV_TAKEOVER=0 disables the console takeover entirely (development
+  over a serial console), SDLOP_FBDEV_CURSOR=0 disables the software cursor.
+
+  Headless verification: with SDLOP_FBDEV_DUMP=<file.ppm> the driver opens no
+  device and keeps the scanout in RAM (SDLOP_FBDEV_SIZE=WxH, default
+  1024x768), dumping every presented frame as binary P6. That is what
+  tests/test_fbdev.c runs in CI. SDLOP_FBDEV_PATH points the driver at
+  another device node.
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
@@ -27,16 +40,67 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/signalfd.h>
 #include <unistd.h>
 
 #define FBDEV_MAX_WINDOWS 8
 #define FBDEV_DEFAULT_W 1024
 #define FBDEV_DEFAULT_H 768
+#define FBDEV_MAX_DIM 16384
+#define FBDEV_ARROW_W 12
+#define FBDEV_ARROW_H 16
+
+/* ------------------------------------------------------------------ */
+/* Types                                                               */
+/* ------------------------------------------------------------------ */
+
+/* The buffer that reaches the screen: the mapped card memory, or RAM in dump
+   mode. `pitch` is the row stride in bytes and is always valid. */
+typedef struct FBDEV_Scanout
+{
+    Uint8 *pixels;
+    int w, h;
+    size_t pitch;
+    bool mapped;
+    size_t length;
+} FBDEV_Scanout;
+
+/* Pixel layout, straight from FBIOGET_VSCREENINFO. */
+typedef struct FBDEV_PixelLayout
+{
+    int bpp;                     /* 16, 24 or 32 */
+    int bytes;                   /* bpp / 8 */
+    Uint8 r_off, g_off, b_off;   /* bit offsets */
+    Uint8 r_len, g_len, b_len;   /* channel widths in bits */
+    bool native;                 /* XRGB8888 in, XRGB8888 out: zero copy */
+} FBDEV_PixelLayout;
+
+/* Console (virtual terminal) ownership. */
+typedef struct FBDEV_VT
+{
+    int fd;                 /* /dev/ttyN, -1 when we have no console */
+    int num;                /* VT number, 0 when unknown */
+    bool process_mode;      /* VT_PROCESS installed (we acknowledge switches) */
+    bool graphics;          /* we set KD_GRAPHICS */
+    bool active;            /* our VT is the one on screen */
+    int saved_kbmode;       /* -1 when unknown */
+    int rel_sig, acq_sig;   /* 0 when no signal could be claimed */
+    struct sigaction old_rel, old_acq;
+    bool handlers_installed;
+    int signal_fd;          /* signalfd over both signals, -1 if none */
+    sigset_t saved_mask;
+    bool mask_saved;
+} FBDEV_VT;
 
 typedef struct FBDEV_WindowRecord
 {
@@ -46,41 +110,469 @@ typedef struct FBDEV_WindowRecord
 
 static struct
 {
-    /* real device */
     int fd;
     char path[256];
-    bool mapped;
-    Uint8 *map;
-    size_t maplen;
-    int fb_w, fb_h;
-    int fb_bpp;
-    int fb_line_length;
-    SDL_PixelFormat fb_format;
-    Uint32 fb_red_offset, fb_green_offset, fb_blue_offset;
-    /* RAM scanout (dump mode, or a card we could not mmap) */
-    Uint8 *ram;
+    FBDEV_Scanout scanout;
+    Uint8 *ram;               /* owns scanout.pixels when the card is not mapped */
+    size_t ram_size;
+    Uint8 *surface_ram;       /* XRGB8888 window pixels for non-native cards */
+    size_t surface_ram_size;
+    FBDEV_PixelLayout layout;
     bool dump;
     char dump_path[512];
-    int dump_counter;
+    int dump_frames;
     Uint32 refresh_hz;
     SDL_DisplayID display;
-    Uint8 *present; /* one framebuffer worth of converted pixels */
+    FBDEV_VT vt;
+    SDL_Cursor *cursor;       /* last cursor handed to ShowCursor (not owned) */
+    SDL_Rect cursor_rect;     /* where it is drawn; empty = not on screen */
+    float cursor_drawn_x, cursor_drawn_y; /* logical position of that draw */
+    bool cursor_enabled;
     FBDEV_WindowRecord windows[FBDEV_MAX_WINDOWS];
 } fbdev;
 
+/* set by the signal handlers when no signalfd could be created */
+static volatile sig_atomic_t fbdev_vt_rel_pending;
+static volatile sig_atomic_t fbdev_vt_acq_pending;
+
 /* ------------------------------------------------------------------ */
-/* Scanout access                                                      */
+/* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-static Uint8 *fbdev_scanout(void)
+static void fbdev_log(const char *fmt, ...)
 {
-    return fbdev.map ? fbdev.map : fbdev.ram;
+    va_list ap;
+    char text[512];
+
+    va_start(ap, fmt);
+    SDL_vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "fbdev: %s", text);
 }
 
-static size_t fbdev_scanout_pitch(void)
+static bool fbdev_replace8(const char *name, bool fallback)
 {
-    /* the real card may pad rows; our RAM scanout never does */
-    return fbdev.mapped ? (size_t)fbdev.fb_line_length : (size_t)fbdev.fb_w * 4u;
+    const char *value = SDL_getenv(name);
+
+    if (!value || !*value) {
+        return fallback;
+    }
+    if (SDL_strcasecmp(value, "0") == 0 || SDL_strcasecmp(value, "off") == 0 ||
+        SDL_strcasecmp(value, "no") == 0 || SDL_strcasecmp(value, "false") == 0) {
+        return false;
+    }
+    if (SDL_strcasecmp(value, "1") == 0 || SDL_strcasecmp(value, "on") == 0 ||
+        SDL_strcasecmp(value, "yes") == 0 || SDL_strcasecmp(value, "true") == 0) {
+        return true;
+    }
+    return fallback;
+}
+
+static bool fbdev_scanout_ready(void)
+{
+    return fbdev.scanout.pixels != NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pixel packing                                                       */
+/* ------------------------------------------------------------------ */
+
+static Uint32 fbdev_pack(const FBDEV_PixelLayout *l, Uint32 xrgb)
+{
+    const Uint32 r = (xrgb >> 16) & 0xFF;
+    const Uint32 g = (xrgb >> 8) & 0xFF;
+    const Uint32 b = xrgb & 0xFF;
+    Uint32 out = 0;
+
+    if (l->r_len) {
+        out |= (r >> (8 - l->r_len)) << l->r_off;
+    }
+    if (l->g_len) {
+        out |= (g >> (8 - l->g_len)) << l->g_off;
+    }
+    if (l->b_len) {
+        out |= (b >> (8 - l->b_len)) << l->b_off;
+    }
+    return out;
+}
+
+static Uint32 fbdev_unpack(const FBDEV_PixelLayout *l, Uint32 raw)
+{
+    Uint32 out = 0;
+
+    if (l->r_len) {
+        const Uint32 mask = (1u << l->r_len) - 1u;
+        out |= (((raw >> l->r_off) & mask) * 255u / mask) << 16;
+    }
+    if (l->g_len) {
+        const Uint32 mask = (1u << l->g_len) - 1u;
+        out |= (((raw >> l->g_off) & mask) * 255u / mask) << 8;
+    }
+    if (l->b_len) {
+        const Uint32 mask = (1u << l->b_len) - 1u;
+        out |= ((raw >> l->b_off) & mask) * 255u / mask;
+    }
+    return out;
+}
+
+static Uint32 fbdev_load(const FBDEV_PixelLayout *l, const Uint8 *p)
+{
+    switch (l->bytes) {
+    case 2: {
+        Uint16 v = 0;
+        memcpy(&v, p, sizeof(v));
+        return v;
+    }
+    case 3:
+        return (Uint32)p[0] | ((Uint32)p[1] << 8) | ((Uint32)p[2] << 16);
+    default: {
+        Uint32 v = 0;
+        memcpy(&v, p, sizeof(v));
+        return v;
+    }
+    }
+}
+
+static void fbdev_store(const FBDEV_PixelLayout *l, Uint8 *p, Uint32 packed)
+{
+    switch (l->bytes) {
+    case 2: {
+        const Uint16 v = (Uint16)packed;
+        memcpy(p, &v, sizeof(v));
+        break;
+    }
+    case 3:
+        p[0] = (Uint8)(packed & 0xFF);
+        p[1] = (Uint8)((packed >> 8) & 0xFF);
+        p[2] = (Uint8)((packed >> 16) & 0xFF);
+        break;
+    default: {
+        const Uint32 v = packed;
+        memcpy(p, &v, sizeof(v));
+        break;
+    }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Painting                                                            */
+/* ------------------------------------------------------------------ */
+
+static SDL_Rect fbdev_clip(SDL_Rect rect)
+{
+    const SDL_Rect bounds = { 0, 0, fbdev.scanout.w, fbdev.scanout.h };
+    SDL_Rect out = { 0, 0, 0, 0 };
+
+    if (!SDL_GetRectIntersection(&rect, &bounds, &out)) {
+        return (SDL_Rect){ 0, 0, 0, 0 };
+    }
+    return out;
+}
+
+/* Copy a rectangle of the window surface into the scanout. */
+static void fbdev_blit(SDL_Surface *surface, SDL_Rect rect)
+{
+    if (!surface || !surface->pixels || !fbdev_scanout_ready()) {
+        return;
+    }
+    rect = fbdev_clip(rect);
+    if (rect.w <= 0 || rect.h <= 0) {
+        return;
+    }
+
+    const FBDEV_PixelLayout *l = &fbdev.layout;
+    const size_t src_pitch = (size_t)surface->pitch;
+    const size_t dst_pitch = fbdev.scanout.pitch;
+
+    for (int y = 0; y < rect.h; y++) {
+        const Uint8 *src_row = (const Uint8 *)surface->pixels +
+                               (size_t)(rect.y + y) * src_pitch + (size_t)rect.x * 4u;
+        Uint8 *dst_row = fbdev.scanout.pixels + (size_t)(rect.y + y) * dst_pitch +
+                         (size_t)rect.x * (size_t)l->bytes;
+        if (l->native) {
+            memcpy(dst_row, src_row, (size_t)rect.w * 4u);
+            continue;
+        }
+        for (int x = 0; x < rect.w; x++) {
+            Uint32 px = 0;
+            memcpy(&px, src_row + (size_t)x * 4u, sizeof(px));
+            fbdev_store(l, dst_row + (size_t)x * (size_t)l->bytes, fbdev_pack(l, px));
+        }
+    }
+}
+
+static void fbdev_fill(SDL_Rect rect, Uint32 xrgb)
+{
+    rect = fbdev_clip(rect);
+    if (rect.w <= 0 || rect.h <= 0 || !fbdev_scanout_ready()) {
+        return;
+    }
+    const FBDEV_PixelLayout *l = &fbdev.layout;
+    const Uint32 packed = fbdev_pack(l, xrgb);
+    for (int y = 0; y < rect.h; y++) {
+        Uint8 *row = fbdev.scanout.pixels + (size_t)(rect.y + y) * fbdev.scanout.pitch +
+                     (size_t)rect.x * (size_t)l->bytes;
+        for (int x = 0; x < rect.w; x++) {
+            fbdev_store(l, row + (size_t)x * (size_t)l->bytes, packed);
+        }
+    }
+}
+
+static FBDEV_WindowRecord *fbdev_record(SDL_Window *window, bool create)
+{
+    if (!window) {
+        return NULL;
+    }
+    for (int i = 0; i < FBDEV_MAX_WINDOWS; i++) {
+        if (fbdev.windows[i].window == window) {
+            return &fbdev.windows[i];
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    for (int i = 0; i < FBDEV_MAX_WINDOWS; i++) {
+        if (!fbdev.windows[i].window) {
+            fbdev.windows[i].window = window;
+            fbdev.windows[i].visible = false;
+            return &fbdev.windows[i];
+        }
+    }
+    return NULL;
+}
+
+/* The window whose surface is on screen: pointer focus first, then keyboard
+   focus, then the first visible window with a surface. */
+static SDL_Window *fbdev_onscreen_window(void)
+{
+    SDL_Window *focus[2] = { sdlop.mouse_focus, sdlop.keyboard_focus };
+
+    for (int i = 0; i < 2; i++) {
+        FBDEV_WindowRecord *rec = fbdev_record(focus[i], false);
+        if (rec && rec->visible && focus[i]->surface) {
+            return focus[i];
+        }
+    }
+    for (int i = 0; i < FBDEV_MAX_WINDOWS; i++) {
+        SDL_Window *w = fbdev.windows[i].window;
+        if (w && fbdev.windows[i].visible && w->surface) {
+            return w;
+        }
+    }
+    return NULL;
+}
+
+/* Put window content on screen (black when there is no window/surface). */
+static void fbdev_repaint(SDL_Window *window, const SDL_Rect *rects, int numrects)
+{
+    if (!fbdev_scanout_ready()) {
+        return;
+    }
+    if (!window || !window->surface) {
+        fbdev_fill((SDL_Rect){ 0, 0, fbdev.scanout.w, fbdev.scanout.h }, 0x000000);
+        return;
+    }
+    if (rects && numrects > 0) {
+        for (int i = 0; i < numrects; i++) {
+            fbdev_blit(window->surface, rects[i]);
+        }
+        return;
+    }
+    fbdev_blit(window->surface, (SDL_Rect){ 0, 0, fbdev.scanout.w, fbdev.scanout.h });
+}
+
+/* ---- software cursor ---- */
+
+static bool fbdev_console_visible(void)
+{
+    /* without a VT takeover there is no notion of "on screen": always draw */
+    return fbdev.vt.fd < 0 || fbdev.vt.active;
+}
+
+static void fbdev_cursor_erase(void)
+{
+    if (SDL_RectEmpty(&fbdev.cursor_rect)) {
+        return;
+    }
+    /* restore the covered pixels from the window surface: the scanout is a
+       pure function of that surface, so nothing may go stale */
+    fbdev_repaint(fbdev_onscreen_window(), &fbdev.cursor_rect, 1);
+    fbdev.cursor_rect = (SDL_Rect){ 0, 0, 0, 0 };
+}
+
+/* The console has no cursor theme to load, and system cursors carry no
+   image, so a plain arrow is drawn instead: an outline (X), a white body (W)
+   and transparency (.). Hot spot is the top-left pixel. */
+static const char *const fbdev_arrow[FBDEV_ARROW_H] = {
+    "X...........",
+    "XX..........",
+    "XWX.........",
+    "XWWX........",
+    "XWWWX.......",
+    "XWWWWX......",
+    "XWWWWWX.....",
+    "XWWWWWWX....",
+    "XWWWWWWWX...",
+    "XWWWWXXXX...",
+    "XWWXWWX.....",
+    "XWX.XWWX....",
+    "XX..XWWX....",
+    "X....XWWX...",
+    ".....XWWX...",
+    "......XX...."
+};
+
+static void fbdev_put_px(int x, int y, Uint32 xrgb)
+{
+    if (x < 0 || y < 0 || x >= fbdev.scanout.w || y >= fbdev.scanout.h || !fbdev_scanout_ready()) {
+        return;
+    }
+    fbdev_store(&fbdev.layout,
+                fbdev.scanout.pixels + (size_t)y * fbdev.scanout.pitch +
+                    (size_t)x * (size_t)fbdev.layout.bytes,
+                fbdev_pack(&fbdev.layout, xrgb));
+}
+
+static void fbdev_cursor_draw_arrow(int x, int y)
+{
+    for (int row = 0; row < FBDEV_ARROW_H; row++) {
+        const char *line = fbdev_arrow[row];
+        for (int col = 0; line[col] && col < FBDEV_ARROW_W; col++) {
+            if (line[col] == 'X') {
+                fbdev_put_px(x + col, y + row, 0x000000);
+            } else if (line[col] == 'W') {
+                fbdev_put_px(x + col, y + row, 0xFFFFFF);
+            }
+        }
+    }
+    fbdev.cursor_rect = (SDL_Rect){ x, y, FBDEV_ARROW_W, FBDEV_ARROW_H };
+    fbdev.cursor_drawn_x = sdlop.mouse_x;
+    fbdev.cursor_drawn_y = sdlop.mouse_y;
+}
+
+static void fbdev_cursor_draw(void)
+{
+    /* NULL means "hidden" to ShowCursor: that is the only signal we act on,
+       and SDL_CursorVisible() is the core's own flag */
+    if (!fbdev.cursor_enabled || !fbdev_scanout_ready() || !fbdev_console_visible()) {
+        return;
+    }
+    if (!fbdev.cursor && !SDLOP_CursorVisible()) {
+        return; /* SDL_HideCursor() with no cursor object installed */
+    }
+
+    SDL_Surface *image = fbdev.cursor ? fbdev.cursor->surface : NULL;
+    if (!image || !image->pixels || image->format != SDL_PIXELFORMAT_ARGB8888) {
+        /* system cursor (no image) or an image the core could not convert:
+           the built-in arrow stands in for the pointer */
+        if (fbdev.scanout.w < FBDEV_ARROW_W || fbdev.scanout.h < FBDEV_ARROW_H) {
+            return;
+        }
+        const int ax = SDL_clamp((int)sdlop.mouse_x, 0, fbdev.scanout.w - FBDEV_ARROW_W);
+        const int ay = SDL_clamp((int)sdlop.mouse_y, 0, fbdev.scanout.h - FBDEV_ARROW_H);
+        fbdev_cursor_draw_arrow(ax, ay);
+        return;
+    }
+
+    int x = (int)sdlop.mouse_x - fbdev.cursor->hot_x;
+    int y = (int)sdlop.mouse_y - fbdev.cursor->hot_y;
+    if (image->w <= 0 || image->h <= 0 || image->w > fbdev.scanout.w || image->h > fbdev.scanout.h) {
+        return;
+    }
+    x = SDL_clamp(x, 0, fbdev.scanout.w - image->w);
+    y = SDL_clamp(y, 0, fbdev.scanout.h - image->h);
+
+    const FBDEV_PixelLayout *l = &fbdev.layout;
+    for (int row = 0; row < image->h; row++) {
+        const Uint8 *src = (const Uint8 *)image->pixels + (size_t)row * (size_t)image->pitch;
+        Uint8 *dst = fbdev.scanout.pixels + (size_t)(y + row) * fbdev.scanout.pitch +
+                     (size_t)x * (size_t)l->bytes;
+        for (int col = 0; col < image->w; col++) {
+            Uint32 px = 0;
+            memcpy(&px, src + (size_t)col * 4u, sizeof(px));
+            const Uint32 a = (px >> 24) & 0xFF;
+            if (a == 0) {
+                continue;
+            }
+            Uint8 *out = dst + (size_t)col * (size_t)l->bytes;
+            Uint32 value = px & 0x00FFFFFFu;
+            if (a != 0xFF) {
+                const Uint32 under = fbdev_unpack(l, fbdev_load(l, out));
+                const Uint32 inv = 255u - a;
+                const Uint32 r = ((((value >> 16) & 0xFF) * a) + (((under >> 16) & 0xFF) * inv)) / 255u;
+                const Uint32 g = ((((value >> 8) & 0xFF) * a) + (((under >> 8) & 0xFF) * inv)) / 255u;
+                const Uint32 b = ((((value & 0xFF) * a) + ((under & 0xFF) * inv)) / 255u);
+                value = (r << 16) | (g << 8) | b;
+            }
+            fbdev_store(l, out, fbdev_pack(l, value));
+        }
+    }
+    fbdev.cursor_rect = (SDL_Rect){ x, y, image->w, image->h };
+    fbdev.cursor_drawn_x = sdlop.mouse_x;
+    fbdev.cursor_drawn_y = sdlop.mouse_y;
+}
+
+/* Write the scanout as binary PPM (P6). Image IO is not linked into SDLop, so
+   the encoder lives here; the dump path is a test affordance. */
+static void fbdev_dump_frame(void)
+{
+    if (!fbdev.dump || !fbdev.dump_path[0] || !fbdev_scanout_ready()) {
+        return;
+    }
+    FILE *f = fopen(fbdev.dump_path, "wb");
+    if (!f) {
+        fbdev_log("cannot write %s: %s", fbdev.dump_path, strerror(errno));
+        return;
+    }
+    fprintf(f, "P6\n%d %d\n255\n", fbdev.scanout.w, fbdev.scanout.h);
+    for (int y = 0; y < fbdev.scanout.h; y++) {
+        const Uint8 *row = fbdev.scanout.pixels + (size_t)y * fbdev.scanout.pitch;
+        for (int x = 0; x < fbdev.scanout.w; x++) {
+            const Uint32 xrgb = fbdev_unpack(&fbdev.layout,
+                                             fbdev_load(&fbdev.layout, row + (size_t)x * (size_t)fbdev.layout.bytes));
+            const Uint8 rgb[3] = { (Uint8)((xrgb >> 16) & 0xFF), (Uint8)((xrgb >> 8) & 0xFF), (Uint8)(xrgb & 0xFF) };
+            if (fwrite(rgb, 1, sizeof(rgb), f) != sizeof(rgb)) {
+                fbdev_log("short write to %s", fbdev.dump_path);
+                fclose(f);
+                return;
+            }
+        }
+    }
+    fclose(f);
+    fbdev.dump_frames++;
+}
+
+/* Repaint everything from the window surface, cursor on top. Used on show,
+   after a VT switch back, and once at init. */
+static void fbdev_refresh(void)
+{
+    fbdev_cursor_erase();
+    fbdev_repaint(fbdev_onscreen_window(), NULL, 0);
+    fbdev_cursor_draw();
+    fbdev_dump_frame();
+}
+
+/* ------------------------------------------------------------------ */
+/* Device setup                                                        */
+/* ------------------------------------------------------------------ */
+
+static bool fbdev_alloc_ram(size_t bytes, bool for_surface)
+{
+    Uint8 **slot = for_surface ? &fbdev.surface_ram : &fbdev.ram;
+    size_t *size = for_surface ? &fbdev.surface_ram_size : &fbdev.ram_size;
+
+    free(*slot);
+    *slot = NULL;
+    *size = 0;
+    if (bytes == 0) {
+        return true;
+    }
+    *slot = (Uint8 *)calloc(1, bytes);
+    if (!*slot) {
+        return SDL_OutOfMemory();
+    }
+    *size = bytes;
+    return true;
 }
 
 static bool fbdev_open_device(const char *path)
@@ -107,155 +599,502 @@ static bool fbdev_open_device(const char *path)
         close(fd);
         return false;
     }
+    if (var.xres == 0 || var.yres == 0 || var.xres > FBDEV_MAX_DIM || var.yres > FBDEV_MAX_DIM ||
+        fix.line_length == 0 || var.yres_virtual == 0) {
+        SDL_SetError("fbdev: implausible mode %ux%u (stride %u, virtual height %u)",
+                     var.xres, var.yres, fix.line_length, var.yres_virtual);
+        close(fd);
+        return false;
+    }
+    const size_t min_pitch = (size_t)var.xres * ((size_t)var.bits_per_pixel / 8u);
+    if ((size_t)fix.line_length < min_pitch) {
+        SDL_SetError("fbdev: stride %u is too small for %u px at %u bpp",
+                     fix.line_length, var.xres, var.bits_per_pixel);
+        close(fd);
+        return false;
+    }
+    const Uint64 length = (Uint64)fix.line_length * (Uint64)var.yres_virtual;
+    if (length == 0 || length > (Uint64)SIZE_MAX) {
+        SDL_SetError("fbdev: unusable scanout size");
+        close(fd);
+        return false;
+    }
 
-    const size_t maplen = (size_t)fix.line_length * (size_t)var.yres_virtual;
-    void *map = mmap(NULL, maplen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *map = mmap(NULL, (size_t)length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
-        /* a card that will not let us map still has a usable mode: render
-           into RAM and skip presentation rather than failing to start */
-        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "fbdev: mmap of %s failed (%s); scanout stays in RAM",
-                    path, strerror(errno));
+        /* the card refuses the mapping but the mode is still ours: keep
+           painting in RAM so the app runs, and say so once */
+        fbdev_log("mmap of %s failed (%s); frames stay in RAM", path, strerror(errno));
         map = NULL;
     }
 
     fbdev.fd = fd;
     SDL_strlcpy(fbdev.path, path, sizeof(fbdev.path));
-    fbdev.map = (Uint8 *)map;
-    fbdev.maplen = map ? maplen : 0;
-    fbdev.mapped = (map != NULL);
-    fbdev.fb_w = (int)var.xres;
-    fbdev.fb_h = (int)var.yres;
-    fbdev.fb_bpp = (int)var.bits_per_pixel;
-    fbdev.fb_line_length = (int)fix.line_length;
-    fbdev.fb_red_offset = var.red.offset;
-    fbdev.fb_green_offset = var.green.offset;
-    fbdev.fb_blue_offset = var.blue.offset;
-    fbdev.fb_format = (var.bits_per_pixel == 16) ? SDL_PIXELFORMAT_RGB565 : SDL_PIXELFORMAT_XRGB8888;
-    if (var.bits_per_pixel == 32 && var.red.offset == 16 && var.green.offset == 8 && var.blue.offset == 0) {
-        fbdev.fb_format = SDL_PIXELFORMAT_XRGB8888;
+    fbdev.layout.bpp = (int)var.bits_per_pixel;
+    fbdev.layout.bytes = fbdev.layout.bpp / 8;
+    fbdev.layout.r_off = (Uint8)var.red.offset;
+    fbdev.layout.r_len = (Uint8)var.red.length;
+    fbdev.layout.g_off = (Uint8)var.green.offset;
+    fbdev.layout.g_len = (Uint8)var.green.length;
+    fbdev.layout.b_off = (Uint8)var.blue.offset;
+    fbdev.layout.b_len = (Uint8)var.blue.length;
+    fbdev.layout.native = (fbdev.layout.bpp == 32 &&
+                           var.red.offset == 16 && var.red.length == 8 &&
+                           var.green.offset == 8 && var.green.length == 8 &&
+                           var.blue.offset == 0 && var.blue.length == 8);
+
+    fbdev.scanout.w = (int)var.xres;
+    fbdev.scanout.h = (int)var.yres;
+    fbdev.scanout.pitch = (size_t)fix.line_length;
+    fbdev.scanout.length = (size_t)length;
+    fbdev.scanout.mapped = (map != NULL);
+
+    bool ok = true;
+    if (map) {
+        fbdev.scanout.pixels = (Uint8 *)map;
+    } else {
+        ok = fbdev_alloc_ram((size_t)length, false);
+        fbdev.scanout.pixels = fbdev.ram;
     }
-    if (var.bits_per_pixel == 32 && var.red.offset == 0 && var.green.offset == 8 && var.blue.offset == 16) {
-        fbdev.fb_format = SDL_PIXELFORMAT_XBGR8888;
+    if (ok && !fbdev.layout.native) {
+        /* the window surface needs its own XRGB8888 buffer */
+        ok = fbdev_alloc_ram((size_t)fbdev.scanout.w * 4u * (size_t)fbdev.scanout.h, true);
+    }
+    if (!ok) {
+        close(fd);
+        fbdev.fd = -1;
+        return false;
     }
 
-    /* a 0 Hz variable refresh is normal on the console; report a sane rate */
-    if (var.upper_margin + var.lower_margin + var.yres + var.vsync_len > 0) {
+    /* refresh rate from the timings; console modes often report 0 pixclock */
+    fbdev.refresh_hz = 60;
+    if (var.pixclock > 0) {
         const Uint32 htotal = var.left_margin + var.right_margin + var.xres + var.hsync_len;
         const Uint32 vtotal = var.upper_margin + var.lower_margin + var.yres + var.vsync_len;
-        if (htotal > 0 && vtotal > 0 && var.pixclock > 0) {
+        if (htotal > 0 && vtotal > 0) {
             const Uint64 pix_hz = 1000000000000ull / (Uint64)var.pixclock;
-            fbdev.refresh_hz = (Uint32)(pix_hz / ((Uint64)htotal * (Uint64)vtotal));
+            const Uint64 hz = pix_hz / ((Uint64)htotal * (Uint64)vtotal);
+            if (hz >= 1 && hz <= 240) {
+                fbdev.refresh_hz = (Uint32)hz;
+            }
         }
-    }
-    if (fbdev.refresh_hz < 1 || fbdev.refresh_hz > 240) {
-        fbdev.refresh_hz = 60;
     }
     return true;
 }
 
 static bool fbdev_open_ram(const char *dump_path, int w, int h)
 {
-    free(fbdev.ram);
-    fbdev.ram = (Uint8 *)calloc((size_t)w * 4u, (size_t)h);
-    if (!fbdev.ram) {
-        return SDL_OutOfMemory();
-    }
-    fbdev.map = NULL;
-    fbdev.mapped = false;
     fbdev.fd = -1;
     fbdev.dump = true;
     SDL_strlcpy(fbdev.dump_path, dump_path, sizeof(fbdev.dump_path));
-    fbdev.fb_w = w;
-    fbdev.fb_h = h;
-    fbdev.fb_bpp = 32;
-    fbdev.fb_line_length = w * 4;
-    fbdev.fb_format = SDL_PIXELFORMAT_XRGB8888;
-    fbdev.fb_red_offset = 16;
-    fbdev.fb_green_offset = 8;
-    fbdev.fb_blue_offset = 0;
+    fbdev.scanout.w = w;
+    fbdev.scanout.h = h;
+    fbdev.scanout.pitch = (size_t)w * 4u;
+    fbdev.scanout.length = (size_t)w * 4u * (size_t)h;
+    fbdev.scanout.mapped = false;
+    fbdev.layout.bpp = 32;
+    fbdev.layout.bytes = 4;
+    fbdev.layout.r_off = 16;
+    fbdev.layout.r_len = 8;
+    fbdev.layout.g_off = 8;
+    fbdev.layout.g_len = 8;
+    fbdev.layout.b_off = 0;
+    fbdev.layout.b_len = 8;
+    fbdev.layout.native = true;
     fbdev.refresh_hz = 60;
+    if (!fbdev_alloc_ram(fbdev.scanout.length, false)) {
+        return false;
+    }
+    fbdev.scanout.pixels = fbdev.ram;
     return true;
 }
 
-/* Write the scanout as a binary PPM (P6). Image IO is not linked into SDLop,
-   so the 15-line encoder lives here (the dump path is a test affordance). */
-static void fbdev_dump_frame(void)
+/* ------------------------------------------------------------------ */
+/* Console (VT) ownership                                             */
+/* ------------------------------------------------------------------ */
+
+static void fbdev_vt_signal(int signum)
 {
-    const Uint8 *src = fbdev_scanout();
-    if (!fbdev.dump || !fbdev.dump_path[0] || !src) {
-        return;
+    if (signum == fbdev.vt.rel_sig) {
+        fbdev_vt_rel_pending = 1;
+    } else if (signum == fbdev.vt.acq_sig) {
+        fbdev_vt_acq_pending = 1;
     }
-    FILE *f = fopen(fbdev.dump_path, "wb");
-    if (!f) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "fbdev: cannot write %s: %s", fbdev.dump_path, strerror(errno));
-        return;
-    }
-    fprintf(f, "P6\n%d %d\n255\n", fbdev.fb_w, fbdev.fb_h);
-    for (int y = 0; y < fbdev.fb_h; y++) {
-        const Uint32 *row = (const Uint32 *)(src + (size_t)y * fbdev_scanout_pitch());
-        for (int x = 0; x < fbdev.fb_w; x++) {
-            const Uint32 px = row[x];
-            const Uint8 rgb[3] = { (Uint8)((px >> 16) & 0xFF), (Uint8)((px >> 8) & 0xFF), (Uint8)(px & 0xFF) };
-            fwrite(rgb, 1, 3, f);
-        }
-    }
-    fclose(f);
-    fbdev.dump_counter++;
 }
 
-/* 32-bit XRGB8888 -> the card's pixel layout */
-static Uint32 fbdev_convert_pixel(Uint32 xrgb)
+static bool fbdev_vt_signal_free(int signum)
 {
-    const Uint32 r = (xrgb >> 16) & 0xFF;
-    const Uint32 g = (xrgb >> 8) & 0xFF;
-    const Uint32 b = xrgb & 0xFF;
+    struct sigaction current;
 
-    if (fbdev.fb_bpp == 16) {
-        return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    memset(&current, 0, sizeof(current));
+    if (sigaction(signum, NULL, &current) != 0) {
+        return false;
     }
-    return (r << fbdev.fb_red_offset) | (g << fbdev.fb_green_offset) | (b << fbdev.fb_blue_offset);
+    return current.sa_handler == SIG_DFL;
 }
 
-static void fbdev_present_window(SDL_Window *window)
+static int fbdev_vt_find_signal(int exclude)
 {
-    Uint8 *dst = fbdev_scanout();
-    SDL_Surface *surface = window->surface;
-    if (!dst || !surface || !surface->pixels) {
+#ifdef SIGRTMIN
+    for (int signum = SIGRTMIN + 2; signum <= SIGRTMAX; signum++) {
+        if (signum != exclude && fbdev_vt_signal_free(signum)) {
+            return signum;
+        }
+    }
+#endif
+    if (exclude != SIGUSR1 && fbdev_vt_signal_free(SIGUSR1)) {
+        return SIGUSR1;
+    }
+    if (exclude != SIGUSR2 && fbdev_vt_signal_free(SIGUSR2)) {
+        return SIGUSR2;
+    }
+    return 0;
+}
+
+static bool fbdev_vt_take_signals(void)
+{
+    struct sigaction action;
+    sigset_t mask;
+
+    fbdev_vt_rel_pending = 0;
+    fbdev_vt_acq_pending = 0;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = fbdev_vt_signal;
+    action.sa_flags = SA_RESTART;
+    sigemptyset(&action.sa_mask);
+
+    if (sigaction(fbdev.vt.rel_sig, &action, &fbdev.vt.old_rel) != 0) {
+        return false;
+    }
+    if (sigaction(fbdev.vt.acq_sig, &action, &fbdev.vt.old_acq) != 0) {
+        sigaction(fbdev.vt.rel_sig, &fbdev.vt.old_rel, NULL);
+        return false;
+    }
+    fbdev.vt.handlers_installed = true;
+
+    sigemptyset(&mask);
+    sigaddset(&mask, fbdev.vt.rel_sig);
+    sigaddset(&mask, fbdev.vt.acq_sig);
+    if (pthread_sigmask(SIG_BLOCK, &mask, &fbdev.vt.saved_mask) != 0) {
+        fbdev_log("cannot block the VT signals; falling back to handlers");
+        return true; /* the handlers still work on their own */
+    }
+    fbdev.vt.mask_saved = true;
+
+    fbdev.vt.signal_fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (fbdev.vt.signal_fd < 0) {
+        fbdev_log("signalfd failed (%s); using the handler flag", strerror(errno));
+    }
+    return true;
+}
+
+static void fbdev_vt_drop_signals(void)
+{
+    if (fbdev.vt.signal_fd >= 0) {
+        close(fbdev.vt.signal_fd);
+        fbdev.vt.signal_fd = -1;
+    }
+    if (fbdev.vt.mask_saved) {
+        pthread_sigmask(SIG_SETMASK, &fbdev.vt.saved_mask, NULL);
+        fbdev.vt.mask_saved = false;
+    }
+    if (fbdev.vt.handlers_installed) {
+        sigaction(fbdev.vt.rel_sig, &fbdev.vt.old_rel, NULL);
+        sigaction(fbdev.vt.acq_sig, &fbdev.vt.old_acq, NULL);
+        fbdev.vt.handlers_installed = false;
+    }
+}
+
+/* Take the console: graphics mode + keyboard off, so fbcon and the console
+   keyboard handler stay out of the way while we own the VT. */
+static void fbdev_console_take(void)
+{
+    if (fbdev.vt.fd < 0 || fbdev.vt.graphics) {
+        return;
+    }
+    if (fbdev.vt.saved_kbmode < 0) {
+        int kbmode = 0;
+        if (ioctl(fbdev.vt.fd, KDGKBMODE, &kbmode) == 0) {
+            fbdev.vt.saved_kbmode = kbmode;
+        }
+    }
+    if (fbdev.vt.saved_kbmode >= 0 && ioctl(fbdev.vt.fd, KDSKBMODE, K_OFF) != 0) {
+        fbdev_log("KDSKBMODE K_OFF failed: %s", strerror(errno));
+    }
+    if (ioctl(fbdev.vt.fd, KDSETMODE, KD_GRAPHICS) != 0) {
+        fbdev_log("KDSETMODE KD_GRAPHICS failed: %s", strerror(errno));
+        return;
+    }
+    fbdev.vt.graphics = true;
+}
+
+/* Give the console back in text mode with its keyboard handler restored. */
+static void fbdev_console_release(void)
+{
+    if (fbdev.vt.fd < 0) {
+        return;
+    }
+    fbdev_cursor_erase();
+    if (fbdev.vt.graphics) {
+        if (ioctl(fbdev.vt.fd, KDSETMODE, KD_TEXT) != 0) {
+            fbdev_log("KDSETMODE KD_TEXT failed: %s", strerror(errno));
+        }
+        fbdev.vt.graphics = false;
+    }
+    if (fbdev.vt.saved_kbmode >= 0) {
+        if (ioctl(fbdev.vt.fd, KDSKBMODE, fbdev.vt.saved_kbmode) != 0) {
+            fbdev_log("KDSKBMODE restore failed: %s", strerror(errno));
+        }
+    }
+}
+
+/* VT switch requested by the kernel: hand the console over. */
+static void fbdev_vt_release(void)
+{
+    if (fbdev.vt.fd < 0) {
+        return;
+    }
+    fbdev.vt.active = false;
+    fbdev_console_release();
+    if (fbdev.vt.process_mode && ioctl(fbdev.vt.fd, VT_RELDISP, 1) != 0) {
+        fbdev_log("VT_RELDISP(1) failed: %s", strerror(errno));
+    }
+}
+
+/* Coming back: retake the console and repaint from the window surface. */
+static void fbdev_vt_acquire(void)
+{
+    if (fbdev.vt.fd < 0) {
+        return;
+    }
+    fbdev.vt.active = true;
+    fbdev_console_take();
+    if (fbdev.vt.process_mode && ioctl(fbdev.vt.fd, VT_RELDISP, VT_ACKACQ) != 0) {
+        fbdev_log("VT_RELDISP(VT_ACKACQ) failed: %s", strerror(errno));
+    }
+    fbdev_refresh();
+    SDL_Window *window = fbdev_onscreen_window();
+    if (window) {
+        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+    }
+}
+
+static bool fbdev_vt_onscreen(int fd, int num)
+{
+    struct vt_stat state;
+
+    if (num <= 0) {
+        return false;
+    }
+    memset(&state, 0, sizeof(state));
+    if (ioctl(fd, VT_GETSTATE, &state) != 0) {
+        return true; /* cannot tell: assume we are visible */
+    }
+    return state.v_active == (unsigned short)num;
+}
+
+/* Find the VT we were started on. $TTYNO names one, otherwise fall back to
+   the controlling terminal and then to the first console device. Nothing is
+   activated here. */
+static bool fbdev_vt_open_target(void)
+{
+    const char *ttyno = SDL_getenv("TTYNO");
+
+    if (ttyno && *ttyno) {
+        char *end = NULL;
+        const unsigned long wanted = SDL_strtoul(ttyno, &end, 10);
+        if (wanted == 0 || !end || *end != '\0' || wanted > 63) {
+            fbdev_log("invalid $TTYNO '%s'; ignoring", ttyno);
+        } else {
+            char path[32];
+            SDL_snprintf(path, sizeof(path), "/dev/tty%lu", wanted);
+            const int fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+            if (fd >= 0) {
+                fbdev.vt.fd = fd;
+                fbdev.vt.num = (int)wanted;
+                return true;
+            }
+            fbdev_log("cannot open $TTYNO console %s: %s", path, strerror(errno));
+        }
+    }
+
+    int fd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (fd >= 0) {
+        fbdev.vt.fd = fd;
+        return true;
+    }
+    for (int n = 1; n <= 63; n++) {
+        char path[32];
+        SDL_snprintf(path, sizeof(path), "/dev/tty%d", n);
+        fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (fd >= 0) {
+            fbdev.vt.fd = fd;
+            fbdev.vt.num = n;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Set up console ownership. Failure is not fatal: the picture still appears
+   on the framebuffer, only VT switching is left to the kernel. */
+static void fbdev_vt_setup(void)
+{
+    fbdev.vt.fd = -1;
+    fbdev.vt.saved_kbmode = -1;
+    fbdev.vt.signal_fd = -1;
+    fbdev.vt.active = true;
+
+    if (fbdev.dump) {
+        return;
+    }
+    if (!fbdev_replace8("SDLOP_FBDEV_TAKEOVER", true)) {
+        fbdev_log("console takeover disabled (SDLOP_FBDEV_TAKEOVER)");
+        return;
+    }
+    if (!fbdev_vt_open_target()) {
+        fbdev_log("no VT console available; VT switching left to the kernel");
         return;
     }
 
-    const size_t pitch = fbdev_scanout_pitch();
-    const int copy_w = SDL_min(surface->w, fbdev.fb_w);
-    const int copy_h = SDL_min(surface->h, fbdev.fb_h);
+    char kbtype = 0;
+    if (ioctl(fbdev.vt.fd, KDGKBTYPE, &kbtype) != 0 || (kbtype != KB_101 && kbtype != KB_84)) {
+        fbdev_log("%s is not a keyboard console; leaving VT_AUTO",
+                  fbdev.vt.num ? "the VT" : "/dev/tty");
+        close(fbdev.vt.fd);
+        fbdev.vt.fd = -1;
+        return;
+    }
 
-    if (fbdev.fb_bpp == 32 && fbdev.fb_red_offset == 16 && fbdev.fb_green_offset == 8 && fbdev.fb_blue_offset == 0) {
-        /* native layout: straight row copies */
-        const size_t bytes = (size_t)copy_w * 4u;
-        for (int y = 0; y < copy_h; y++) {
-            memcpy(dst + (size_t)y * pitch, (const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch, bytes);
+    if (fbdev.vt.num == 0) {
+        struct vt_stat state;
+        memset(&state, 0, sizeof(state));
+        if (ioctl(fbdev.vt.fd, VT_GETSTATE, &state) == 0) {
+            fbdev.vt.num = (int)state.v_active;
         }
-    } else {
-        for (int y = 0; y < copy_h; y++) {
-            const Uint32 *src = (const Uint32 *)((const Uint8 *)surface->pixels + (size_t)y * (size_t)surface->pitch);
-            Uint8 *row = dst + (size_t)y * pitch;
-            if (fbdev.fb_bpp == 32) {
-                Uint32 *out = (Uint32 *)row;
-                for (int x = 0; x < copy_w; x++) {
-                    out[x] = fbdev_convert_pixel(src[x]);
-                }
+    }
+
+    fbdev.vt.rel_sig = fbdev_vt_find_signal(0);
+    fbdev.vt.acq_sig = fbdev_vt_find_signal(fbdev.vt.rel_sig);
+    if (!fbdev.vt.rel_sig || !fbdev.vt.acq_sig) {
+        fbdev_log("no free signals for VT switching; leaving VT_AUTO");
+        fbdev.vt.rel_sig = fbdev.vt.acq_sig = 0;
+        close(fbdev.vt.fd);
+        fbdev.vt.fd = -1;
+        return;
+    }
+    if (!fbdev_vt_take_signals()) {
+        fbdev_log("cannot take the VT signals; leaving VT_AUTO");
+        fbdev_vt_drop_signals();
+        fbdev.vt.rel_sig = fbdev.vt.acq_sig = 0;
+        close(fbdev.vt.fd);
+        fbdev.vt.fd = -1;
+        return;
+    }
+
+    struct vt_mode mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.mode = VT_PROCESS;
+    mode.relsig = (short)fbdev.vt.rel_sig;
+    mode.acqsig = (short)fbdev.vt.acq_sig;
+    mode.frsig = 0;
+    if (ioctl(fbdev.vt.fd, VT_SETMODE, &mode) != 0) {
+        fbdev_log("VT_SETMODE(VT_PROCESS) failed (%s); leaving VT_AUTO", strerror(errno));
+        fbdev_vt_drop_signals();
+        fbdev.vt.rel_sig = fbdev.vt.acq_sig = 0;
+        close(fbdev.vt.fd);
+        fbdev.vt.fd = -1;
+        return;
+    }
+    fbdev.vt.process_mode = true;
+
+    fbdev_console_take();
+    fbdev.vt.active = fbdev_vt_onscreen(fbdev.vt.fd, fbdev.vt.num);
+
+    /* opt-in: switch to the VT we were asked to run on */
+    const bool want_switch = fbdev_replace8("SDLOP_FBDEV_VT_SWITCH", false) ||
+                             (SDL_getenv("TTYNO") && *SDL_getenv("TTYNO"));
+    if (want_switch && fbdev.vt.num > 0 && !fbdev.vt.active) {
+        if (ioctl(fbdev.vt.fd, VT_ACTIVATE, fbdev.vt.num) == 0) {
+            if (ioctl(fbdev.vt.fd, VT_WAITACTIVE, fbdev.vt.num) == 0) {
+                fbdev.vt.active = true;
+                fbdev_log("switched to VT %d", fbdev.vt.num);
             } else {
-                Uint16 *out = (Uint16 *)row;
-                for (int x = 0; x < copy_w; x++) {
-                    out[x] = (Uint16)fbdev_convert_pixel(src[x]);
-                }
+                fbdev_log("VT_WAITACTIVE(%d) failed: %s", fbdev.vt.num, strerror(errno));
+            }
+        } else {
+            fbdev_log("VT_ACTIVATE(%d) failed: %s", fbdev.vt.num, strerror(errno));
+        }
+    }
+    fbdev_log("console on VT %d (relsig=%d acqsig=%d%s)", fbdev.vt.num,
+              fbdev.vt.rel_sig, fbdev.vt.acq_sig,
+              fbdev.vt.active ? "" : ", not on screen");
+}
+
+/* Undo everything fbdev_vt_setup did: text mode, keyboard back, VT_AUTO. */
+static void fbdev_vt_shutdown(void)
+{
+    if (fbdev.vt.fd >= 0) {
+        fbdev_console_release();
+        if (fbdev.vt.process_mode) {
+            struct vt_mode mode;
+            memset(&mode, 0, sizeof(mode));
+            mode.mode = VT_AUTO;
+            if (ioctl(fbdev.vt.fd, VT_SETMODE, &mode) != 0) {
+                fbdev_log("VT_SETMODE(VT_AUTO) failed: %s", strerror(errno));
+            }
+            fbdev.vt.process_mode = false;
+        }
+        close(fbdev.vt.fd);
+        fbdev.vt.fd = -1;
+    }
+    fbdev_vt_drop_signals();
+    fbdev.vt.rel_sig = fbdev.vt.acq_sig = 0;
+}
+
+/* Drain VT switch requests: signalfd first, handler flags as a fallback. */
+static void fbdev_vt_pump(void)
+{
+    if (fbdev.vt.fd < 0) {
+        return;
+    }
+    bool release = false, acquire = false;
+
+    if (fbdev.vt.signal_fd >= 0) {
+        for (;;) {
+            struct signalfd_siginfo info;
+            const ssize_t got = read(fbdev.vt.signal_fd, &info, sizeof(info));
+            if (got != (ssize_t)sizeof(info)) {
+                break; /* EAGAIN, or a short read we cannot use */
+            }
+            if (info.ssi_signo == (Uint32)fbdev.vt.rel_sig) {
+                release = true;
+            } else if (info.ssi_signo == (Uint32)fbdev.vt.acq_sig) {
+                acquire = true;
             }
         }
     }
-    fbdev_dump_frame();
+    if (fbdev_vt_rel_pending) {
+        fbdev_vt_rel_pending = 0;
+        release = true;
+    }
+    if (fbdev_vt_acq_pending) {
+        fbdev_vt_acq_pending = 0;
+        acquire = true;
+    }
+    if (release) {
+        fbdev_log("VT release requested");
+        fbdev_vt_release();
+    }
+    if (acquire) {
+        fbdev_log("VT acquire requested");
+        fbdev_vt_acquire();
+    }
 }
 
 /* ------------------------------------------------------------------ */
-/* Driver entry points                                                 */
+/* Driver entry points                                                */
 /* ------------------------------------------------------------------ */
 
 static bool fbdev_Init(SDLop_VideoDevice *device)
@@ -263,22 +1102,29 @@ static bool fbdev_Init(SDLop_VideoDevice *device)
     (void)device;
     memset(&fbdev, 0, sizeof(fbdev));
     fbdev.fd = -1;
+    fbdev.vt.fd = -1;
+    fbdev.vt.saved_kbmode = -1;
+    fbdev.vt.signal_fd = -1;
+    fbdev.cursor_enabled = fbdev_replace8("SDLOP_FBDEV_CURSOR", true);
 
-    /* dump mode: SDLOP_FBDEV_DUMP<name> keeps everything in RAM so CI (and
+    /* dump mode: SDLOP_FBDEV_DUMP=<file> keeps everything in RAM so CI (and
        any machine without a console framebuffer) can verify the scanout */
-    const char *env = SDL_getenv("SDLOP_FBDEV_DUMP");
-    if (env && *env) {
+    const char *dump = SDL_getenv("SDLOP_FBDEV_DUMP");
+    if (dump && *dump) {
         int w = FBDEV_DEFAULT_W;
         int h = FBDEV_DEFAULT_H;
         const char *size = SDL_getenv("SDLOP_FBDEV_SIZE");
         if (size && *size) {
             int pw = 0, ph = 0;
-            if (sscanf(size, "%dx%d", &pw, &ph) == 2 && pw > 0 && ph > 0) {
+            if (SDL_sscanf(size, "%dx%d", &pw, &ph) == 2 && pw > 0 && ph > 0 &&
+                pw <= FBDEV_MAX_DIM && ph <= FBDEV_MAX_DIM) {
                 w = pw;
                 h = ph;
+            } else {
+                fbdev_log("ignoring SDLOP_FBDEV_SIZE '%s'", size);
             }
         }
-        if (!fbdev_open_ram(env, w, h)) {
+        if (!fbdev_open_ram(dump, w, h)) {
             return false;
         }
     } else {
@@ -289,78 +1135,73 @@ static bool fbdev_Init(SDLop_VideoDevice *device)
         if (!fbdev_open_device(path)) {
             return false;
         }
-        if (!fbdev.mapped) {
-            const size_t bytes = (size_t)fbdev.fb_w * 4u * (size_t)fbdev.fb_h;
-            fbdev.ram = (Uint8 *)calloc(1, bytes);
-            if (!fbdev.ram) {
-                return SDL_OutOfMemory();
-            }
-        }
-    }
-
-    fbdev.present = (Uint8 *)calloc((size_t)fbdev.fb_w * 4u, (size_t)fbdev.fb_h);
-    if (!fbdev.present) {
-        return SDL_OutOfMemory();
     }
 
     fbdev.display = SDLOP_AddDisplay(fbdev.dump ? "fbdev-ram" : fbdev.path,
-                                     fbdev.fb_w, fbdev.fb_h, (int)fbdev.refresh_hz * 1000,
+                                     fbdev.scanout.w, fbdev.scanout.h,
+                                     (int)fbdev.refresh_hz * 1000,
                                      SDL_ORIENTATION_LANDSCAPE, NULL, sdlop.init_done);
     if (!fbdev.display) {
+        if (fbdev.scanout.mapped && fbdev.scanout.pixels) {
+            munmap(fbdev.scanout.pixels, fbdev.scanout.length);
+        }
+        fbdev.scanout.pixels = NULL;
+        free(fbdev.ram);
+        free(fbdev.surface_ram);
+        fbdev.ram = fbdev.surface_ram = NULL;
+        if (fbdev.fd >= 0) {
+            close(fbdev.fd);
+            fbdev.fd = -1;
+        }
         return false;
     }
+
+    /* keep the scanout black instead of showing whatever the card held */
+    fbdev_fill((SDL_Rect){ 0, 0, fbdev.scanout.w, fbdev.scanout.h }, 0x000000);
+
+    fbdev_vt_setup();
     return true;
 }
 
 static void fbdev_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    fbdev_cursor_erase();
     if (fbdev.display) {
         SDLOP_DelDisplay(fbdev.display, false);
         fbdev.display = 0;
     }
-    if (fbdev.map) {
-        munmap(fbdev.map, fbdev.maplen);
-        fbdev.map = NULL;
-        fbdev.maplen = 0;
+    fbdev_vt_shutdown();
+    if (fbdev.scanout.mapped && fbdev.scanout.pixels) {
+        munmap(fbdev.scanout.pixels, fbdev.scanout.length);
     }
+    fbdev.scanout.pixels = NULL;
+    fbdev.scanout.mapped = false;
     if (fbdev.fd >= 0) {
         close(fbdev.fd);
         fbdev.fd = -1;
     }
     free(fbdev.ram);
+    free(fbdev.surface_ram);
     fbdev.ram = NULL;
-    free(fbdev.present);
-    fbdev.present = NULL;
+    fbdev.surface_ram = NULL;
+    fbdev.ram_size = fbdev.surface_ram_size = 0;
     memset(fbdev.windows, 0, sizeof(fbdev.windows));
+    fbdev.cursor = NULL;
+    fbdev.cursor_rect = (SDL_Rect){ 0, 0, 0, 0 };
     fbdev.dump = false;
-}
-
-static FBDEV_WindowRecord *fbdev_record(SDL_Window *window, bool create)
-{
-    for (int i = 0; i < FBDEV_MAX_WINDOWS; i++) {
-        if (fbdev.windows[i].window == window) {
-            return &fbdev.windows[i];
-        }
-    }
-    if (!create) {
-        return NULL;
-    }
-    for (int i = 0; i < FBDEV_MAX_WINDOWS; i++) {
-        if (!fbdev.windows[i].window) {
-            fbdev.windows[i].window = window;
-            fbdev.windows[i].visible = false;
-            return &fbdev.windows[i];
-        }
-    }
-    return NULL;
 }
 
 /* The console has a single mode: every window is the scanout. */
 static void fbdev_snap_window(SDL_Window *window)
 {
-    window->w = fbdev.fb_w;
-    window->h = fbdev.fb_h;
+    if (!window) {
+        return;
+    }
+    window->w = fbdev.scanout.w;
+    window->h = fbdev.scanout.h;
+    window->x = 0;
+    window->y = 0;
 }
 
 static bool fbdev_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
@@ -380,6 +1221,12 @@ static void fbdev_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (rec) {
         memset(rec, 0, sizeof(*rec));
     }
+    if (sdlop.keyboard_focus == window) {
+        sdlop.keyboard_focus = NULL;
+    }
+    if (sdlop.mouse_focus == window) {
+        sdlop.mouse_focus = NULL;
+    }
 }
 
 static void fbdev_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
@@ -392,6 +1239,7 @@ static void fbdev_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
     sdlop.keyboard_focus = window;
     sdlop.mouse_focus = window;
     window->flags |= SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_MOUSE_FOCUS;
+    fbdev_refresh();
 }
 
 static void fbdev_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
@@ -420,24 +1268,10 @@ static bool fbdev_SetWindowTitle(SDLop_VideoDevice *device, SDL_Window *window)
 static bool fbdev_SetWindowSize(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    /* the console mode is not negotiable: snap back and, if the request was
-       honoured by the core, tell the app the real size and keep the
-       window surface allocated at scanout size */
+    /* the console mode is not negotiable: snap back and report the real size.
+       The window surface always matches the scanout, so there is nothing to
+       reallocate here. */
     fbdev_snap_window(window);
-    if (!window->surface) {
-        SDL_Surface *surface = SDL_CreateSurface(fbdev.fb_w, fbdev.fb_h, SDL_PIXELFORMAT_XRGB8888);
-        if (!surface) {
-            return false;
-        }
-        window->surface = surface;
-    } else if (window->surface->w != fbdev.fb_w || window->surface->h != fbdev.fb_h) {
-        SDL_Surface *surface = SDL_CreateSurface(fbdev.fb_w, fbdev.fb_h, SDL_PIXELFORMAT_XRGB8888);
-        if (!surface) {
-            return false;
-        }
-        SDL_DestroySurface(window->surface);
-        window->surface = surface;
-    }
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
     return true;
@@ -446,7 +1280,6 @@ static bool fbdev_SetWindowSize(SDLop_VideoDevice *device, SDL_Window *window)
 static bool fbdev_SetWindowPosition(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    /* console: the only position is (0,0) */
     window->x = 0;
     window->y = 0;
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, 0, 0);
@@ -462,7 +1295,7 @@ static void fbdev_MinimizeWindow(SDLop_VideoDevice *device, SDL_Window *window)
 static void fbdev_MaximizeWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    (void)window; /* already the full console */
+    (void)window; /* always the full console */
 }
 
 static void fbdev_RestoreWindow(SDLop_VideoDevice *device, SDL_Window *window)
@@ -474,13 +1307,14 @@ static void fbdev_RestoreWindow(SDLop_VideoDevice *device, SDL_Window *window)
 static bool fbdev_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    /* the console is always fullscreen; track the flag so the app sees the
-       events it expects */
+    /* the console is always fullscreen; report the transition so apps that
+       wait for the event keep working */
     if (window->flags & SDL_WINDOW_FULLSCREEN) {
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_ENTER_FULLSCREEN, 0, 0);
     } else {
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_LEAVE_FULLSCREEN, 0, 0);
     }
+    fbdev_snap_window(window);
     return true;
 }
 
@@ -499,78 +1333,93 @@ static bool fbdev_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Wind
 {
     (void)device;
     (void)window;
-    (void)enabled; /* no pointer device on the console */
+    (void)enabled; /* the console has no pointer device to lock */
     return true;
 }
 
 static void fbdev_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
 {
     (void)device;
+    (void)timeout_ms; /* the core owns waiting; blocking here would stall it */
+
+    fbdev_vt_pump();
     SDLOP_KeyboardProcessRepeats();
-    if (timeout_ms > 0) {
-        int waited = 0;
-        while (waited < timeout_ms) {
-            SDL_Delay(1);
-            waited++;
-        }
+
+    /* follow the pointer: the input layer owns the logical position, we only
+       have to keep the drawn cursor under it. With no cursor object yet,
+       SDL_CursorVisible() is the core's answer for "is the pointer shown". */
+    const bool pointer_shown = fbdev.cursor ? true : SDLOP_CursorVisible();
+    const bool moved = sdlop.mouse_x != fbdev.cursor_drawn_x || sdlop.mouse_y != fbdev.cursor_drawn_y;
+    if (pointer_shown && fbdev_console_visible() && (moved || SDL_RectEmpty(&fbdev.cursor_rect))) {
+        fbdev_cursor_erase();
+        fbdev_cursor_draw();
     }
 }
 
 static int fbdev_GetEventFD(SDLop_VideoDevice *device)
 {
     (void)device;
-    return -1;
+    /* expose the VT signalfd so SDL_WaitEvent wakes on Ctrl+Alt+Fn */
+    return fbdev.vt.fd >= 0 ? fbdev.vt.signal_fd : -1;
 }
 
-/* software scanout: the window surface is the framebuffer */
+/* ---- software scanout ---- */
 
 static bool fbdev_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface)
 {
     (void)device;
-    Uint8 *pixels = fbdev_scanout();
+    (void)window;
+    Uint8 *pixels = fbdev.layout.native ? fbdev.scanout.pixels : fbdev.surface_ram;
+    const size_t pitch = fbdev.layout.native ? fbdev.scanout.pitch : (size_t)fbdev.scanout.w * 4u;
+
     if (!pixels) {
         return SDL_SetError("fbdev: no scanout memory");
     }
-    SDL_Surface *s = SDL_CreateSurfaceFrom(fbdev.fb_w, fbdev.fb_h, SDL_PIXELFORMAT_XRGB8888,
-                                           pixels, (int)fbdev_scanout_pitch());
-    if (!s) {
+    if (pitch > (size_t)INT32_MAX) {
+        return SDL_SetError("fbdev: scanout stride is too large");
+    }
+    /* the surface starts black so nothing from the card shows through */
+    memset(pixels, 0, fbdev.layout.native ? fbdev.scanout.length : fbdev.surface_ram_size);
+
+    SDL_Surface *created = SDL_CreateSurfaceFrom(fbdev.scanout.w, fbdev.scanout.h,
+                                                 SDL_PIXELFORMAT_XRGB8888, pixels, (int)pitch);
+    if (!created) {
         return false;
     }
-    *surface = s;
+    *surface = created;
     return true;
 }
 
 static bool fbdev_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, const SDL_Rect *rects, int numrects)
 {
     (void)device;
-    (void)rects;
-    (void)numrects;
-    /* the window surface already *is* the scanout when it could be mapped,
-       so presenting is only a flush (dump mode) or a copy for cards whose
-       pixel layout differs from XRGB8888 */
-    if (!fbdev.mapped) {
-        fbdev_present_window(window);
-        return true;
+    if (!fbdev_scanout_ready()) {
+        return SDL_SetError("fbdev: no scanout memory");
     }
-    if (fbdev.fb_bpp != 32 || fbdev.fb_red_offset != 16 || fbdev.fb_green_offset != 8 || fbdev.fb_blue_offset != 0) {
-        fbdev_present_window(window);
-        return true;
+    /* lift the old cursor first: its pixels come back from the surface we
+       are about to publish, so it can never leave a trail */
+    fbdev_cursor_erase();
+    if (!fbdev.layout.native) {
+        /* the surface lives in RAM; the card needs a converted copy */
+        fbdev_repaint(window, rects, numrects);
     }
-    if (fbdev.dump) {
-        fbdev_dump_frame();
-    }
+    /* native layout: the surface *is* the scanout, nothing to copy */
+    fbdev_cursor_draw();
+    fbdev_dump_frame();
     return true;
 }
 
 static void fbdev_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    if (window->surface) {
-        /* the pixels are the scanout, not ours to free: detach first */
-        window->surface->pixels = NULL;
-        SDL_DestroySurface(window->surface);
-        window->surface = NULL;
+    if (!window || !window->surface) {
+        return;
     }
+    /* the pixels belong to the driver (scanout or surface RAM), not to the
+       surface: detach before destroying it */
+    window->surface->pixels = NULL;
+    SDL_DestroySurface(window->surface);
+    window->surface = NULL;
 }
 
 /* ---- SDL 3.4 window management: the console has no window manager ---- */
@@ -600,7 +1449,18 @@ static bool fbdev_GetWindowBordersSize(SDLop_VideoDevice *device, SDL_Window *wi
 {
     (void)device;
     (void)window;
-    *top = *left = *bottom = *right = 0;
+    if (top) {
+        *top = 0;
+    }
+    if (left) {
+        *left = 0;
+    }
+    if (bottom) {
+        *bottom = 0;
+    }
+    if (right) {
+        *right = 0;
+    }
     return true;
 }
 
@@ -617,7 +1477,7 @@ static bool fbdev_SetWindowParent(SDLop_VideoDevice *device, SDL_Window *window,
     (void)device;
     (void)window;
     (void)parent;
-    return SDL_SetError("fbdev: no parent windows on the console");
+    return SDL_Unsupported();
 }
 
 static bool fbdev_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon)
@@ -643,18 +1503,61 @@ static bool fbdev_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL
     return true;
 }
 
+static bool fbdev_SetWindowFramebufferVSync(SDLop_VideoDevice *device, SDL_Window *window, int vsync)
+{
+    (void)device;
+    (void)window;
+    (void)vsync;
+    return true; /* presenting is a memory copy; there is nothing to sync to */
+}
+
+static bool fbdev_GetWindowFramebufferVSync(SDLop_VideoDevice *device, SDL_Window *window, int *vsync)
+{
+    (void)device;
+    (void)window;
+    if (vsync) {
+        *vsync = 0;
+    }
+    return true;
+}
+
 static bool fbdev_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
 {
     (void)device;
-    (void)cursor;
-    return true;
+    /* nothing to upload: the cursor is composited in software at present */
+    return cursor != NULL;
+}
+
+static void fbdev_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    if (fbdev.cursor == cursor) {
+        fbdev_cursor_erase();
+        fbdev.cursor = NULL;
+    }
 }
 
 static bool fbdev_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
 {
     (void)device;
-    (void)cursor;
+    fbdev_cursor_erase();
+    fbdev.cursor = cursor; /* NULL hides */
+    if (cursor) {
+        fbdev_cursor_draw();
+    }
     return true;
+}
+
+static bool fbdev_WarpMouse(SDLop_VideoDevice *device, SDL_Window *window, float x, float y)
+{
+    (void)device;
+    (void)window;
+    (void)x;
+    (void)y;
+    /* the core makes the motion event and updates the logical position; the
+       cursor follows on the next pump/present. Claiming the warp would mean
+       writing core mouse state from here. */
+    return false;
 }
 
 SDLop_VideoDevice SDLop_fbdev_device = {
@@ -708,8 +1611,12 @@ SDLop_VideoDevice SDLop_fbdev_device = {
     .SetWindowMouseRect = fbdev_SetWindowMouseRect,
     .FlashWindow = fbdev_FlashWindow,
     .SetWindowFocusable = fbdev_WindowOkBool,
+    .SetWindowFramebufferVSync = fbdev_SetWindowFramebufferVSync,
+    .GetWindowFramebufferVSync = fbdev_GetWindowFramebufferVSync,
     .CreateCursor = fbdev_CreateCursor,
+    .FreeCursor = fbdev_FreeCursor,
     .ShowCursor = fbdev_ShowCursor,
+    .WarpMouse = fbdev_WarpMouse,
 };
 
 #endif /* __linux__ */

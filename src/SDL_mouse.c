@@ -927,6 +927,7 @@ void SDL_DestroyCursor(SDL_Cursor *cursor)
 
 bool SDL_ShowCursor(void)
 {
+    ensure_cursors();
     if (cursor_hidden) {
         cursor_hidden = false;
         SDLOP_RedrawCursor();
@@ -936,6 +937,7 @@ bool SDL_ShowCursor(void)
 
 bool SDL_HideCursor(void)
 {
+    ensure_cursors();
     if (!cursor_hidden) {
         cursor_hidden = true;
         SDLOP_RedrawCursor();
@@ -945,5 +947,12 @@ bool SDL_HideCursor(void)
 
 bool SDL_CursorVisible(void)
 {
+    /* the pointer counts as visible until SDL_HideCursor() asks otherwise;
+       before any cursor API call there is no cursor object, but the driver
+       may already be drawing one (stock SDL3 seeds a default cursor at video
+       init, SDLop creates it lazily) */
+    if (!cursors_initialized) {
+        ensure_cursors();
+    }
     return !cursor_hidden;
 }

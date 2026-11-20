@@ -15,9 +15,13 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDLop.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #define CHECK(cond, ...)                          \
@@ -130,6 +134,143 @@ static int check_ppm_bands(const char *path, int expect_w, int expect_h, int *fa
     fclose(f);
     *failures += local_failures;
     return local_failures;
+}
+
+
+/* read one pixel of the window surface as 0xRRGGBB (0xFFFFFFFF on failure) */
+static unsigned surface_pixel(SDL_Surface *s, int x, int y)
+{
+    Uint8 r = 0, g = 0, b = 0, a = 0;
+    if (!SDL_ReadSurfacePixel(s, x, y, &r, &g, &b, &a)) {
+        return 0xFFFFFFFFu;
+    }
+    return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
+}
+
+/* ---- software cursor: it must be drawn and follow the pointer. Whether the
+   old spot is clean depends on the core: SDL_WarpMouseInWindow() frees the
+   previous position (stock SDL3 behaviour) and reports the move
+   asynchronously, so a trail is only checked after the surface was repainted
+   (which is where a stale-pixel bug would show up). ---- */
+static void cursor_phase(SDL_Window *window, SDL_Surface *s, int *failures)
+{
+    SDL_ShowCursor();
+    SDL_WarpMouseInWindow(window, (float)(s->w / 2), (float)(s->h / 2));
+    SDL_PumpEvents();
+    SDL_UpdateWindowSurface(window);
+
+    /* the built-in arrow is white inside a black outline on the green band;
+       sample the band well away from both pointer positions */
+    const unsigned band = surface_pixel(s, s->w / 8, s->h / 2);
+    int drawn = 0;
+    for (int y = s->h / 2 - 10; y < s->h / 2 + 10 && !drawn; y++) {
+        for (int x = s->w / 2 - 10; x < s->w / 2 + 10; x++) {
+            if (x >= 0 && y >= 0 && x < s->w && y < s->h && surface_pixel(s, x, y) != band) {
+                drawn = 1;
+                break;
+            }
+        }
+    }
+    CHECK(drawn, "cursor is drawn on the scanout");
+
+    SDL_WarpMouseInWindow(window, (float)(s->w / 4), (float)(s->h / 4));
+    SDL_PumpEvents();
+    SDL_UpdateWindowSurface(window);
+    int trail = 0; /* informational until the core reports motion */
+    for (int y = s->h / 2 - 10; y < s->h / 2 + 10; y++) {
+        for (int x = s->w / 2 - 10; x < s->w / 2 + 10; x++) {
+            if (x >= 0 && y >= 0 && x < s->w && y < s->h && surface_pixel(s, x, y) != band) {
+                trail++;
+            }
+        }
+    }
+    printf("  info: %d pixels changed at the old pointer spot\n", trail);
+
+    /* repaint the whole surface: the old spot must come back from it */
+    paint_bands(s);
+    SDL_UpdateWindowSurface(window);
+    const unsigned again = surface_pixel(s, s->w / 2, s->h / 2);
+    CHECK(again == band, "surface repaint restores the pixels under the cursor (got %06x)", again);
+
+    SDL_HideCursor();
+    SDL_PumpEvents();
+    CHECK(SDL_CursorVisible() == false, "SDL_HideCursor takes effect");
+    SDL_ShowCursor();
+}
+
+/* ---- real console drill: KD_ and VT_ state, a switch away and back.
+   Needs root, /dev/fb0 and a VT; the QEMU harness sets SDLOP_FBDEV_VT_CHECK=1. ---- */
+static void vt_phase(SDL_Window *window, SDL_Surface *s, int *failures)
+{
+    const char *tty = getenv("SDLOP_FBDEV_VT_CHECK_TTY");
+    if (!tty || !*tty) {
+        tty = "/dev/tty0";
+    }
+    int fd = open(tty, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        printf("  note: VT drill skipped, cannot open %s: %s\n", tty, strerror(errno));
+        return;
+    }
+
+    int mode = -1, kbmode = -1;
+    struct vt_mode vm;
+    struct vt_stat state;
+    memset(&vm, 0, sizeof(vm));
+    memset(&state, 0, sizeof(state));
+
+    CHECK(ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS,
+          "console is in KD_GRAPHICS while we own it (got %d)", mode);
+    CHECK(ioctl(fd, KDGKBMODE, &kbmode) == 0 && kbmode == K_OFF,
+          "console keyboard handler is off while we own it (got %d)", kbmode);
+    CHECK(ioctl(fd, VT_GETMODE, &vm) == 0 && vm.mode == VT_PROCESS,
+          "VT_PROCESS is installed (got %d)", (int)vm.mode);
+
+    const int our_vt = (ioctl(fd, VT_GETSTATE, &state) == 0) ? (int)state.v_active : 0;
+    if (our_vt <= 0) {
+        printf("  note: no active VT reported; skipping the switch half\n");
+        close(fd);
+        return;
+    }
+    const int other_vt = (our_vt == 2) ? 3 : 2;
+    char other_path[32];
+    SDL_snprintf(other_path, sizeof(other_path), "/dev/tty%d", other_vt);
+    const int other = open(other_path, O_RDWR | O_CLOEXEC);
+    if (other < 0) {
+        printf("  note: cannot open %s; skipping the switch half\n", other_path);
+        close(fd);
+        return;
+    }
+
+    /* away: the driver must hand the console back in text mode */
+    CHECK(ioctl(fd, VT_ACTIVATE, other_vt) == 0, "VT_ACTIVATE(%d)", other_vt);
+    CHECK(ioctl(fd, VT_WAITACTIVE, other_vt) == 0, "VT_WAITACTIVE(%d)", other_vt);
+    for (int i = 0; i < 50; i++) {
+        SDL_PumpEvents();
+        SDL_Delay(10);
+    }
+    mode = kbmode = -1;
+    CHECK(ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_TEXT,
+          "console returned to KD_TEXT while away (got %d)", mode);
+    CHECK(ioctl(fd, KDGKBMODE, &kbmode) == 0 && kbmode != K_OFF,
+          "console keyboard handler restored while away (got %d)", kbmode);
+
+    /* back: graphics mode again, and the frame is repainted */
+    CHECK(ioctl(fd, VT_ACTIVATE, our_vt) == 0, "VT_ACTIVATE(%d)", our_vt);
+    CHECK(ioctl(fd, VT_WAITACTIVE, our_vt) == 0, "VT_WAITACTIVE(%d)", our_vt);
+    for (int i = 0; i < 50; i++) {
+        SDL_PumpEvents();
+        SDL_Delay(10);
+    }
+    mode = -1;
+    CHECK(ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS,
+          "console back in KD_GRAPHICS after the switch (got %d)", mode);
+    paint_bands(s);
+    SDL_UpdateWindowSurface(window);
+    const unsigned mid = surface_pixel(s, s->w / 2, s->h / 2);
+    CHECK(mid == 0x00C000u, "frame intact after switching back (got %06x)", mid);
+
+    close(other);
+    close(fd);
 }
 
 int main(void)
@@ -263,6 +404,22 @@ int main(void)
         if (glw) {
             SDL_DestroyWindow(glw);
         }
+    }
+
+    /* these phases repaint the scanout: run them before the dump check and
+       leave a banded frame behind for the hold/host observer */
+    if (s) {
+        printf("-- software cursor --\n");
+        cursor_phase(w, s, &failures);
+        const char *vt_check = getenv("SDLOP_FBDEV_VT_CHECK");
+        if (vt_check && *vt_check && strcmp(vt_check, "0") != 0) {
+            printf("-- console (VT) drill --\n");
+            paint_bands(s);
+            SDL_UpdateWindowSurface(w);
+            vt_phase(w, s, &failures);
+        }
+        paint_bands(s);
+        SDL_UpdateWindowSurface(w);
     }
 
     if (dump_mode) {
