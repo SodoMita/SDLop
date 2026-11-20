@@ -515,8 +515,8 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
     (void)time;
     wl_data.input_serial = serial;
 
-    /* evdev worker covers the keyboard: ignore seat events to avoid
-     * double-delivery (this is the "wayland fallback" policy) */
+    /* Desktop keyboards use the focus-aware seat stream even with a readable
+     * evdev device. Only console keyboard ownership enables raw SDL keys. */
     if (SDLOP_RawInputKeyboardActive()) {
         return;
     }

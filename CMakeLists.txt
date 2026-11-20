@@ -309,9 +309,10 @@ set(SDLop_SOURCES
   src/video/kmsdrm/sdlop_kmsdrm_gl.c
   src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
   src/video/kmsdrm/sdlop_xcursor.c
+  src/video/fbdev/sdlop_fbdev.c
   src/video/dummy/sdlop_dummy.c
 )
-set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
 if(SDLOP_VIDEO_X11)
   list(APPEND SDLop_SOURCES
     src/video/x11/sdlop_x11.c
@@ -398,13 +399,14 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
+  target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
   # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
   # below, verified from a second xcb connection)
   add_executable(test_window_api tests/test_window_api.c)
@@ -515,6 +517,17 @@ if(SDLop_BUILD_TESTS)
       set_tests_properties(test_x11_touch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
     endif()
   endif()
+
+  # framebuffer (fbdev) driver: needs no device - SDLOP_FBDEV_DUMP makes the
+  # driver render into RAM and dump each presented frame as a PPM we check
+  add_executable(test_fbdev tests/test_fbdev.c)
+  target_link_libraries(test_fbdev PRIVATE sdlop)
+  target_include_directories(test_fbdev PRIVATE src)
+  target_compile_options(test_fbdev PRIVATE -UNDEBUG)
+  add_test(NAME test_fbdev COMMAND test_fbdev)
+  set_tests_properties(test_fbdev PROPERTIES
+    ENVIRONMENT "SDLOP_DISABLE_RAW_INPUT=1;SDLOP_TEST_STRICT=1;SDLOP_FBDEV_SIZE=320x240;SDLOP_FBDEV_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test_fbdev_frame.ppm"
+    TIMEOUT 60)
 
   add_executable(test_kmsdrm tests/test_kmsdrm.c)
   target_link_libraries(test_kmsdrm PRIVATE sdlop)

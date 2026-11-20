@@ -25,6 +25,9 @@ static SDLop_VideoDevice *const video_drivers[] = {
 #if SDLop_VIDEO_KMSDRM
     &SDLop_kmsdrm_device,
 #endif
+#if SDLop_VIDEO_FBDEV
+    &SDLop_fbdev_device,
+#endif
     &SDLop_dummy_device,
 };
 
@@ -761,6 +764,14 @@ SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
     }
     if (flags & SDL_WINDOW_METAL) {
         SDL_SetError("Metal support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
+        return NULL;
+    }
+    if ((flags & SDL_WINDOW_OPENGL) && !sdlop.video->GL_CreateContext) {
+        SDL_SetError("OpenGL support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
+        return NULL;
+    }
+    if ((flags & SDL_WINDOW_VULKAN) && !sdlop.video->Vulkan_CreateSurface) {
+        SDL_SetError("Vulkan support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
         return NULL;
     }
 

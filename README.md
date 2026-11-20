@@ -30,8 +30,9 @@ int main(void) {
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
   rings and fires your callback *on the worker thread*. Native evdev codes,
-  zero translation cost, kernel timestamps. Falls back to Wayland seat / X11
-  input when `/dev/input` is not readable.
+  zero translation cost, kernel timestamps. Direct keyboard access is through
+  the raw API or an owned foreground console; desktop SDL key events always
+  use the focus-aware Wayland seat / X11 stream (see input routing below).
 
 ## Status
 
@@ -61,7 +62,7 @@ int main(void) {
             └───────────────┬──────────────────────────────────────┘
                             │ eventfd wake
    Wayland / X11 fd ───► SDL_PumpEvents (main thread)
-   (windows, fallback input)   │
+   (windows, native keys)   │
                                ▼
                     SDL_PollEvent / SDL_WaitEvent / state queries
 ```
@@ -72,12 +73,53 @@ int main(void) {
 - **One translation, one place.** Raw events keep native evdev codes
   (zero cost). The single evdev→`SDL_Scancode` table lookup happens only when
   draining into SDL events.
-- **Evdev-preferred, window-system fallback.** When the worker sees a keyboard
-  or pointer device, the corresponding `wl_seat` / X11 core input stream is
-  ignored (keymap and modifier state are still consumed for correct
-  layout/keysyms via xkbcommon). No double-delivered events.
-- **Kernel timestamps** flow into `SDL_Event.timestamp` (ns) and every
-  `SDLop_RawEvent.timestamp_ns`, so you can measure end-to-end latency.
+### Input routing and focus
+
+- **X11 / Wayland SDL keyboard events always come from the window system**,
+  even when the evdev worker can read a keyboard. This is intentional: a
+  background or unfocused window must not receive global evdev keystrokes.
+  The compositor/server determines keyboard focus, layout and native delivery;
+  having a readable `/dev/input` device does not suppress that stream.
+- **fbdev / kmsdrm SDL keyboard events use evdev only while SDLop owns `K_OFF`
+  on the foreground VT.** A working raw keyboard is required before disabling
+  the kernel keyboard handler. Ctrl+Alt+Fn is forwarded through `VT_ACTIVATE`.
+  Switch-away detaches keyboard delivery and releases SDL's held key state.
+  With raw input disabled/unavailable the console retains its kernel handler;
+  that preserves VT switching but does not create an SDL keyboard event source.
+- **Raw mouse routing is unchanged:** when a readable evdev pointer is present,
+  its events feed SDL mouse events and the corresponding window-system mouse
+  stream is suppressed. Thus desktop keys and pointer events can have different
+  sources. This revision does not make raw mouse delivery focus-aware.
+- **The low-latency raw API remains available on every Linux video driver.**
+  `SDLop_RegisterRawEventCallback` runs on the worker thread and
+  `SDLop_PollRawEvents` drains a separate ring. These expose global device
+  events, including keys, regardless of window/VT focus. Applications using
+  this API must implement their own focus/security policy; do not treat it as
+  a focus-filtered SDL event queue. `SDLop_RawInputAvailable` reports the worker,
+  not whether raw keys are currently being forwarded to SDL.
+- **Timestamp provenance differs.** Raw events carry normalized kernel times;
+  raw-derived SDL events convert these to SDL's tick epoch. Desktop SDL key
+  events use the native handler's receipt time in the SDL tick epoch, not the
+  keyboard's evdev timestamp. Nanosecond units do not imply identical latency
+  or ordering across desktop keyboard and raw mouse sources. The raw-input
+  benchmark below measures the evdev path, not desktop SDL keyboard latency.
+
+Set `SDLOP_DISABLE_RAW_INPUT=1` to disable the worker and use only native
+window-system input on X11/Wayland. `0` or an empty value leaves it enabled.
+
+### fbdev arbitration
+
+If a target VT already belongs to another program (`KD_GRAPHICS` or
+`VT_PROCESS`), fbdev leaves its console state **and scanout pixels** untouched.
+Window surfaces and presents remain usable in RAM; frames are not made visible.
+`SDLOP_FBDEV_TAKEOVER=0` explicitly requests direct framebuffer rendering without
+console arbitration, including on an owned VT. Use it only when external
+coordination makes those writes safe. It is not the default refusal behavior.
+
+Console drivers reserve their VT release/acquire signals until shutdown. They
+undo only signal blocks they introduced; unrelated application signal-mask
+changes made after video initialization are preserved. Do not change the two
+reserved VT signal bits while the driver owns them.
 
 ## Benchmarks (this sandbox, x86-64, RelWithDebInfo)
 
@@ -223,7 +265,7 @@ with `SDLOP_LIB_WAYLAND` / `SDLOP_LIB_XKB` / `SDLOP_LIB_EGL` /
 `SDLOP_LIB_XKBCOMMON_X11` / `SDLOP_LIB_XCB_XINPUT` / `SDLOP_LIB_XCB_RANDR` /
 `SDLOP_LIB_X11` (the value `none` disables a module).
 
-Driver order is wayland → x11 → kmsdrm → dummy (X11 is used when
+Driver order is wayland → x11 → kmsdrm → fbdev → dummy (X11 is used when
 `WAYLAND_DISPLAY` is unset or the compositor is unreachable);
 `SDL_VIDEODRIVER=x11` forces it, e.g. to run under XWayland. Building the X11
 driver needs only the xcb **headers** (`libxcb*-dev`, `libxkbcommon-x11-dev`);

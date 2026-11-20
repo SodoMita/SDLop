@@ -3,8 +3,8 @@
 
   Creates a synthetic keyboard+mouse device via /dev/uinput, injects
   events, and verifies they arrive through the asyncinput-style worker:
-  raw ring, callbacks, and the SDL event queue (with sane kernel
-  timestamps).
+  raw ring and callbacks (with sane kernel timestamps). Raw pointer events
+  feed SDL; global raw keys must not feed SDL without console ownership.
 
   Skips cleanly when /dev/uinput or /dev/input are not accessible.
 
@@ -161,8 +161,8 @@ int main(void)
             break;
         }
     }
-    CHECK(saw_keydown, "SDL_EVENT_KEY_DOWN for W");
-    CHECK(saw_keyup, "SDL_EVENT_KEY_UP for W");
+    CHECK(!saw_keydown, "no global raw KEY_DOWN without console ownership");
+    CHECK(!saw_keyup, "no global raw KEY_UP without console ownership");
     CHECK(saw_motion, "SDL_EVENT_MOUSE_MOTION from REL");
     CHECK(saw_button_down, "SDL_EVENT_MOUSE_BUTTON_DOWN from BTN_LEFT");
     CHECK(saw_button_up, "SDL_EVENT_MOUSE_BUTTON_UP from BTN_LEFT");
@@ -170,13 +170,13 @@ int main(void)
     /* W should be released now */
     CHECK(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_W], "W released in keystate");
 
-    /* press again and check state sticks until release */
+    /* Global raw keys must not change the SDL keyboard state either. */
     uinput_synth_key(synth, KEY_D, 1);
     uinput_synth_syn(synth);
     SDL_Delay(50);
     SDL_PumpEvents();
     SDL_FlushEvents(0, 0xFFFFFFFFu);
-    CHECK(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_D], "D held in keystate");
+    CHECK(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_D], "global raw D press does not change SDL state");
     uinput_synth_key(synth, KEY_D, 0);
     uinput_synth_syn(synth);
     SDL_Delay(50);
