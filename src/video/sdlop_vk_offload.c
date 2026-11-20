@@ -20,11 +20,16 @@
 /* ------------------------------------------------------------------ */
 
 #define VK_SUCCESS 0
+#define VK_ERROR_INITIALIZATION_FAILED (-3)
 #define VK_TRUE 1u
 #define VK_FALSE 0u
 #define VK_MAX_EXTENSION_NAME_SIZE 256
 #define VK_API_VERSION_1_0 (1u << 22)
 #define VK_QUEUE_FAMILY_IGNORED (~0u)
+
+#define VK_QUEUE_GRAPHICS_BIT 0x00000001u
+#define VK_QUEUE_COMPUTE_BIT 0x00000002u
+#define VK_QUEUE_TRANSFER_BIT 0x00000004u
 
 #define VK_PHYSICAL_DEVICE_TYPE_OTHER 0
 #define VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU 1
@@ -49,19 +54,23 @@
 
 #define VK_ACCESS_TRANSFER_READ_BIT 0x00000800u
 #define VK_ACCESS_MEMORY_READ_BIT 0x00008000u
+#define VK_ACCESS_MEMORY_WRITE_BIT 0x00010000u
 #define VK_PIPELINE_STAGE_TRANSFER_BIT 0x00001000u
 #define VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT 0x00002000u
+#define VK_PIPELINE_STAGE_ALL_COMMANDS_BIT 0x00010000u
 
 #define VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT 0x00000002u
 #define VK_COMMAND_BUFFER_LEVEL_PRIMARY 0u
 #define VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT 0x00000001u
 #define VK_SHARING_MODE_EXCLUSIVE 0u
+#define VK_SHARING_MODE_CONCURRENT 1u
 
 #define VK_STRUCTURE_TYPE_APPLICATION_INFO 0u
 #define VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO 1u
 #define VK_STRUCTURE_TYPE_SUBMIT_INFO 4u
 #define VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO 5u
 #define VK_STRUCTURE_TYPE_FENCE_CREATE_INFO 8u
+#define VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO 9u
 #define VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO 12u
 #define VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO 39u
 #define VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO 40u
@@ -327,6 +336,27 @@ typedef struct VkFenceCreateInfo_ {
     VkFlags_ flags;
 } VkFenceCreateInfo_;
 
+typedef struct VkSemaphoreCreateInfo_ {
+    uint32_t sType;
+    const void *pNext;
+    VkFlags_ flags;
+} VkSemaphoreCreateInfo_;
+
+typedef struct VkQueueFamilyProperties_ {
+    VkFlags_ queueFlags;
+    uint32_t queueCount;
+    uint32_t timestampValidBits;
+    VkExtent3D_ minImageTransferGranularity;
+} VkQueueFamilyProperties_;
+
+typedef struct VkDeviceQueueInfo2_ {
+    uint32_t sType;
+    const void *pNext;
+    VkFlags_ flags;
+    uint32_t queueFamilyIndex;
+    uint32_t queueIndex;
+} VkDeviceQueueInfo2_;
+
 typedef struct VkDisplayPropertiesKHR_ {
     void *display;
     const char *displayName;
@@ -347,6 +377,7 @@ typedef VkResult_ (*PFN_vkCreateInstance_)(const VkInstanceCreateInfo_ *, const 
 typedef void (*PFN_vkDestroyInstance_)(VkInstance_, const void *);
 typedef VkResult_ (*PFN_vkEnumeratePhysicalDevices_)(VkInstance_, uint32_t *, VkPhysicalDevice_ *);
 typedef void (*PFN_vkGetPhysicalDeviceProperties_)(VkPhysicalDevice_, VkPhysicalDevicePropertiesBuf_ *);
+typedef void (*PFN_vkGetPhysicalDeviceQueueFamilyProperties_)(VkPhysicalDevice_, uint32_t *, VkQueueFamilyProperties_ *);
 typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties_)(VkPhysicalDevice_, VkPhysicalDeviceMemoryProperties_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceDisplayPropertiesKHR_)(VkPhysicalDevice_, uint32_t *, VkDisplayPropertiesKHR_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceSupportKHR_)(VkPhysicalDevice_, uint32_t, VkSurfaceKHR_, VkBool32_ *);
@@ -355,6 +386,8 @@ typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_)(VkPhysicalDevice_
 typedef VkResult_ (*PFN_vkCreateHeadlessSurfaceEXT_)(VkInstance_, const VkHeadlessSurfaceCreateInfoEXT_ *, const void *, VkSurfaceKHR_ *);
 typedef VkResult_ (*PFN_vkCreateDevice_)(VkPhysicalDevice_, const VkDeviceCreateInfo_ *, const void *, VkDevice_ *);
 typedef void (*PFN_vkDestroyDevice_)(VkDevice_, const void *);
+typedef void (*PFN_vkGetDeviceQueue_)(VkDevice_, uint32_t, uint32_t, VkQueue_ *);
+typedef void (*PFN_vkGetDeviceQueue2_)(VkDevice_, const VkDeviceQueueInfo2_ *, VkQueue_ *);
 typedef VkResult_ (*PFN_vkCreateSwapchainKHR_)(VkDevice_, const VkSwapchainCreateInfoKHR_ *, const void *, VkSwapchainKHR_ *);
 typedef void (*PFN_vkDestroySwapchainKHR_)(VkDevice_, VkSwapchainKHR_, const void *);
 typedef VkResult_ (*PFN_vkGetSwapchainImagesKHR_)(VkDevice_, VkSwapchainKHR_, uint32_t *, VkImage_ *);
@@ -379,6 +412,8 @@ typedef VkResult_ (*PFN_vkCreateFence_)(VkDevice_, const VkFenceCreateInfo_ *, c
 typedef void (*PFN_vkDestroyFence_)(VkDevice_, VkFence_, const void *);
 typedef VkResult_ (*PFN_vkResetFences_)(VkDevice_, uint32_t, const VkFence_ *);
 typedef VkResult_ (*PFN_vkWaitForFences_)(VkDevice_, uint32_t, const VkFence_ *, VkBool32_, uint64_t);
+typedef VkResult_ (*PFN_vkCreateSemaphore_)(VkDevice_, const VkSemaphoreCreateInfo_ *, const void *, VkSemaphore_ *);
+typedef void (*PFN_vkDestroySemaphore_)(VkDevice_, VkSemaphore_, const void *);
 typedef VkResult_ (*PFN_vkQueueSubmit_)(VkQueue_, uint32_t, const VkSubmitInfo_ *, VkFence_);
 
 /* ------------------------------------------------------------------ */
@@ -400,15 +435,29 @@ typedef struct TrackedPhysicalDevice
     struct TrackedPhysicalDevice *next;
 } TrackedPhysicalDevice;
 
+typedef struct TrackedQueue
+{
+    VkQueue_ queue;
+    uint32_t family;
+    struct TrackedQueue *next;
+} TrackedQueue;
+
 typedef struct TrackedDevice
 {
     VkDevice_ device;
     VkInstance_ instance;
     VkPhysicalDevice_ gpu;
-    uint32_t queue_family;
+    uint32_t *qf_flags;
+    uint32_t qf_count;
+    uint32_t transfer_qf;
+    bool has_transfer_qf;
+    VkQueue_ transfer_queue;
+    TrackedQueue *queues;
 
     PFN_vkGetDeviceProcAddr_ real_gdpa;
     PFN_vkDestroyDevice_ real_destroy_device;
+    PFN_vkGetDeviceQueue_ real_get_device_queue;
+    PFN_vkGetDeviceQueue2_ real_get_device_queue2;
     PFN_vkCreateSwapchainKHR_ real_create_swapchain;
     PFN_vkDestroySwapchainKHR_ real_destroy_swapchain;
     PFN_vkGetSwapchainImagesKHR_ real_get_swapchain_images;
@@ -434,6 +483,8 @@ typedef struct TrackedDevice
     PFN_vkDestroyFence_ p_destroy_fence;
     PFN_vkResetFences_ p_reset_fences;
     PFN_vkWaitForFences_ p_wait_fences;
+    PFN_vkCreateSemaphore_ p_create_sem;
+    PFN_vkDestroySemaphore_ p_destroy_sem;
     PFN_vkQueueSubmit_ p_queue_submit;
 
     struct TrackedDevice *next;
@@ -447,6 +498,8 @@ typedef struct TrackedSwapchain
     uint32_t width;
     uint32_t height;
     uint32_t format;
+    uint32_t sharing_mode;
+    bool concurrent_has_transfer_qf;
     VkImage_ *images;
     uint32_t image_count;
 
@@ -457,9 +510,20 @@ typedef struct TrackedSwapchain
     VkDeviceMemory_ staging_mem;
     VkDeviceSize_ staging_size;
     void *staging_mapped;
+    uint32_t cmd_pool_qf;
     VkCommandPool_ cmd_pool;
     VkCommandBuffer_ cmd_buf;
     VkFence_ fence;
+    VkSemaphore_ readback_sem;
+    bool readback_sem_pending;
+
+    /* Cross-family QFOT state (used only when present queue cannot transfer) */
+    uint32_t pres_cmd_pool_qf;
+    VkCommandPool_ pres_cmd_pool;
+    VkCommandBuffer_ pres_rel_cb;
+    VkCommandBuffer_ pres_acq_cb;
+    VkSemaphore_ qfot_rel_sem;
+    VkSemaphore_ qfot_acq_sem;
 
     struct TrackedSwapchain *next;
 } TrackedSwapchain;
@@ -627,8 +691,7 @@ static void probe_vulkan_devices(PFN_vkGetInstanceProcAddr_ gipa,
     *has_kms_display_out = false;
 
     PFN_vkCreateInstance_ p_create = VK_CAST(PFN_vkCreateInstance_, gipa(NULL, "vkCreateInstance"));
-    PFN_vkDestroyInstance_ p_destroy = VK_CAST(PFN_vkDestroyInstance_, gipa(NULL, "vkDestroyInstance"));
-    if (!p_create || !p_destroy) {
+    if (!p_create) {
         return;
     }
 
@@ -694,7 +757,11 @@ static void probe_vulkan_devices(PFN_vkGetInstanceProcAddr_ gipa,
         }
     }
 
-    p_destroy(inst, NULL);
+    PFN_vkDestroyInstance_ p_destroy =
+        VK_CAST(PFN_vkDestroyInstance_, gipa(inst, "vkDestroyInstance"));
+    if (p_destroy) {
+        p_destroy(inst, NULL);
+    }
 }
 
 bool SDLOP_VulkanOffload_ShouldUseOffload(SDL_FunctionPointer real_gipa)
@@ -815,6 +882,47 @@ static TrackedSwapchain *find_swapchain(VkSwapchainKHR_ sc)
     return NULL;
 }
 
+static void track_device_queue(TrackedDevice *td, VkQueue_ queue, uint32_t family)
+{
+    if (!td || !queue) {
+        return;
+    }
+    for (TrackedQueue *tq = td->queues; tq; tq = tq->next) {
+        if (tq->queue == queue) {
+            tq->family = family;
+            return;
+        }
+    }
+    TrackedQueue *tq = (TrackedQueue *)calloc(1, sizeof(*tq));
+    if (tq) {
+        tq->queue = queue;
+        tq->family = family;
+        tq->next = td->queues;
+        td->queues = tq;
+    }
+}
+
+static bool find_device_queue_family(TrackedDevice *td, VkQueue_ queue, uint32_t *family_out)
+{
+    if (!td || !queue) {
+        return false;
+    }
+    for (TrackedQueue *tq = td->queues; tq; tq = tq->next) {
+        if (tq->queue == queue) {
+            if (family_out) {
+                *family_out = tq->family;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_transfer_capable_flags(uint32_t qflags)
+{
+    return (qflags & (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
+}
+
 static void destroy_swapchain_staging(TrackedSwapchain *ts)
 {
     if (!ts || !ts->dev) {
@@ -825,9 +933,28 @@ static void destroy_swapchain_staging(TrackedSwapchain *ts)
         dev->p_unmap_mem(dev->device, ts->staging_mem);
         ts->staging_mapped = NULL;
     }
+    if (ts->readback_sem && dev->p_destroy_sem) {
+        dev->p_destroy_sem(dev->device, ts->readback_sem, NULL);
+        ts->readback_sem = 0;
+    }
+    ts->readback_sem_pending = false;
+    if (ts->qfot_rel_sem && dev->p_destroy_sem) {
+        dev->p_destroy_sem(dev->device, ts->qfot_rel_sem, NULL);
+        ts->qfot_rel_sem = 0;
+    }
+    if (ts->qfot_acq_sem && dev->p_destroy_sem) {
+        dev->p_destroy_sem(dev->device, ts->qfot_acq_sem, NULL);
+        ts->qfot_acq_sem = 0;
+    }
     if (ts->fence && dev->p_destroy_fence) {
         dev->p_destroy_fence(dev->device, ts->fence, NULL);
         ts->fence = 0;
+    }
+    if (ts->pres_cmd_pool && dev->p_destroy_cmd_pool) {
+        dev->p_destroy_cmd_pool(dev->device, ts->pres_cmd_pool, NULL);
+        ts->pres_cmd_pool = 0;
+        ts->pres_rel_cb = NULL;
+        ts->pres_acq_cb = NULL;
     }
     if (ts->cmd_pool && dev->p_destroy_cmd_pool) {
         dev->p_destroy_cmd_pool(dev->device, ts->cmd_pool, NULL);
@@ -972,11 +1099,62 @@ static int find_host_mem_type(TrackedDevice *dev, uint32_t type_bits)
     return -1;
 }
 
-static bool ensure_swapchain_staging(TrackedSwapchain *sc)
+static bool ensure_cmd_pool_and_bufs(TrackedDevice *d, uint32_t qf,
+                                     VkCommandPool_ *pool_io, uint32_t *pool_qf_io,
+                                     uint32_t count, VkCommandBuffer_ *bufs_out)
 {
-    if (sc->staging_init) {
-        return !sc->staging_failed;
+    if (*pool_io && *pool_qf_io != qf) {
+        if (d->p_destroy_cmd_pool) {
+            d->p_destroy_cmd_pool(d->device, *pool_io, NULL);
+        }
+        *pool_io = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            bufs_out[i] = NULL;
+        }
     }
+    if (!*pool_io) {
+        VkCommandPoolCreateInfo_ cpci;
+        memset(&cpci, 0, sizeof(cpci));
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = qf;
+
+        if (d->p_create_cmd_pool(d->device, &cpci, NULL, pool_io) != VK_SUCCESS || !*pool_io) {
+            return false;
+        }
+        *pool_qf_io = qf;
+
+        VkCommandBufferAllocateInfo_ cbai;
+        memset(&cbai, 0, sizeof(cbai));
+        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = *pool_io;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = count;
+
+        if (d->p_alloc_cmd_bufs(d->device, &cbai, bufs_out) != VK_SUCCESS) {
+            d->p_destroy_cmd_pool(d->device, *pool_io, NULL);
+            *pool_io = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                bufs_out[i] = NULL;
+            }
+            return false;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (!bufs_out[i]) {
+                d->p_destroy_cmd_pool(d->device, *pool_io, NULL);
+                *pool_io = 0;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ensure_swapchain_staging(TrackedSwapchain *sc,
+                                     uint32_t readback_qf,
+                                     bool need_qfot,
+                                     uint32_t present_qf)
+{
     if (sc->staging_failed || !sc->dev || sc->width == 0 || sc->height == 0) {
         return false;
     }
@@ -987,95 +1165,129 @@ static bool ensure_swapchain_staging(TrackedSwapchain *sc)
         !d->p_alloc_cmd_bufs || !d->p_reset_cmd_buf || !d->p_begin_cmd_buf ||
         !d->p_end_cmd_buf || !d->p_cmd_barrier || !d->p_cmd_copy_img_to_buf ||
         !d->p_create_fence || !d->p_reset_fences || !d->p_wait_fences ||
-        !d->p_queue_submit) {
+        !d->p_create_sem || !d->p_destroy_sem || !d->p_queue_submit) {
         sc->staging_failed = true;
         return false;
     }
 
-    VkDeviceSize_ bytes = (VkDeviceSize_)sc->width * (VkDeviceSize_)sc->height * 4u;
+    if (!sc->staging_init) {
+        VkDeviceSize_ bytes = (VkDeviceSize_)sc->width * (VkDeviceSize_)sc->height * 4u;
 
-    VkBufferCreateInfo_ bci;
-    memset(&bci, 0, sizeof(bci));
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = bytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBufferCreateInfo_ bci;
+        memset(&bci, 0, sizeof(bci));
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = bytes;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (d->p_create_buffer(d->device, &bci, NULL, &sc->staging_buf) != VK_SUCCESS || !sc->staging_buf) {
-        sc->staging_failed = true;
-        return false;
+        if (d->p_create_buffer(d->device, &bci, NULL, &sc->staging_buf) != VK_SUCCESS || !sc->staging_buf) {
+            sc->staging_failed = true;
+            return false;
+        }
+
+        VkMemoryRequirements_ req;
+        memset(&req, 0, sizeof(req));
+        d->p_get_buf_mem_req(d->device, sc->staging_buf, &req);
+
+        int mtype = find_host_mem_type(d, req.memoryTypeBits);
+        if (mtype < 0) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+
+        VkMemoryAllocateInfo_ mai;
+        memset(&mai, 0, sizeof(mai));
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = (uint32_t)mtype;
+
+        if (d->p_alloc_mem(d->device, &mai, NULL, &sc->staging_mem) != VK_SUCCESS || !sc->staging_mem) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+        if (d->p_bind_buf_mem(d->device, sc->staging_buf, sc->staging_mem, 0) != VK_SUCCESS) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+        if (d->p_map_mem(d->device, sc->staging_mem, 0, bytes, 0, &sc->staging_mapped) != VK_SUCCESS ||
+            !sc->staging_mapped) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+
+        VkFenceCreateInfo_ fci;
+        memset(&fci, 0, sizeof(fci));
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (d->p_create_fence(d->device, &fci, NULL, &sc->fence) != VK_SUCCESS || !sc->fence) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+
+        VkSemaphoreCreateInfo_ sci;
+        memset(&sci, 0, sizeof(sci));
+        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        if (d->p_create_sem(d->device, &sci, NULL, &sc->readback_sem) != VK_SUCCESS || !sc->readback_sem) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+
+        sc->staging_size = bytes;
+        sc->staging_init = true;
     }
 
-    VkMemoryRequirements_ req;
-    memset(&req, 0, sizeof(req));
-    d->p_get_buf_mem_req(d->device, sc->staging_buf, &req);
+    if (sc->readback_sem_pending) {
+        d->p_destroy_sem(d->device, sc->readback_sem, NULL);
+        sc->readback_sem = 0;
+        sc->readback_sem_pending = false;
+        VkSemaphoreCreateInfo_ sci;
+        memset(&sci, 0, sizeof(sci));
+        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        if (d->p_create_sem(d->device, &sci, NULL, &sc->readback_sem) != VK_SUCCESS || !sc->readback_sem) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+    }
 
-    int mtype = find_host_mem_type(d, req.memoryTypeBits);
-    if (mtype < 0) {
+    if (!ensure_cmd_pool_and_bufs(d, readback_qf, &sc->cmd_pool, &sc->cmd_pool_qf, 1, &sc->cmd_buf)) {
         destroy_swapchain_staging(sc);
         sc->staging_failed = true;
         return false;
     }
 
-    VkMemoryAllocateInfo_ mai;
-    memset(&mai, 0, sizeof(mai));
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = (uint32_t)mtype;
+    if (need_qfot) {
+        VkCommandBuffer_ pres_bufs[2] = { sc->pres_rel_cb, sc->pres_acq_cb };
+        if (!ensure_cmd_pool_and_bufs(d, present_qf, &sc->pres_cmd_pool, &sc->pres_cmd_pool_qf, 2, pres_bufs)) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+        sc->pres_rel_cb = pres_bufs[0];
+        sc->pres_acq_cb = pres_bufs[1];
 
-    if (d->p_alloc_mem(d->device, &mai, NULL, &sc->staging_mem) != VK_SUCCESS || !sc->staging_mem) {
-        destroy_swapchain_staging(sc);
-        sc->staging_failed = true;
-        return false;
-    }
-    if (d->p_bind_buf_mem(d->device, sc->staging_buf, sc->staging_mem, 0) != VK_SUCCESS) {
-        destroy_swapchain_staging(sc);
-        sc->staging_failed = true;
-        return false;
-    }
-    if (d->p_map_mem(d->device, sc->staging_mem, 0, bytes, 0, &sc->staging_mapped) != VK_SUCCESS ||
-        !sc->staging_mapped) {
-        destroy_swapchain_staging(sc);
-        sc->staging_failed = true;
-        return false;
-    }
-
-    VkCommandPoolCreateInfo_ cpci;
-    memset(&cpci, 0, sizeof(cpci));
-    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cpci.queueFamilyIndex = d->queue_family;
-
-    if (d->p_create_cmd_pool(d->device, &cpci, NULL, &sc->cmd_pool) != VK_SUCCESS || !sc->cmd_pool) {
-        destroy_swapchain_staging(sc);
-        sc->staging_failed = true;
-        return false;
+        VkSemaphoreCreateInfo_ sci;
+        memset(&sci, 0, sizeof(sci));
+        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        if (!sc->qfot_rel_sem &&
+            (d->p_create_sem(d->device, &sci, NULL, &sc->qfot_rel_sem) != VK_SUCCESS || !sc->qfot_rel_sem)) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
+        if (!sc->qfot_acq_sem &&
+            (d->p_create_sem(d->device, &sci, NULL, &sc->qfot_acq_sem) != VK_SUCCESS || !sc->qfot_acq_sem)) {
+            destroy_swapchain_staging(sc);
+            sc->staging_failed = true;
+            return false;
+        }
     }
 
-    VkCommandBufferAllocateInfo_ cbai;
-    memset(&cbai, 0, sizeof(cbai));
-    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = sc->cmd_pool;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-
-    if (d->p_alloc_cmd_bufs(d->device, &cbai, &sc->cmd_buf) != VK_SUCCESS || !sc->cmd_buf) {
-        destroy_swapchain_staging(sc);
-        sc->staging_failed = true;
-        return false;
-    }
-
-    VkFenceCreateInfo_ fci;
-    memset(&fci, 0, sizeof(fci));
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (d->p_create_fence(d->device, &fci, NULL, &sc->fence) != VK_SUCCESS || !sc->fence) {
-        destroy_swapchain_staging(sc);
-        sc->staging_failed = true;
-        return false;
-    }
-
-    sc->staging_size = bytes;
-    sc->staging_init = true;
     return true;
 }
 
@@ -1109,52 +1321,136 @@ static void copy_vk_pixels_to_xrgb8888(const uint8_t *src,
     }
 }
 
-static void blit_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image_index, VkQueue_ queue)
+static bool choose_readback_queue(TrackedDevice *d, TrackedSwapchain *sc, VkQueue_ present_queue,
+                                  uint32_t *present_qf_out, uint32_t *readback_qf_out,
+                                  VkQueue_ *readback_queue_out, bool *need_qfot_out)
+{
+    uint32_t present_qf = 0;
+    bool know_present_qf = find_device_queue_family(d, present_queue, &present_qf);
+    if (know_present_qf) {
+        bool present_can_transfer = (present_qf < d->qf_count)
+            ? is_transfer_capable_flags(d->qf_flags[present_qf])
+            : true;
+        if (present_can_transfer) {
+            *present_qf_out = present_qf;
+            *readback_qf_out = present_qf;
+            *readback_queue_out = present_queue;
+            *need_qfot_out = false;
+            return true;
+        }
+        if (!d->has_transfer_qf || !d->transfer_queue) {
+            return false;
+        }
+        *present_qf_out = present_qf;
+        *readback_qf_out = d->transfer_qf;
+        *readback_queue_out = d->transfer_queue;
+        *need_qfot_out = !(sc->sharing_mode == VK_SHARING_MODE_CONCURRENT &&
+                           sc->concurrent_has_transfer_qf);
+        return true;
+    }
+
+    if (!d->has_transfer_qf) {
+        return false;
+    }
+    *present_qf_out = d->transfer_qf;
+    *readback_qf_out = d->transfer_qf;
+    *readback_queue_out = present_queue;
+    *need_qfot_out = false;
+    return true;
+}
+
+static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image_index,
+                                            VkQueue_ present_queue,
+                                            uint32_t in_wait_count,
+                                            const VkSemaphore_ *in_wait_sems,
+                                            VkSemaphore_ *out_sem)
 {
     if (!sc || !sc->window || !sc->images || image_index >= sc->image_count) {
-        return;
+        return false;
     }
     if (!sdlop.video ||
         !sdlop.video->CreateWindowFramebuffer ||
         !sdlop.video->UpdateWindowFramebuffer) {
-        return;
-    }
-    if (!ensure_swapchain_staging(sc)) {
-        return;
+        return false;
     }
 
     TrackedDevice *d = sc->dev;
+    uint32_t present_qf = 0, readback_qf = 0;
+    VkQueue_ readback_queue = NULL;
+    bool need_qfot = false;
+    if (!choose_readback_queue(d, sc, present_queue, &present_qf, &readback_qf,
+                               &readback_queue, &need_qfot)) {
+        return false;
+    }
+
+    if (!ensure_swapchain_staging(sc, readback_qf, need_qfot, present_qf)) {
+        return false;
+    }
+
     VkImage_ img = sc->images[image_index];
 
     if (d->p_reset_fences(d->device, 1, &sc->fence) != VK_SUCCESS ||
         d->p_reset_cmd_buf(sc->cmd_buf, 0) != VK_SUCCESS) {
-        return;
+        return false;
+    }
+    if (need_qfot &&
+        (d->p_reset_cmd_buf(sc->pres_rel_cb, 0) != VK_SUCCESS ||
+         d->p_reset_cmd_buf(sc->pres_acq_cb, 0) != VK_SUCCESS)) {
+        return false;
     }
 
     VkCommandBufferBeginInfo_ cbbi;
     memset(&cbbi, 0, sizeof(cbbi));
     cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    if (need_qfot) {
+        if (d->p_begin_cmd_buf(sc->pres_rel_cb, &cbbi) != VK_SUCCESS) {
+            return false;
+        }
+        VkImageMemoryBarrier_ qf_rel;
+        memset(&qf_rel, 0, sizeof(qf_rel));
+        qf_rel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        qf_rel.srcAccessMask = in_wait_count ? 0u : VK_ACCESS_MEMORY_WRITE_BIT;
+        qf_rel.dstAccessMask = 0u;
+        qf_rel.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        qf_rel.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        qf_rel.srcQueueFamilyIndex = present_qf;
+        qf_rel.dstQueueFamilyIndex = readback_qf;
+        qf_rel.image = img;
+        qf_rel.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        qf_rel.subresourceRange.levelCount = 1;
+        qf_rel.subresourceRange.layerCount = 1;
+        d->p_cmd_barrier(sc->pres_rel_cb,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, NULL, 0, NULL, 1, &qf_rel);
+        if (d->p_end_cmd_buf(sc->pres_rel_cb) != VK_SUCCESS) {
+            return false;
+        }
+    }
+
     if (d->p_begin_cmd_buf(sc->cmd_buf, &cbbi) != VK_SUCCESS) {
-        return;
+        return false;
     }
 
     VkImageMemoryBarrier_ to_src;
     memset(&to_src, 0, sizeof(to_src));
     to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_src.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    to_src.srcAccessMask = (!need_qfot && !in_wait_count) ? VK_ACCESS_MEMORY_WRITE_BIT : 0u;
     to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_src.srcQueueFamilyIndex = need_qfot ? present_qf : VK_QUEUE_FAMILY_IGNORED;
+    to_src.dstQueueFamilyIndex = need_qfot ? readback_qf : VK_QUEUE_FAMILY_IGNORED;
     to_src.image = img;
     to_src.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     to_src.subresourceRange.levelCount = 1;
     to_src.subresourceRange.layerCount = 1;
 
     d->p_cmd_barrier(sc->cmd_buf,
-                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                     (!need_qfot && !in_wait_count) ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+                                                    : VK_PIPELINE_STAGE_TRANSFER_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT,
                      0, 0, NULL, 0, NULL, 1, &to_src);
 
@@ -1171,9 +1467,11 @@ static void blit_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image_ind
 
     VkImageMemoryBarrier_ to_present = to_src;
     to_present.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    to_present.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    to_present.dstAccessMask = 0u;
     to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    to_present.srcQueueFamilyIndex = need_qfot ? readback_qf : VK_QUEUE_FAMILY_IGNORED;
+    to_present.dstQueueFamilyIndex = need_qfot ? present_qf : VK_QUEUE_FAMILY_IGNORED;
 
     d->p_cmd_barrier(sc->cmd_buf,
                      VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1181,20 +1479,123 @@ static void blit_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image_ind
                      0, 0, NULL, 0, NULL, 1, &to_present);
 
     if (d->p_end_cmd_buf(sc->cmd_buf) != VK_SUCCESS) {
-        return;
+        return false;
     }
 
-    VkSubmitInfo_ si;
-    memset(&si, 0, sizeof(si));
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &sc->cmd_buf;
-
-    if (d->p_queue_submit(queue, 1, &si, sc->fence) != VK_SUCCESS) {
-        return;
+    if (need_qfot) {
+        if (d->p_begin_cmd_buf(sc->pres_acq_cb, &cbbi) != VK_SUCCESS) {
+            return false;
+        }
+        VkImageMemoryBarrier_ qf_acq;
+        memset(&qf_acq, 0, sizeof(qf_acq));
+        qf_acq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        qf_acq.srcAccessMask = 0u;
+        qf_acq.dstAccessMask = 0u;
+        qf_acq.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        qf_acq.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        qf_acq.srcQueueFamilyIndex = readback_qf;
+        qf_acq.dstQueueFamilyIndex = present_qf;
+        qf_acq.image = img;
+        qf_acq.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        qf_acq.subresourceRange.levelCount = 1;
+        qf_acq.subresourceRange.layerCount = 1;
+        d->p_cmd_barrier(sc->pres_acq_cb,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, NULL, 0, NULL, 1, &qf_acq);
+        if (d->p_end_cmd_buf(sc->pres_acq_cb) != VK_SUCCESS) {
+            return false;
+        }
     }
+
+    VkFlags_ stack_stages[16];
+    VkFlags_ *wait_stages = NULL;
+    if (in_wait_count > 0) {
+        wait_stages = (in_wait_count <= 16)
+            ? stack_stages
+            : (VkFlags_ *)calloc(in_wait_count, sizeof(VkFlags_));
+        if (!wait_stages) {
+            return false;
+        }
+        VkFlags_ st = need_qfot ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+        for (uint32_t i = 0; i < in_wait_count; i++) {
+            wait_stages[i] = st;
+        }
+    }
+
+    if (need_qfot) {
+        VkSubmitInfo_ si1;
+        memset(&si1, 0, sizeof(si1));
+        si1.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si1.waitSemaphoreCount = in_wait_count;
+        si1.pWaitSemaphores = in_wait_sems;
+        si1.pWaitDstStageMask = wait_stages;
+        si1.commandBufferCount = 1;
+        si1.pCommandBuffers = &sc->pres_rel_cb;
+        si1.signalSemaphoreCount = 1;
+        si1.pSignalSemaphores = &sc->qfot_rel_sem;
+        VkResult_ sres = d->p_queue_submit(present_queue, 1, &si1, 0);
+        if (wait_stages && wait_stages != stack_stages) {
+            free(wait_stages);
+        }
+        if (sres != VK_SUCCESS) {
+            return false;
+        }
+
+        VkFlags_ rel_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo_ si2;
+        memset(&si2, 0, sizeof(si2));
+        si2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si2.waitSemaphoreCount = 1;
+        si2.pWaitSemaphores = &sc->qfot_rel_sem;
+        si2.pWaitDstStageMask = &rel_stage;
+        si2.commandBufferCount = 1;
+        si2.pCommandBuffers = &sc->cmd_buf;
+        si2.signalSemaphoreCount = 1;
+        si2.pSignalSemaphores = &sc->qfot_acq_sem;
+        if (d->p_queue_submit(readback_queue, 1, &si2, sc->fence) != VK_SUCCESS) {
+            return false;
+        }
+
+        VkFlags_ acq_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo_ si3;
+        memset(&si3, 0, sizeof(si3));
+        si3.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si3.waitSemaphoreCount = 1;
+        si3.pWaitSemaphores = &sc->qfot_acq_sem;
+        si3.pWaitDstStageMask = &acq_stage;
+        si3.commandBufferCount = 1;
+        si3.pCommandBuffers = &sc->pres_acq_cb;
+        si3.signalSemaphoreCount = 1;
+        si3.pSignalSemaphores = &sc->readback_sem;
+        if (d->p_queue_submit(present_queue, 1, &si3, 0) != VK_SUCCESS) {
+            return false;
+        }
+    } else {
+        VkSubmitInfo_ si;
+        memset(&si, 0, sizeof(si));
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.waitSemaphoreCount = in_wait_count;
+        si.pWaitSemaphores = in_wait_sems;
+        si.pWaitDstStageMask = wait_stages;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &sc->cmd_buf;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &sc->readback_sem;
+        VkResult_ sres = d->p_queue_submit(readback_queue, 1, &si, sc->fence);
+        if (wait_stages && wait_stages != stack_stages) {
+            free(wait_stages);
+        }
+        if (sres != VK_SUCCESS) {
+            return false;
+        }
+    }
+
+    sc->readback_sem_pending = true;
+    *out_sem = sc->readback_sem;
+
     if (d->p_wait_fences(d->device, 1, &sc->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        return;
+        return true; /* semaphore already chained; skip CPU blit */
     }
 
     SDL_Window *win = sc->window;
@@ -1210,11 +1611,11 @@ static void blit_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image_ind
     }
     if (!win->surface) {
         if (!sdlop.video->CreateWindowFramebuffer(sdlop.video, win, &win->surface)) {
-            return;
+            return true;
         }
     }
     if (!win->surface || !win->surface->pixels) {
-        return;
+        return true;
     }
 
     copy_vk_pixels_to_xrgb8888((const uint8_t *)sc->staging_mapped,
@@ -1225,6 +1626,7 @@ static void blit_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image_ind
     SDL_Rect rect = { 0, 0, win->surface->w, win->surface->h };
     sdlop.video->UpdateWindowFramebuffer(sdlop.video, win, &rect, 1);
     SDLOP_SendWindowEvent(win, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1314,14 +1716,11 @@ static VkResult_ wrap_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice
     VkResult_ res = p_real(gpu, surface, pCapabilities);
     if (res == VK_SUCCESS && pCapabilities) {
         TrackedSurface *ts = find_surface(surface);
-        if (ts) {
-            pCapabilities->supportedUsageFlags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-            if (ts->window &&
-                (pCapabilities->currentExtent.width == 0xFFFFFFFFu ||
-                 pCapabilities->currentExtent.height == 0xFFFFFFFFu)) {
-                pCapabilities->currentExtent.width = ts->window->w > 0 ? (uint32_t)ts->window->w : 640u;
-                pCapabilities->currentExtent.height = ts->window->h > 0 ? (uint32_t)ts->window->h : 480u;
-            }
+        if (ts && ts->window &&
+            (pCapabilities->currentExtent.width == 0xFFFFFFFFu ||
+             pCapabilities->currentExtent.height == 0xFFFFFFFFu)) {
+            pCapabilities->currentExtent.width = ts->window->w > 0 ? (uint32_t)ts->window->w : 640u;
+            pCapabilities->currentExtent.height = ts->window->h > 0 ? (uint32_t)ts->window->h : 480u;
         }
     }
     return res;
@@ -1364,14 +1763,23 @@ static VkResult_ wrap_vkCreateSwapchainKHR(VkDevice_ device,
     TrackedSurface *ts = find_surface(pCreateInfo->surface);
     VkSwapchainCreateInfoKHR_ ci = *pCreateInfo;
     if (ts) {
+        VkInstance_ inst = td->instance ? td->instance : resolve_instance_for_gpu(td->gpu);
+        PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_caps = (vk_offload.real_gipa && inst && td->gpu) ?
+            VK_CAST(PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_,
+                    vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) : NULL;
+        if (p_caps) {
+            VkSurfaceCapabilitiesKHR_ caps;
+            memset(&caps, 0, sizeof(caps));
+            if (p_caps(td->gpu, pCreateInfo->surface, &caps) == VK_SUCCESS &&
+                (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0) {
+                SDL_SetError("Vulkan offload requires VK_IMAGE_USAGE_TRANSFER_SRC_BIT, which the surface does not support");
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
         ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     }
 
     VkResult_ res = td->real_create_swapchain(device, &ci, pAllocator, pSwapchain);
-    if (res != VK_SUCCESS && ts) {
-        /* Retry without forcing TRANSFER_SRC_BIT if driver rejected it. */
-        res = td->real_create_swapchain(device, pCreateInfo, pAllocator, pSwapchain);
-    }
     if (res == VK_SUCCESS && ts && *pSwapchain) {
         TrackedSwapchain *sc = (TrackedSwapchain *)calloc(1, sizeof(*sc));
         if (sc) {
@@ -1381,6 +1789,16 @@ static VkResult_ wrap_vkCreateSwapchainKHR(VkDevice_ device,
             sc->width = pCreateInfo->imageExtent.width;
             sc->height = pCreateInfo->imageExtent.height;
             sc->format = pCreateInfo->imageFormat;
+            sc->sharing_mode = pCreateInfo->imageSharingMode;
+            if (pCreateInfo->imageSharingMode == VK_SHARING_MODE_CONCURRENT &&
+                pCreateInfo->pQueueFamilyIndices && td->has_transfer_qf) {
+                for (uint32_t i = 0; i < pCreateInfo->queueFamilyIndexCount; i++) {
+                    if (pCreateInfo->pQueueFamilyIndices[i] == td->transfer_qf) {
+                        sc->concurrent_has_transfer_qf = true;
+                        break;
+                    }
+                }
+            }
             if (td->real_get_swapchain_images) {
                 uint32_t ic = 0;
                 if (td->real_get_swapchain_images(device, *pSwapchain, &ic, NULL) == VK_SUCCESS && ic > 0) {
@@ -1458,16 +1876,80 @@ static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ 
         return -1;
     }
 
-    VkResult_ res = p_present(queue, pPresentInfo);
-    if (res == VK_SUCCESS && pPresentInfo && pPresentInfo->pSwapchains && pPresentInfo->pImageIndices) {
-        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
-            TrackedSwapchain *sc = find_swapchain(pPresentInfo->pSwapchains[i]);
-            if (sc && sc->window) {
-                blit_swapchain_to_window_fb(sc, pPresentInfo->pImageIndices[i], queue);
+    if (!pPresentInfo || !pPresentInfo->pSwapchains || !pPresentInfo->pImageIndices ||
+        pPresentInfo->swapchainCount == 0) {
+        return p_present(queue, pPresentInfo);
+    }
+
+    uint32_t cur_wait_count = pPresentInfo->waitSemaphoreCount;
+    const VkSemaphore_ *cur_wait_sems = pPresentInfo->pWaitSemaphores;
+    VkSemaphore_ chained_sem = 0;
+    TrackedSwapchain *last_sc = NULL;
+
+    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
+        TrackedSwapchain *sc = find_swapchain(pPresentInfo->pSwapchains[i]);
+        if (sc && sc->window) {
+            VkSemaphore_ out_sem = 0;
+            if (readback_swapchain_to_window_fb(sc, pPresentInfo->pImageIndices[i], queue,
+                                                cur_wait_count, cur_wait_sems, &out_sem)) {
+                if (last_sc) {
+                    last_sc->readback_sem_pending = false;
+                }
+                chained_sem = out_sem;
+                cur_wait_count = 1;
+                cur_wait_sems = &chained_sem;
+                last_sc = sc;
             }
         }
     }
+
+    VkPresentInfoKHR_ pi = *pPresentInfo;
+    pi.waitSemaphoreCount = cur_wait_count;
+    pi.pWaitSemaphores = cur_wait_sems;
+
+    VkResult_ res = p_present(queue, &pi);
+    if (last_sc && (res == VK_SUCCESS || res == 1000001003 /* VK_SUBOPTIMAL_KHR */)) {
+        last_sc->readback_sem_pending = false;
+    }
     return res;
+}
+
+static void wrap_vkGetDeviceQueue(VkDevice_ device,
+                                  uint32_t queueFamilyIndex,
+                                  uint32_t queueIndex,
+                                  VkQueue_ *pQueue)
+{
+    TrackedDevice *td = find_device(device);
+    if (td && td->real_get_device_queue) {
+        td->real_get_device_queue(device, queueFamilyIndex, queueIndex, pQueue);
+        if (pQueue && *pQueue) {
+            track_device_queue(td, *pQueue, queueFamilyIndex);
+        }
+    }
+}
+
+static void wrap_vkGetDeviceQueue2(VkDevice_ device,
+                                   const VkDeviceQueueInfo2_ *pQueueInfo,
+                                   VkQueue_ *pQueue)
+{
+    TrackedDevice *td = find_device(device);
+    if (td && td->real_get_device_queue2) {
+        td->real_get_device_queue2(device, pQueueInfo, pQueue);
+        if (pQueue && *pQueue && pQueueInfo) {
+            track_device_queue(td, *pQueue, pQueueInfo->queueFamilyIndex);
+        }
+    }
+}
+
+static void free_tracked_device_fields(TrackedDevice *td)
+{
+    while (td->queues) {
+        TrackedQueue *tq = td->queues;
+        td->queues = tq->next;
+        free(tq);
+    }
+    free(td->qf_flags);
+    td->qf_flags = NULL;
 }
 
 static void wrap_vkDestroyDevice(VkDevice_ device, const void *pAllocator)
@@ -1496,6 +1978,7 @@ static void wrap_vkDestroyDevice(VkDevice_ device, const void *pAllocator)
 
     if (td) {
         PFN_vkDestroyDevice_ real_destroy = td->real_destroy_device;
+        free_tracked_device_fields(td);
         free(td);
         if (real_destroy) {
             real_destroy(device, pAllocator);
@@ -1514,6 +1997,12 @@ static PFN_vkVoid_ wrap_vkGetDeviceProcAddr(VkDevice_ device, const char *pName)
         return (vk_offload.real_gipa && inst) ? vk_offload.real_gipa(inst, pName) : NULL;
     }
     if (vk_offload.active) {
+        if (strcmp(pName, "vkGetDeviceQueue") == 0 && td->real_get_device_queue) {
+            return VK_VOID(wrap_vkGetDeviceQueue);
+        }
+        if (strcmp(pName, "vkGetDeviceQueue2") == 0 && td->real_get_device_queue2) {
+            return VK_VOID(wrap_vkGetDeviceQueue2);
+        }
         if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
             return VK_VOID(wrap_vkCreateSwapchainKHR);
         }
@@ -1593,13 +2082,36 @@ static VkResult_ wrap_vkCreateDevice(VkPhysicalDevice_ physicalDevice,
     td->device = *pDevice;
     td->instance = inst;
     td->gpu = physicalDevice;
-    td->queue_family = (pCreateInfo && pCreateInfo->queueCreateInfoCount > 0 && pCreateInfo->pQueueCreateInfos)
-        ? pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex : 0u;
+
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties_ p_qf_props =
+        VK_CAST(PFN_vkGetPhysicalDeviceQueueFamilyProperties_,
+                vk_offload.real_gipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    if (p_qf_props) {
+        uint32_t qfc = 0;
+        p_qf_props(physicalDevice, &qfc, NULL);
+        if (qfc > 0) {
+            VkQueueFamilyProperties_ *props = (VkQueueFamilyProperties_ *)calloc(qfc, sizeof(*props));
+            td->qf_flags = (uint32_t *)calloc(qfc, sizeof(uint32_t));
+            if (props && td->qf_flags) {
+                p_qf_props(physicalDevice, &qfc, props);
+                td->qf_count = qfc;
+                for (uint32_t i = 0; i < qfc; i++) {
+                    td->qf_flags[i] = props[i].queueFlags;
+                }
+            } else {
+                free(td->qf_flags);
+                td->qf_flags = NULL;
+            }
+            free(props);
+        }
+    }
 
     td->real_gdpa = VK_CAST(PFN_vkGetDeviceProcAddr_, vk_offload.real_gipa(inst, "vkGetDeviceProcAddr"));
     PFN_vkGetDeviceProcAddr_ gdpa = td->real_gdpa;
     if (gdpa) {
         td->real_destroy_device = VK_CAST(PFN_vkDestroyDevice_, gdpa(*pDevice, "vkDestroyDevice"));
+        td->real_get_device_queue = VK_CAST(PFN_vkGetDeviceQueue_, gdpa(*pDevice, "vkGetDeviceQueue"));
+        td->real_get_device_queue2 = VK_CAST(PFN_vkGetDeviceQueue2_, gdpa(*pDevice, "vkGetDeviceQueue2"));
         td->real_create_swapchain = VK_CAST(PFN_vkCreateSwapchainKHR_, gdpa(*pDevice, "vkCreateSwapchainKHR"));
         td->real_destroy_swapchain = VK_CAST(PFN_vkDestroySwapchainKHR_, gdpa(*pDevice, "vkDestroySwapchainKHR"));
         td->real_get_swapchain_images = VK_CAST(PFN_vkGetSwapchainImagesKHR_, gdpa(*pDevice, "vkGetSwapchainImagesKHR"));
@@ -1625,7 +2137,41 @@ static VkResult_ wrap_vkCreateDevice(VkPhysicalDevice_ physicalDevice,
         td->p_destroy_fence = VK_CAST(PFN_vkDestroyFence_, gdpa(*pDevice, "vkDestroyFence"));
         td->p_reset_fences = VK_CAST(PFN_vkResetFences_, gdpa(*pDevice, "vkResetFences"));
         td->p_wait_fences = VK_CAST(PFN_vkWaitForFences_, gdpa(*pDevice, "vkWaitForFences"));
+        td->p_create_sem = VK_CAST(PFN_vkCreateSemaphore_, gdpa(*pDevice, "vkCreateSemaphore"));
+        td->p_destroy_sem = VK_CAST(PFN_vkDestroySemaphore_, gdpa(*pDevice, "vkDestroySemaphore"));
         td->p_queue_submit = VK_CAST(PFN_vkQueueSubmit_, gdpa(*pDevice, "vkQueueSubmit"));
+    }
+
+    if (pCreateInfo && pCreateInfo->pQueueCreateInfos) {
+        uint32_t chosen_flags = 0;
+        for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+            uint32_t qf = pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex;
+            bool ok = (qf < td->qf_count) ? is_transfer_capable_flags(td->qf_flags[qf]) : true;
+            if (ok && pCreateInfo->pQueueCreateInfos[i].queueCount > 0) {
+                td->transfer_qf = qf;
+                td->has_transfer_qf = true;
+                chosen_flags = pCreateInfo->pQueueCreateInfos[i].flags;
+                if (chosen_flags == 0) {
+                    break;
+                }
+            }
+        }
+        if (td->has_transfer_qf) {
+            if (chosen_flags == 0 && td->real_get_device_queue) {
+                td->real_get_device_queue(*pDevice, td->transfer_qf, 0, &td->transfer_queue);
+            } else if (td->real_get_device_queue2) {
+                VkDeviceQueueInfo2_ qi2;
+                memset(&qi2, 0, sizeof(qi2));
+                qi2.sType = 1000145003u; /* VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2 */
+                qi2.flags = chosen_flags;
+                qi2.queueFamilyIndex = td->transfer_qf;
+                qi2.queueIndex = 0;
+                td->real_get_device_queue2(*pDevice, &qi2, &td->transfer_queue);
+            }
+            if (td->transfer_queue) {
+                track_device_queue(td, td->transfer_queue, td->transfer_qf);
+            }
+        }
     }
 
     td->next = vk_offload.devices;
@@ -1642,8 +2188,19 @@ static PFN_vkVoid_ wrapped_vkGetInstanceProcAddr(VkInstance_ instance, const cha
         vk_offload.instance = instance;
     }
     if (vk_offload.active) {
-        if (!instance && strcmp(pName, "vkCreateInstance") == 0) {
-            return VK_VOID(wrap_vkCreateInstance);
+        if (strcmp(pName, "vkGetInstanceProcAddr") == 0) {
+            return VK_VOID(wrapped_vkGetInstanceProcAddr);
+        }
+        if (!instance) {
+            if (strcmp(pName, "vkCreateInstance") == 0) {
+                return VK_VOID(wrap_vkCreateInstance);
+            }
+            if (strcmp(pName, "vkEnumerateInstanceExtensionProperties") == 0 ||
+                strcmp(pName, "vkEnumerateInstanceLayerProperties") == 0 ||
+                strcmp(pName, "vkEnumerateInstanceVersion") == 0) {
+                return vk_offload.real_gipa(NULL, pName);
+            }
+            return NULL;
         }
         if (strcmp(pName, "vkDestroyInstance") == 0) {
             return VK_VOID(wrap_vkDestroyInstance);
@@ -1668,6 +2225,12 @@ static PFN_vkVoid_ wrapped_vkGetInstanceProcAddr(VkInstance_ instance, const cha
         }
         if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
             return VK_VOID(wrap_vkGetDeviceProcAddr);
+        }
+        if (strcmp(pName, "vkGetDeviceQueue") == 0) {
+            return VK_VOID(wrap_vkGetDeviceQueue);
+        }
+        if (strcmp(pName, "vkGetDeviceQueue2") == 0) {
+            return VK_VOID(wrap_vkGetDeviceQueue2);
         }
         if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
             return VK_VOID(wrap_vkCreateSwapchainKHR);
@@ -1704,6 +2267,7 @@ void SDLOP_VulkanOffload_Shutdown(void)
     while (vk_offload.devices) {
         TrackedDevice *td = vk_offload.devices;
         vk_offload.devices = td->next;
+        free_tracked_device_fields(td);
         free(td);
     }
     while (vk_offload.gpus) {

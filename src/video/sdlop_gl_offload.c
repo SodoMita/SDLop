@@ -54,6 +54,9 @@
 #ifndef EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR
 #define EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR 0x00000002
 #endif
+#ifndef EGL_CONTEXT_FLAGS_KHR
+#define EGL_CONTEXT_FLAGS_KHR 0x30FC
+#endif
 #ifndef EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR
 #define EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR 0x00000001
 #endif
@@ -800,6 +803,47 @@ const char *SDLOP_GLOffload_GetGPUDescription(void)
 /* Context and surface lifecycle                                       */
 /* ------------------------------------------------------------------ */
 
+int SDLOP_GLOffload_BuildContextAttribs(uint32_t egl_api,
+                                        int major_version,
+                                        int minor_version,
+                                        int profile_mask,
+                                        int flags,
+                                        int *attribs,
+                                        int max_attribs)
+{
+    if (!attribs || max_attribs < 10) {
+        return -1;
+    }
+    int n = 0;
+    if (egl_api == EGL_OPENGL_API) {
+        int ctx_flags = 0;
+        attribs[n++] = EGL_CONTEXT_MAJOR_VERSION_KHR; attribs[n++] = major_version;
+        attribs[n++] = EGL_CONTEXT_MINOR_VERSION_KHR; attribs[n++] = minor_version;
+        attribs[n++] = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
+        attribs[n++] = (profile_mask & SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
+            ? EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR
+            : EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR;
+        if (flags & SDL_GL_CONTEXT_DEBUG_FLAG) {
+            ctx_flags |= EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
+        }
+        if (flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) {
+            ctx_flags |= EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR;
+        }
+        if (ctx_flags != 0) {
+            attribs[n++] = EGL_CONTEXT_FLAGS_KHR;
+            attribs[n++] = ctx_flags;
+        }
+    } else {
+        attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
+        attribs[n++] = major_version >= 3 ? 3 : 2;
+        if (flags & SDL_GL_CONTEXT_DEBUG_FLAG) {
+            attribs[n++] = EGL_CONTEXT_FLAGS_KHR;
+            attribs[n++] = EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
+        }
+    }
+    return n;
+}
+
 SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContext(uint32_t egl_api,
                                                       SDLOP_GLOffloadContext *share_ctx)
 {
@@ -823,26 +867,27 @@ SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContext(uint32_t egl_api,
         return NULL;
     }
 
-    EGLint ctx_attribs[16];
-    int n = 0;
-    if (egl_api == EGL_OPENGL_API) {
-        ctx_attribs[n++] = EGL_CONTEXT_MAJOR_VERSION_KHR; ctx_attribs[n++] = sdlop_glattrs.major_version;
-        ctx_attribs[n++] = EGL_CONTEXT_MINOR_VERSION_KHR; ctx_attribs[n++] = sdlop_glattrs.minor_version;
-        ctx_attribs[n++] = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
-        ctx_attribs[n++] = (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
-            ? EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR
-            : EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR;
-        if (sdlop_glattrs.flags & SDL_GL_CONTEXT_DEBUG_FLAG) {
-            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
-        }
-        if (sdlop_glattrs.flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) {
-            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR;
-        }
-    } else {
-        ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
-        ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
+    int base_attribs[16];
+    int n = SDLOP_GLOffload_BuildContextAttribs(egl_api,
+                                                sdlop_glattrs.major_version,
+                                                sdlop_glattrs.minor_version,
+                                                sdlop_glattrs.profile_mask,
+                                                sdlop_glattrs.flags,
+                                                base_attribs,
+                                                (int)(sizeof(base_attribs) / sizeof(base_attribs[0])));
+    if (n < 0) {
+        return NULL;
     }
-    ctx_attribs[n++] = EGL_NONE;
+
+    EGLint ctx_attribs[64];
+    for (int i = 0; i < n; i++) {
+        ctx_attribs[i] = (EGLint)base_attribs[i];
+    }
+    n = SDLOP_EGL_AppendUserAttribs(true, offload.dpy, config, ctx_attribs, n,
+                                    (int)(sizeof(ctx_attribs) / sizeof(ctx_attribs[0])));
+    if (n < 0) {
+        return NULL;
+    }
 
     EGLContext share = share_ctx ? share_ctx->egl_ctx : EGL_NO_CONTEXT;
     EGLContext egl_ctx = SDLOP_EGL_eglCreateContext(offload.dpy, config, share, ctx_attribs);

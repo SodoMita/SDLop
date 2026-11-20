@@ -201,6 +201,227 @@ static void test_live_backend(void)
     unsetenv("SDLOP_GL_OFFLOAD");
 }
 
+static int find_attrib_val(const int *attribs, int n, int key, int *val_out)
+{
+    for (int i = 0; i + 1 < n; i += 2) {
+        if (attribs[i] == key) {
+            if (val_out) {
+                *val_out = attribs[i + 1];
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void test_build_context_attribs(void)
+{
+    enum {
+        kEGL_OPENGL_ES_API = 0x30A0,
+        kEGL_OPENGL_API = 0x30A2,
+        kEGL_CONTEXT_CLIENT_VERSION = 0x3098,
+        kEGL_CONTEXT_MAJOR_VERSION_KHR = 0x3098,
+        kEGL_CONTEXT_MINOR_VERSION_KHR = 0x30FB,
+        kEGL_CONTEXT_FLAGS_KHR = 0x30FC,
+        kEGL_CONTEXT_OPENGL_PROFILE_MASK_KHR = 0x30FD,
+        kEGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR = 0x00000001,
+        kEGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR = 0x00000002,
+        kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR = 0x00000001,
+        kEGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR = 0x00000002,
+    };
+
+    int attribs[16];
+    int n = 0;
+    int val = 0;
+
+    /* Core 3.2, no flags -> no EGL_CONTEXT_FLAGS_KHR emitted */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_API, 3, 2,
+                                            SDL_GL_CONTEXT_PROFILE_CORE, 0,
+                                            attribs, 16);
+    CHECK(n > 0 && (n % 2) == 0, "Core no-flags attrib count valid (%d)", n);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_MAJOR_VERSION_KHR, &val) && val == 3, "major==3");
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_MINOR_VERSION_KHR, &val) && val == 2, "minor==2");
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, &val) &&
+          val == kEGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR, "core profile mask");
+    CHECK(!find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, NULL), "no flags -> no EGL_CONTEXT_FLAGS_KHR");
+
+    /* Core 3.2 + DEBUG */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_API, 3, 2,
+                                            SDL_GL_CONTEXT_PROFILE_CORE,
+                                            SDL_GL_CONTEXT_DEBUG_FLAG,
+                                            attribs, 16);
+    CHECK(n > 0 && (n % 2) == 0, "Core DEBUG attrib count valid (%d)", n);
+    for (int i = 0; i < n; i += 2) {
+        CHECK(attribs[i] >= 0x3000, "Core DEBUG key[%d]=0x%x must be valid EGL attrib", i, attribs[i]);
+    }
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, &val) &&
+          val == kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR,
+          "Core DEBUG emits EGL_CONTEXT_FLAGS_KHR=0x%x (got 0x%x)",
+          kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR, val);
+
+    /* Core 3.2 + FORWARD_COMPATIBLE */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_API, 3, 2,
+                                            SDL_GL_CONTEXT_PROFILE_CORE,
+                                            SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG,
+                                            attribs, 16);
+    CHECK(n > 0 && (n % 2) == 0, "Core FWD attrib count valid (%d)", n);
+    for (int i = 0; i < n; i += 2) {
+        CHECK(attribs[i] >= 0x3000, "Core FWD key[%d]=0x%x must be valid EGL attrib", i, attribs[i]);
+    }
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, &val) &&
+          val == kEGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR,
+          "Core FWD emits EGL_CONTEXT_FLAGS_KHR=0x%x (got 0x%x)",
+          kEGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR, val);
+
+    /* Core 3.2 + DEBUG | FORWARD_COMPATIBLE combined bitmask */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_API, 3, 2,
+                                            SDL_GL_CONTEXT_PROFILE_CORE,
+                                            SDL_GL_CONTEXT_DEBUG_FLAG |
+                                            SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG,
+                                            attribs, 16);
+    CHECK(n > 0 && (n % 2) == 0, "Core DEBUG|FWD attrib count valid (%d)", n);
+    for (int i = 0; i < n; i += 2) {
+        CHECK(attribs[i] >= 0x3000, "Core DEBUG|FWD key[%d]=0x%x must be valid EGL attrib", i, attribs[i]);
+    }
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, &val) &&
+          val == (kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR | kEGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR),
+          "Core DEBUG|FWD emits combined bitmask 0x%x (got 0x%x)",
+          kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR | kEGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR, val);
+
+    /* Compatibility profile + DEBUG */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_API, 3, 0,
+                                            SDL_GL_CONTEXT_PROFILE_COMPATIBILITY,
+                                            SDL_GL_CONTEXT_DEBUG_FLAG,
+                                            attribs, 16);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, &val) &&
+          val == kEGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR, "compat profile mask");
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, &val) &&
+          val == kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR, "compat DEBUG flag");
+
+    /* ES 2.0 + DEBUG */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_ES_API, 2, 0,
+                                            SDL_GL_CONTEXT_PROFILE_ES,
+                                            SDL_GL_CONTEXT_DEBUG_FLAG,
+                                            attribs, 16);
+    CHECK(n > 0 && (n % 2) == 0, "ES DEBUG attrib count valid (%d)", n);
+    for (int i = 0; i < n; i += 2) {
+        CHECK(attribs[i] >= 0x3000, "ES DEBUG key[%d]=0x%x must be valid EGL attrib", i, attribs[i]);
+    }
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_CLIENT_VERSION, &val) && val == 2, "ES2 version");
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, &val) &&
+          val == kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR, "ES2 DEBUG emits EGL_CONTEXT_FLAGS_KHR");
+}
+
+static void test_context_flags_offload(void)
+{
+    typedef void (*PFN_glClearColor)(float, float, float, float);
+    typedef void (*PFN_glClear)(unsigned int);
+    typedef void (*PFN_glGetIntegerv)(unsigned int, int *);
+
+    setenv("SDL_VIDEODRIVER", "dummy", 1);
+    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    setenv("SDLOP_GL_OFFLOAD", "1", 1);
+
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        printf("test_gl_offload: context flags check skipped (SDL_Init: %s)\n", SDL_GetError());
+        goto done;
+    }
+
+    /* Probe whether EGL + Mesa is present at all using a plain ES2 context. */
+    SDL_GL_ResetAttributes();
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_Window *probe_w = SDL_CreateWindow("gl-flags-probe", 32, 32, SDL_WINDOW_OPENGL);
+    if (!probe_w) {
+        SDL_Quit();
+        printf("test_gl_offload: context flags check skipped (no GL window)\n");
+        goto done;
+    }
+    SDL_GLContext probe_ctx = SDL_GL_CreateContext(probe_w);
+    if (!probe_ctx) {
+        SDL_DestroyWindow(probe_w);
+        SDL_Quit();
+        printf("test_gl_offload: context flags check skipped (no EGL offload: %s)\n", SDL_GetError());
+        goto done;
+    }
+    SDL_GL_DestroyContext(probe_ctx);
+    SDL_DestroyWindow(probe_w);
+
+    static const struct {
+        const char *name;
+        int profile;
+        int major;
+        int minor;
+        int flags;
+    } cases[] = {
+        { "Core 3.2 + DEBUG",
+          SDL_GL_CONTEXT_PROFILE_CORE, 3, 2, SDL_GL_CONTEXT_DEBUG_FLAG },
+        { "Core 3.2 + FORWARD_COMPATIBLE",
+          SDL_GL_CONTEXT_PROFILE_CORE, 3, 2, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG },
+        { "Core 3.2 + DEBUG | FORWARD_COMPATIBLE",
+          SDL_GL_CONTEXT_PROFILE_CORE, 3, 2,
+          SDL_GL_CONTEXT_DEBUG_FLAG | SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG },
+        { "ES 2.0 + DEBUG",
+          SDL_GL_CONTEXT_PROFILE_ES, 2, 0, SDL_GL_CONTEXT_DEBUG_FLAG },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        SDL_GL_ResetAttributes();
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, cases[i].profile);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, cases[i].major);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, cases[i].minor);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, cases[i].flags);
+
+        SDL_Window *w = SDL_CreateWindow(cases[i].name, 64, 48, SDL_WINDOW_OPENGL);
+        CHECK(w != NULL, "%s: SDL_CreateWindow: %s", cases[i].name, SDL_GetError());
+        if (!w) {
+            continue;
+        }
+        SDL_GLContext ctx = SDL_GL_CreateContext(w);
+        CHECK(ctx != NULL, "%s: SDL_GL_CreateContext: %s", cases[i].name, SDL_GetError());
+        if (ctx) {
+            if (cases[i].profile == SDL_GL_CONTEXT_PROFILE_CORE) {
+                PFN_glGetIntegerv pGetIntegerv = (PFN_glGetIntegerv)SDL_GL_GetProcAddress("glGetIntegerv");
+                if (pGetIntegerv) {
+                    int gl_flags = 0;
+                    /* GL_CONTEXT_FLAGS == 0x821E; bit 0 = FORWARD_COMPATIBLE (1), bit 1 = DEBUG (2) */
+                    pGetIntegerv(0x821Eu, &gl_flags);
+                    int expect = 0;
+                    if (cases[i].flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) {
+                        expect |= 1;
+                    }
+                    if (cases[i].flags & SDL_GL_CONTEXT_DEBUG_FLAG) {
+                        expect |= 2;
+                    }
+                    CHECK((gl_flags & expect) == expect,
+                          "%s: GL_CONTEXT_FLAGS=0x%x missing expected 0x%x",
+                          cases[i].name, gl_flags, expect);
+                }
+            }
+
+            PFN_glClearColor pClearColor = (PFN_glClearColor)SDL_GL_GetProcAddress("glClearColor");
+            PFN_glClear pClear = (PFN_glClear)SDL_GL_GetProcAddress("glClear");
+            CHECK(pClearColor && pClear, "%s: GL procs", cases[i].name);
+            if (pClearColor && pClear) {
+                pClearColor(0.25f, 0.5f, 0.75f, 1.0f);
+                pClear(0x00004000u);
+                CHECK(SDL_GL_SwapWindow(w), "%s: swap: %s", cases[i].name, SDL_GetError());
+                SDL_Surface *fb = SDL_GetWindowSurface(w);
+                CHECK(fb && fb->pixels, "%s: window surface populated", cases[i].name);
+            }
+            SDL_GL_DestroyContext(ctx);
+        }
+        SDL_DestroyWindow(w);
+    }
+
+    SDL_Quit();
+done:
+    unsetenv("SDLOP_GL_OFFLOAD");
+    unsetenv("SDL_VIDEODRIVER");
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDLOP_GL_OFFLOAD");
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDL_VIDEODRIVER");
+}
+
 static void test_dummy_opt_out(void)
 {
     setenv("SDL_VIDEODRIVER", "dummy", 1);
@@ -226,7 +447,9 @@ int main(void)
     test_software_renderer_detection();
     test_flip_copy();
     test_gl_attrs();
+    test_build_context_attribs();
     test_live_backend();
+    test_context_flags_offload();
     test_dummy_opt_out();
 
     if (failures) {

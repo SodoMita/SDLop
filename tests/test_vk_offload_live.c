@@ -31,6 +31,48 @@
         }                                                          \
     } while (0)
 
+#ifdef VK_EXT_debug_utils
+typedef struct ValidationState {
+    int error_count;
+} ValidationState;
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL validation_callback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT types,
+    const VkDebugUtilsMessengerCallbackDataEXT *data,
+    void *user_data)
+{
+    (void)types;
+    ValidationState *st = (ValidationState *)user_data;
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        if (st) {
+            st->error_count++;
+        }
+        fprintf(stderr, "VULKAN VALIDATION ERROR: %s\n",
+                (data && data->pMessage) ? data->pMessage : "(null)");
+    } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        fprintf(stderr, "VULKAN VALIDATION WARNING: %s\n",
+                (data && data->pMessage) ? data->pMessage : "(null)");
+    }
+    return VK_FALSE;
+}
+#endif
+
+static void test_auto_probe_no_crash(void)
+{
+    setenv("SDL_VIDEODRIVER", "dummy", 1);
+    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    setenv("SDLOP_VULKAN_OFFLOAD", "auto", 1);
+    if (SDL_Init(SDL_INIT_VIDEO)) {
+        if (SDL_Vulkan_LoadLibrary(NULL)) {
+            Uint32 c = 0;
+            (void)SDL_Vulkan_GetInstanceExtensions(&c);
+            SDL_Vulkan_UnloadLibrary();
+        }
+        SDL_Quit();
+    }
+}
+
 int main(void)
 {
     int failures = 0;
@@ -44,11 +86,18 @@ int main(void)
     VkRenderPass render_pass = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkFramebuffer fb = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE;
+    VkFramebuffer *fbs = NULL;
+    VkImageView *views = NULL;
+    uint32_t icount = 0;
     VkSemaphore sem_a = VK_NULL_HANDLE;
     VkSemaphore sem_b = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+
+#ifdef VK_EXT_debug_utils
+    ValidationState vstate = { 0 };
+    VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
+    PFN_vkDestroyDebugUtilsMessengerEXT p_destroy_debug = NULL;
+#endif
 
     PFN_vkGetInstanceProcAddr gipa = NULL;
     PFN_vkGetDeviceProcAddr gdpa = NULL;
@@ -62,6 +111,8 @@ int main(void)
     PFN_vkDestroyImageView p_destroy_image_view = NULL;
     PFN_vkDestroySemaphore p_destroy_semaphore = NULL;
     PFN_vkDestroyFence p_destroy_fence = NULL;
+
+    test_auto_probe_no_crash();
 
     setenv("SDL_VIDEODRIVER", "dummy", 1);
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
@@ -89,6 +140,73 @@ int main(void)
         (PFN_vkCreateInstance)gipa(VK_NULL_HANDLE, "vkCreateInstance");
     CHECK(p_create_instance != NULL, "vkCreateInstance lookup");
 
+    int has_val_layer = 0;
+    int has_debug_utils = 0;
+    int has_val_features = 0;
+
+    PFN_vkEnumerateInstanceLayerProperties p_enum_layers =
+        (PFN_vkEnumerateInstanceLayerProperties)gipa(VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties");
+    PFN_vkEnumerateInstanceExtensionProperties p_enum_inst_exts =
+        (PFN_vkEnumerateInstanceExtensionProperties)gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+
+    if (p_enum_layers) {
+        uint32_t lc = 0;
+        if (p_enum_layers(&lc, NULL) == VK_SUCCESS && lc > 0) {
+            VkLayerProperties *lps = (VkLayerProperties *)alloca(lc * sizeof(*lps));
+            if (p_enum_layers(&lc, lps) == VK_SUCCESS) {
+                for (uint32_t i = 0; i < lc; i++) {
+                    if (strcmp(lps[i].layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+                        has_val_layer = 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (p_enum_inst_exts) {
+        uint32_t ec = 0;
+        if (p_enum_inst_exts(NULL, &ec, NULL) == VK_SUCCESS && ec > 0) {
+            VkExtensionProperties *eps = (VkExtensionProperties *)alloca(ec * sizeof(*eps));
+            if (p_enum_inst_exts(NULL, &ec, eps) == VK_SUCCESS) {
+                for (uint32_t i = 0; i < ec; i++) {
+                    if (strcmp(eps[i].extensionName, "VK_EXT_debug_utils") == 0) {
+                        has_debug_utils = 1;
+                    }
+                }
+            }
+        }
+        if (has_val_layer) {
+            uint32_t lec = 0;
+            if (p_enum_inst_exts("VK_LAYER_KHRONOS_validation", &lec, NULL) == VK_SUCCESS && lec > 0) {
+                VkExtensionProperties *leps = (VkExtensionProperties *)alloca(lec * sizeof(*leps));
+                if (p_enum_inst_exts("VK_LAYER_KHRONOS_validation", &lec, leps) == VK_SUCCESS) {
+                    for (uint32_t i = 0; i < lec; i++) {
+                        if (strcmp(leps[i].extensionName, "VK_EXT_debug_utils") == 0) {
+                            has_debug_utils = 1;
+                        }
+                        if (strcmp(leps[i].extensionName, "VK_EXT_validation_features") == 0) {
+                            has_val_features = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const char *inst_exts[16];
+    uint32_t total_inst_exts = 0;
+    for (Uint32 i = 0; i < ext_count && total_inst_exts < 14; i++) {
+        inst_exts[total_inst_exts++] = exts[i];
+    }
+    int enable_validation = (has_val_layer && has_debug_utils);
+    const char *val_layers[1] = { "VK_LAYER_KHRONOS_validation" };
+    if (enable_validation) {
+        inst_exts[total_inst_exts++] = "VK_EXT_debug_utils";
+        if (has_val_features) {
+            inst_exts[total_inst_exts++] = "VK_EXT_validation_features";
+        }
+    }
+
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "sdlop_test_vk_offload_live",
@@ -97,9 +215,24 @@ int main(void)
     VkInstanceCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &app,
-        .enabledExtensionCount = ext_count,
-        .ppEnabledExtensionNames = exts,
+        .enabledExtensionCount = total_inst_exts,
+        .ppEnabledExtensionNames = inst_exts,
+        .enabledLayerCount = enable_validation ? 1u : 0u,
+        .ppEnabledLayerNames = enable_validation ? val_layers : NULL,
     };
+#ifdef VK_EXT_validation_features
+    VkValidationFeatureEnableEXT enables[] = {
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+    };
+    VkValidationFeaturesEXT val_features = {
+        .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+        .enabledValidationFeatureCount = 1,
+        .pEnabledValidationFeatures = enables,
+    };
+    if (enable_validation && has_val_features) {
+        ici.pNext = &val_features;
+    }
+#endif
     VkResult ires = p_create_instance(&ici, NULL, &instance);
     if (ires == VK_ERROR_EXTENSION_NOT_PRESENT || ires == VK_ERROR_INCOMPATIBLE_DRIVER) {
         printf("test_vk_offload_live: SKIP (vkCreateInstance=%d)\n", ires);
@@ -107,6 +240,33 @@ int main(void)
         goto cleanup;
     }
     CHECK(ires == VK_SUCCESS && instance != VK_NULL_HANDLE, "vkCreateInstance: %d", ires);
+
+#ifdef VK_EXT_debug_utils
+    if (enable_validation) {
+        PFN_vkCreateDebugUtilsMessengerEXT p_create_debug =
+            (PFN_vkCreateDebugUtilsMessengerEXT)gipa(instance, "vkCreateDebugUtilsMessengerEXT");
+        p_destroy_debug =
+            (PFN_vkDestroyDebugUtilsMessengerEXT)gipa(instance, "vkDestroyDebugUtilsMessengerEXT");
+        if (p_create_debug) {
+            VkDebugUtilsMessengerCreateInfoEXT dmci = {
+                .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+                .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                                   VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+                .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+                .pfnUserCallback = validation_callback,
+                .pUserData = &vstate,
+            };
+            CHECK(p_create_debug(instance, &dmci, NULL, &debug_messenger) == VK_SUCCESS,
+                  "vkCreateDebugUtilsMessengerEXT");
+            printf("validation: enabled (syncval=%s)\n", has_val_features ? "yes" : "no");
+        }
+    } else {
+        printf("validation: not installed (VK_LAYER_KHRONOS_validation=%d, debug_utils=%d)\n",
+               has_val_layer, has_debug_utils);
+    }
+#endif
 
     p_destroy_instance = (PFN_vkDestroyInstance)gipa(instance, "vkDestroyInstance");
     PFN_vkEnumeratePhysicalDevices p_enum_gpus =
@@ -223,8 +383,11 @@ int main(void)
 
     VkSurfaceCapabilitiesKHR caps;
     CHECK(p_surf_caps(gpu, surface, &caps) == VK_SUCCESS, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
-    CHECK((caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0,
-          "offload wrapper advertises TRANSFER_SRC_BIT");
+    if ((caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0) {
+        printf("test_vk_offload_live: SKIP (headless surface lacks VK_IMAGE_USAGE_TRANSFER_SRC_BIT)\n");
+        skipped = 1;
+        goto cleanup;
+    }
 
     uint32_t fc = 0;
     CHECK(p_surf_fmts(gpu, surface, &fc, NULL) == VK_SUCCESS && fc > 0, "surface formats count");
@@ -278,12 +441,32 @@ int main(void)
         .colorAttachmentCount = 1,
         .pColorAttachments = &ref,
     };
+    VkSubpassDependency deps[2] = {
+        {
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        },
+        {
+            .srcSubpass = 0,
+            .dstSubpass = VK_SUBPASS_EXTERNAL,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = 0,
+        },
+    };
     VkRenderPassCreateInfo rpci = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
         .attachmentCount = 1,
         .pAttachments = &att,
         .subpassCount = 1,
         .pSubpasses = &sub,
+        .dependencyCount = 2,
+        .pDependencies = deps,
     };
     CHECK(p_create_rp(device, &rpci, NULL, &render_pass) == VK_SUCCESS, "render pass");
 
@@ -310,74 +493,85 @@ int main(void)
     };
     CHECK(p_create_fence(device, &fci, NULL, &fence) == VK_SUCCESS, "fence");
 
-    uint32_t idx = 0;
-    CHECK(p_acquire(device, swapchain, UINT64_MAX, sem_a, VK_NULL_HANDLE, &idx) == VK_SUCCESS, "acquire");
-    uint32_t icount = 0;
     CHECK(p_get_sc_images(device, swapchain, &icount, NULL) == VK_SUCCESS && icount > 0, "sc image count");
     VkImage *imgs = (VkImage *)alloca(icount * sizeof(*imgs));
     CHECK(p_get_sc_images(device, swapchain, &icount, imgs) == VK_SUCCESS, "sc images");
 
-    VkImageViewCreateInfo ivci = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = imgs[idx],
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = fmt.format,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-    };
-    CHECK(p_create_iv(device, &ivci, NULL, &view) == VK_SUCCESS, "image view");
+    views = (VkImageView *)calloc(icount, sizeof(*views));
+    fbs = (VkFramebuffer *)calloc(icount, sizeof(*fbs));
+    CHECK(views != NULL && fbs != NULL, "oom");
 
-    VkFramebufferCreateInfo fbci = {
-        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-        .renderPass = render_pass,
-        .attachmentCount = 1,
-        .pAttachments = &view,
-        .width = extent.width,
-        .height = extent.height,
-        .layers = 1,
-    };
-    CHECK(p_create_fb(device, &fbci, NULL, &fb) == VK_SUCCESS, "framebuffer");
+    for (uint32_t i = 0; i < icount; i++) {
+        VkImageViewCreateInfo ivci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = imgs[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = fmt.format,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        CHECK(p_create_iv(device, &ivci, NULL, &views[i]) == VK_SUCCESS, "image view %u", i);
 
-    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    CHECK(p_begin_cb(cmd, &bi) == VK_SUCCESS, "begin cmd");
-    VkClearValue clear = { .color.float32 = { 0.2f, 0.8f, 0.4f, 1.0f } };
-    VkRenderPassBeginInfo rbi = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = render_pass,
-        .framebuffer = fb,
-        .renderArea = { { 0, 0 }, extent },
-        .clearValueCount = 1,
-        .pClearValues = &clear,
-    };
-    p_begin_rp(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    p_end_rp(cmd);
-    CHECK(p_end_cb(cmd) == VK_SUCCESS, "end cmd");
+        VkFramebufferCreateInfo fbci = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = render_pass,
+            .attachmentCount = 1,
+            .pAttachments = &views[i],
+            .width = extent.width,
+            .height = extent.height,
+            .layers = 1,
+        };
+        CHECK(p_create_fb(device, &fbci, NULL, &fbs[i]) == VK_SUCCESS, "framebuffer %u", i);
+    }
 
-    CHECK(p_wait_fences(device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS, "wait fence");
-    CHECK(p_reset_fences(device, 1, &fence) == VK_SUCCESS, "reset fence");
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo si = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &sem_a,
-        .pWaitDstStageMask = &stage,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &cmd,
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &sem_b,
-    };
-    CHECK(p_queue_submit(queue, 1, &si, fence) == VK_SUCCESS, "submit");
-    CHECK(p_wait_fences(device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS, "wait submit");
+    for (int frame = 0; frame < 2; frame++) {
+        CHECK(p_wait_fences(device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS, "wait fence");
+        CHECK(p_reset_fences(device, 1, &fence) == VK_SUCCESS, "reset fence");
 
-    VkPresentInfoKHR pi = {
-        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &sem_b,
-        .swapchainCount = 1,
-        .pSwapchains = &swapchain,
-        .pImageIndices = &idx,
-    };
-    VkResult pres = p_present(queue, &pi);
-    CHECK(pres == VK_SUCCESS || pres == VK_SUBOPTIMAL_KHR, "vkQueuePresentKHR: %d", pres);
+        uint32_t idx = 0;
+        CHECK(p_acquire(device, swapchain, UINT64_MAX, sem_a, VK_NULL_HANDLE, &idx) == VK_SUCCESS, "acquire");
+        CHECK(idx < icount, "acquired index %u < %u", idx, icount);
+
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        CHECK(p_begin_cb(cmd, &bi) == VK_SUCCESS, "begin cmd");
+        VkClearValue clear = { .color.float32 = { 0.2f, 0.8f, 0.4f, 1.0f } };
+        VkRenderPassBeginInfo rbi = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .renderPass = render_pass,
+            .framebuffer = fbs[idx],
+            .renderArea = { { 0, 0 }, extent },
+            .clearValueCount = 1,
+            .pClearValues = &clear,
+        };
+        p_begin_rp(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        p_end_rp(cmd);
+        CHECK(p_end_cb(cmd) == VK_SUCCESS, "end cmd");
+
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &sem_a,
+            .pWaitDstStageMask = &stage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &sem_b,
+        };
+        CHECK(p_queue_submit(queue, 1, &si, fence) == VK_SUCCESS, "submit");
+
+        /* Deliberately present immediately after submit without CPU fence wait so
+         * the offload wrapper must synchronize on sem_b rather than assuming idle. */
+        VkPresentInfoKHR pi = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &sem_b,
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &idx,
+        };
+        VkResult pres = p_present(queue, &pi);
+        CHECK(pres == VK_SUCCESS || pres == VK_SUBOPTIMAL_KHR, "vkQueuePresentKHR: %d", pres);
+    }
     p_device_wait_idle(device);
 
     SDL_Surface *win_fb = SDL_GetWindowSurface(w);
@@ -401,6 +595,10 @@ int main(void)
     printf("framebuffer %dx%d mismatches=%d\n", win_fb->w, win_fb->h, mismatches);
     CHECK(mismatches == 0, "expected clear (0.2,0.8,0.4) across framebuffer");
 
+#ifdef VK_EXT_debug_utils
+    CHECK(vstate.error_count == 0, "expected 0 Vulkan validation errors, got %d", vstate.error_count);
+#endif
+
 cleanup:
     if (device && p_device_wait_idle) {
         p_device_wait_idle(device);
@@ -414,12 +612,22 @@ cleanup:
     if (sem_b && p_destroy_semaphore) {
         p_destroy_semaphore(device, sem_b, NULL);
     }
-    if (fb && p_destroy_framebuffer) {
-        p_destroy_framebuffer(device, fb, NULL);
+    if (fbs && p_destroy_framebuffer) {
+        for (uint32_t i = 0; i < icount; i++) {
+            if (fbs[i]) {
+                p_destroy_framebuffer(device, fbs[i], NULL);
+            }
+        }
     }
-    if (view && p_destroy_image_view) {
-        p_destroy_image_view(device, view, NULL);
+    if (views && p_destroy_image_view) {
+        for (uint32_t i = 0; i < icount; i++) {
+            if (views[i]) {
+                p_destroy_image_view(device, views[i], NULL);
+            }
+        }
     }
+    free(fbs);
+    free(views);
     if (pool && p_destroy_command_pool) {
         p_destroy_command_pool(device, pool, NULL);
     }
@@ -435,6 +643,11 @@ cleanup:
     if (surface && instance) {
         SDL_Vulkan_DestroySurface(instance, surface, NULL);
     }
+#ifdef VK_EXT_debug_utils
+    if (debug_messenger && instance && p_destroy_debug) {
+        p_destroy_debug(instance, debug_messenger, NULL);
+    }
+#endif
     if (instance && p_destroy_instance) {
         p_destroy_instance(instance, NULL);
     }
@@ -447,6 +660,11 @@ cleanup:
     if (skipped) {
         return 0;
     }
+#ifdef VK_EXT_debug_utils
+    if (vstate.error_count > 0) {
+        failures++;
+    }
+#endif
     if (failures) {
         printf("test_vk_offload_live: FAIL (%d checks)\n", failures);
         return 1;

@@ -59,6 +59,17 @@ bool SDLOP_GLOffload_HasHardwareGPU(void);
 /* Human-readable GPU description (valid while offload is initialized), or NULL. */
 const char *SDLOP_GLOffload_GetGPUDescription(void);
 
+/* Build EGL context attribute list (without EGL_NONE terminator) for `egl_api`
+ * (`EGL_OPENGL_API` = 0x30A2 or `EGL_OPENGL_ES_API` = 0x30A0). Returns the
+ * number of EGLint entries written, or -1 if `max_attribs` is insufficient. */
+int SDLOP_GLOffload_BuildContextAttribs(uint32_t egl_api,
+                                        int major_version,
+                                        int minor_version,
+                                        int profile_mask,
+                                        int flags,
+                                        int *attribs,
+                                        int max_attribs);
+
 /* Offload context lifecycle (egl_api is EGL_OPENGL_API or EGL_OPENGL_ES_API). */
 SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContext(uint32_t egl_api,
                                                       SDLOP_GLOffloadContext *share_ctx);
