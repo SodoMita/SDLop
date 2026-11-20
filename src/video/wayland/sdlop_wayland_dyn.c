@@ -26,7 +26,7 @@ bool SDLOP_Wayland_LoadSymbols(void)
         return true;
     }
 
-    const char *libname = getenv("SDLOP_LIB_WAYLAND");
+    const char *libname = SDL_GetHint("SDLOP_LIB_WAYLAND");
     if (!libname || !libname[0]) {
         libname = "libwayland-client.so.0";
     }

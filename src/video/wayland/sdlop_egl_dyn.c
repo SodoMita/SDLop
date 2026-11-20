@@ -25,7 +25,7 @@ bool SDLOP_EGL_LoadSymbols(void)
         return true;
     }
 
-    const char *libname = getenv("SDLOP_LIB_EGL");
+    const char *libname = SDL_GetHint("SDLOP_LIB_EGL");
     if (!libname || !libname[0]) {
         libname = "libEGL.so.1";
     }

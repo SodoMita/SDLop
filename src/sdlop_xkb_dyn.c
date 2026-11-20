@@ -26,7 +26,7 @@ bool SDLOP_Xkb_LoadSymbols(void)
         return true;
     }
 
-    const char *libname = getenv("SDLOP_LIB_XKB");
+    const char *libname = SDL_GetHint("SDLOP_LIB_XKB");
     if (!libname || !libname[0]) {
         libname = "libxkbcommon.so.0";
     }

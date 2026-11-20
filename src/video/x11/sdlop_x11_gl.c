@@ -76,7 +76,7 @@ static XDisplay_ *open_private_xlib_display(void)
         return xlib_display;
     }
     if (!xlib_handle) {
-        const char *name = getenv("SDLOP_LIB_X11");
+        const char *name = SDL_GetHint("SDLOP_LIB_X11");
         xlib_handle = dlopen(name && *name ? name : "libX11.so.6", RTLD_NOW | RTLD_LOCAL);
         if (!xlib_handle) {
             SDL_SetError("EGL needs libX11 on this system (no EGL_EXT_platform_xcb): %s", dlerror());
@@ -114,7 +114,7 @@ static bool ensure_egl_display(void)
     const char *client_ext = SDLOP_EGL_eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)SDLOP_EGL_eglGetProcAddress("eglGetPlatformDisplayEXT");
-    const char *force = getenv("SDLOP_X11_EGL_PLATFORM");
+    const char *force = SDL_GetHint("SDLOP_X11_EGL_PLATFORM");
     bool allow_xcb = !(force && strcmp(force, "x11") == 0);
     const char *platform = "?";
 

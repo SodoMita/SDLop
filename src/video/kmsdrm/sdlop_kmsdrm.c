@@ -92,7 +92,7 @@ static void kmsdrm_destroy_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *winda
 
 static int env_int(const char *name, int fallback)
 {
-    const char *v = getenv(name);
+    const char *v = SDL_GetHint(name);
     if (!v || !*v) {
         return fallback;
     }
@@ -132,8 +132,7 @@ static bool is_permission_error(int err)
  * out and get the historical warn-and-continue behavior. */
 static bool kmsdrm_require_master(void)
 {
-    const char *v = getenv("SDLOP_KMSDRM_REQUIRE_MASTER");
-    return !(v && *v && strcmp(v, "0") == 0);
+    return SDLOP_HintFlag("SDLOP_KMSDRM_REQUIRE_MASTER", true);
 }
 
 
@@ -144,8 +143,7 @@ static bool kmsdrm_require_master(void)
 /* Vulkan normally takes DRM master; this opt-out keeps it on our fd. */
 static bool kmsdrm_keep_master(void)
 {
-    const char *keep = getenv("SDLOP_KMSDRM_KEEP_MASTER");
-    return keep && *keep && strcmp(keep, "0") != 0;
+    return SDLOP_HintFlag("SDLOP_KMSDRM_KEEP_MASTER", false);
 }
 
 /* Re-acquire DRM master after a VT switch or Vulkan handover. */
@@ -492,12 +490,11 @@ static void kmsdrm_vt_init(void)
     char tty_dev[32];
     int vt_num = 0;         /* the VT we will own */
     bool want_switch = false;
-    const char *switch_env = getenv("SDLOP_KMSDRM_VT_SWITCH");
-    if (switch_env && *switch_env && strcmp(switch_env, "0") != 0) {
+    if (SDLOP_HintFlag("SDLOP_KMSDRM_VT_SWITCH", false)) {
         want_switch = true;
     }
 
-    const char *tty_num_env = getenv("TTYNO");
+    const char *tty_num_env = SDL_GetHint("TTYNO");
     if (tty_num_env && *tty_num_env) {
         char *endptr = NULL;
         unsigned long tty = strtoul(tty_num_env, &endptr, 10);
@@ -653,7 +650,7 @@ static void kmsdrm_vt_init(void)
                 }
             } else {
                 kmsdrm_log("KMSDRM: no raw keyboard (%s); leaving the console keyboard alone",
-                           SDL_getenv("SDLOP_DISABLE_RAW_INPUT") ? "raw input disabled" : "none found");
+                           SDL_GetHint("SDLOP_DISABLE_RAW_INPUT") ? "raw input disabled" : "none found");
             }
         } else {
             kmsdrm_vt_saved_kbmode = -1;
@@ -860,7 +857,7 @@ void KMSDRM_FlushDeferred(void)
 /* Returns a heap-allocated path of a usable DRM device, or NULL. */
 static char *kmsdrm_find_device(void)
 {
-    const char *hint = getenv("SDLOP_KMSDRM_DEVICE");
+    const char *hint = SDL_GetHint("SDLOP_KMSDRM_DEVICE");
     if (hint && *hint) {
         char *path = malloc(64);
         if (!path) {
@@ -1257,7 +1254,7 @@ static bool kmsdrm_init_displays(void)
         goto cleanup;
     }
 
-    const char *filter = getenv("SDLOP_KMSDRM_CONNECTOR");
+    const char *filter = SDL_GetHint("SDLOP_KMSDRM_CONNECTOR");
     drmModeConnector *first = NULL; /* fallback when the filter matches nothing */
 
     vid->num_displays = 0;
@@ -1337,8 +1334,8 @@ static bool kmsdrm_init_displays(void)
 
     if (vid->num_displays == 0) {
         SDL_SetError("No connected connector%s%s",
-                     getenv("SDLOP_KMSDRM_CONNECTOR") ? " matching SDLOP_KMSDRM_CONNECTOR=" : "",
-                     getenv("SDLOP_KMSDRM_CONNECTOR") ? getenv("SDLOP_KMSDRM_CONNECTOR") : "");
+                     SDL_GetHint("SDLOP_KMSDRM_CONNECTOR") ? " matching SDLOP_KMSDRM_CONNECTOR=" : "",
+                     SDL_GetHint("SDLOP_KMSDRM_CONNECTOR") ? SDL_GetHint("SDLOP_KMSDRM_CONNECTOR") : "");
         goto cleanup;
     }
 
@@ -3285,8 +3282,7 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
         return false; /* error set by the loader */
     }
 
-    const char *no_flip = getenv("SDLOP_KMSDRM_NOFLIP");
-    vid->no_flip = no_flip && *no_flip && strcmp(no_flip, "0") != 0;
+    vid->no_flip = SDLOP_HintFlag("SDLOP_KMSDRM_NOFLIP", false);
 
     char *path = kmsdrm_find_device();
     if (!path) {
@@ -3330,8 +3326,7 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
 
     /* connector hotplug uevents via a non-blocking netlink socket */
     {
-        const char *hotplug_env = getenv("SDLOP_KMSDRM_HOTPLUG");
-        if (!(hotplug_env && hotplug_env[0] == '0')) {
+        if (SDLOP_HintFlag("SDLOP_KMSDRM_HOTPLUG", true)) {
             int hfd = socket(PF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
                              NETLINK_KOBJECT_UEVENT);
             if (hfd >= 0) {

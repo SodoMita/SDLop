@@ -1098,8 +1098,8 @@ static void handle_key(xcb_key_press_event_t *kev, bool down)
 {
     SDL_Window *window = window_from_xid(kev->event);
     (void)window;
-    if (SDLOP_RawInputKeyboardActive()) {
-        return; /* only console ownership enables raw SDL keys; not desktop evdev availability */
+    if (SDLOP_RawInputIsSource()) {
+        return; /* SDLOP_RAW_INPUT: evdev delivers every key; never mix the two */
     }
     if (kev->detail < 8) {
         return;
@@ -1197,7 +1197,7 @@ static void select_raw_motion(bool on)
  * sequences; the core synthesizes the SDL_TOUCH_MOUSEID mouse instead. */
 static void select_touch(xcb_window_t xid)
 {
-    if (!x11.has_xi2 || getenv("SDLOP_X11_NO_TOUCH")) {
+    if (!x11.has_xi2 || SDLOP_HintFlag("SDLOP_X11_NO_TOUCH", false)) {
         return;
     }
     struct {
@@ -1233,8 +1233,10 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
             int dx = mev->event_x - x11.warp_cx;
             int dy = mev->event_y - x11.warp_cy;
             if (dx || dy) {
-                SDLOP_SendMouseMotion(SDLOP_NO_POS, SDLOP_NO_POS, (float)dx, (float)dy, ts);
-                warp_to_center(window);
+                if (!SDLOP_RawInputIsSource()) { /* else evdev sends the deltas */
+                    SDLOP_SendMouseMotion(SDLOP_NO_POS, SDLOP_NO_POS, (float)dx, (float)dy, ts);
+                }
+                warp_to_center(window); /* still keep the hidden pointer inside */
             }
         }
         return; /* XInput2 raw motion carries relative input */
@@ -1245,7 +1247,9 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
         window->flags |= SDL_WINDOW_MOUSE_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
     }
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
+        /* evdev sends the motion; the server's pointer only re-anchors the
+           absolute position evdev's relative deltas are added to */
         sdlop.mouse_x = mev->event_x;
         sdlop.mouse_y = mev->event_y;
         sdlop.mouse_has_position = true;
@@ -1272,9 +1276,10 @@ static void handle_button(xcb_button_press_event_t *bev, bool down)
         return;
     }
     Uint64 ts = SDLOP_MonotonicNS();
+    const bool raw_source = SDLOP_RawInputIsSource(); /* evdev sends buttons and wheel */
     /* core protocol wheel: 4/5 vertical, 6/7 horizontal (press only) */
     if (bev->detail >= 4 && bev->detail <= 7) {
-        if (down) {
+        if (down && !raw_source) {
             float x = 0.0f, y = 0.0f;
             switch (bev->detail) {
             case 4: y = 1.0f; break;
@@ -1286,9 +1291,6 @@ static void handle_button(xcb_button_press_event_t *bev, bool down)
         }
         return;
     }
-    if (SDLOP_RawInputMouseActive()) {
-        return;
-    }
     Uint8 button;
     switch (bev->detail) {
     case 1: button = SDL_BUTTON_LEFT; break;
@@ -1298,6 +1300,9 @@ static void handle_button(xcb_button_press_event_t *bev, bool down)
     }
     if (down && x11.relative_window == window && x11.pointer_grabbed == false && wdata(window)->want_grab) {
         grab_pointer(window);
+    }
+    if (raw_source) {
+        return;
     }
     SDLOP_SendMouseButton(down, button, SDLOP_NO_POS, SDLOP_NO_POS, ts);
 }
@@ -1428,7 +1433,7 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
             vi++;
         }
     }
-    if (dx != 0.0 || dy != 0.0) {
+    if ((dx != 0.0 || dy != 0.0) && !SDLOP_RawInputIsSource()) {
         SDLOP_SendMouseMotion(SDLOP_NO_POS, SDLOP_NO_POS, (float)dx, (float)dy, SDLOP_MonotonicNS());
     }
 }
@@ -1839,7 +1844,7 @@ static bool x11_Init(SDLop_VideoDevice *device)
     }
 
     /* MIT-SHM (env SDLOP_X11_NO_SHM=1 or SDLOP_LIB_XCB_SHM=none disables) */
-    if (SDLOP_X11_HAVE(SHM) && !getenv("SDLOP_X11_NO_SHM")) {
+    if (SDLOP_X11_HAVE(SHM) && !SDLOP_HintFlag("SDLOP_X11_NO_SHM", false)) {
         const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_shm_id);
         if (ext && ext->present) {
             xcb_shm_query_version_reply_t *v =
@@ -2469,7 +2474,7 @@ static bool x11_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Window
             x11_SetWindowRelativeMouseMode(device, x11.relative_window, false);
         }
         x11.relative_window = window;
-        x11.warp_relative = !x11.has_xi2 || getenv("SDLOP_X11_RELATIVE_WARP") != NULL;
+        x11.warp_relative = !x11.has_xi2 || SDLOP_HintFlag("SDLOP_X11_RELATIVE_WARP", false);
         if (!x11.warp_relative) {
             select_raw_motion(true);
         }
@@ -2769,7 +2774,7 @@ static void x11_find_argb_format(void)
         return;
     }
     x11.render_checked = true;
-    if (!SDLOP_X11_HaveModule(SDLOP_X11_MOD_RENDER) || getenv("SDLOP_X11_NO_RENDER")) {
+    if (!SDLOP_X11_HaveModule(SDLOP_X11_MOD_RENDER) || SDLOP_HintFlag("SDLOP_X11_NO_RENDER", false)) {
         return;
     }
     const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_render_id);
@@ -3230,6 +3235,9 @@ static void x11_dispatch(xcb_generic_event_t *ev)
     case XCB_ENTER_NOTIFY: {
         xcb_enter_notify_event_t *en = (xcb_enter_notify_event_t *)ev;
         SDL_Window *window = window_from_xid(en->event);
+        if (window && en->mode == XCB_NOTIFY_MODE_UNGRAB) {
+            sdlop.pointer_grabbed_elsewhere = false; /* someone's pointer grab ended */
+        }
         if (!window || (en->mode == XCB_NOTIFY_MODE_GRAB && sdlop.mouse_focus == window)) {
             break;
         }
@@ -3240,7 +3248,13 @@ static void x11_dispatch(xcb_generic_event_t *ev)
             sdlop.mouse_has_position = false;
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
         }
-        if (x11.relative_window != window && !SDLOP_RawInputMouseActive()) {
+        if (x11.relative_window == window) {
+            /* relative mode: no absolute position */
+        } else if (SDLOP_RawInputIsSource()) {
+            sdlop.mouse_x = en->event_x; /* anchor only; evdev sends motion */
+            sdlop.mouse_y = en->event_y;
+            sdlop.mouse_has_position = true;
+        } else {
             SDLOP_SendMouseMotion((float)en->event_x, (float)en->event_y, 0.0f, 0.0f, SDLOP_MonotonicNS());
         }
         break;
@@ -3248,6 +3262,11 @@ static void x11_dispatch(xcb_generic_event_t *ev)
     case XCB_LEAVE_NOTIFY: {
         xcb_leave_notify_event_t *lv = (xcb_leave_notify_event_t *)ev;
         SDL_Window *window = window_from_xid(lv->event);
+        if (window && lv->mode == XCB_NOTIFY_MODE_GRAB && !x11.pointer_grabbed && !x11.confine_window) {
+            /* another client (WM move/menu, ...) grabbed the pointer: the
+               server sends us nothing until it ends, nor may raw input */
+            sdlop.pointer_grabbed_elsewhere = true;
+        }
         /* grabs (WM moves, our relative grab) and moves into child
          * windows are not real leaves (SDL3 filter) */
         if (!window || lv->mode == XCB_NOTIFY_MODE_GRAB || lv->mode == XCB_NOTIFY_MODE_UNGRAB ||
@@ -3268,6 +3287,16 @@ static void x11_dispatch(xcb_generic_event_t *ev)
     case XCB_FOCUS_OUT: {
         xcb_focus_in_event_t *fe = (xcb_focus_in_event_t *)ev;
         SDL_Window *window = window_from_xid(fe->event);
+        if (window && fe->mode == XCB_NOTIFY_MODE_GRAB) {
+            /* FocusOut(Grab): someone else's keyboard grab (screen locker,
+               WM switcher) - key events go there, raw ones must too.
+               FocusIn(Grab): the grab is on one of our windows (ours). */
+            sdlop.keyboard_grabbed_elsewhere = (type == XCB_FOCUS_OUT) && !x11.keyboard_grab_window;
+        } else if (window && fe->mode == XCB_NOTIFY_MODE_UNGRAB) {
+            sdlop.keyboard_grabbed_elsewhere = false;
+        } else if (window && type == XCB_FOCUS_IN) {
+            sdlop.keyboard_grabbed_elsewhere = false;
+        }
         if (!window || fe->mode == XCB_NOTIFY_MODE_GRAB || fe->mode == XCB_NOTIFY_MODE_UNGRAB ||
             fe->detail == XCB_NOTIFY_DETAIL_INFERIOR || fe->detail == XCB_NOTIFY_DETAIL_POINTER) {
             break;
@@ -3494,6 +3523,7 @@ SDLop_VideoDevice SDLop_x11_device = {
     /* optional hooks */
     .Vulkan_GetPresentationSupport = SDLOP_X11_Vulkan_GetPresentationSupport,
     .supports_popups = true,
+    .window_system_input = true,
     .EGL_GetDisplay = SDLOP_X11_EGL_GetDisplay,
     .EGL_GetConfig = SDLOP_X11_EGL_GetConfig,
     .EGL_GetWindowSurface = SDLOP_X11_EGL_GetWindowSurface,

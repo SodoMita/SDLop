@@ -159,6 +159,7 @@ struct SDLop_VideoDevice
     /* SDL 3.4 window management (same contracts as SDL_sysvideo.h; NULL =
      * SDL_Unsupported() where stock SDL3 reports that) */
     bool supports_popups;            /* SDL_WINDOW_TOOLTIP / SDL_WINDOW_POPUP_MENU */
+    bool window_system_input;        /* the driver has its own keyboard/mouse stream (X11, Wayland) */
     void (*SetWindowMinimumSize)(SDLop_VideoDevice *device, SDL_Window *window);
     void (*SetWindowMaximumSize)(SDLop_VideoDevice *device, SDL_Window *window);
     void (*SetWindowAspectRatio)(SDLop_VideoDevice *device, SDL_Window *window);
@@ -272,6 +273,11 @@ typedef struct SDLop_Globals
     /* focus */
     SDL_Window *keyboard_focus;
     SDL_Window *mouse_focus;
+    /* another client holds an active keyboard / pointer grab while our
+       window keeps nominal focus (X11 grab-mode Focus/Crossing events): the
+       window system delivers nothing to us, so raw evdev must not either */
+    bool keyboard_grabbed_elsewhere;
+    bool pointer_grabbed_elsewhere;
 
     /* mouse state */
     float mouse_x, mouse_y;         /* window-relative position */
@@ -381,9 +387,13 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
 /* Raw input worker (evdev), implemented in sdlop_evdev.c */
 bool SDLOP_RawInputInit(void);      /* starts worker thread if possible */
 void SDLOP_RawInputQuit(void);
-bool SDLOP_RawInputKeyboardActive(void); /* raw keyboard owns console delivery */
 bool SDLOP_RawInputHasKeyboard(void);    /* ensure a working raw keyboard before K_OFF */
-bool SDLOP_RawInputMouseActive(void);    /* a raw pointer device exists */
+/* Input source policy: SDL keyboard *and* mouse events come from exactly one
+   source. On a window-system driver this is true only when raw input was
+   requested (SDLOP_RAW_INPUT=1) and the worker reads both a keyboard and a
+   pointer; the driver then drops its own key/button/motion/wheel events.
+   On the console drivers raw input is the only source. */
+bool SDLOP_RawInputIsSource(void);
 /* Console keyboard ownership: call AttachConsole once the console keyboard is
    in K_OFF (raw key events then reach SDL, and Ctrl+Alt+Fn is forwarded),
    DetachConsole as soon as it is given back. */
@@ -449,6 +459,11 @@ extern bool sdlop_quitting;
 bool SDLOP_IsMainThread(void);
 void SDLOP_InitMainThread(void);
 bool SDLOP_GetStringBoolean(const char *value, bool default_value); /* SDL3's SDL_GetStringBoolean */
+/* SDLop option lookup: every SDLOP_* knob is a hint, so SDL_SetHint() sets
+   it from code and an environment variable of the same name overrides that
+   (SDL_HINT_OVERRIDE beats the environment). Unset/empty -> default_value;
+   0/false/off/no -> false; anything else -> true. */
+bool SDLOP_HintFlag(const char *name, bool default_value);
 void SDLOP_SendSimpleEvent(SDL_EventType type);  /* type + timestamp only */
 const char *SDLOP_GetExeName(void);  /* basename of /proc/self/exe or NULL */
 const char *SDLOP_GetAppID(void);    /* SDL3 SDL_GetAppID() for WM_CLASS / xdg app_id */

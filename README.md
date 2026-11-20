@@ -30,9 +30,10 @@ int main(void) {
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
   rings and fires your callback *on the worker thread*. Native evdev codes,
-  zero translation cost, kernel timestamps. Direct keyboard access is through
-  the raw API or an owned foreground console; desktop SDL key events always
-  use the focus-aware Wayland seat / X11 stream (see input routing below).
+  zero translation cost, kernel timestamps. On the console drivers it is the
+  input source; on X11/Wayland it is opt-in (`SDLOP_RAW_INPUT=1`) and then
+  replaces the window system's keyboard and mouse entirely — sources are never
+  mixed (see input routing below).
 
 ## Status
 
@@ -75,37 +76,78 @@ int main(void) {
   draining into SDL events.
 ### Input routing and focus
 
-- **X11 / Wayland SDL keyboard events always come from the window system**,
-  even when the evdev worker can read a keyboard. This is intentional: a
-  background or unfocused window must not receive global evdev keystrokes.
-  The compositor/server determines keyboard focus, layout and native delivery;
-  having a readable `/dev/input` device does not suppress that stream.
-- **fbdev / kmsdrm SDL keyboard events use evdev only while SDLop owns `K_OFF`
-  on the foreground VT.** A working raw keyboard is required before disabling
-  the kernel keyboard handler. Ctrl+Alt+Fn is forwarded through `VT_ACTIVATE`.
+SDLop never mixes input sources: SDL keyboard **and** mouse events come
+either all from evdev (`/dev/input`) or all from the window system.
+
+- **X11 / Wayland default to window-system input.** The evdev worker is not
+  started; keys, buttons, motion, wheel and relative motion all come from the
+  server/compositor, which owns focus, layout and delivery.
+- **`SDLOP_RAW_INPUT=1` makes evdev the only source on X11 / Wayland.** The
+  driver then drops its own key, button, motion, wheel and relative-motion
+  events; it still tracks focus, enter/leave, keymap/layout/lock state and
+  repeat settings, and the pointer position it reports only re-anchors the
+  position evdev's deltas are added to. Because `/dev/input` sees the whole
+  seat, raw events are filtered with the window system's focus: keys need one
+  of our windows to have keyboard focus, pointer input needs the pointer over
+  one of our windows (or relative mode on the focused window); releases of
+  keys/buttons SDL reported down always pass, and a drag that started in our
+  window keeps its motion. All or nothing: if the worker cannot read both a
+  keyboard and a pointer, SDLop logs why and uses window-system input for
+  both. Touch stays with the window system.
+- **fbdev / kmsdrm use evdev by default** (`SDLOP_RAW_INPUT=0` turns that
+  off). SDL keyboard events use evdev only while SDLop owns `K_OFF` on the
+  foreground VT. A working raw keyboard is required before disabling the
+  kernel keyboard handler. Ctrl+Alt+Fn is forwarded through `VT_ACTIVATE`.
   Switch-away detaches keyboard delivery and releases SDL's held key state.
   With raw input disabled/unavailable the console retains its kernel handler;
   that preserves VT switching but does not create an SDL keyboard event source.
-- **Raw mouse routing is unchanged:** when a readable evdev pointer is present,
-  its events feed SDL mouse events and the corresponding window-system mouse
-  stream is suppressed. Thus desktop keys and pointer events can have different
-  sources. This revision does not make raw mouse delivery focus-aware.
-- **The low-latency raw API remains available on every Linux video driver.**
-  `SDLop_RegisterRawEventCallback` runs on the worker thread and
-  `SDLop_PollRawEvents` drains a separate ring. These expose global device
-  events, including keys, regardless of window/VT focus. Applications using
-  this API must implement their own focus/security policy; do not treat it as
-  a focus-filtered SDL event queue. `SDLop_RawInputAvailable` reports the worker,
-  not whether raw keys are currently being forwarded to SDL.
-- **Timestamp provenance differs.** Raw events carry normalized kernel times;
-  raw-derived SDL events convert these to SDL's tick epoch. Desktop SDL key
-  events use the native handler's receipt time in the SDL tick epoch, not the
-  keyboard's evdev timestamp. Nanosecond units do not imply identical latency
-  or ordering across desktop keyboard and raw mouse sources. The raw-input
-  benchmark below measures the evdev path, not desktop SDL keyboard latency.
+- **The low-latency raw API needs the worker.** `SDLop_RegisterRawEventCallback`
+  runs on the worker thread and `SDLop_PollRawEvents` drains a separate ring;
+  on X11/Wayland they only receive events with `SDLOP_RAW_INPUT=1`. These
+  expose global device events, including keys, regardless of window/VT focus.
+  Applications using this API must implement their own focus/security policy;
+  do not treat it as a focus-filtered SDL event queue. `SDLop_RawInputAvailable`
+  reports the worker; on X11/Wayland true also means evdev is the SDL source.
+- **Timestamp provenance follows the source.** Raw-derived SDL events convert
+  kernel times to SDL's tick epoch; window-system events use the native
+  handler's receipt time. The raw-input benchmark below measures the evdev path.
 
-Set `SDLOP_DISABLE_RAW_INPUT=1` to disable the worker and use only native
-window-system input on X11/Wayland. `0` or an empty value leaves it enabled.
+`SDLOP_DISABLE_RAW_INPUT=1` (legacy) never starts the worker, whatever
+`SDLOP_RAW_INPUT` says. `0` or an empty value leaves the default.
+
+### Options: environment or code
+
+Every `SDLOP_*` environment variable is also an SDL hint of the same name
+(`SDLOP_HINT_*` macros in `<SDL3/SDLop.h>`), so code can choose it too:
+
+```c
+SDL_SetHint(SDLOP_HINT_RAW_INPUT, "1");      /* app default; the environment may override */
+SDL_SetHintWithPriority(SDLOP_HINT_X11_NO_SHM, "1",
+                        SDL_HINT_OVERRIDE);  /* wins over the environment */
+SDL_Init(SDL_INIT_VIDEO);
+```
+
+Precedence: `SDL_HINT_OVERRIDE` hint > environment > lower-priority hint >
+built-in default. Options are read when the subsystem or driver using them
+initialises (mostly `SDL_Init`), so set them first; `SDL_ResetHint` returns to
+environment/default, and `SDL_Quit` drops all hints (as in SDL3). The
+environment is read through `SDL_GetEnvironment()`, a snapshot taken on first
+use, so change it with `SDL_setenv_unsafe` after that. Booleans: unset/empty = default, `0`/`false`/`off`/`no` =
+false, anything else true.
+
+| Option | Meaning |
+|---|---|
+| `SDLOP_RAW_INPUT` | evdev input (default: on for kmsdrm/fbdev, off for X11/Wayland; see above) |
+| `SDLOP_DISABLE_RAW_INPUT` | legacy: never start evdev input |
+| `SDLOP_LOG_PRIORITY` | default log priority when `SDL_LOGGING` is unset |
+| `SDLOP_POWER_SUPPLY_PATH` | sysfs power-supply directory (tests) |
+| `TTYNO` | console drivers: VT to run on (implies switching to it) |
+| `SDLOP_X11_NO_SHM`, `_NO_RENDER`, `_NO_TOUCH` | don't use MIT-SHM / XRender / XInput2 touch |
+| `SDLOP_X11_RELATIVE_WARP` | relative mode by warping instead of XInput2 raw motion |
+| `SDLOP_X11_EGL_PLATFORM` | `x11` skips the EGL xcb platform |
+| `SDLOP_KMSDRM_*` | `DEVICE`, `CONNECTOR`, `ATOMIC`, `ATOMIC_CURSOR`, `DOUBLE_BUFFER`, `FLIP_TIMEOUT_MS`, `HOTPLUG`, `KEEP_MASTER`, `NOFLIP`, `REQUIRE_MASTER`, `VT_SWITCH` (see `sdlop_kmsdrm.c`) |
+| `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
+| `SDLOP_LIB_*` | dlopen name for `X11`, `XCB`, `XCB_RANDR`, `XCB_RENDER`, `XCB_SHM`, `XCB_XINPUT`, `XCB_XKB`, `XKB`, `XKBCOMMON_X11`, `WAYLAND`, `EGL`, `DRM`, `GBM` (`none` disables an optional X11 extension library) |
 
 ### fbdev arbitration
 
@@ -327,7 +369,8 @@ Highlights:
 - `examples/window.c` — classic SDL3 loop; **compiles unmodified against real
   SDL3 too** (verified).
 - `examples/wasd.c` — asyncinput-style: raw callback drives movement, with
-  automatic SDL-queue fallback when raw input is unavailable.
+  automatic SDL-queue fallback when raw input is unavailable (on X11/Wayland
+  run it with `SDLOP_RAW_INPUT=1` for the raw path).
 - `examples/raw_latency.c` — measures kernel→callback latency percentiles
   (asyncinput `read_keys` equivalent).
 - `examples/surface_plasma.c` — software rendering: plasma drawn straight
@@ -344,8 +387,9 @@ Highlights:
 ## Notes & limitations
 
 - Raw evdev input needs read access to `/dev/input` (root or `input` group);
-  otherwise SDLop silently uses Wayland seat input. Like asyncinput, the raw
-  path bypasses compositor keyboard focus/layout.
+  otherwise SDLop silently uses window-system input. On X11/Wayland it is off
+  unless `SDLOP_RAW_INPUT=1`; then SDL events follow the window system's
+  focus, while the raw callback/poll API, like asyncinput, sees the whole seat.
 - Wayland cannot position toplevel windows: `SDL_SetWindowPosition` returns
   false for them. Popup and tooltip windows are `xdg_popup`s placed relative
   to their parent (menus grab input and close on outside clicks). Requests
@@ -387,8 +431,8 @@ Highlights:
   selection (and thus the server's own pointer emulation) to X11.
 - Relative mouse mode uses real pointer lock (`zwp_pointer_constraints` +
   `zwp_relative_pointer`) on Wayland when the compositor has a seat/pointer,
-  and raw evdev deltas when the worker thread is active; the window-system
-  fallback streams deltas from the relative-pointer protocol.
+  and raw evdev deltas when `SDLOP_RAW_INPUT=1` made evdev the input source;
+  otherwise deltas come from the relative-pointer protocol.
 - Window decorations: X11 uses `_MOTIF_WM_HINTS`; Wayland asks for
   server-side decorations via xdg-decoration (borderless windows request
   client-side mode, and SDLop draws none). Compositors without

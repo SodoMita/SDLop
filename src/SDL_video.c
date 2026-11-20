@@ -90,6 +90,8 @@ void SDLOP_VideoQuit(void)
     }
     SDLOP_MouseQuit(); /* cursors hold driver resources */
     sdlop.grabbed_window = NULL;
+    sdlop.keyboard_grabbed_elsewhere = false;
+    sdlop.pointer_grabbed_elsewhere = false;
     sdlop.suspend_screensaver = false;
     if (sdlop.video) {
         sdlop.video->Quit(sdlop.video);

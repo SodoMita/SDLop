@@ -515,9 +515,9 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
     (void)time;
     wl_data.input_serial = serial;
 
-    /* Desktop keyboards use the focus-aware seat stream even with a readable
-     * evdev device. Only console keyboard ownership enables raw SDL keys. */
-    if (SDLOP_RawInputKeyboardActive()) {
+    /* SDLOP_RAW_INPUT: evdev delivers every key; never mix the two. The
+     * modifiers/keymap/repeat events below still keep the layout state. */
+    if (SDLOP_RawInputIsSource()) {
         return;
     }
 
@@ -799,12 +799,19 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     window->flags |= SDL_WINDOW_MOUSE_FOCUS;
     sdlop.mouse_has_position = false; /* stock: the enter's own motion carries no delta */
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
-    /* stock delivers the enter position through the motion path (a movement
-       event with zero delta); a confine warp may arrive with no following
-       motion, so the enter coordinates are the position. */
-    SDLOP_SendMouseMotion((float)wl_fixed_to_double(surface_x),
-                          (float)wl_fixed_to_double(surface_y), 0.0f, 0.0f,
-                          SDLOP_MonotonicNS());
+    if (SDLOP_RawInputIsSource()) {
+        /* evdev sends motion; the enter position only anchors it */
+        sdlop.mouse_x = (float)wl_fixed_to_double(surface_x);
+        sdlop.mouse_y = (float)wl_fixed_to_double(surface_y);
+        sdlop.mouse_has_position = true;
+    } else {
+        /* stock delivers the enter position through the motion path (a
+           movement event with zero delta); a confine warp may arrive with no
+           following motion, so the enter coordinates are the position. */
+        SDLOP_SendMouseMotion((float)wl_fixed_to_double(surface_x),
+                              (float)wl_fixed_to_double(surface_y), 0.0f, 0.0f,
+                              SDLOP_MonotonicNS());
+    }
 
     if (sdlop.relative_mode_window == window) {
         if (!wl_data.locked_pointer) {
@@ -847,7 +854,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     float x = (float)wl_fixed_to_double(surface_x);
     float y = (float)wl_fixed_to_double(surface_y);
 
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         if (sdlop.relative_mode_window == window) {
             return; /* relative mode: evdev owns motion entirely */
         }
@@ -855,6 +862,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
          * evdev already emitted the low-latency motion event) */
         sdlop.mouse_x = x;
         sdlop.mouse_y = y;
+        sdlop.mouse_has_position = true;
         return;
     }
     SDLOP_SendMouseMotion(x, y, 0.0f, 0.0f, SDLOP_MonotonicNS()); /* core derives deltas from clamped positions (stock) */
@@ -880,7 +888,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     (void)pointer;
     (void)time;
     wl_data.input_serial = serial;
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         return; /* evdev owns buttons */
     }
     Uint8 btn = wl_button_to_sdl(button);
@@ -894,7 +902,7 @@ static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, 
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
     (void)time;
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         return;
     }
     float v = (float)wl_fixed_to_double(value) / 10.0f; /* weston: 10 units per detent */
@@ -909,14 +917,14 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
-    if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) {
+    if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) { /* accumulators stay empty under raw input */
         SDLOP_SendMouseWheel(d->axis_x_acc, d->axis_y_acc, SDLOP_MonotonicNS());
         d->axis_x_acc = d->axis_y_acc = 0.0f;
     }
     /* relative mouse mode: flush accumulated relative-pointer motion
      * (skipped when the raw evdev worker owns the mouse) */
     if (d->relative_pointer && (d->rel_x_acc != 0.0f || d->rel_y_acc != 0.0f)) {
-        if (!SDLOP_RawInputMouseActive()) {
+        if (!SDLOP_RawInputIsSource()) {
             SDLOP_SendMouseMotion(SDLOP_NO_POS, SDLOP_NO_POS, d->rel_x_acc, d->rel_y_acc, SDLOP_MonotonicNS());
         }
         d->rel_x_acc = d->rel_y_acc = 0.0f;
@@ -950,7 +958,7 @@ static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         return;
     }
     float v = (float)value120 / 120.0f;
@@ -2326,6 +2334,7 @@ SDLop_VideoDevice SDLop_wayland_device = {
     /* optional hooks */
     .Vulkan_GetPresentationSupport = SDLOP_Wayland_Vulkan_GetPresentationSupport,
     .supports_popups = true,
+    .window_system_input = true,
     .EGL_GetDisplay = SDLOP_Wayland_EGL_GetDisplay,
     .EGL_GetConfig = SDLOP_Wayland_EGL_GetConfig,
     .EGL_GetWindowSurface = SDLOP_Wayland_EGL_GetWindowSurface,

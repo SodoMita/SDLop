@@ -61,8 +61,7 @@ static int swap_interval = 1; /* vsync by default (SDL3 behavior) */
  * always synchronous) */
 static bool kmsdrm_double_buffer(void)
 {
-    const char *v = getenv("SDLOP_KMSDRM_DOUBLE_BUFFER");
-    return v && *v && strcmp(v, "0") != 0;
+    return SDLOP_HintFlag("SDLOP_KMSDRM_DOUBLE_BUFFER", false);
 }
 static uint32_t kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888; /* must match the GBM surface format */
 
