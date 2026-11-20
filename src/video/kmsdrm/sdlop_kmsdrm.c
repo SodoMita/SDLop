@@ -58,6 +58,7 @@
 #endif
 
 #include "sdlop_kmsdrm.h"
+#include "internal/sdlop_vt.h"
 #include "sdlop_xcursor.h"
 
 #include <dirent.h>
@@ -425,7 +426,7 @@ static bool kmsdrm_vt_take_signals(int release_sig, int acquire_sig)
     }
     kmsdrm_vt_signal_fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     if (kmsdrm_vt_signal_fd < 0) {
-        pthread_sigmask(SIG_SETMASK, &kmsdrm_vt_saved_mask, NULL);
+        SDLOP_VTRestoreSignalMask(&kmsdrm_vt_saved_mask, release_sig, acquire_sig);
         kmsdrm_vt_mask_saved = false;
         sigaction(release_sig, &kmsdrm_vt_old_release, NULL);
         sigaction(acquire_sig, &kmsdrm_vt_old_acquire, NULL);
@@ -445,6 +446,10 @@ static void kmsdrm_vt_shutdown(void)
     }
     sdlop.vt_signals[0] = 0;
     sdlop.vt_signals[1] = 0;
+    if (kmsdrm_vt_mask_saved) {
+        SDLOP_VTRestoreSignalMask(&kmsdrm_vt_saved_mask, kmsdrm_vt_release_sig, kmsdrm_vt_acquire_sig);
+        kmsdrm_vt_mask_saved = false;
+    }
     if (kmsdrm_vt_release_sig) {
         sigaction(kmsdrm_vt_release_sig, &kmsdrm_vt_old_release, NULL);
         kmsdrm_vt_release_sig = 0;
@@ -452,10 +457,6 @@ static void kmsdrm_vt_shutdown(void)
     if (kmsdrm_vt_acquire_sig) {
         sigaction(kmsdrm_vt_acquire_sig, &kmsdrm_vt_old_acquire, NULL);
         kmsdrm_vt_acquire_sig = 0;
-    }
-    if (kmsdrm_vt_mask_saved) {
-        pthread_sigmask(SIG_SETMASK, &kmsdrm_vt_saved_mask, NULL);
-        kmsdrm_vt_mask_saved = false;
     }
     if (kmsdrm_vt_raw_attached) {
         SDLOP_RawInputDetachConsole();
@@ -2783,8 +2784,8 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return true;
     }
 
-    /* init dropped DRM master (see kmsdrm_Init); take it back for the
-     * dumb/GBM scanout paths. Best effort - modesetting fails cleanly
+    /* Re-acquire master after a Vulkan-window handover or VT release for
+     * the dumb/GBM scanout paths. Best effort - modesetting fails cleanly
      * later with a lost-master error if we cannot get it. */
     if (!kmsdrm_ensure_master(vid)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,

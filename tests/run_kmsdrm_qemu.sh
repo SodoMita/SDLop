@@ -25,6 +25,8 @@
 #   SDLOP_QEMU_RAW=1    leave raw input enabled (default: SDLOP_DISABLE_RAW_INPUT=1;
 #                       with a raw keyboard the driver takes K_OFF and forwards
 #                       Ctrl+Alt+Fn itself)
+#   SDLOP_QEMU_VULKAN_CHECK=1 test master ownership at Vulkan-window creation (no Vulkan surface)
+#   SDLOP_QEMU_INPUT_CHECK=1  also test global raw API / SDL key isolation via uinput
 #   SDLOP_QEMU_CTTY=1   start on controlling VT 3 while VT 2 remains visible
 #   SDLOP_QEMU_CHORD=1  also inject Ctrl+Alt+F3 into the virtual keyboard and
 #                       check the VT moves (needs SDLOP_QEMU_RAW=1)
@@ -95,7 +97,7 @@ stage_module() {
     return 0
 }
 MODULES=""
-for name in drm drm_kms_helper drm_shmem_helper drm_ttm_helper ttm drm_vram_helper drm_exec virtio_dma_buf virtio-gpu bochs input-core evdev virtio_input; do
+for name in drm drm_kms_helper drm_shmem_helper drm_ttm_helper ttm drm_vram_helper drm_exec virtio_dma_buf virtio-gpu bochs input-core evdev virtio_input uinput; do
     if stage_module "$name"; then
         MODULES="$MODULES $name"
     fi
@@ -103,7 +105,7 @@ done
 # order matters for insmod: dependencies first (ttm before drm_ttm_helper,
 # which is what virtio-gpu and bochs actually need)
 ORDER=""
-for name in drm drm_kms_helper drm_exec drm_shmem_helper ttm drm_ttm_helper drm_vram_helper virtio_dma_buf virtio-gpu bochs input-core evdev virtio_input; do
+for name in drm drm_kms_helper drm_exec drm_shmem_helper ttm drm_ttm_helper drm_vram_helper virtio_dma_buf virtio-gpu bochs input-core evdev virtio_input uinput; do
     case " $MODULES " in
         *" $name "*) ORDER="$ORDER $name" ;;
     esac
@@ -129,6 +131,7 @@ cat >"$WORK/drill.c" <<'DRILL'
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "qemu/vt_mask_check.h"
 
 static int failures;
 
@@ -489,6 +492,8 @@ int main(void)
     if (!getenv("SDLOP_DISABLE_RAW_INPUT")) {
         setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
     }
+    struct vt_mask_probe mask_probe;
+    check("mask-setup", vt_mask_begin(&mask_probe), "fixture initialized");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         printf("VT-CHECK init FAIL %s\n", SDL_GetError());
         return 1;
@@ -737,8 +742,38 @@ int main(void)
         check("away-text", 0, "could not switch away to VT %d", other_vt);
     }
 
+    const int rel = vm.relsig, acq = vm.acqsig;
     SDL_DestroyWindow(w);
+    if (getenv("SDLOP_QEMU_VULKAN_CHECK") && strcmp(getenv("SDLOP_QEMU_VULKAN_CHECK"), "1") == 0) {
+        /* This exercises window-creation handover, not a Vulkan ICD/surface. */
+        SDL_Window *vk = SDL_CreateWindow("Vulkan ownership", 640, 480,
+                                          SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+        check("vulkan-window", vk != NULL, "%s", vk ? "created" : SDL_GetError());
+        if (vk) {
+            int probe = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+            int free_master = probe >= 0 && drmSetMaster(probe) == 0;
+            const char *keep = getenv("SDLOP_KMSDRM_KEEP_MASTER");
+            const int retained = keep && *keep && strcmp(keep, "0") != 0;
+            check("vulkan-window-master", probe >= 0 && free_master == !retained,
+                  "KEEP_MASTER=%d master available to a fresh fd=%d", retained, free_master);
+            if (free_master) { drmDropMaster(probe); }
+            if (probe >= 0) { close(probe); }
+            SDL_DestroyWindow(vk);
+            SDL_Window *sw = SDL_CreateWindow("software reacquire", 640, 480, SDL_WINDOW_HIDDEN);
+            check("software-after-vulkan", sw != NULL, "%s", sw ? "created" : SDL_GetError());
+            probe = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+            free_master = probe >= 0 && drmSetMaster(probe) == 0;
+            check("software-master-reacquired", sw && probe >= 0 && !free_master,
+                  "software window holds master again (free=%d)", free_master);
+            if (free_master) { drmDropMaster(probe); }
+            if (probe >= 0) { close(probe); }
+            SDL_DestroyWindow(sw);
+        }
+    }
+    check("mask-edit", vt_mask_edit(), "application changed unrelated mask bits");
     SDL_Quit();
+    check("mask-preserved", vt_mask_finish(&mask_probe, rel, acq),
+          "owned VT bits restored; application mask edits preserved");
 
     /* --- after quit the console belongs to the user again --- */
     if (our_vt > 0) {
@@ -775,9 +810,16 @@ cmake --build "$BUILD" --target sdlop >"$WORK/build.log" 2>&1 || die "library bu
 LIB=$(ls -1 "$BUILD"/libSDLop.a "$BUILD"/libsdlop.a 2>/dev/null | head -1)
 say "static drill binary (libdrm.a for the DRM_IOCTL shims)"
 cc -static -O1 -o "$WORK/root/bin/drill" "$WORK/drill.c" \
-    -I"$SRC/src" -I"$SRC/include" -I/usr/include/libdrm -D_GNU_SOURCE \
+    -I"$SRC/src" -I"$SRC/include" -I"$SRC/tests" -I/usr/include/libdrm -D_GNU_SOURCE \
     -DSDLop_VIDEO_KMSDRM=1 -DSDLop_VIDEO_FBDEV=1 -DSDLop_VIDEO_WAYLAND=1 -DSDLop_VIDEO_X11=1 \
     "$LIB" -lpthread -lm -ldl /usr/lib/x86_64-linux-gnu/libdrm.a 2>"$WORK/cc.log" || die "static link failed (see $WORK/cc.log)"
+
+if [ "${SDLOP_QEMU_INPUT_CHECK:-0}" = "1" ]; then
+    cc -static -O1 -o "$WORK/root/bin/raw-check" "$SRC/tests/test_evdev_uinput.c" \
+        "$SRC/tests/uinput_synth.c" -I"$SRC/include" -D_GNU_SOURCE \
+        "$LIB" -lpthread -lm -ldl 2>"$WORK/cc-input.log" ||
+        die "raw-input drill link failed (see $WORK/cc-input.log)"
+fi
 
 # SDLop dlopen()s libdrm and libc is needed by the loader: a static binary can
 # still load a shared object as long as the loader and the object's own
@@ -812,7 +854,7 @@ fi
 say "guest libs: $(ls "$WORK/root/lib/x86_64-linux-gnu" 2>/dev/null | tr '\n' ' ')"
 
 cp "$(command -v busybox)" "$WORK/root/bin/busybox"
-for applet in sh mount umount ls cat echo sleep mknod chvt poweroff dmesg insmod setsid; do
+for applet in sh mount umount ls cat echo sleep mknod chvt poweroff dmesg insmod setsid grep; do
     ln -sf busybox "$WORK/root/bin/$applet"
 done
 
@@ -862,6 +904,8 @@ export SDLOP_KMSDRM_VT_SWITCH="${SDLOP_KMSDRM_VT_SWITCH:-}"
 export SDLOP_DISABLE_RAW_INPUT="$DISABLE_RAW"
 export SDLOP_QEMU_CHORD="${SDLOP_QEMU_CHORD:-0}"
 export SDLOP_QEMU_CTTY="${SDLOP_QEMU_CTTY:-0}"
+export SDLOP_QEMU_VULKAN_CHECK="${SDLOP_QEMU_VULKAN_CHECK:-0}"
+export SDLOP_KMSDRM_KEEP_MASTER="${SDLOP_KMSDRM_KEEP_MASTER:-0}"
 export SDLOP_QEMU_CMD=ttyS1
 export TTYNO="${TTYNO:-}"
 echo "VTHARNESS: running the drill"
@@ -871,6 +915,16 @@ else
     /bin/drill
 fi
 echo "VTHARNESS: exit=\$?"
+if [ -x /bin/raw-check ]; then
+    SDLOP_DISABLE_RAW_INPUT=0 /bin/raw-check >/tmp/raw-check.log 2>&1
+    raw_rc=\$?
+    cat /tmp/raw-check.log
+    if [ "\$raw_rc" = "0" ] && grep -q '^test_evdev_uinput: PASS' /tmp/raw-check.log; then
+        echo "VT-CHECK raw-api-isolation PASS raw keys reach callbacks/ring, not unfocused SDL keys"
+    else
+        echo "VT-CHECK raw-api-isolation FAIL raw-input test failed or skipped"
+    fi
+fi
 poweroff -f
 INIT
 chmod +x "$WORK/root/init"

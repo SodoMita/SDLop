@@ -1099,7 +1099,7 @@ static void handle_key(xcb_key_press_event_t *kev, bool down)
     SDL_Window *window = window_from_xid(kev->event);
     (void)window;
     if (SDLOP_RawInputKeyboardActive()) {
-        return; /* evdev worker delivers keys (same policy as Wayland) */
+        return; /* only console ownership enables raw SDL keys; not desktop evdev availability */
     }
     if (kev->detail < 8) {
         return;

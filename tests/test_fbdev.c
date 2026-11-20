@@ -26,6 +26,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "qemu/vt_mask_check.h"
 
 #define CHECK(cond, ...)                          \
     do {                                          \
@@ -251,11 +252,8 @@ static unsigned surface_pixel(SDL_Surface *s, int x, int y)
     return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
 }
 
-/* ---- software cursor: it must be drawn and follow the pointer. Whether the
-   old spot is clean depends on the core: SDL_WarpMouseInWindow() frees the
-   previous position (stock SDL3 behaviour) and reports the move
-   asynchronously, so a trail is only checked after the surface was repainted
-   (which is where a stale-pixel bug would show up). ---- */
+/* Dirty-rect presentation must erase the old cursor from the RAM surface,
+   not rely on a full-frame repaint to hide trails. */
 static void cursor_phase(SDL_Window *window, SDL_Surface *s, int *failures)
 {
     SDL_ShowCursor();
@@ -287,15 +285,17 @@ static void cursor_phase(SDL_Window *window, SDL_Surface *s, int *failures)
 
     SDL_WarpMouseInWindow(window, (float)(s->w / 4), (float)(s->h / 4));
     SDL_PumpEvents();
-    SDL_UpdateWindowSurface(window);
-    int trail = 0; /* informational until the core reports motion */
-    for (int y = s->h / 2 - 10; y < s->h / 2 + 10; y++) {
-        for (int x = s->w / 2 - 10; x < s->w / 2 + 10; x++) {
+    SDL_Rect dirty = { 4, 4, 2, 2 }; /* nowhere near either cursor position */
+    CHECK(SDL_UpdateWindowSurfaceRects(window, &dirty, 1), "dirty-rect present after cursor move");
+    int trail = 0;
+    for (int y = s->h / 2 - 24; y < s->h / 2 + 24; y++) {
+        for (int x = s->w / 2 - 24; x < s->w / 2 + 24; x++) {
             if (x >= 0 && y >= 0 && x < s->w && y < s->h && screen_pixel(s, x, y) != band) {
                 trail++;
             }
         }
     }
+    CHECK(trail == 0, "old cursor position has no stale pixels after dirty-rect present (got %d)", trail);
     /* The app's buffer is its own: whatever the cursor does on screen, the
        pixels it drew must be untouched (the old driver drew the arrow straight
        into the app's buffer, which is also what left the trail). */
@@ -578,6 +578,8 @@ int main(void)
     setenv("SDL_VIDEODRIVER", "fbdev", 1);
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 0); /* default: window-system input only */
 
+    struct vt_mask_probe mask_probe;
+    CHECK(vt_mask_begin(&mask_probe), "signal-mask fixture initialized");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         if (dump_mode) {
             fprintf(stderr, "FAIL: SDL_Init failed in dump mode: %s\n", SDL_GetError());
@@ -771,7 +773,24 @@ int main(void)
     SDL_DestroyWindow(w);
     free(display_ids);
 
+    int rel = 0, acq = 0;
+    if (driver_vt > 0) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/tty%d", driver_vt);
+        int mask_fd = open(path, O_RDWR | O_CLOEXEC);
+        struct vt_mode vm;
+        if (mask_fd >= 0 && ioctl(mask_fd, VT_GETMODE, &vm) == 0) {
+            rel = vm.relsig;
+            acq = vm.acqsig;
+        }
+        if (mask_fd >= 0) {
+            close(mask_fd);
+        }
+    }
+    CHECK(vt_mask_edit(), "application changed unrelated signal-mask bits");
     SDL_Quit();
+    CHECK(vt_mask_finish(&mask_probe, rel, acq),
+          "quit restores owned VT signal bits without clobbering application mask edits");
 
     /* after quit the console must be usable again: text mode, keyboard
        handler back, VT_AUTO (no leftover graphics mode or cursor) */

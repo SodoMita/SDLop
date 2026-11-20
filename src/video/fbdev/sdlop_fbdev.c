@@ -34,6 +34,7 @@
 */
 
 #include "internal/sdlop_internal.h"
+#include "internal/sdlop_vt.h"
 
 #if defined(__linux__)
 
@@ -92,6 +93,7 @@ typedef struct FBDEV_VT
 {
     int fd;                 /* /dev/ttyN, -1 when we have no console */
     int num;                /* VT number, 0 when unknown */
+    bool refused;          /* another program owns the VT: never touch scanout */
     bool process_mode;      /* VT_PROCESS installed (we acknowledge switches) */
     bool graphics;          /* we set KD_GRAPHICS */
     bool kb_off;            /* we set K_OFF (only with a keyboard of our own) */
@@ -401,8 +403,9 @@ static void fbdev_repaint(SDL_Window *window, const SDL_Rect *rects, int numrect
 
 static bool fbdev_console_visible(void)
 {
-    /* without a VT takeover there is no notion of "on screen": always draw */
-    return fbdev.vt.fd < 0 || fbdev.vt.active;
+    /* An explicit no-takeover request permits direct framebuffer writes.
+       Refusing an already-owned VT is different: keep frames in RAM. */
+    return !fbdev.vt.refused && (fbdev.vt.fd < 0 || fbdev.vt.active);
 }
 
 static void fbdev_cursor_erase(void)
@@ -639,18 +642,27 @@ static bool fbdev_open_device(const char *path)
     /* validate the layout before believing it: a channel wider than a byte
        would make the shifting below shift by a negative amount, and offsets
        past the pixel would scribble on the next pixel */
-    if (fix.type != FB_TYPE_PACKED_PIXELS || fix.visual != FB_VISUAL_TRUECOLOR ||
-        var.nonstd || var.grayscale != 0 || var.red.msb_right || var.green.msb_right || var.blue.msb_right ||
-        var.red.length == 0 || var.green.length == 0 || var.blue.length == 0 ||
-        var.red.length > 8 || var.green.length > 8 || var.blue.length > 8 ||
-        var.red.offset > var.bits_per_pixel - var.red.length ||
-        var.green.offset > var.bits_per_pixel - var.green.length ||
-        var.blue.offset > var.bits_per_pixel - var.blue.length) {
-        SDL_SetError("fbdev: unusable pixel layout (bpp %u, R%u/%u G%u/%u B%u/%u, %s)",
+    const char *layout_error = NULL;
+    if (fix.type != FB_TYPE_PACKED_PIXELS || fix.visual != FB_VISUAL_TRUECOLOR) {
+        layout_error = "requires a packed true-colour visual";
+    } else if (var.nonstd || var.grayscale) {
+        layout_error = "nonstandard or greyscale mode";
+    } else if (var.red.msb_right || var.green.msb_right || var.blue.msb_right) {
+        layout_error = "reversed channel bit order";
+    } else if (!var.red.length || !var.green.length || !var.blue.length) {
+        layout_error = "empty RGB channel";
+    } else if (var.red.length > 8 || var.green.length > 8 || var.blue.length > 8) {
+        layout_error = "channel wider than 8 bits";
+    } else if (var.red.offset > var.bits_per_pixel - var.red.length ||
+               var.green.offset > var.bits_per_pixel - var.green.length ||
+               var.blue.offset > var.bits_per_pixel - var.blue.length) {
+        layout_error = "channel extends beyond the pixel";
+    }
+    if (layout_error) {
+        SDL_SetError("fbdev: unusable pixel layout (bpp %u, R%u/%u G%u/%u B%u/%u): %s",
                      var.bits_per_pixel, var.red.offset, var.red.length,
-                     var.green.offset, var.green.length,
-                     var.blue.offset, var.blue.length,
-                     var.grayscale ? "greyscale" : "not a true-colour visual");
+                     var.green.offset, var.green.length, var.blue.offset, var.blue.length,
+                     layout_error);
         close(fd);
         return false;
     }
@@ -853,7 +865,7 @@ static bool fbdev_vt_take_signals(void)
     fbdev.vt.signal_fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     if (fbdev.vt.signal_fd < 0) {
         fbdev_log("signalfd failed (%s); using the handler flag", strerror(errno));
-        pthread_sigmask(SIG_SETMASK, &fbdev.vt.saved_mask, NULL);
+        SDLOP_VTRestoreSignalMask(&fbdev.vt.saved_mask, fbdev.vt.rel_sig, fbdev.vt.acq_sig);
         fbdev.vt.mask_saved = false;
     }
     return true;
@@ -866,7 +878,7 @@ static void fbdev_vt_drop_signals(void)
         fbdev.vt.signal_fd = -1;
     }
     if (fbdev.vt.mask_saved) {
-        pthread_sigmask(SIG_SETMASK, &fbdev.vt.saved_mask, NULL);
+        SDLOP_VTRestoreSignalMask(&fbdev.vt.saved_mask, fbdev.vt.rel_sig, fbdev.vt.acq_sig);
         fbdev.vt.mask_saved = false;
     }
     if (fbdev.vt.handlers_installed) {
@@ -1164,8 +1176,9 @@ static void fbdev_vt_setup(void)
         memset(&existing, 0, sizeof(existing));
         if ((ioctl(fbdev.vt.fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS) ||
             (ioctl(fbdev.vt.fd, VT_GETMODE, &existing) == 0 && existing.mode == VT_PROCESS)) {
+            fbdev.vt.refused = true;
             fbdev_log("VT %d is already owned by another program (mode=%d vt_mode=%d); "
-                      "leaving the console alone", fbdev.vt.num, mode, (int)existing.mode);
+                      "leaving console and scanout alone (SDLOP_FBDEV_TAKEOVER=0 overrides)", fbdev.vt.num, mode, (int)existing.mode);
             close(fbdev.vt.fd);
             fbdev.vt.fd = -1;
             return;

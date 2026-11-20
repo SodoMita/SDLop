@@ -165,6 +165,8 @@ if [ -x /bin/owned ]; then
     echo "VTHARNESS: owned-VT drill"
     /bin/owned
     echo "VTHARNESS: owned exit=$?"
+    /bin/owned --allow
+    echo "VTHARNESS: owned override exit=$?"
 fi
 poweroff -f
 INIT
