@@ -112,6 +112,9 @@ int main(void)
     PFN_vkDestroySemaphore p_destroy_semaphore = NULL;
     PFN_vkDestroyFence p_destroy_fence = NULL;
 
+    const char *strict_env = getenv("SDLOP_TEST_STRICT");
+    int strict = (strict_env && strcmp(strict_env, "1") == 0);
+
     test_auto_probe_no_crash();
 
     setenv("SDL_VIDEODRIVER", "dummy", 1);
@@ -199,6 +202,11 @@ int main(void)
         inst_exts[total_inst_exts++] = exts[i];
     }
     int enable_validation = (has_val_layer && has_debug_utils);
+    if (strict) {
+        CHECK(enable_validation && has_val_features,
+              "SDLOP_TEST_STRICT=1 requires VK_LAYER_KHRONOS_validation (%d), VK_EXT_debug_utils (%d), VK_EXT_validation_features (%d)",
+              has_val_layer, has_debug_utils, has_val_features);
+    }
     const char *val_layers[1] = { "VK_LAYER_KHRONOS_validation" };
     if (enable_validation) {
         inst_exts[total_inst_exts++] = "VK_EXT_debug_utils";
@@ -230,7 +238,32 @@ int main(void)
         .pEnabledValidationFeatures = enables,
     };
     if (enable_validation && has_val_features) {
+        val_features.pNext = ici.pNext;
         ici.pNext = &val_features;
+    }
+#else
+    if (strict) {
+        CHECK(0, "SDLOP_TEST_STRICT=1 requires VK_EXT_validation_features at compile time");
+    }
+#endif
+#ifdef VK_EXT_debug_utils
+    VkDebugUtilsMessengerCreateInfoEXT dmci = {
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = validation_callback,
+        .pUserData = &vstate,
+    };
+    if (enable_validation) {
+        dmci.pNext = ici.pNext;
+        ici.pNext = &dmci;
+    }
+#else
+    if (strict) {
+        CHECK(0, "SDLOP_TEST_STRICT=1 requires VK_EXT_debug_utils at compile time");
     }
 #endif
     VkResult ires = p_create_instance(&ici, NULL, &instance);
@@ -248,19 +281,11 @@ int main(void)
         p_destroy_debug =
             (PFN_vkDestroyDebugUtilsMessengerEXT)gipa(instance, "vkDestroyDebugUtilsMessengerEXT");
         if (p_create_debug) {
-            VkDebugUtilsMessengerCreateInfoEXT dmci = {
-                .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-                .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
-                                   VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
-                .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                               VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                               VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-                .pfnUserCallback = validation_callback,
-                .pUserData = &vstate,
-            };
             CHECK(p_create_debug(instance, &dmci, NULL, &debug_messenger) == VK_SUCCESS,
                   "vkCreateDebugUtilsMessengerEXT");
             printf("validation: enabled (syncval=%s)\n", has_val_features ? "yes" : "no");
+        } else if (strict) {
+            CHECK(0, "SDLOP_TEST_STRICT=1 requires vkCreateDebugUtilsMessengerEXT");
         }
     } else {
         printf("validation: not installed (VK_LAYER_KHRONOS_validation=%d, debug_utils=%d)\n",
@@ -658,6 +683,10 @@ cleanup:
     SDL_Quit();
 
     if (skipped) {
+        if (strict) {
+            fprintf(stderr, "FAIL: test_vk_offload_live skipped under SDLOP_TEST_STRICT=1\n");
+            return 1;
+        }
         return 0;
     }
 #ifdef VK_EXT_debug_utils

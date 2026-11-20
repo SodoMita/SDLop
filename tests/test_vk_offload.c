@@ -233,6 +233,11 @@ static struct {
     int probe_destroyed;
     int present_qf_has_transfer;
     uint32_t supported_usage;
+    uint32_t mem_flags;
+    int expose_invalidate;
+    int invalidate_calls;
+    int host_barrier_seen;
+    int multi_sc_suboptimal_second;
     int create_sc_calls;
     uint32_t last_sc_usage;
     int copy_seen;
@@ -252,7 +257,7 @@ static struct {
     uint8_t staging[64 * 48 * 4];
 } mvk;
 
-static int mvk_inst_obj, mvk_gpu_obj, mvk_dev_obj, mvk_q_pres_obj, mvk_q_xfer_obj;
+static int mvk_inst_obj, mvk_gpu_obj, mvk_dev_obj, mvk_q_pres_obj, mvk_q_xfer_obj, mvk_q_untracked_obj;
 
 static int mvk_create_inst(const void *ci, const void *a, void **out) {
     (void)ci; (void)a; mvk.probe_created++; *out = &mvk_inst_obj; return 0;
@@ -303,12 +308,12 @@ static void mvk_mem_props(void *g, MockVkMemProps *m) {
     (void)g;
     memset(m, 0, sizeof(*m));
     m->memoryTypeCount = 1;
-    m->memoryTypes[0].propertyFlags = 2u | 4u;
+    m->memoryTypes[0].propertyFlags = mvk.mem_flags ? mvk.mem_flags : (2u | 4u);
     m->memoryHeapCount = 1;
     m->memoryHeaps[0].size = 1024 * 1024;
 }
 static int mvk_create_headless_surf(void *i, const void *ci, const void *a, uint64_t *s) {
-    (void)i; (void)ci; (void)a; *s = 0x1111u; return 0;
+    (void)i; (void)ci; (void)a; *s = 0x1110u + mvk.next_h++; return 0;
 }
 static void mvk_destroy_surf(void *i, uint64_t s, const void *a) { (void)i;(void)s;(void)a; }
 static int mvk_surf_caps(void *g, uint64_t s, MockVkSurfCaps *caps) {
@@ -338,7 +343,7 @@ static int mvk_create_sc(void *d, const MockVkSwapchainCI *ci, const void *a, ui
     if ((ci->imageUsage & 1u) && !(mvk.supported_usage & 1u)) {
         return -3;
     }
-    *sc = 0x2222u;
+    *sc = 0x2220u + mvk.next_h++;
     return 0;
 }
 static void mvk_destroy_sc(void *d, uint64_t sc, const void *a) { (void)d;(void)sc;(void)a; }
@@ -366,6 +371,11 @@ static int mvk_map_mem(void *d, uint64_t m, uint64_t o, uint64_t sz, uint32_t f,
     (void)d;(void)m;(void)o;(void)sz;(void)f; *pp = mvk.staging; return 0;
 }
 static void mvk_unmap_mem(void *d, uint64_t m) { (void)d;(void)m; }
+static int mvk_invalidate(void *d, uint32_t cnt, const void *ranges) {
+    (void)d; (void)cnt; (void)ranges;
+    mvk.invalidate_calls++;
+    return 0;
+}
 static int mvk_create_cp(void *d, const void *ci, const void *a, uint64_t *cp) {
     (void)d; (void)a;
     uint64_t h = mvk.next_h++;
@@ -404,7 +414,10 @@ static int mvk_end_cb(void *cb) { (void)cb; return 0; }
 static void mvk_barrier(void *cb, uint32_t s, uint32_t d, uint32_t df,
                         uint32_t mc, const void *mp, uint32_t bc, const void *bp,
                         uint32_t ic, const MockVkImgBarrier *ip) {
-    (void)s;(void)d;(void)df;(void)mc;(void)mp;(void)bc;(void)bp;
+    (void)s;(void)df;(void)bc;(void)bp;
+    if (mc > 0 && mp && (d & 0x00004000u)) {
+        mvk.host_barrier_seen++;
+    }
     MockVkCmd *cmd = (MockVkCmd *)cb;
     for (uint32_t i = 0; i < ic; i++) {
         if (ip[i].srcQueueFamilyIndex != ~0u && ip[i].dstQueueFamilyIndex != ~0u &&
@@ -469,6 +482,16 @@ static int mvk_present(void *q, const MockVkPresentInfo *pi) {
                 mvk.sem_wait[h]++;
             }
         }
+        if (pi->pResults) {
+            for (uint32_t i = 0; i < pi->swapchainCount; i++) {
+                pi->pResults[i] = (mvk.multi_sc_suboptimal_second && i == 1)
+                    ? 1000001003 /* VK_SUBOPTIMAL_KHR */
+                    : 0;
+            }
+        }
+        if (mvk.multi_sc_suboptimal_second && pi->swapchainCount > 1) {
+            return 1000001003;
+        }
     }
     return 0;
 }
@@ -490,6 +513,9 @@ static MockVkVoidFn mvk_gdpa(void *d, const char *n) {
     if (strcmp(n, "vkBindBufferMemory") == 0) return (MockVkVoidFn)mvk_bind_buf;
     if (strcmp(n, "vkMapMemory") == 0) return (MockVkVoidFn)mvk_map_mem;
     if (strcmp(n, "vkUnmapMemory") == 0) return (MockVkVoidFn)mvk_unmap_mem;
+    if (strcmp(n, "vkInvalidateMappedMemoryRanges") == 0) {
+        return mvk.expose_invalidate ? (MockVkVoidFn)mvk_invalidate : NULL;
+    }
     if (strcmp(n, "vkCreateCommandPool") == 0) return (MockVkVoidFn)mvk_create_cp;
     if (strcmp(n, "vkDestroyCommandPool") == 0) return (MockVkVoidFn)mvk_destroy_cp;
     if (strcmp(n, "vkAllocateCommandBuffers") == 0) return (MockVkVoidFn)mvk_alloc_cb;
@@ -690,12 +716,212 @@ cleanup:
     unsetenv("SDL_VIDEODRIVER");
 }
 
+static void run_mock_vk_edge_cases(void)
+{
+    typedef int (*PFN_ci)(const void *, const void *, void **);
+    typedef void (*PFN_di)(void *, const void *);
+    typedef int (*PFN_epd)(void *, uint32_t *, void **);
+    typedef int (*PFN_cd)(void *, const MockVkDevCI *, const void *, void **);
+    typedef void (*PFN_dd)(void *, const void *);
+    typedef void (*PFN_gq)(void *, uint32_t, uint32_t, void **);
+    typedef int (*PFN_csc)(void *, const MockVkSwapchainCI *, const void *, uint64_t *);
+    typedef void (*PFN_dsc)(void *, uint64_t, const void *);
+    typedef int (*PFN_pres)(void *, const MockVkPresentInfo *);
+
+    /* Case A & B: Non-coherent HOST_VISIBLE memory (with and without invalidate fn) */
+    for (int has_inv = 0; has_inv <= 1; has_inv++) {
+        memset(&mvk, 0, sizeof(mvk));
+        mvk.present_qf_has_transfer = 1;
+        mvk.supported_usage = 0x11u;
+        mvk.mem_flags = 2u; /* HOST_VISIBLE only, no HOST_COHERENT */
+        mvk.expose_invalidate = has_inv;
+        mvk.next_h = 1;
+
+        setenv("SDL_VIDEODRIVER", "dummy", 1);
+        setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+        setenv("SDLOP_VULKAN_OFFLOAD", "force", 1);
+        CHECK(SDL_Init(SDL_INIT_VIDEO), "noncoherent(%d): SDL_Init", has_inv);
+
+        MockPFN_gipa gipa = (MockPFN_gipa)SDLOP_VulkanOffload_WrapGetInstanceProcAddr(
+            (SDL_FunctionPointer)mvk_gipa);
+        CHECK(SDLOP_VulkanOffload_ShouldUseOffload((SDL_FunctionPointer)mvk_gipa), "nc offload");
+        void *inst = NULL;
+        CHECK(((PFN_ci)gipa(NULL, "vkCreateInstance"))(NULL, NULL, &inst) == 0, "nc ci");
+        PFN_di p_di = (PFN_di)gipa(inst, "vkDestroyInstance");
+        PFN_epd p_epd = (PFN_epd)gipa(inst, "vkEnumeratePhysicalDevices");
+        PFN_cd p_cd = (PFN_cd)gipa(inst, "vkCreateDevice");
+        MockPFN_gdpa gdpa = (MockPFN_gdpa)gipa(inst, "vkGetDeviceProcAddr");
+
+        SDL_Window *w = SDL_CreateWindow("nc", 64, 48, 0);
+        Uint64 surf = 0;
+        CHECK(SDLOP_VulkanOffload_CreateSurface((SDL_FunctionPointer)mvk_gipa, w, inst, NULL, &surf), "nc surf");
+        void *gpu = NULL; uint32_t gc = 1;
+        CHECK(p_epd(inst, &gc, &gpu) == 0, "nc gpu");
+        float prio = 1.0f;
+        MockVkDevQueueCI qci = { 2, NULL, 0, 0, 1, &prio };
+        MockVkDevCI dci = { 3, NULL, 0, 1, &qci, 0, NULL, 0, NULL, NULL };
+        void *dev = NULL;
+        CHECK(p_cd(gpu, &dci, NULL, &dev) == 0, "nc dev");
+
+        PFN_dd p_dd = (PFN_dd)gdpa(dev, "vkDestroyDevice");
+        PFN_gq p_gq = (PFN_gq)gdpa(dev, "vkGetDeviceQueue");
+        PFN_csc p_csc = (PFN_csc)gdpa(dev, "vkCreateSwapchainKHR");
+        PFN_dsc p_dsc = (PFN_dsc)gdpa(dev, "vkDestroySwapchainKHR");
+        PFN_pres p_pres = (PFN_pres)gdpa(dev, "vkQueuePresentKHR");
+        void *pres_q = NULL;
+        p_gq(dev, 0, 0, &pres_q);
+
+        MockVkSwapchainCI sci;
+        memset(&sci, 0, sizeof(sci));
+        sci.surface = surf; sci.minImageCount = 2; sci.imageFormat = 44;
+        sci.imageExtent.width = 64; sci.imageExtent.height = 48;
+        sci.imageArrayLayers = 1; sci.imageUsage = 0x10u;
+
+        uint64_t sc = 0;
+        CHECK(p_csc(dev, &sci, NULL, &sc) == 0, "nc sc");
+        uint64_t app_sem = mvk.next_h++;
+        mvk.sem_sig[app_sem]++;
+        uint32_t idx = 0;
+        MockVkPresentInfo pi = { 1000001001u, NULL, 1, &app_sem, 1, &sc, &idx, NULL };
+        CHECK(p_pres(pres_q, &pi) == 0, "nc present");
+
+        if (has_inv) {
+            CHECK(mvk.invalidate_calls == 1 && mvk.host_barrier_seen == 1 && mvk.copy_seen == 1,
+                  "noncoherent(1): inv=%d barrier=%d copy=%d",
+                  mvk.invalidate_calls, mvk.host_barrier_seen, mvk.copy_seen);
+            SDL_Surface *fb = SDL_GetWindowSurface(w);
+            CHECK(fb && fb->pixels, "nc fb");
+            if (fb && fb->pixels) {
+                uint32_t px = *(const uint32_t *)fb->pixels;
+                CHECK(((px >> 16) & 0xFFu) == 51 && ((px >> 8) & 0xFFu) == 204 && (px & 0xFFu) == 102,
+                      "nc fb pixel mismatch 0x%08x", px);
+            }
+        } else {
+            CHECK(mvk.copy_seen == 0 && mvk.invalidate_calls == 0 &&
+                  mvk.last_present_sem == app_sem && mvk.double_consume == 0,
+                  "noncoherent(0): refused staging (copy=%d inv=%d sem=%llu/%llu)",
+                  mvk.copy_seen, mvk.invalidate_calls,
+                  (unsigned long long)mvk.last_present_sem, (unsigned long long)app_sem);
+        }
+
+        p_dsc(dev, sc, NULL);
+        p_dd(dev, NULL);
+        SDLOP_VulkanOffload_NotifyDestroySurface(surf);
+        p_di(inst, NULL);
+        SDLOP_VulkanOffload_Shutdown();
+        SDL_DestroyWindow(w);
+        SDL_Quit();
+        unsetenv("SDLOP_VULKAN_OFFLOAD");
+        unsetenv("SDL_VIDEODRIVER");
+    }
+
+    /* Case C & D: Untracked present queue refused + multi-swapchain present chaining & pResults */
+    {
+        memset(&mvk, 0, sizeof(mvk));
+        mvk.present_qf_has_transfer = 1;
+        mvk.supported_usage = 0x11u;
+        mvk.mem_flags = 2u | 4u;
+        mvk.multi_sc_suboptimal_second = 1;
+        mvk.next_h = 1;
+
+        setenv("SDL_VIDEODRIVER", "dummy", 1);
+        setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+        setenv("SDLOP_VULKAN_OFFLOAD", "force", 1);
+        CHECK(SDL_Init(SDL_INIT_VIDEO), "multi/untracked: SDL_Init");
+
+        MockPFN_gipa gipa = (MockPFN_gipa)SDLOP_VulkanOffload_WrapGetInstanceProcAddr(
+            (SDL_FunctionPointer)mvk_gipa);
+        CHECK(SDLOP_VulkanOffload_ShouldUseOffload((SDL_FunctionPointer)mvk_gipa), "multi offload");
+        void *inst = NULL;
+        CHECK(((PFN_ci)gipa(NULL, "vkCreateInstance"))(NULL, NULL, &inst) == 0, "m ci");
+        PFN_di p_di = (PFN_di)gipa(inst, "vkDestroyInstance");
+        PFN_epd p_epd = (PFN_epd)gipa(inst, "vkEnumeratePhysicalDevices");
+        PFN_cd p_cd = (PFN_cd)gipa(inst, "vkCreateDevice");
+        MockPFN_gdpa gdpa = (MockPFN_gdpa)gipa(inst, "vkGetDeviceProcAddr");
+
+        SDL_Window *w1 = SDL_CreateWindow("m1", 64, 48, 0);
+        SDL_Window *w2 = SDL_CreateWindow("m2", 64, 48, 0);
+        Uint64 surf1 = 0, surf2 = 0;
+        CHECK(SDLOP_VulkanOffload_CreateSurface((SDL_FunctionPointer)mvk_gipa, w1, inst, NULL, &surf1), "m s1");
+        CHECK(SDLOP_VulkanOffload_CreateSurface((SDL_FunctionPointer)mvk_gipa, w2, inst, NULL, &surf2), "m s2");
+
+        void *gpu = NULL; uint32_t gc = 1;
+        CHECK(p_epd(inst, &gc, &gpu) == 0, "m gpu");
+        float prio = 1.0f;
+        MockVkDevQueueCI qci = { 2, NULL, 0, 0, 1, &prio };
+        MockVkDevCI dci = { 3, NULL, 0, 1, &qci, 0, NULL, 0, NULL, NULL };
+        void *dev = NULL;
+        CHECK(p_cd(gpu, &dci, NULL, &dev) == 0, "m dev");
+
+        PFN_dd p_dd = (PFN_dd)gdpa(dev, "vkDestroyDevice");
+        PFN_gq p_gq = (PFN_gq)gdpa(dev, "vkGetDeviceQueue");
+        PFN_csc p_csc = (PFN_csc)gdpa(dev, "vkCreateSwapchainKHR");
+        PFN_dsc p_dsc = (PFN_dsc)gdpa(dev, "vkDestroySwapchainKHR");
+        PFN_pres p_pres = (PFN_pres)gdpa(dev, "vkQueuePresentKHR");
+        void *pres_q = NULL;
+        p_gq(dev, 0, 0, &pres_q);
+
+        MockVkSwapchainCI sci;
+        memset(&sci, 0, sizeof(sci));
+        sci.surface = surf1; sci.minImageCount = 2; sci.imageFormat = 44;
+        sci.imageExtent.width = 64; sci.imageExtent.height = 48;
+        sci.imageArrayLayers = 1; sci.imageUsage = 0x10u;
+        uint64_t sc1 = 0, sc2 = 0;
+        CHECK(p_csc(dev, &sci, NULL, &sc1) == 0, "m sc1");
+        sci.surface = surf2;
+        CHECK(p_csc(dev, &sci, NULL, &sc2) == 0, "m sc2");
+
+        /* Case C: untracked present queue must be refused cleanly */
+        uint64_t app_sem1 = mvk.next_h++;
+        mvk.sem_sig[app_sem1]++;
+        uint32_t idx0 = 0;
+        MockVkPresentInfo pi_untracked = { 1000001001u, NULL, 1, &app_sem1, 1, &sc1, &idx0, NULL };
+        CHECK(p_pres(&mvk_q_untracked_obj, &pi_untracked) == 0, "untracked pres");
+        CHECK(mvk.copy_seen == 0 && mvk.last_present_sem == app_sem1 && mvk.double_consume == 0,
+              "untracked queue refused readback (copy=%d sem=%llu/%llu)",
+              mvk.copy_seen, (unsigned long long)mvk.last_present_sem, (unsigned long long)app_sem1);
+
+        /* Case D: multi-swapchain present chains both readbacks & preserves pResults */
+        uint64_t app_sem2 = mvk.next_h++;
+        mvk.sem_sig[app_sem2]++;
+        uint64_t scs[2] = { sc1, sc2 };
+        uint32_t idxs[2] = { 0, 1 };
+        int results[2] = { -99, -99 };
+        MockVkPresentInfo pi_multi = { 1000001001u, NULL, 1, &app_sem2, 2, scs, idxs, results };
+        int pres_res = p_pres(pres_q, &pi_multi);
+        CHECK(pres_res == 1000001003, "multi pres res=%d", pres_res);
+        CHECK(results[0] == 0 && results[1] == 1000001003,
+              "multi pResults=[%d, %d]", results[0], results[1]);
+        CHECK(mvk.copy_seen == 2 && mvk.double_consume == 0 && mvk.wrong_qf == 0 &&
+              mvk.last_present_wait_cnt == 1 && mvk.last_present_sem != app_sem2,
+              "multi chain copy=%d dc=%d wqf=%d", mvk.copy_seen, mvk.double_consume, mvk.wrong_qf);
+
+        SDL_Surface *fb1 = SDL_GetWindowSurface(w1);
+        SDL_Surface *fb2 = SDL_GetWindowSurface(w2);
+        CHECK(fb1 && fb1->pixels && fb2 && fb2->pixels, "multi fbs");
+
+        p_dsc(dev, sc1, NULL);
+        p_dsc(dev, sc2, NULL);
+        p_dd(dev, NULL);
+        SDLOP_VulkanOffload_NotifyDestroySurface(surf1);
+        SDLOP_VulkanOffload_NotifyDestroySurface(surf2);
+        p_di(inst, NULL);
+        SDLOP_VulkanOffload_Shutdown();
+        SDL_DestroyWindow(w1);
+        SDL_DestroyWindow(w2);
+        SDL_Quit();
+        unsetenv("SDLOP_VULKAN_OFFLOAD");
+        unsetenv("SDL_VIDEODRIVER");
+    }
+}
+
 static void test_mock_vulkan_offload(void)
 {
     run_mock_vk_case("auto_probe_single_qf", "auto", 1, 0x11u, 0, 0u, 0);
     run_mock_vk_case("qfot_get_queue2_qf1_qf2", "force", 0, 0x11u, 1, 0u, 0);
     run_mock_vk_case("concurrent_skip_qfot", "force", 0, 0x11u, 1, 1u, 0);
     run_mock_vk_case("reject_no_transfer_src", "force", 1, 0x10u, 0, 0u, 1);
+    run_mock_vk_edge_cases();
 }
 
 int main(void)

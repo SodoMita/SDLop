@@ -26,6 +26,7 @@
 #define VK_MAX_EXTENSION_NAME_SIZE 256
 #define VK_API_VERSION_1_0 (1u << 22)
 #define VK_QUEUE_FAMILY_IGNORED (~0u)
+#define VK_WHOLE_SIZE (~(uint64_t)0)
 
 #define VK_QUEUE_GRAPHICS_BIT 0x00000001u
 #define VK_QUEUE_COMPUTE_BIT 0x00000002u
@@ -53,10 +54,13 @@
 #define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT 0x00000004u
 
 #define VK_ACCESS_TRANSFER_READ_BIT 0x00000800u
+#define VK_ACCESS_TRANSFER_WRITE_BIT 0x00001000u
+#define VK_ACCESS_HOST_READ_BIT 0x00002000u
 #define VK_ACCESS_MEMORY_READ_BIT 0x00008000u
 #define VK_ACCESS_MEMORY_WRITE_BIT 0x00010000u
 #define VK_PIPELINE_STAGE_TRANSFER_BIT 0x00001000u
 #define VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT 0x00002000u
+#define VK_PIPELINE_STAGE_HOST_BIT 0x00004000u
 #define VK_PIPELINE_STAGE_ALL_COMMANDS_BIT 0x00010000u
 
 #define VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT 0x00000002u
@@ -69,6 +73,7 @@
 #define VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO 1u
 #define VK_STRUCTURE_TYPE_SUBMIT_INFO 4u
 #define VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO 5u
+#define VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE 6u
 #define VK_STRUCTURE_TYPE_FENCE_CREATE_INFO 8u
 #define VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO 9u
 #define VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO 12u
@@ -76,6 +81,7 @@
 #define VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO 40u
 #define VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO 42u
 #define VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER 45u
+#define VK_STRUCTURE_TYPE_MEMORY_BARRIER 46u
 #define VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT 1000256000u
 
 typedef int32_t VkResult_;
@@ -259,6 +265,21 @@ typedef struct VkMemoryAllocateInfo_ {
     uint32_t memoryTypeIndex;
 } VkMemoryAllocateInfo_;
 
+typedef struct VkMappedMemoryRange_ {
+    uint32_t sType;
+    const void *pNext;
+    VkDeviceMemory_ memory;
+    VkDeviceSize_ offset;
+    VkDeviceSize_ size;
+} VkMappedMemoryRange_;
+
+typedef struct VkMemoryBarrier_ {
+    uint32_t sType;
+    const void *pNext;
+    VkFlags_ srcAccessMask;
+    VkFlags_ dstAccessMask;
+} VkMemoryBarrier_;
+
 typedef struct VkCommandPoolCreateInfo_ {
     uint32_t sType;
     const void *pNext;
@@ -400,6 +421,7 @@ typedef void (*PFN_vkFreeMemory_)(VkDevice_, VkDeviceMemory_, const void *);
 typedef VkResult_ (*PFN_vkBindBufferMemory_)(VkDevice_, VkBuffer_, VkDeviceMemory_, VkDeviceSize_);
 typedef VkResult_ (*PFN_vkMapMemory_)(VkDevice_, VkDeviceMemory_, VkDeviceSize_, VkDeviceSize_, VkFlags_, void **);
 typedef void (*PFN_vkUnmapMemory_)(VkDevice_, VkDeviceMemory_);
+typedef VkResult_ (*PFN_vkInvalidateMappedMemoryRanges_)(VkDevice_, uint32_t, const VkMappedMemoryRange_ *);
 typedef VkResult_ (*PFN_vkCreateCommandPool_)(VkDevice_, const VkCommandPoolCreateInfo_ *, const void *, VkCommandPool_ *);
 typedef void (*PFN_vkDestroyCommandPool_)(VkDevice_, VkCommandPool_, const void *);
 typedef VkResult_ (*PFN_vkAllocateCommandBuffers_)(VkDevice_, const VkCommandBufferAllocateInfo_ *, VkCommandBuffer_ *);
@@ -471,6 +493,7 @@ typedef struct TrackedDevice
     PFN_vkBindBufferMemory_ p_bind_buf_mem;
     PFN_vkMapMemory_ p_map_mem;
     PFN_vkUnmapMemory_ p_unmap_mem;
+    PFN_vkInvalidateMappedMemoryRanges_ p_invalidate_mapped_ranges;
     PFN_vkCreateCommandPool_ p_create_cmd_pool;
     PFN_vkDestroyCommandPool_ p_destroy_cmd_pool;
     PFN_vkAllocateCommandBuffers_ p_alloc_cmd_bufs;
@@ -506,6 +529,7 @@ typedef struct TrackedSwapchain
     /* Lazy readback staging state */
     bool staging_init;
     bool staging_failed;
+    bool staging_coherent;
     VkBuffer_ staging_buf;
     VkDeviceMemory_ staging_mem;
     VkDeviceSize_ staging_size;
@@ -1069,7 +1093,7 @@ void SDLOP_VulkanOffload_NotifyWindowDestroyed(SDL_Window *window)
 /* Staging readback into software framebuffer                          */
 /* ------------------------------------------------------------------ */
 
-static int find_host_mem_type(TrackedDevice *dev, uint32_t type_bits)
+static int find_host_mem_type(TrackedDevice *dev, uint32_t type_bits, bool *is_coherent_out)
 {
     VkInstance_ inst = dev->instance ? dev->instance : resolve_instance_for_gpu(dev->gpu);
     if (!vk_offload.real_gipa || !dev->gpu || !inst) {
@@ -1087,13 +1111,21 @@ static int find_host_mem_type(TrackedDevice *dev, uint32_t type_bits)
     const uint32_t wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
         if ((type_bits & (1u << i)) && ((mp.memoryTypes[i].propertyFlags & wanted) == wanted)) {
+            if (is_coherent_out) {
+                *is_coherent_out = true;
+            }
             return (int)i;
         }
     }
-    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
-        if ((type_bits & (1u << i)) &&
-            ((mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)) {
-            return (int)i;
+    if (dev->p_invalidate_mapped_ranges) {
+        for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
+            if ((type_bits & (1u << i)) &&
+                ((mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)) {
+                if (is_coherent_out) {
+                    *is_coherent_out = false;
+                }
+                return (int)i;
+            }
         }
     }
     return -1;
@@ -1189,12 +1221,14 @@ static bool ensure_swapchain_staging(TrackedSwapchain *sc,
         memset(&req, 0, sizeof(req));
         d->p_get_buf_mem_req(d->device, sc->staging_buf, &req);
 
-        int mtype = find_host_mem_type(d, req.memoryTypeBits);
+        bool is_coherent = true;
+        int mtype = find_host_mem_type(d, req.memoryTypeBits, &is_coherent);
         if (mtype < 0) {
             destroy_swapchain_staging(sc);
             sc->staging_failed = true;
             return false;
         }
+        sc->staging_coherent = is_coherent;
 
         VkMemoryAllocateInfo_ mai;
         memset(&mai, 0, sizeof(mai));
@@ -1349,14 +1383,10 @@ static bool choose_readback_queue(TrackedDevice *d, TrackedSwapchain *sc, VkQueu
         return true;
     }
 
-    if (!d->has_transfer_qf) {
-        return false;
-    }
-    *present_qf_out = d->transfer_qf;
-    *readback_qf_out = d->transfer_qf;
-    *readback_queue_out = present_queue;
-    *need_qfot_out = false;
-    return true;
+    /* Refuse untracked queues rather than guessing a queue family index;
+       submitting command buffers tagged with d->transfer_qf on a queue from
+       another family violates Vulkan and can cause device loss. */
+    return false;
 }
 
 static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image_index,
@@ -1464,6 +1494,18 @@ static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image
 
     d->p_cmd_copy_img_to_buf(sc->cmd_buf, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                              sc->staging_buf, 1, &region);
+
+    if (!sc->staging_coherent) {
+        VkMemoryBarrier_ host_mb;
+        memset(&host_mb, 0, sizeof(host_mb));
+        host_mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        host_mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host_mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        d->p_cmd_barrier(sc->cmd_buf,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &host_mb, 0, NULL, 0, NULL);
+    }
 
     VkImageMemoryBarrier_ to_present = to_src;
     to_present.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -1616,6 +1658,19 @@ static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image
     }
     if (!win->surface || !win->surface->pixels) {
         return true;
+    }
+
+    if (!sc->staging_coherent) {
+        VkMappedMemoryRange_ range;
+        memset(&range, 0, sizeof(range));
+        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = sc->staging_mem;
+        range.offset = 0;
+        range.size = VK_WHOLE_SIZE;
+        if (!d->p_invalidate_mapped_ranges ||
+            d->p_invalidate_mapped_ranges(d->device, 1, &range) != VK_SUCCESS) {
+            return true;
+        }
     }
 
     copy_vk_pixels_to_xrgb8888((const uint8_t *)sc->staging_mapped,
@@ -1881,6 +1936,10 @@ static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ 
         return p_present(queue, pPresentInfo);
     }
 
+    /* Chain readbacks sequentially so each swapchain's semaphore wait consumes
+       the previous one; the single p_present call waits on the final
+       chained_sem (transitively after all readbacks and caller wait
+       semaphores) and preserves pPresentInfo->pResults for every swapchain. */
     uint32_t cur_wait_count = pPresentInfo->waitSemaphoreCount;
     const VkSemaphore_ *cur_wait_sems = pPresentInfo->pWaitSemaphores;
     VkSemaphore_ chained_sem = 0;
@@ -2125,6 +2184,8 @@ static VkResult_ wrap_vkCreateDevice(VkPhysicalDevice_ physicalDevice,
         td->p_bind_buf_mem = VK_CAST(PFN_vkBindBufferMemory_, gdpa(*pDevice, "vkBindBufferMemory"));
         td->p_map_mem = VK_CAST(PFN_vkMapMemory_, gdpa(*pDevice, "vkMapMemory"));
         td->p_unmap_mem = VK_CAST(PFN_vkUnmapMemory_, gdpa(*pDevice, "vkUnmapMemory"));
+        td->p_invalidate_mapped_ranges =
+            VK_CAST(PFN_vkInvalidateMappedMemoryRanges_, gdpa(*pDevice, "vkInvalidateMappedMemoryRanges"));
         td->p_create_cmd_pool = VK_CAST(PFN_vkCreateCommandPool_, gdpa(*pDevice, "vkCreateCommandPool"));
         td->p_destroy_cmd_pool = VK_CAST(PFN_vkDestroyCommandPool_, gdpa(*pDevice, "vkDestroyCommandPool"));
         td->p_alloc_cmd_bufs = VK_CAST(PFN_vkAllocateCommandBuffers_, gdpa(*pDevice, "vkAllocateCommandBuffers"));
