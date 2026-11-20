@@ -381,8 +381,14 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
 /* Raw input worker (evdev), implemented in sdlop_evdev.c */
 bool SDLOP_RawInputInit(void);      /* starts worker thread if possible */
 void SDLOP_RawInputQuit(void);
-bool SDLOP_RawInputKeyboardActive(void); /* a raw keyboard device exists */
+bool SDLOP_RawInputKeyboardActive(void); /* raw keyboard owns console delivery */
+bool SDLOP_RawInputHasKeyboard(void);    /* ensure a working raw keyboard before K_OFF */
 bool SDLOP_RawInputMouseActive(void);    /* a raw pointer device exists */
+/* Console keyboard ownership: call AttachConsole once the console keyboard is
+   in K_OFF (raw key events then reach SDL, and Ctrl+Alt+Fn is forwarded),
+   DetachConsole as soon as it is given back. */
+void SDLOP_RawInputAttachConsole(int console_fd);
+void SDLOP_RawInputDetachConsole(void);
 void SDLOP_RawInputPump(void);      /* drain raw ring -> SDL events (main thread) */
 void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms);
 

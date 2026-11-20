@@ -51,6 +51,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #define FBDEV_MAX_WINDOWS 8
@@ -75,14 +76,15 @@ typedef struct FBDEV_Scanout
     size_t length;
 } FBDEV_Scanout;
 
-/* Pixel layout, straight from FBIOGET_VSCREENINFO. */
+/* Pixel layout, straight from FBIOGET_VSCREENINFO (validated: only true
+   colour, right-aligned, <= 8 bit channels and in-range offsets get here). */
 typedef struct FBDEV_PixelLayout
 {
     int bpp;                     /* 16, 24 or 32 */
     int bytes;                   /* bpp / 8 */
     Uint8 r_off, g_off, b_off;   /* bit offsets */
     Uint8 r_len, g_len, b_len;   /* channel widths in bits */
-    bool native;                 /* XRGB8888 in, XRGB8888 out: zero copy */
+    bool native;                 /* XRGB8888, so the copy can be a memcpy */
 } FBDEV_PixelLayout;
 
 /* Console (virtual terminal) ownership. */
@@ -92,6 +94,8 @@ typedef struct FBDEV_VT
     int num;                /* VT number, 0 when unknown */
     bool process_mode;      /* VT_PROCESS installed (we acknowledge switches) */
     bool graphics;          /* we set KD_GRAPHICS */
+    bool kb_off;            /* we set K_OFF (only with a keyboard of our own) */
+    bool raw_attached;      /* raw input delivers our key events */
     bool active;            /* our VT is the one on screen */
     int saved_kbmode;       /* -1 when unknown */
     int rel_sig, acq_sig;   /* 0 when no signal could be claimed */
@@ -115,8 +119,8 @@ static struct
     FBDEV_Scanout scanout;
     Uint8 *ram;               /* owns scanout.pixels when the card is not mapped */
     size_t ram_size;
-    Uint8 *surface_ram;       /* XRGB8888 window pixels for non-native cards */
-    size_t surface_ram_size;
+    bool shadow_live;         /* a window has presented at least once */
+    int pan_x, pan_y;         /* visible window inside the card memory */
     FBDEV_PixelLayout layout;
     bool dump;
     char dump_path[512];
@@ -171,6 +175,15 @@ static bool fbdev_replace8(const char *name, bool fallback)
 static bool fbdev_scanout_ready(void)
 {
     return fbdev.scanout.pixels != NULL;
+}
+
+static void fbdev_scanout_free(void)
+{
+    if (fbdev.scanout.mapped && fbdev.scanout.pixels) {
+        munmap(fbdev.scanout.pixels, fbdev.scanout.length);
+    }
+    fbdev.scanout.pixels = NULL;
+    fbdev.scanout.mapped = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -260,6 +273,7 @@ static void fbdev_store(const FBDEV_PixelLayout *l, Uint8 *p, Uint32 packed)
 
 static SDL_Rect fbdev_clip(SDL_Rect rect)
 {
+    /* coordinates are window/shadow space; the scanout starts at the pan */
     const SDL_Rect bounds = { 0, 0, fbdev.scanout.w, fbdev.scanout.h };
     SDL_Rect out = { 0, 0, 0, 0 };
 
@@ -287,8 +301,8 @@ static void fbdev_blit(SDL_Surface *surface, SDL_Rect rect)
     for (int y = 0; y < rect.h; y++) {
         const Uint8 *src_row = (const Uint8 *)surface->pixels +
                                (size_t)(rect.y + y) * src_pitch + (size_t)rect.x * 4u;
-        Uint8 *dst_row = fbdev.scanout.pixels + (size_t)(rect.y + y) * dst_pitch +
-                         (size_t)rect.x * (size_t)l->bytes;
+        Uint8 *dst_row = fbdev.scanout.pixels + (size_t)(fbdev.pan_y + rect.y + y) * dst_pitch +
+                         (size_t)(fbdev.pan_x + rect.x) * (size_t)l->bytes;
         if (l->native) {
             memcpy(dst_row, src_row, (size_t)rect.w * 4u);
             continue;
@@ -310,8 +324,8 @@ static void fbdev_fill(SDL_Rect rect, Uint32 xrgb)
     const FBDEV_PixelLayout *l = &fbdev.layout;
     const Uint32 packed = fbdev_pack(l, xrgb);
     for (int y = 0; y < rect.h; y++) {
-        Uint8 *row = fbdev.scanout.pixels + (size_t)(rect.y + y) * fbdev.scanout.pitch +
-                     (size_t)rect.x * (size_t)l->bytes;
+        Uint8 *row = fbdev.scanout.pixels + (size_t)(fbdev.pan_y + rect.y + y) * fbdev.scanout.pitch +
+                     (size_t)(fbdev.pan_x + rect.x) * (size_t)l->bytes;
         for (int x = 0; x < rect.w; x++) {
             fbdev_store(l, row + (size_t)x * (size_t)l->bytes, packed);
         }
@@ -362,10 +376,12 @@ static SDL_Window *fbdev_onscreen_window(void)
     return NULL;
 }
 
+static bool fbdev_console_visible(void);
+
 /* Put window content on screen (black when there is no window/surface). */
 static void fbdev_repaint(SDL_Window *window, const SDL_Rect *rects, int numrects)
 {
-    if (!fbdev_scanout_ready()) {
+    if (!fbdev_scanout_ready() || !fbdev_console_visible()) {
         return;
     }
     if (!window || !window->surface) {
@@ -428,8 +444,8 @@ static void fbdev_put_px(int x, int y, Uint32 xrgb)
         return;
     }
     fbdev_store(&fbdev.layout,
-                fbdev.scanout.pixels + (size_t)y * fbdev.scanout.pitch +
-                    (size_t)x * (size_t)fbdev.layout.bytes,
+                fbdev.scanout.pixels + (size_t)(fbdev.pan_y + y) * fbdev.scanout.pitch +
+                    (size_t)(fbdev.pan_x + x) * (size_t)fbdev.layout.bytes,
                 fbdev_pack(&fbdev.layout, xrgb));
 }
 
@@ -485,8 +501,8 @@ static void fbdev_cursor_draw(void)
     const FBDEV_PixelLayout *l = &fbdev.layout;
     for (int row = 0; row < image->h; row++) {
         const Uint8 *src = (const Uint8 *)image->pixels + (size_t)row * (size_t)image->pitch;
-        Uint8 *dst = fbdev.scanout.pixels + (size_t)(y + row) * fbdev.scanout.pitch +
-                     (size_t)x * (size_t)l->bytes;
+        Uint8 *dst = fbdev.scanout.pixels + (size_t)(fbdev.pan_y + y + row) * fbdev.scanout.pitch +
+                     (size_t)(fbdev.pan_x + x) * (size_t)l->bytes;
         for (int col = 0; col < image->w; col++) {
             Uint32 px = 0;
             memcpy(&px, src + (size_t)col * 4u, sizeof(px));
@@ -546,6 +562,9 @@ static void fbdev_dump_frame(void)
    after a VT switch back, and once at init. */
 static void fbdev_refresh(void)
 {
+    if (!fbdev.shadow_live) {
+        return; /* nothing drawn yet: do not put black over the console */
+    }
     fbdev_cursor_erase();
     fbdev_repaint(fbdev_onscreen_window(), NULL, 0);
     fbdev_cursor_draw();
@@ -556,11 +575,8 @@ static void fbdev_refresh(void)
 /* Device setup                                                        */
 /* ------------------------------------------------------------------ */
 
-static bool fbdev_alloc_ram(size_t bytes, bool for_surface)
+static bool fbdev_alloc8(Uint8 **slot, size_t *size, size_t bytes)
 {
-    Uint8 **slot = for_surface ? &fbdev.surface_ram : &fbdev.ram;
-    size_t *size = for_surface ? &fbdev.surface_ram_size : &fbdev.ram_size;
-
     free(*slot);
     *slot = NULL;
     *size = 0;
@@ -620,12 +636,31 @@ static bool fbdev_open_device(const char *path)
         return false;
     }
 
-    void *map = mmap(NULL, (size_t)length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        /* the card refuses the mapping but the mode is still ours: keep
-           painting in RAM so the app runs, and say so once */
-        fbdev_log("mmap of %s failed (%s); frames stay in RAM", path, strerror(errno));
-        map = NULL;
+    /* validate the layout before believing it: a channel wider than a byte
+       would make the shifting below shift by a negative amount, and offsets
+       past the pixel would scribble on the next pixel */
+    if (fix.type != FB_TYPE_PACKED_PIXELS || fix.visual != FB_VISUAL_TRUECOLOR ||
+        var.nonstd || var.grayscale != 0 || var.red.msb_right || var.green.msb_right || var.blue.msb_right ||
+        var.red.length == 0 || var.green.length == 0 || var.blue.length == 0 ||
+        var.red.length > 8 || var.green.length > 8 || var.blue.length > 8 ||
+        var.red.offset > var.bits_per_pixel - var.red.length ||
+        var.green.offset > var.bits_per_pixel - var.green.length ||
+        var.blue.offset > var.bits_per_pixel - var.blue.length) {
+        SDL_SetError("fbdev: unusable pixel layout (bpp %u, R%u/%u G%u/%u B%u/%u, %s)",
+                     var.bits_per_pixel, var.red.offset, var.red.length,
+                     var.green.offset, var.green.length,
+                     var.blue.offset, var.blue.length,
+                     var.grayscale ? "greyscale" : "not a true-colour visual");
+        close(fd);
+        return false;
+    }
+
+    const Uint32 rm = ((1u << var.red.length) - 1u) << var.red.offset;
+    const Uint32 gm = ((1u << var.green.length) - 1u) << var.green.offset;
+    const Uint32 bm = ((1u << var.blue.length) - 1u) << var.blue.offset;
+    if ((rm & gm) || (rm & bm) || (gm & bm)) {
+        close(fd);
+        return SDL_SetError("fbdev: overlapping colour channels");
     }
 
     fbdev.fd = fd;
@@ -643,6 +678,33 @@ static bool fbdev_open_device(const char *path)
                            var.green.offset == 8 && var.green.length == 8 &&
                            var.blue.offset == 0 && var.blue.length == 8);
 
+    /* the console may have been left scrolled: the visible window starts at
+       (xoffset, yoffset) inside the memory, so present there and nowhere
+       else. We never scroll ourselves. */
+    if ((Uint64)var.xoffset + var.xres > var.xres_virtual ||
+        ((Uint64)var.xoffset + var.xres) * (var.bits_per_pixel / 8u) > fix.line_length ||
+        (Uint64)var.yoffset + var.yres > var.yres_virtual ||
+        ((Uint64)var.yoffset + var.yres) * fix.line_length > length ||
+        (fix.smem_len && length > fix.smem_len) || var.vmode & FB_VMODE_YWRAP) {
+        close(fd);
+        fbdev.fd = -1;
+        return SDL_SetError("fbdev: visible framebuffer or panning offset is out of range");
+    }
+    fbdev.pan_x = (int)var.xoffset;
+    fbdev.pan_y = (int)var.yoffset;
+    if (fbdev.pan_x || fbdev.pan_y) {
+        fbdev_log("console left scrolled to %dx%d; presenting at that offset",
+                  fbdev.pan_x, fbdev.pan_y);
+    }
+
+    void *map = mmap(NULL, (size_t)length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        /* the card refuses the mapping but the mode is still ours: keep
+           painting in RAM so the app runs, and say so once */
+        fbdev_log("mmap of %s failed (%s); frames stay in RAM", path, strerror(errno));
+        map = NULL;
+    }
+
     fbdev.scanout.w = (int)var.xres;
     fbdev.scanout.h = (int)var.yres;
     fbdev.scanout.pitch = (size_t)fix.line_length;
@@ -653,14 +715,20 @@ static bool fbdev_open_device(const char *path)
     if (map) {
         fbdev.scanout.pixels = (Uint8 *)map;
     } else {
-        ok = fbdev_alloc_ram((size_t)length, false);
+        ok = fbdev_alloc8(&fbdev.ram, &fbdev.ram_size, (size_t)length);
         fbdev.scanout.pixels = fbdev.ram;
-    }
-    if (ok && !fbdev.layout.native) {
-        /* the window surface needs its own XRGB8888 buffer */
-        ok = fbdev_alloc_ram((size_t)fbdev.scanout.w * 4u * (size_t)fbdev.scanout.h, true);
+        if (ok) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "fbdev: %s cannot be mapped; drawing into RAM, nothing will be visible "
+                        "(the app still runs and reads its frames back)", path);
+        }
     }
     if (!ok) {
+        /* release everything this call took: the mapping, the RAM scanout */
+        fbdev_scanout_free();
+        free(fbdev.ram);
+        fbdev.ram = NULL;
+        fbdev.ram_size = 0;
         close(fd);
         fbdev.fd = -1;
         return false;
@@ -702,7 +770,7 @@ static bool fbdev_open_ram(const char *dump_path, int w, int h)
     fbdev.layout.b_len = 8;
     fbdev.layout.native = true;
     fbdev.refresh_hz = 60;
-    if (!fbdev_alloc_ram(fbdev.scanout.length, false)) {
+    if (!fbdev_alloc8(&fbdev.ram, &fbdev.ram_size, fbdev.scanout.length)) {
         return false;
     }
     fbdev.scanout.pixels = fbdev.ram;
@@ -785,6 +853,8 @@ static bool fbdev_vt_take_signals(void)
     fbdev.vt.signal_fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     if (fbdev.vt.signal_fd < 0) {
         fbdev_log("signalfd failed (%s); using the handler flag", strerror(errno));
+        pthread_sigmask(SIG_SETMASK, &fbdev.vt.saved_mask, NULL);
+        fbdev.vt.mask_saved = false;
     }
     return true;
 }
@@ -807,7 +877,10 @@ static void fbdev_vt_drop_signals(void)
 }
 
 /* Take the console: graphics mode + keyboard off, so fbcon and the console
-   keyboard handler stay out of the way while we own the VT. */
+   keyboard handler stay out of the way while we own the VT. The keyboard is
+   only switched off when SDLop has a keyboard path of its own: with raw input
+   disabled or unavailable, K_OFF would also kill Ctrl+Alt+Fn (the kernel
+   handles VT switching in its keyboard driver), Ctrl-C and SysRq. */
 static void fbdev_console_take(void)
 {
     if (fbdev.vt.fd < 0) {
@@ -819,7 +892,7 @@ static void fbdev_console_take(void)
         int mode = -1;
         if (ioctl(fbdev.vt.fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS) {
             fbdev.vt.graphics = true;
-            return;
+            return; /* already ours: mode and keyboard are as we left them */
         }
     }
     if (fbdev.vt.saved_kbmode < 0) {
@@ -828,14 +901,27 @@ static void fbdev_console_take(void)
             fbdev.vt.saved_kbmode = kbmode;
         }
     }
-    if (fbdev.vt.saved_kbmode >= 0 && ioctl(fbdev.vt.fd, KDSKBMODE, K_OFF) != 0) {
+    fbdev.vt.kb_off = SDLOP_RawInputHasKeyboard();
+    if (!fbdev.vt.kb_off) {
+        fbdev_log("no keyboard of our own (raw input off/unavailable): "
+                  "leaving the console keyboard alone so Ctrl+Alt+Fn keeps working");
+    } else if (fbdev.vt.saved_kbmode >= 0 && ioctl(fbdev.vt.fd, KDSKBMODE, K_OFF) != 0) {
         fbdev_log("KDSKBMODE K_OFF failed: %s", strerror(errno));
+        fbdev.vt.kb_off = false;
+    } else {
+        fbdev.vt.kb_off = fbdev.vt.saved_kbmode >= 0;
     }
     if (ioctl(fbdev.vt.fd, KDSETMODE, KD_GRAPHICS) != 0) {
         fbdev_log("KDSETMODE KD_GRAPHICS failed: %s", strerror(errno));
         return;
     }
     fbdev.vt.graphics = true;
+    if (fbdev.vt.kb_off) {
+        /* the console keyboard is in K_OFF, so raw input is the only way the
+           application sees keys - and it has to forward Ctrl+Alt+Fn for us */
+        SDLOP_RawInputAttachConsole(fbdev.vt.fd);
+        fbdev.vt.raw_attached = true;
+    }
     {
         int mode = -1;
         if (ioctl(fbdev.vt.fd, KDGETMODE, &mode) == 0 && mode != KD_GRAPHICS) {
@@ -851,17 +937,22 @@ static void fbdev_console_release(void)
         return;
     }
     fbdev_cursor_erase();
+    if (fbdev.vt.raw_attached) {
+        SDLOP_RawInputDetachConsole();
+        fbdev.vt.raw_attached = false;
+    }
     if (fbdev.vt.graphics) {
         if (ioctl(fbdev.vt.fd, KDSETMODE, KD_TEXT) != 0) {
             fbdev_log("KDSETMODE KD_TEXT failed: %s", strerror(errno));
         }
         fbdev.vt.graphics = false;
     }
-    if (fbdev.vt.saved_kbmode >= 0) {
+    if (fbdev.vt.kb_off && fbdev.vt.saved_kbmode >= 0) {
         if (ioctl(fbdev.vt.fd, KDSKBMODE, fbdev.vt.saved_kbmode) != 0) {
             fbdev_log("KDSKBMODE restore failed: %s", strerror(errno));
         }
     }
+    fbdev.vt.kb_off = false;
 }
 
 /* VT switch requested by the kernel: hand the console over. */
@@ -932,8 +1023,8 @@ static int fbdev_open_vt(const char *path, int *vt_num)
     return fd;
 }
 
-/* Which VT to own. $TTYNO names one, otherwise we adopt the VT the user is
-   looking at, otherwise the first usable console, otherwise a free one from
+/* Which VT to own. $TTYNO names one, then the controlling VT, then the VT
+   on screen, otherwise the first usable console, otherwise a free one from
    VT_OPENQRY. Nothing here activates a VT: the picture appears where the user
    already is, which is the whole point of not being kmsdrm's VT_ACTIVATE. */
 static bool fbdev_vt_open_target(void)
@@ -955,6 +1046,21 @@ static bool fbdev_vt_open_target(void)
             }
             fbdev_log("$TTYNO console %s is not usable: %s", path, strerror(errno));
         }
+    }
+
+    /* Prefer the controlling VT even when a different VT is on screen.
+       TIOCGDEV resolves /dev/tty to its actual device, unlike VT_GETSTATE,
+       which reports the foreground VT rather than this fd's identity. */
+    int controlling = fbdev_open_vt("/dev/tty", NULL);
+    if (controlling >= 0) {
+        unsigned int dev = 0;
+        if (ioctl(controlling, TIOCGDEV, &dev) == 0 && major(dev) == 4 &&
+            minor(dev) > 0 && minor(dev) <= 63) {
+            fbdev.vt.fd = controlling;
+            fbdev.vt.num = (int)minor(dev);
+            return true;
+        }
+        close(controlling);
     }
 
     /* the active VT, as the kernel reports it through /dev/tty0 */
@@ -1048,6 +1154,24 @@ static void fbdev_vt_setup(void)
         return;
     }
 
+    /* Refuse a VT that is already somebody else's console: a graphics-mode VT
+       or one driven in VT_PROCESS belongs to another program (compositor,
+       kiosk, another SDL app). Taking it over would put KD_TEXT and VT_AUTO
+       onto their screen when we quit. */
+    {
+        int mode = -1;
+        struct vt_mode existing;
+        memset(&existing, 0, sizeof(existing));
+        if ((ioctl(fbdev.vt.fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS) ||
+            (ioctl(fbdev.vt.fd, VT_GETMODE, &existing) == 0 && existing.mode == VT_PROCESS)) {
+            fbdev_log("VT %d is already owned by another program (mode=%d vt_mode=%d); "
+                      "leaving the console alone", fbdev.vt.num, mode, (int)existing.mode);
+            close(fbdev.vt.fd);
+            fbdev.vt.fd = -1;
+            return;
+        }
+    }
+
     if (fbdev.vt.num == 0) {
         struct vt_stat state;
         memset(&state, 0, sizeof(state));
@@ -1098,12 +1222,10 @@ static void fbdev_vt_setup(void)
                              (SDL_getenv("TTYNO") && *SDL_getenv("TTYNO"));
     if (want_switch && fbdev.vt.num > 0 && !fbdev.vt.active) {
         if (ioctl(fbdev.vt.fd, VT_ACTIVATE, fbdev.vt.num) == 0) {
-            if (ioctl(fbdev.vt.fd, VT_WAITACTIVE, fbdev.vt.num) == 0) {
-                fbdev.vt.active = true;
-                fbdev_log("switched to VT %d", fbdev.vt.num);
-            } else {
-                fbdev_log("VT_WAITACTIVE(%d) failed: %s", fbdev.vt.num, strerror(errno));
-            }
+            /* asynchronous on purpose: VT_WAITACTIVE would block until this
+               process acknowledges the acquire from the event loop, which has
+               not started yet */
+            fbdev_log("asked for VT %d", fbdev.vt.num);
         } else {
             fbdev_log("VT_ACTIVATE(%d) failed: %s", fbdev.vt.num, strerror(errno));
         }
@@ -1119,7 +1241,7 @@ static void fbdev_vt_setup(void)
 static void fbdev_vt_shutdown(void)
 {
     if (fbdev.vt.fd >= 0) {
-        fbdev_console_release();
+        fbdev_console_release(); /* KD_TEXT, keyboard back, cursor gone */
         if (fbdev.vt.process_mode) {
             struct vt_mode mode;
             memset(&mode, 0, sizeof(mode));
@@ -1225,13 +1347,9 @@ static bool fbdev_Init(SDLop_VideoDevice *device)
                                      (int)fbdev.refresh_hz * 1000,
                                      SDL_ORIENTATION_LANDSCAPE, NULL, sdlop.init_done);
     if (!fbdev.display) {
-        if (fbdev.scanout.mapped && fbdev.scanout.pixels) {
-            munmap(fbdev.scanout.pixels, fbdev.scanout.length);
-        }
-        fbdev.scanout.pixels = NULL;
+        fbdev_scanout_free();
         free(fbdev.ram);
-        free(fbdev.surface_ram);
-        fbdev.ram = fbdev.surface_ram = NULL;
+        fbdev.ram = NULL;
         if (fbdev.fd >= 0) {
             close(fbdev.fd);
             fbdev.fd = -1;
@@ -1239,9 +1357,9 @@ static bool fbdev_Init(SDLop_VideoDevice *device)
         return false;
     }
 
-    /* keep the scanout black instead of showing whatever the card held */
-    fbdev_fill((SDL_Rect){ 0, 0, fbdev.scanout.w, fbdev.scanout.h }, 0x000000);
-
+    /* Nothing is written to the scanout here: until the app presents, the
+       card belongs to whoever was on the console, and the shadow already
+       starts black. */
     fbdev_vt_setup();
     return true;
 }
@@ -1255,20 +1373,15 @@ static void fbdev_Quit(SDLop_VideoDevice *device)
         fbdev.display = 0;
     }
     fbdev_vt_shutdown();
-    if (fbdev.scanout.mapped && fbdev.scanout.pixels) {
-        munmap(fbdev.scanout.pixels, fbdev.scanout.length);
-    }
-    fbdev.scanout.pixels = NULL;
-    fbdev.scanout.mapped = false;
+    fbdev_scanout_free();
     if (fbdev.fd >= 0) {
         close(fbdev.fd);
         fbdev.fd = -1;
     }
     free(fbdev.ram);
-    free(fbdev.surface_ram);
     fbdev.ram = NULL;
-    fbdev.surface_ram = NULL;
-    fbdev.ram_size = fbdev.surface_ram_size = 0;
+    fbdev.ram_size = 0;
+    fbdev.shadow_live = false;
     memset(fbdev.windows, 0, sizeof(fbdev.windows));
     fbdev.cursor = NULL;
     fbdev.cursor_rect = (SDL_Rect){ 0, 0, 0, 0 };
@@ -1452,20 +1565,10 @@ static bool fbdev_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
 {
     (void)device;
     (void)window;
-    Uint8 *pixels = fbdev.layout.native ? fbdev.scanout.pixels : fbdev.surface_ram;
-    const size_t pitch = fbdev.layout.native ? fbdev.scanout.pitch : (size_t)fbdev.scanout.w * 4u;
-
-    if (!pixels) {
-        return SDL_SetError("fbdev: no scanout memory");
-    }
-    if (pitch > (size_t)INT32_MAX) {
-        return SDL_SetError("fbdev: scanout stride is too large");
-    }
-    /* the surface starts black so nothing from the card shows through */
-    memset(pixels, 0, fbdev.layout.native ? fbdev.scanout.length : fbdev.surface_ram_size);
-
-    SDL_Surface *created = SDL_CreateSurfaceFrom(fbdev.scanout.w, fbdev.scanout.h,
-                                                 SDL_PIXELFORMAT_XRGB8888, pixels, (int)pitch);
+    /* Each window owns a RAM shadow. It never aliases scanout memory or
+       another window's surface, even in the native 32-bit mode. */
+    SDL_Surface *created = SDL_CreateSurface(fbdev.scanout.w, fbdev.scanout.h,
+                                             SDL_PIXELFORMAT_XRGB8888);
     if (!created) {
         return false;
     }
@@ -1479,14 +1582,22 @@ static bool fbdev_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
     if (!fbdev_scanout_ready()) {
         return SDL_SetError("fbdev: no scanout memory");
     }
-    /* lift the old cursor first: its pixels come back from the surface we
-       are about to publish, so it can never leave a trail */
-    fbdev_cursor_erase();
-    if (!fbdev.layout.native) {
-        /* the surface lives in RAM; the card needs a converted copy */
-        fbdev_repaint(window, rects, numrects);
+    if (!window || !window->surface || !window->surface->pixels) {
+        return SDL_SetError("fbdev: window surface is not the driver's");
     }
-    /* native layout: the surface *is* the scanout, nothing to copy */
+    fbdev.shadow_live = true;
+
+    /* While another VT is in front, framebuffer memory belongs to that VT's
+       text console: presenting now would paint over it. Keep the pixels in the
+       shadow and let the switch back repaint. */
+    if (!fbdev_console_visible()) {
+        return true;
+    }
+
+    /* lift the old cursor first (it lives in the scanout only), publish the
+       shadow, put the cursor back */
+    fbdev_cursor_erase();
+    fbdev_repaint(window, rects, numrects);
     fbdev_cursor_draw();
     fbdev_dump_frame();
     return true;
@@ -1498,9 +1609,6 @@ static void fbdev_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     if (!window || !window->surface) {
         return;
     }
-    /* the pixels belong to the driver (scanout or surface RAM), not to the
-       surface: detach before destroying it */
-    window->surface->pixels = NULL;
     SDL_DestroySurface(window->surface);
     window->surface = NULL;
 }

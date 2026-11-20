@@ -23,8 +23,9 @@
     SDLOP_KMSDRM_NOFLIP=1                   never page flip; always drmModeSetCrtc
     SDLOP_KMSDRM_FLIP_TIMEOUT_MS=<n>        page flip wait timeout (default 1500)
     SDLOP_KMSDRM_REQUIRE_MASTER=0           do not require DRM master at startup
-    SDLOP_KMSDRM_DROP_MASTER=1              drop DRM master after init, for a
-                                            Vulkan window (default: keep it)
+    SDLOP_KMSDRM_KEEP_MASTER=1              keep DRM master even when a Vulkan
+                                            window asks for it (default: hand it
+                                            over to VK_KHR_display)
     SDLOP_KMSDRM_VT_SWITCH=1                activate our VT on start; default is
                                             to render without switching so the
                                             user decides when to look
@@ -139,10 +140,14 @@ static bool kmsdrm_require_master(void)
 /* DRM master                                                          */
 /* ------------------------------------------------------------------ */
 
-/* Best-effort re-acquisition of DRM master. The device probing code drops
- * master once at the end of init (so a Vulkan window can grab it); the
- * dumb/GL scanout paths need it back. Returns false if we still don't hold
- * it afterwards (modesetting will fail with a lost-master error later). */
+/* Vulkan normally takes DRM master; this opt-out keeps it on our fd. */
+static bool kmsdrm_keep_master(void)
+{
+    const char *keep = getenv("SDLOP_KMSDRM_KEEP_MASTER");
+    return keep && *keep && strcmp(keep, "0") != 0;
+}
+
+/* Re-acquire DRM master after a VT switch or Vulkan handover. */
 static bool kmsdrm_ensure_master(KMSDRM_DeviceData *vid)
 {
     if (vid->drm_fd < 0) {
@@ -334,6 +339,8 @@ static struct sigaction kmsdrm_vt_old_acquire;
 static sigset_t kmsdrm_vt_saved_mask;   /* main-thread mask before we blocked */
 static bool kmsdrm_vt_mask_saved;
 static int kmsdrm_vt_signal_fd = -1;    /* signalfd owning the VT signals (swa) */
+static bool kmsdrm_vt_kb_off = false;   /* K_OFF is ours (a raw keyboard exists) */
+static bool kmsdrm_vt_raw_attached = false; /* raw input delivers our key events */
 
 /* VT signals are consumed through a non-blocking signalfd polled by the
  * event loop (swa behavior) instead of sigaction handlers + a flag: the
@@ -450,8 +457,12 @@ static void kmsdrm_vt_shutdown(void)
         pthread_sigmask(SIG_SETMASK, &kmsdrm_vt_saved_mask, NULL);
         kmsdrm_vt_mask_saved = false;
     }
+    if (kmsdrm_vt_raw_attached) {
+        SDLOP_RawInputDetachConsole();
+        kmsdrm_vt_raw_attached = false;
+    }
     if (kmsdrm_vt_console_fd >= 0) {
-        if (kmsdrm_vt_saved_kbmode >= 0) {
+        if (kmsdrm_vt_kb_off && kmsdrm_vt_saved_kbmode >= 0) {
             ioctl(kmsdrm_vt_console_fd, KDSKBMODE, kmsdrm_vt_saved_kbmode);
             kmsdrm_vt_saved_kbmode = -1;
         }
@@ -463,16 +474,17 @@ static void kmsdrm_vt_shutdown(void)
         close(kmsdrm_vt_console_fd);
         kmsdrm_vt_console_fd = -1;
     }
+    kmsdrm_vt_kb_off = false;
 }
 
 static void kmsdrm_vt_init(void)
 {
     /* VT selection:
      *   1. $TTYNO explicitly requests /dev/tty<N>;
-     *   2. otherwise the VT the user is looking at (read through /dev/tty0);
-     *   3. otherwise the controlling tty;
+     *   2. otherwise the controlling VT;
+     *   3. otherwise the VT on screen (read through /dev/tty0);
      *   4. otherwise a free VT from VT_OPENQRY.
-     * Only 1 and 4 (and $TTYNO) are allowed to activate a VT, and only when
+     * Activation is only requested when
      * SDLOP_KMSDRM_VT_SWITCH=1 or $TTYNO asked for it: by default the picture
      * is rendered on the console the user already has in front of them. */
     int fd = -1;
@@ -488,7 +500,7 @@ static void kmsdrm_vt_init(void)
     if (tty_num_env && *tty_num_env) {
         char *endptr = NULL;
         unsigned long tty = strtoul(tty_num_env, &endptr, 10);
-        if (tty == 0 || !endptr || *endptr != '\0') {
+        if (tty == 0 || tty > 63 || !endptr || *endptr != '\0') {
             kmsdrm_log("KMSDRM: invalid $TTYNO '%s'; ignoring", tty_num_env);
         } else {
             vt_num = (int)tty;
@@ -500,6 +512,22 @@ static void kmsdrm_vt_init(void)
             } else {
                 want_switch = true;
             }
+        }
+    }
+
+    /* A background console app must keep its own controlling VT, not claim
+       whichever VT somebody else happens to be looking at. */
+    if (fd < 0) {
+        int controlling = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+        unsigned int dev = 0;
+        struct vt_mode mode;
+        if (controlling >= 0 && ioctl(controlling, VT_GETMODE, &mode) == 0 &&
+            ioctl(controlling, TIOCGDEV, &dev) == 0 && major(dev) == 4 &&
+            minor(dev) > 0 && minor(dev) <= 63) {
+            fd = controlling;
+            vt_num = (int)minor(dev);
+        } else if (controlling >= 0) {
+            close(controlling);
         }
     }
 
@@ -530,9 +558,6 @@ static void kmsdrm_vt_init(void)
     }
 
     if (fd < 0) {
-        fd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
-    }
-    if (fd < 0) {
         /* no controlling console (e.g. ssh): allocate a free VT. This one does
            need a switch to be seen at all, so it is opt-in. */
         const int tty0 = open("/dev/tty0", O_RDWR | O_CLOEXEC);
@@ -543,7 +568,6 @@ static void kmsdrm_vt_init(void)
                 fd = open(tty_dev, O_RDWR | O_NOCTTY | O_CLOEXEC);
                 if (fd >= 0) {
                     vt_num = free_vt;
-                    want_switch = true;
                     kmsdrm_log("KMSDRM: no controlling tty; allocated VT %d", vt_num);
                 } else {
                     kmsdrm_log("KMSDRM: failed to open allocated VT console %s: %s",
@@ -566,6 +590,22 @@ static void kmsdrm_vt_init(void)
         close(fd);
         kmsdrm_log("KMSDRM: /dev/tty is not a keyboard console; VT switching left to the kernel");
         return;
+    }
+
+    /* A graphics-mode VT or one driven in VT_PROCESS belongs to another
+       program. Adopting it would put KD_TEXT and VT_AUTO on their screen when
+       we leave, so leave the console alone instead. */
+    {
+        int mode = -1;
+        struct vt_mode existing;
+        memset(&existing, 0, sizeof(existing));
+        if ((ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS) ||
+            (ioctl(fd, VT_GETMODE, &existing) == 0 && existing.mode == VT_PROCESS)) {
+            close(fd);
+            kmsdrm_log("KMSDRM: VT is already owned by another program (mode=%d vt_mode=%d); "
+                       "leaving the console alone", mode, (int)existing.mode);
+            return;
+        }
     }
 
     kmsdrm_vt_release_sig = kmsdrm_vt_find_free_signal(&kmsdrm_vt_old_release, 0);
@@ -600,8 +640,19 @@ static void kmsdrm_vt_init(void)
         int kbmode = 0;
         if (ioctl(fd, KDGKBMODE, &kbmode) == 0) {
             kmsdrm_vt_saved_kbmode = kbmode;
-            if (ioctl(fd, KDSKBMODE, K_OFF) != 0) {
-                kmsdrm_log("KMSDRM: KDSKBMODE K_OFF failed: %s", strerror(errno));
+            /* K_OFF also disables the kernel's own Ctrl+Alt+Fn, so it is only
+               worth it when raw input can deliver the keys (and forward the
+               chord) from here on. Without a raw keyboard the console keeps
+               its handler and everything works as the user expects. */
+            if (SDLOP_RawInputHasKeyboard()) {
+                if (ioctl(fd, KDSKBMODE, K_OFF) == 0) {
+                    kmsdrm_vt_kb_off = true;
+                } else {
+                    kmsdrm_log("KMSDRM: KDSKBMODE K_OFF failed: %s", strerror(errno));
+                }
+            } else {
+                kmsdrm_log("KMSDRM: no raw keyboard (%s); leaving the console keyboard alone",
+                           SDL_getenv("SDLOP_DISABLE_RAW_INPUT") ? "raw input disabled" : "none found");
             }
         } else {
             kmsdrm_vt_saved_kbmode = -1;
@@ -614,6 +665,10 @@ static void kmsdrm_vt_init(void)
 
     kmsdrm_vt_console_fd = fd;
     kmsdrm_vt_num = vt_num;
+    if (kmsdrm_vt_kb_off) {
+        SDLOP_RawInputAttachConsole(fd);
+        kmsdrm_vt_raw_attached = true;
+    }
     if (vt_num > 0 && want_switch) {
         /* VT_WAITACTIVE cannot be used here: the switch only completes once
            this process acknowledges it from the event loop, i.e. after
@@ -642,7 +697,11 @@ static void kmsdrm_vt_console_release(void)
     if (kmsdrm_vt_console_fd < 0) {
         return;
     }
-    if (kmsdrm_vt_saved_kbmode >= 0 &&
+    if (kmsdrm_vt_raw_attached) {
+        SDLOP_RawInputDetachConsole();
+        kmsdrm_vt_raw_attached = false;
+    }
+    if (kmsdrm_vt_kb_off && kmsdrm_vt_saved_kbmode >= 0 &&
         ioctl(kmsdrm_vt_console_fd, KDSKBMODE, kmsdrm_vt_saved_kbmode) != 0) {
         kmsdrm_log("KMSDRM: KDSKBMODE restore failed: %s", strerror(errno));
     }
@@ -691,9 +750,16 @@ static void kmsdrm_vt_console_take(void)
     if (kmsdrm_vt_console_fd < 0) {
         return;
     }
-    if (kmsdrm_vt_saved_kbmode >= 0 &&
-        ioctl(kmsdrm_vt_console_fd, KDSKBMODE, K_OFF) != 0) {
-        kmsdrm_log("KMSDRM: KDSKBMODE K_OFF failed: %s", strerror(errno));
+    if (kmsdrm_vt_kb_off) {
+        const bool off = kmsdrm_vt_saved_kbmode >= 0 &&
+                         ioctl(kmsdrm_vt_console_fd, KDSKBMODE, K_OFF) == 0;
+        if (!off) {
+            kmsdrm_log("KMSDRM: KDSKBMODE K_OFF failed: %s", strerror(errno));
+        }
+        if (off && !kmsdrm_vt_raw_attached) {
+            SDLOP_RawInputAttachConsole(kmsdrm_vt_console_fd);
+            kmsdrm_vt_raw_attached = true;
+        }
     }
     if (ioctl(kmsdrm_vt_console_fd, KDSETMODE, KD_GRAPHICS) != 0) {
         kmsdrm_log("KMSDRM: KDSETMODE KD_GRAPHICS failed: %s", strerror(errno));
@@ -1342,14 +1408,19 @@ static void kmsdrm_teardown_display(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *
     }
     memset(&dd->atomic_cursor, 0, sizeof(dd->atomic_cursor));
 
-    if (dd->cursor_bo) {
+    if (dd->cursor_bo || dd->cursor_dumb) {
+        /* exactly one of the two exists: GBM bo, or the dumb buffer used when
+           GBM is unavailable. Both have to go, or the cursor buffer (and its
+           mapping) leaks on every quit in the GBM-free path. */
         kmsdrm_cursor_dumb_free(dd);
         if (dd->cursor_visible && dd->crtc) {
             SDLOP_DRM_drmModeSetCursor(vid->drm_fd, dd->crtc->crtc_id, 0, 0, 0);
             dd->cursor_visible = false;
         }
-        SDLOP_GBM_gbm_bo_destroy(dd->cursor_bo);
-        dd->cursor_bo = NULL;
+        if (dd->cursor_bo) {
+            SDLOP_GBM_gbm_bo_destroy(dd->cursor_bo);
+            dd->cursor_bo = NULL;
+        }
     }
     if (dd->connector) {
         SDLOP_DRM_drmModeFreeConnector(dd->connector);
@@ -2698,6 +2769,17 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         sdlop.mouse_focus = window;
         window->flags |= SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_MOUSE_FOCUS;
         kmsdrm_log("KMSDRM: Vulkan window (scanout handled by VK_KHR_display)");
+        /* VK_KHR_display takes master itself. Handing it back here - rather
+         * than at init - leaves non-Vulkan windows with master they never lost,
+         * and keeps the window usable if no Vulkan surface is ever created.
+         * SDLOP_KMSDRM_KEEP_MASTER=1 keeps it for us instead. */
+        if (!kmsdrm_keep_master()) {
+            if (SDLOP_DRM_drmDropMaster && SDLOP_DRM_drmDropMaster(vid->drm_fd) == 0) {
+                kmsdrm_log("KMSDRM: DRM master handed over for the Vulkan window");
+            } else {
+                kmsdrm_log("KMSDRM: could not hand DRM master to the Vulkan window");
+            }
+        }
         return true;
     }
 
@@ -3274,19 +3356,8 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
 
     /* Master is kept: it is what the modesets, the dumb-buffer scanout and the
      * hardware cursor need (dropping it turns every later ioctl into ENXIO and
-     * the cursor silently disappears). SDLOP_KMSDRM_DROP_MASTER=1 restores the
-     * old behaviour for setups where a Vulkan (VK_KHR_display) window needs to
-     * take master; non-Vulkan windows re-acquire master in
-     * kmsdrm_CreateWindow(). */
-    {
-        const char *drop = getenv("SDLOP_KMSDRM_DROP_MASTER");
-        if (drop && *drop && strcmp(drop, "0") != 0) {
-            if (SDLOP_DRM_drmDropMaster) {
-                SDLOP_DRM_drmDropMaster(vid->drm_fd);
-            }
-            kmsdrm_log("KMSDRM: DRM master dropped after init (SDLOP_KMSDRM_DROP_MASTER)");
-        }
-    }
+     * the cursor silently disappears). A Vulkan window needs it handed over at
+     * the moment it is created, not during init - see kmsdrm_CreateWindow(). */
 
     vid->video_init = true;
     return true;

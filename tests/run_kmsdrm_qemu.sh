@@ -22,7 +22,12 @@
 #   SDLOP_QEMU_MEM        guest memory in MB (default 1024)
 #   SDLOP_QEMU_TIMEOUT    boot+run timeout in seconds (default 300)
 #   SDLOP_KMSDRM_VT_SWITCH=1   expect the opt-in automatic VT switch
-#   SDLOP_KMSDRM_DROP_MASTER=1 forward the legacy drop-master behaviour
+#   SDLOP_QEMU_RAW=1    leave raw input enabled (default: SDLOP_DISABLE_RAW_INPUT=1;
+#                       with a raw keyboard the driver takes K_OFF and forwards
+#                       Ctrl+Alt+Fn itself)
+#   SDLOP_QEMU_CTTY=1   start on controlling VT 3 while VT 2 remains visible
+#   SDLOP_QEMU_CHORD=1  also inject Ctrl+Alt+F3 into the virtual keyboard and
+#                       check the VT moves (needs SDLOP_QEMU_RAW=1)
 #   TTYNO=3               run on /dev/tty3 (implies the opt-in switch)
 #   SDLOP_QEMU_KEEP=1     keep the initramfs and logs
 #
@@ -90,7 +95,7 @@ stage_module() {
     return 0
 }
 MODULES=""
-for name in drm drm_kms_helper drm_shmem_helper drm_ttm_helper ttm drm_vram_helper drm_exec virtio_dma_buf virtio-gpu bochs; do
+for name in drm drm_kms_helper drm_shmem_helper drm_ttm_helper ttm drm_vram_helper drm_exec virtio_dma_buf virtio-gpu bochs input-core evdev virtio_input; do
     if stage_module "$name"; then
         MODULES="$MODULES $name"
     fi
@@ -98,7 +103,7 @@ done
 # order matters for insmod: dependencies first (ttm before drm_ttm_helper,
 # which is what virtio-gpu and bochs actually need)
 ORDER=""
-for name in drm drm_kms_helper drm_exec drm_shmem_helper ttm drm_ttm_helper drm_vram_helper virtio_dma_buf virtio-gpu bochs; do
+for name in drm drm_kms_helper drm_exec drm_shmem_helper ttm drm_ttm_helper drm_vram_helper virtio_dma_buf virtio-gpu bochs input-core evdev virtio_input; do
     case " $MODULES " in
         *" $name "*) ORDER="$ORDER $name" ;;
     esac
@@ -115,6 +120,7 @@ cat >"$WORK/drill.c" <<'DRILL'
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <linux/input.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <stdio.h>
@@ -477,11 +483,12 @@ static void paint(SDL_Surface *s, SDL_Window *w, unsigned color)
 
 int main(void)
 {
-    const char *want_master = getenv("SDLOP_KMSDRM_DROP_MASTER");
     const int vt_before = active_vt();
 
     setenv("SDL_VIDEODRIVER", "kmsdrm", 1);
-    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    if (!getenv("SDLOP_DISABLE_RAW_INPUT")) {
+        setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         printf("VT-CHECK init FAIL %s\n", SDL_GetError());
         return 1;
@@ -534,7 +541,31 @@ int main(void)
     int rc = ioctl(fd, KDGETMODE, &mode);
     check("text-hidden", rc == 0 && mode == KD_GRAPHICS, "KDGETMODE=%d rc=%d", mode, rc);
     rc = ioctl(fd, KDGKBMODE, &kbmode);
-    check("kbd-disabled", rc == 0 && kbmode == K_OFF, "KDGKBMODE=%d rc=%d", kbmode, rc);
+    {
+        /* K_OFF is only ours to set when a raw keyboard exists: it is what
+           delivers the key events, and it forwards Ctrl+Alt+Fn. Without one the
+           console must keep its keyboard handler. */
+        char kbbits[8] = { 0 };
+        int kbfd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (kbfd < 0) {
+            kbfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        }
+        const int raw_on = kbfd >= 0 &&
+                           ioctl(kbfd, EVIOCGBIT(EV_KEY, sizeof(kbbits)), kbbits) >= 0 &&
+                           (kbbits[KEY_A / 8] & (1 << (KEY_A % 8))) != 0;
+        if (kbfd >= 0) {
+            close(kbfd);
+        }
+        const char *disabled = getenv("SDLOP_DISABLE_RAW_INPUT");
+        if (raw_on && !(disabled && *disabled && strcmp(disabled, "0") != 0)) {
+            check("kbd-enabled-with-raw-keyboard", rc == 0 && kbmode == K_OFF,
+                  "SDLOP_DISABLE_RAW_INPUT unset: KDGKBMODE=%d rc=%d", kbmode, rc);
+        } else {
+            check("kbd-untouched", rc == 0 && kbmode != K_OFF,
+                  "SDLOP_DISABLE_RAW_INPUT=1: console keyboard left alone (kbmode=%d rc=%d)",
+                  kbmode, rc);
+        }
+    }
     rc = ioctl(fd, VT_GETMODE, &vm);
     check("vt-process", rc == 0 && vm.mode == VT_PROCESS, "VT_GETMODE=%d rc=%d", (int)vm.mode, rc);
 
@@ -551,6 +582,12 @@ int main(void)
                   "user was on VT %d before init, active now VT %d, ours %d",
                   vt_before, now_active, our_vt);
         }
+    }
+
+    if (getenv("SDLOP_QEMU_CTTY") && strcmp(getenv("SDLOP_QEMU_CTTY"), "1") == 0) {
+        check("controlling-vt", our_vt == 3 && now_active == vt_before && vt_before == 2,
+              "controlling VT 3 selected without activating it (ours=%d active=%d)", our_vt, now_active);
+        check("controlling-vt-show", switch_to(w, our_vt), "user switched to our background VT");
     }
 
     /* --- the cursor: it must be on screen while we own it and gone when the
@@ -602,19 +639,49 @@ int main(void)
             if (free_master) {
                 ioctl(master_fd, DROP_MASTER); /* hand it straight back */
             }
-            const char *drop_env = getenv("SDLOP_KMSDRM_DROP_MASTER");
-            if (drop_env && *drop_env && strcmp(drop_env, "0") != 0) {
-                /* the knob is for Vulkan: init drops master, then creating
-                   this (software) window takes it back, which is the point -
-                   the drop must not leave the software path broken */
-                check("master-drop-note", !free_master,
-                      "drop-at-init is opt-in and a software window re-takes it (free=%d)",
-                      free_master);
-            } else {
-                check("master-kept", !free_master,
-                      "SDL holds DRM master by default (free=%d)", free_master);
-            }
+            /* master is only handed over when a Vulkan window is created;
+               this window is a software one, so SDL must still hold it */
+            check("master-kept", !free_master,
+                  "SDL holds DRM master (free=%d)", free_master);
             close(master_fd);
+        }
+    }
+
+    /* --- Ctrl+Alt+Fn through the raw input path ---
+       The console keyboard is in K_OFF, so the kernel's own chord handler is
+       dead and sdlop has to recognise the chord itself. The host types it into
+       the virtio keyboard through the QEMU monitor once this line is printed;
+       all this side does is watch the VT. */
+    if (getenv("SDLOP_QEMU_CHORD") && strcmp(getenv("SDLOP_QEMU_CHORD"), "1") == 0) {
+        printf("VT-CHORD-READY\n");
+        fflush(stdout);
+        const int want_vt = 3;
+        const int from_vt = active_vt();
+        bool moved = false;
+        for (int i = 0; i < 250; i++) { /* up to ~5 s */
+            SDL_PumpEvents();
+            if (active_vt() == want_vt) {
+                moved = true;
+                break;
+            }
+            SDL_Delay(20);
+        }
+        check("chord-ctrl-alt-fn", moved,
+              "Ctrl+Alt+F%d switched the console, from VT %d now on VT %d", want_vt, from_vt,
+              active_vt());
+        if (moved) {
+            /* hand VT 3 back to the console so the switch checks are unaffected */
+            char path[32];
+            snprintf(path, sizeof(path), "/dev/tty%d", want_vt);
+            const int cleanup = open(path, O_RDWR | O_CLOEXEC);
+            if (cleanup >= 0) {
+                ioctl(cleanup, KDSETMODE, KD_TEXT);
+                struct vt_mode vm2;
+                memset(&vm2, 0, sizeof(vm2));
+                vm2.mode = VT_AUTO;
+                ioctl(cleanup, VT_SETMODE, &vm2);
+                close(cleanup);
+            }
         }
     }
 
@@ -745,7 +812,7 @@ fi
 say "guest libs: $(ls "$WORK/root/lib/x86_64-linux-gnu" 2>/dev/null | tr '\n' ' ')"
 
 cp "$(command -v busybox)" "$WORK/root/bin/busybox"
-for applet in sh mount umount ls cat echo sleep mknod chvt poweroff dmesg insmod; do
+for applet in sh mount umount ls cat echo sleep mknod chvt poweroff dmesg insmod setsid; do
     ln -sf busybox "$WORK/root/bin/$applet"
 done
 
@@ -755,6 +822,8 @@ GUEST_LOGGING=${SDLOP_QEMU_LOGGING:-debug}
 GUEST_GLIBC_TUNABLES=${GLIBC_TUNABLES:-glibc.rtld.dynamic_sort=1}
 export GUEST_LOGGING GUEST_GLIBC_TUNABLES
 
+DISABLE_RAW=1
+[ "${SDLOP_QEMU_RAW:-0}" = "1" ] && DISABLE_RAW=0
 cat >"$WORK/root/init" <<INIT
 #!/bin/sh
 mount -t proc proc /proc
@@ -765,6 +834,7 @@ exec >/dev/ttyS0 2>&1
 echo "1" > /proc/sys/kernel/printk
 PATH=/bin
 echo "VTHARNESS: up"
+# the drill reads commands from a second serial port (host -> guest)
 export LD_LIBRARY_PATH=/lib/x86_64-linux-gnu
 
 sin() {
@@ -788,11 +858,18 @@ echo "VTHARNESS: tty0 -> \$(cat /sys/class/tty/tty0/active 2>/dev/null)"
 
 export SDL_LOGGING="$GUEST_LOGGING"
 export GLIBC_TUNABLES="$GUEST_GLIBC_TUNABLES"
-export SDLOP_KMSDRM_DROP_MASTER="${SDLOP_KMSDRM_DROP_MASTER:-}"
 export SDLOP_KMSDRM_VT_SWITCH="${SDLOP_KMSDRM_VT_SWITCH:-}"
+export SDLOP_DISABLE_RAW_INPUT="$DISABLE_RAW"
+export SDLOP_QEMU_CHORD="${SDLOP_QEMU_CHORD:-0}"
+export SDLOP_QEMU_CTTY="${SDLOP_QEMU_CTTY:-0}"
+export SDLOP_QEMU_CMD=ttyS1
 export TTYNO="${TTYNO:-}"
 echo "VTHARNESS: running the drill"
-/bin/drill
+if [ "${SDLOP_QEMU_CTTY:-0}" = "1" ]; then
+    setsid sh -c 'exec /bin/drill </dev/tty3'
+else
+    /bin/drill
+fi
 echo "VTHARNESS: exit=\$?"
 poweroff -f
 INIT
@@ -801,16 +878,52 @@ chmod +x "$WORK/root/init"
 ( cd "$WORK/root" && find . | cpio -o -H newc --quiet 2>/dev/null | gzip -9 ) >"$WORK/initramfs.gz" ||
     die "initramfs failed"
 
+# --- Ctrl+Alt+Fn: type the chord into the virtual keyboard -------------------
+# QEMU's human monitor is the only interface that can inject key presses, so
+# the guest's "VT-CHORD-READY" triggers one `sendkey` on the monitor socket.
+# Only meaningful with raw input on (SDLOP_QEMU_RAW=1): without it the console
+# keeps its own keyboard handler and the kernel switches VTs by itself.
+CHORD=${SDLOP_QEMU_CHORD:-0}
+inject_chord() {
+    i=0
+    while [ "$i" -lt 600 ]; do
+        [ -s "$WORK/serial.log" ] && grep -aq '^VT-CHORD-READY' "$WORK/serial.log" && break
+        i=$((i + 1))
+        sleep 0.1
+    done
+    if ! grep -aq '^VT-CHORD-READY' "$WORK/serial.log" 2>/dev/null; then
+        say "the guest never reached the chord phase"
+        return 0
+    fi
+    { printf 'sendkey ctrl-alt-f3\n'; sleep 0.5; } |
+        socat -t 3 - "UNIX-CONNECT:$WORK/mon.sock" >/dev/null 2>&1 ||
+        say "could not talk to the QEMU monitor"
+    say "Ctrl+Alt+F3 injected into the virtio keyboard"
+}
+
 # --- boot ------------------------------------------------------------------
 say "booting (${BOOT_TIMEOUT}s cap)"
+rm -f "$WORK/mon.sock" "$WORK/serial.log"
+CHORD_PID=
+if [ "$CHORD" = "1" ]; then
+    command -v socat >/dev/null 2>&1 || die "socat not found (needed for the chord drill)"
+    inject_chord &
+    CHORD_PID=$!
+fi
 set +e
 timeout "$BOOT_TIMEOUT" qemu-system-x86_64 \
     -M q35 -m "$MEM" -smp 2 \
     -kernel "$KERNEL" -initrd "$WORK/initramfs.gz" \
     -append "console=ttyS0,115200 panic=1 loglevel=4" \
-    -display none -vga none -device "$GPU" -monitor none -no-reboot \
+    -display none -vga none -device "$GPU" \
+    -device "virtio-keyboard-pci,id=kbd0" -no-reboot \
+    -monitor "unix:$WORK/mon.sock,server=on,wait=off" \
     -serial "file:$WORK/serial.log"
 rc=$?
+if [ -n "$CHORD_PID" ]; then
+    kill "$CHORD_PID" 2>/dev/null || true
+    wait "$CHORD_PID" 2>/dev/null || true
+fi
 set -e
 case $rc in
     0) ;;

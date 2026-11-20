@@ -173,6 +173,7 @@ static bool subsystem_init(SDL_InitFlags flags)
 {
     if (flags & SDL_INIT_VIDEO) {
         if (!SDLOP_VideoInit()) {
+            SDLOP_RawInputQuit(); /* a console driver may have started it */
             return false;
         }
         /* default xkb layout; replaced by the Wayland keymap when a

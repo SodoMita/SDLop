@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <linux/input.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <stdio.h>
@@ -172,6 +173,31 @@ static unsigned screen_pixel(SDL_Surface *surface, int x, int y)
         }
     }
     if (fb_fd < 0 || !map) {
+        /* dump mode: the driver's own frame is what "the screen" is */
+        const char *dump = getenv("SDLOP_FBDEV_DUMP");
+        if (dump && *dump) {
+            FILE *f = fopen(dump, "rb");
+            if (!f) {
+                return 0xFFFFFFFFu;
+            }
+            int dw = 0, dh = 0, maxval = 0;
+            char magic[3] = { 0 };
+            if (fscanf(f, "%2s %d %d %d", magic, &dw, &dh, &maxval) != 4 || strcmp(magic, "P6") != 0) {
+                fclose(f);
+                return 0xFFFFFFFFu;
+            }
+            fgetc(f);
+            unsigned px = 0xFFFFFFFFu;
+            if (x >= 0 && y >= 0 && x < dw && y < dh) {
+                const long offset = (long)y * dw * 3 + (long)x * 3;
+                unsigned char rgb[3];
+                if (fseek(f, offset, SEEK_CUR) == 0 && fread(rgb, 1, 3, f) == 3) {
+                    px = ((unsigned)rgb[0] << 16) | ((unsigned)rgb[1] << 8) | rgb[2];
+                }
+            }
+            fclose(f);
+            return px;
+        }
         Uint8 r = 0, g = 0, b = 0, a = 0;
         if (!surface || !SDL_ReadSurfacePixel(surface, x, y, &r, &g, &b, &a)) {
             return 0xFFFFFFFFu;
@@ -213,6 +239,16 @@ static bool pixel_near(unsigned got, unsigned want, int slack)
         }
     }
     return true;
+}
+
+/* read one pixel of the window surface (the app's own buffer) */
+static unsigned surface_pixel(SDL_Surface *s, int x, int y)
+{
+    Uint8 r = 0, g = 0, b = 0, a = 0;
+    if (!SDL_ReadSurfacePixel(s, x, y, &r, &g, &b, &a)) {
+        return 0xFFFFFFFFu;
+    }
+    return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
 }
 
 /* ---- software cursor: it must be drawn and follow the pointer. Whether the
@@ -260,7 +296,12 @@ static void cursor_phase(SDL_Window *window, SDL_Surface *s, int *failures)
             }
         }
     }
-    printf("  info: %d pixels changed at the old pointer spot\n", trail);
+    /* The app's buffer is its own: whatever the cursor does on screen, the
+       pixels it drew must be untouched (the old driver drew the arrow straight
+       into the app's buffer, which is also what left the trail). */
+    const unsigned app_px = surface_pixel(s, s->w / 2, s->h / 2);
+    CHECK(pixel_near(app_px, band, 2),
+          "app pixels untouched by the cursor (got %06x, want %06x)", app_px, band);
 
     /* repaint the whole surface: the old spot must come back from it */
     paint_bands(s);
@@ -272,6 +313,18 @@ static void cursor_phase(SDL_Window *window, SDL_Surface *s, int *failures)
     SDL_PumpEvents();
     CHECK(SDL_CursorVisible() == false, "SDL_HideCursor takes effect");
     SDL_ShowCursor();
+
+    /* partial updates: after painting the whole surface, presenting only a
+       small rect must not disturb anything outside it */
+    paint_bands(s);
+    SDL_UpdateWindowSurface(window);
+    SDL_Rect patch = { 4, 4, 16, 16 };
+    SDL_FillSurfaceRect(s, &patch, 0x00FFFF00u);
+    CHECK(SDL_UpdateWindowSurfaceRects(window, &patch, 1), "present a small rect");
+    const unsigned inside = screen_pixel(s, 8, 8);
+    const unsigned outside = screen_pixel(s, s->w / 2, s->h / 2);
+    CHECK(pixel_near(inside, 0x00FFFF00u, 8), "the patched rect reached the screen (got %06x)", inside);
+    CHECK(pixel_near(outside, 0x00C000u, 8), "the rest of the screen was left alone (got %06x)", outside);
 }
 
 /* ---- real console drill: KD_ and VT_ state, a switch away and back.
@@ -359,6 +412,12 @@ static int find_driver_vt(int *out_fd)
    VT_PROCESS), starting SDL did not take the user's VT away, and switching
    away hands the console back in text mode. Needs root and a VT; the QEMU
    harness sets SDLOP_FBDEV_VT_CHECK=1. ---- */
+/* solid fill of the whole window surface */
+static void paint_plane(SDL_Surface *s, unsigned color)
+{
+    SDL_FillSurfaceRect(s, NULL, color);
+}
+
 static int vt_phase(SDL_Window *window, SDL_Surface *s, int vt_before, int *failures)
 {
     int fd = -1;
@@ -374,8 +433,32 @@ static int vt_phase(SDL_Window *window, SDL_Surface *s, int vt_before, int *fail
     memset(&vm, 0, sizeof(vm));
     CHECK(ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS,
           "the driver's VT is in KD_GRAPHICS (got %d)", mode);
-    CHECK(ioctl(fd, KDGKBMODE, &kbmode) == 0 && kbmode == K_OFF,
-          "the keyboard handler on it is off (got %d)", kbmode);
+    {
+        /* K_OFF is only set when a raw keyboard exists to deliver the keys and
+           forward Ctrl+Alt+Fn; with raw input off the console keeps its own
+           handler, which is what makes the VT switch chord keep working. Both
+           are correct as long as the keyboard is usable one way or the other. */
+        char kbbits[8] = { 0 };
+        int kbfd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (kbfd < 0) {
+            kbfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        }
+        const int raw_kb = kbfd >= 0 &&
+                           ioctl(kbfd, EVIOCGBIT(EV_KEY, sizeof(kbbits)), kbbits) >= 0 &&
+                           (kbbits[KEY_A / 8] & (1 << (KEY_A % 8))) != 0;
+        if (kbfd >= 0) {
+            close(kbfd);
+        }
+        const char *raw_knob = getenv("SDLOP_DISABLE_RAW_INPUT");
+        const bool raw_off = raw_knob && *raw_knob && strcmp(raw_knob, "0") != 0;
+        if (raw_kb && !raw_off) {
+            CHECK(ioctl(fd, KDGKBMODE, &kbmode) == 0 && kbmode == K_OFF,
+                  "with a raw keyboard the console handler is off (got %d)", kbmode);
+        } else {
+            CHECK(ioctl(fd, KDGKBMODE, &kbmode) == 0 && kbmode != K_OFF,
+                  "without raw input the console keyboard is left alone (got %d)", kbmode);
+        }
+    }
     CHECK(ioctl(fd, VT_GETMODE, &vm) == 0 && vm.mode == VT_PROCESS,
           "VT_PROCESS is installed (got %d)", (int)vm.mode);
 
@@ -392,6 +475,11 @@ static int vt_phase(SDL_Window *window, SDL_Surface *s, int vt_before, int *fail
                   "no hijack: the user was on VT %d before init and is on VT %d now",
                   vt_before, now_active);
         }
+    }
+
+    if (getenv("SDLOP_QEMU_CTTY") && strcmp(getenv("SDLOP_QEMU_CTTY"), "1") == 0) {
+        CHECK(our_vt == 3 && now_active == vt_before && vt_before == 2,
+              "controlling VT 3 selected without activating it (ours=%d active=%d)", our_vt, now_active);
     }
 
     const int other_vt = (our_vt == 2) ? 3 : 2;
@@ -419,6 +507,45 @@ static int vt_phase(SDL_Window *window, SDL_Surface *s, int vt_before, int *fail
           "console returned to KD_TEXT while away (got %d)", mode);
     CHECK(ioctl(fd, KDGKBMODE, &kbmode) == 0 && kbmode != K_OFF,
           "console keyboard handler restored while away (got %d)", kbmode);
+
+    /* while the other VT is in front the driver must not touch the scanout:
+       present a colour nobody has seen yet and check the screen still shows
+       the last frame we put there, not the new one */
+    paint_plane(s, 0x00FFFFFFu);
+    SDL_UpdateWindowSurface(window);
+    const unsigned while_away = screen_pixel(s, s->w / 2, s->h / 2);
+    /* the console owns the screen here and may blank it, so do not demand our
+       last frame - only that the present did not reach the scanout */
+    CHECK(!pixel_near(while_away, 0x00FFFFFFu, 8),
+          "nothing was written to the scanout while another VT was in front (got %06x)",
+          while_away);
+    const unsigned kept = surface_pixel(s, s->w / 2, s->h / 2);
+    CHECK(pixel_near(kept, 0x00FFFFFFu, 6),
+          "the app's own pixels survived that present (got %06x)", kept);
+
+    /* Ctrl+Alt+Fn: the console keyboard is in K_OFF, so only sdlop can see the
+       kernel's switch chord. The host types it into the virtual keyboard once
+       this line shows up; here we only watch the VT. */
+    if (getenv("SDLOP_QEMU_CHORD") && strcmp(getenv("SDLOP_QEMU_CHORD"), "1") == 0) {
+        CHECK(switch_to(window, our_vt), "back on our VT before the chord");
+        int chord_kbmode = -1;
+        const int chord_kbrc = ioctl(fd, KDGKBMODE, &chord_kbmode);
+        CHECK(chord_kbrc == 0 && chord_kbmode == K_OFF, "chord starts with K_OFF (got %d)", chord_kbmode);
+        printf("VT-CHORD-READY\n");
+        fflush(stdout);
+        const int from_vt = active_vt();
+        bool moved = false;
+        for (int i = 0; i < 250; i++) { /* up to ~5 s */
+            SDL_PumpEvents();
+            if (active_vt() == other_vt) {
+                moved = true;
+                break;
+            }
+            SDL_Delay(20);
+        }
+        CHECK(moved, "Ctrl+Alt+F%d switched the console, from VT %d now on VT %d",
+              other_vt, from_vt, active_vt());
+    }
 
     /* back: graphics mode again, and the frame is repainted */
     CHECK(switch_to(window, our_vt), "switched back to the driver's VT %d", our_vt);
@@ -449,7 +576,7 @@ int main(void)
     const int vt_before = active_vt();
 
     setenv("SDL_VIDEODRIVER", "fbdev", 1);
-    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1); /* window-system input only */
+    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 0); /* default: window-system input only */
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         if (dump_mode) {
@@ -512,7 +639,7 @@ int main(void)
         CHECK(s->w == bounds.w && s->h == bounds.h,
               "surface matches the fb mode (%dx%d)", s->w, s->h);
         CHECK(s->pitch >= s->w * 4, "pitch valid (%d)", s->pitch);
-        CHECK(s->pixels != NULL, "surface maps the scanout");
+        CHECK(s->pixels != NULL, "surface has RAM pixels");
 
         paint_bands(s);
         Uint8 r = 0, g = 0, b = 0, a = 0;
@@ -528,6 +655,24 @@ int main(void)
         CHECK(SDL_UpdateWindowSurface(w), "second present");
         paint_bands(s);
         CHECK(SDL_UpdateWindowSurface(w), "third present (bands again)");
+    }
+
+    /* A second surface must not clear or alias the first window's shadow. */
+    if (s) {
+        SDL_Window *second = SDL_CreateWindow("second shadow", bounds.w, bounds.h, SDL_WINDOW_HIDDEN);
+        CHECK(second != NULL, "second window");
+        if (second) {
+            SDL_Surface *ss = SDL_GetWindowSurface(second);
+            CHECK(ss && ss->pixels != s->pixels, "windows have distinct shadow buffers");
+            if (ss) {
+                paint_plane(ss, 0x00FFFFFFu);
+                CHECK(pixel_near(surface_pixel(s, s->w / 2, s->h / 2), 0x00C000u, 6),
+                      "creating and painting another surface preserves the first window");
+            }
+            SDL_DestroyWindow(second);
+            CHECK(pixel_near(surface_pixel(s, s->w / 2, s->h / 2), 0x00C000u, 6),
+                  "destroying another surface preserves the first window");
+        }
     }
 
     printf("-- resize request snaps back to fb mode --\n");
