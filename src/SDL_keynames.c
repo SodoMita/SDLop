@@ -2,7 +2,7 @@
   SDLop - scancode/key names, key-name lookups, text-input gating.
 
   Shared by the native (xkb) and web (DOM) keyboard backends. Semantics
-  follow stock SDL3 3.2.10: names resolve through the scancode table,
+  follow stock SDL3 (3.2.10 - 3.4.20): names resolve through the scancode table,
   the extended-key table and UCS4->UTF-8 with stable interned pointers,
   and TEXT_INPUT is only delivered while SDL_StartTextInput() is active.
 
@@ -15,27 +15,101 @@
 #include <string.h>
 #include <strings.h>
 
-bool SDL_StartTextInput(SDL_Window *window)
+#define CHECK_WINDOW(window, retval)                                  \
+    if (!sdlop.video) {                                               \
+        SDL_SetError("Video subsystem has not been initialized");     \
+        return retval;                                                \
+    }                                                                 \
+    if (!SDLOP_WindowValid(window)) {                                 \
+        SDL_SetError("Invalid window");                               \
+        return retval;                                                \
+    }
+
+bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID props)
 {
-    if (!window) {
-        return SDL_SetError("Invalid window");
+    CHECK_WINDOW(window, false);
+    /* kept for SDL_PROP_TEXTINPUT_* queries; there is no on-screen
+     * keyboard or IME backend that would consume them yet */
+    if (window->text_input_props) {
+        SDL_DestroyProperties(window->text_input_props);
+        window->text_input_props = 0;
+    }
+    if (props) {
+        window->text_input_props = SDL_CreateProperties();
+        if (!window->text_input_props) {
+            return false;
+        }
+        if (!SDL_CopyProperties(props, window->text_input_props)) {
+            return false;
+        }
     }
     window->text_input_active = true;
     return true;
 }
 
+bool SDL_StartTextInput(SDL_Window *window)
+{
+    return SDL_StartTextInputWithProperties(window, 0);
+}
+
 bool SDL_StopTextInput(SDL_Window *window)
 {
-    if (!window) {
-        return SDL_SetError("Invalid window");
-    }
+    CHECK_WINDOW(window, false);
     window->text_input_active = false;
     return true;
 }
 
 bool SDL_TextInputActive(SDL_Window *window)
 {
-    return window && window->text_input_active;
+    CHECK_WINDOW(window, false);
+    return window->text_input_active;
+}
+
+bool SDL_SetTextInputArea(SDL_Window *window, const SDL_Rect *rect, int cursor)
+{
+    CHECK_WINDOW(window, false);
+    if (rect) {
+        window->text_input_rect = *rect;
+        window->text_input_cursor = cursor;
+    } else {
+        SDL_zero(window->text_input_rect);
+        window->text_input_cursor = 0;
+    }
+    if (sdlop.video->UpdateTextInputArea && !sdlop.video->UpdateTextInputArea(sdlop.video, window)) {
+        return false;
+    }
+    return true;
+}
+
+bool SDL_GetTextInputArea(SDL_Window *window, SDL_Rect *rect, int *cursor)
+{
+    CHECK_WINDOW(window, false);
+    if (rect) {
+        *rect = window->text_input_rect;
+    }
+    if (cursor) {
+        *cursor = window->text_input_cursor;
+    }
+    return true;
+}
+
+bool SDL_ClearComposition(SDL_Window *window)
+{
+    CHECK_WINDOW(window, false);
+    /* compose sequences are resolved per key press; nothing is pending
+     * across calls that an application could clear (no IME) */
+    return true;
+}
+
+bool SDL_HasScreenKeyboardSupport(void)
+{
+    return false; /* desktop/web backends: no on-screen keyboard */
+}
+
+bool SDL_ScreenKeyboardShown(SDL_Window *window)
+{
+    CHECK_WINDOW(window, false);
+    return false;
 }
 
 void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
@@ -64,15 +138,50 @@ void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
 
 #include "scancode_names.h"
 
+/* SDL_SetScancodeName overrides (application-owned strings) */
+static const char *sdlop_custom_scancode_names[SDL_SCANCODE_COUNT];
+static bool sdlop_custom_scancode_set[SDL_SCANCODE_COUNT];
+
+static const char *scancode_name_raw(int scancode)
+{
+    return sdlop_custom_scancode_set[scancode] ? sdlop_custom_scancode_names[scancode]
+                                               : sdlop_scancode_names[scancode];
+}
+
+bool SDL_SetScancodeName(SDL_Scancode scancode, const char *name)
+{
+    if ((int)scancode < SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
+        return SDL_SetError("Parameter '%s' is invalid", "scancode");
+    }
+    sdlop_custom_scancode_names[scancode] = name;
+    sdlop_custom_scancode_set[scancode] = true;
+    return true;
+}
+
 const char *SDL_GetScancodeName(SDL_Scancode scancode)
 {
-    if (scancode > SDL_SCANCODE_UNKNOWN && scancode < SDL_SCANCODE_COUNT) {
-        const char *name = sdlop_scancode_names[scancode];
-        if (name) {
-            return name;
+    if ((int)scancode < SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
+        SDL_SetError("Parameter '%s' is invalid", "scancode");
+        return "";
+    }
+    const char *name = scancode_name_raw(scancode);
+    return name ? name : "";
+}
+
+SDL_Scancode SDL_GetScancodeFromName(const char *name)
+{
+    if (!name || !*name) {
+        SDL_SetError("Parameter '%s' is invalid", "name");
+        return SDL_SCANCODE_UNKNOWN;
+    }
+    for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
+        const char *sc_name = scancode_name_raw(i);
+        if (sc_name && strcasecmp(name, sc_name) == 0) {
+            return (SDL_Scancode)i;
         }
     }
-    return "";
+    SDL_SetError("Parameter '%s' is invalid", "name");
+    return SDL_SCANCODE_UNKNOWN;
 }
 
 /* SDL3 keeps these names in their own table (src/events/SDL_keymap.c). */
@@ -154,11 +263,8 @@ const char *SDL_GetKeyName(SDL_Keycode key)
     }
 
     /* a keycode is the unshifted key; the NAME is the printed letter, usually
-       the shifted capital (stock SDL_GetKeyName). ASCII case here; non-ASCII
-       capitalization would need the active keymap, which stock consults. */
-    if (key >= 'a' && key <= 'z') {
-        key += 'A' - 'a';
-    }
+       the shifted capital, looked up on the active keymap (stock) */
+    key = SDLOP_KeyboardKeyNameCapital(key);
     if (key > 0 && key < 0x110000) {
         char name[8];
         ucs4_to_utf8((Uint32)key, name);
@@ -204,6 +310,15 @@ SDL_Keycode SDL_GetKeyFromName(const char *name)
         key = 0;
     }
     if (key) {
+        /* SDL3: a keycode is the unshifted key, but a name is the symbol
+         * printed on the key - usually the shifted one ("A" names 'a'). So a
+         * single character that needs shift/caps on the current layout maps
+         * back to the unmodified keycode of that key. */
+        SDL_Keymod mod = SDL_KMOD_NONE;
+        SDL_Scancode sc = SDL_GetScancodeFromKey((SDL_Keycode)key, &mod);
+        if (sc != SDL_SCANCODE_UNKNOWN && (mod & (SDL_KMOD_SHIFT | SDL_KMOD_CAPS))) {
+            return SDL_GetKeyFromScancode(sc, SDL_KMOD_NONE, false);
+        }
         return (SDL_Keycode)key;
     }
 
@@ -216,7 +331,9 @@ SDL_Keycode SDL_GetKeyFromName(const char *name)
     for (int i = 0; i < SDL_SCANCODE_COUNT; i++) {
         const char *sc_name = SDL_GetScancodeName((SDL_Scancode)i);
         if (*sc_name && *sc_name == *name && strcasecmp(name, sc_name) == 0) {
-            return (SDL_Keycode)i | SDLK_SCANCODE_MASK;
+            /* SDL3: the key that scancode produces ("Space" -> ' ',
+             * "Return" -> '\r'); non-character keys stay scancode-masked */
+            return SDL_GetKeyFromScancode((SDL_Scancode)i, SDL_KMOD_NONE, false);
         }
     }
 

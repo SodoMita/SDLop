@@ -90,11 +90,7 @@ static bool ensure_egl_display(void)
     if (!wl) {
         return SDL_SetError("Wayland display not available");
     }
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
-        (PFNEGLGETPLATFORMDISPLAYEXTPROC)SDLOP_EGL_eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (get_platform_display) {
-        egl_display = get_platform_display(EGL_PLATFORM_WAYLAND_EXT, wl, NULL);
-    }
+    egl_display = SDLOP_EGL_PlatformDisplay(EGL_PLATFORM_WAYLAND_EXT, wl, NULL);
     if (egl_display == EGL_NO_DISPLAY) {
         egl_display = SDLOP_EGL_eglGetDisplay((EGLNativeDisplayType)wl);
     }
@@ -241,7 +237,7 @@ void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *wind
         return NULL;
     }
 
-    EGLint ctx_attribs[12];
+    EGLint ctx_attribs[64];
     int n = 0;
     if (api == EGL_OPENGL_API) {
         ctx_attribs[n++] = EGL_CONTEXT_MAJOR_VERSION_KHR; ctx_attribs[n++] = sdlop_glattrs.major_version;
@@ -250,17 +246,22 @@ void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *wind
         ctx_attribs[n++] = (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
                                ? EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR
                                : EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR;
+        /* EGL 1.5 boolean attributes (the *_BIT_KHR values belong to
+         * EGL_CONTEXT_FLAGS_KHR and are not attribute names) */
         if (sdlop_glattrs.flags & SDL_GL_CONTEXT_DEBUG_FLAG) {
-            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
+            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_DEBUG; ctx_attribs[n++] = EGL_TRUE;
         }
         if (sdlop_glattrs.flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) {
-            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR;
+            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE; ctx_attribs[n++] = EGL_TRUE;
         }
     } else {
         ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
         ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
     }
-    ctx_attribs[n++] = EGL_NONE;
+    n = SDLOP_EGL_AppendUserAttribs(true, egl_display, config, ctx_attribs, n, (int)SDL_arraysize(ctx_attribs));
+    if (n < 0) {
+        return NULL;
+    }
 
     /* SDL_GL_SHARE_WITH_CURRENT_CONTEXT: share with the currently bound
      * context (EGL requires compatible client APIs for sharing) */
@@ -424,7 +425,13 @@ bool SDLOP_Wayland_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window,
             if (!config) {
                 return SDL_SetError("No EGL config for context");
             }
-            *slot = SDLOP_EGL_eglCreateWindowSurface(egl_display, config, (EGLNativeWindowType)*eglwin_slot, NULL);
+            EGLint surf_attribs[64];
+            if (SDLOP_EGL_AppendUserAttribs(false, egl_display, config, surf_attribs, 0,
+                                            (int)SDL_arraysize(surf_attribs)) < 0) {
+                return false;
+            }
+            *slot = SDLOP_EGL_eglCreateWindowSurface(egl_display, config, (EGLNativeWindowType)*eglwin_slot,
+                                                     surf_attribs);
             if (*slot == NULL) {
                 return SDL_SetError("eglCreateWindowSurface failed: 0x%x", SDLOP_EGL_eglGetError());
             }
@@ -593,6 +600,33 @@ SDL_FunctionPointer SDLOP_Wayland_GL_GetProcAddress(const char *proc)
      * process symbol table for library functions */
     void *sym = dlsym(RTLD_DEFAULT, proc);
     return (SDL_FunctionPointer)sym;
+}
+
+/* SDL_EGL_GetCurrentDisplay / GetCurrentConfig / GetWindowSurface */
+void *SDLOP_Wayland_EGL_GetDisplay(SDLop_VideoDevice *device)
+{
+    (void)device;
+    return egl_initialized ? (void *)egl_display : NULL;
+}
+
+void *SDLOP_Wayland_EGL_GetConfig(SDLop_VideoDevice *device)
+{
+    (void)device;
+    WaylandGLContext *cur = (WaylandGLContext *)SDLOP_GL_CurrentContext();
+    if (!egl_initialized || !cur) {
+        return NULL;
+    }
+    return (void *)config_for_context(cur);
+}
+
+void *SDLOP_Wayland_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    if (!window || SDLOP_Wayland_IsGLOffloadActive(window)) {
+        return NULL;
+    }
+    void **slot = SDLOP_Wayland_GetGLSurfaceSlot(window);
+    return slot ? *slot : NULL;
 }
 
 SDL_FunctionPointer SDLOP_Wayland_GL_GetProcAddressThunk(SDLop_VideoDevice *device, const char *proc)

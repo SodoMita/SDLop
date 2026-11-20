@@ -8,7 +8,7 @@
 
   It calls nothing and links nothing: sizes, member offsets, event/scancode/
   keycode values, flags and hint strings are all compile-time facts, so the diff
-  answers "would an application compiled against stock SDL3 3.2.10 see exactly
+  answers "would an application compiled against stock SDL3 3.4.20 see exactly
   the same things?" without either library being involved.
 */
 #include <SDL3/SDL.h>

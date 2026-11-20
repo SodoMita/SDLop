@@ -28,7 +28,10 @@
 #include <stdatomic.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <linux/vt.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #define SDLOP_MAX_DEVICES     32
@@ -83,6 +86,18 @@ static struct
     pthread_mutex_t cb_mutex;
 } raw;
 
+/* Console keyboard ownership and the Ctrl+Alt+Fn chord.
+
+   Kept apart from `raw` on purpose: a video driver claims the console during
+   its own init. Keep ownership separate from the worker lifecycle. */
+static struct
+{
+    bool kb_owns_off;        /* the console keyboard is in K_OFF because of us */
+    int vt_fd;               /* console the chord applies to, or -1 */
+    unsigned int modifiers; /* left/right Ctrl and Alt bits */
+    Uint16 fn_swallowed;     /* consumed Fn code; swallow its release too */
+} chord = { .vt_fd = -1 };
+
 /* ------------------------------------------------------------------ */
 /* Device discovery                                                    */
 /* ------------------------------------------------------------------ */
@@ -128,7 +143,6 @@ static int open_input_devices(void)
             if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0) {
                 if (test_bit(keybits, KEY_W) || test_bit(keybits, KEY_A)) {
                     dev->is_keyboard = true;
-                    raw.have_keyboard = true;
                 }
             }
         }
@@ -137,7 +151,6 @@ static int open_input_devices(void)
             if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relbits)), relbits) >= 0) {
                 if (test_bit(relbits, REL_X) && test_bit(relbits, REL_Y)) {
                     dev->is_pointer = true;
-                    raw.have_pointer = true;
                 }
             }
         }
@@ -154,6 +167,8 @@ static int open_input_devices(void)
             close(fd);
             continue;
         }
+        raw.have_keyboard |= dev->is_keyboard;
+        raw.have_pointer |= dev->is_pointer;
         raw.num_devices++;
         count++;
     }
@@ -276,8 +291,14 @@ static void *worker_main(void *arg)
 
 bool SDLOP_RawInputInit(void)
 {
-    if (getenv("SDLOP_DISABLE_RAW_INPUT")) {
-        return false;
+    if (raw.running) {
+        return true;
+    }
+    /* an empty value must not disable it: `VAR=` is how a caller forwards an
+       unset knob (the QEMU guest does exactly that) */
+    const char *disabled = getenv("SDLOP_DISABLE_RAW_INPUT");
+    if (disabled && *disabled && strcmp(disabled, "0") != 0) {
+        return SDL_SetError("disabled by SDLOP_DISABLE_RAW_INPUT");
     }
     memset(&raw, 0, sizeof(raw));
     pthread_mutex_init(&raw.cb_mutex, NULL);
@@ -292,6 +313,7 @@ bool SDLOP_RawInputInit(void)
 
     raw.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (raw.epoll_fd < 0) {
+        pthread_mutex_destroy(&raw.cb_mutex);
         return SDL_SetError("epoll_create1 failed: %s", strerror(errno));
     }
 
@@ -299,6 +321,7 @@ bool SDLOP_RawInputInit(void)
     if (raw.control_fd < 0) {
         close(raw.epoll_fd);
         raw.epoll_fd = -1;
+        pthread_mutex_destroy(&raw.cb_mutex);
         return SDL_SetError("eventfd failed: %s", strerror(errno));
     }
     {
@@ -309,6 +332,7 @@ bool SDLOP_RawInputInit(void)
             close(raw.control_fd);
             close(raw.epoll_fd);
             raw.control_fd = raw.epoll_fd = -1;
+            pthread_mutex_destroy(&raw.cb_mutex);
             return SDL_SetError("epoll_ctl failed: %s", strerror(errno));
         }
     }
@@ -317,6 +341,7 @@ bool SDLOP_RawInputInit(void)
         close(raw.control_fd);
         close(raw.epoll_fd);
         raw.control_fd = raw.epoll_fd = -1;
+        pthread_mutex_destroy(&raw.cb_mutex);
         return SDL_SetError("No readable /dev/input devices (need root or the 'input' group); falling back to window-system input");
     }
 
@@ -326,9 +351,11 @@ bool SDLOP_RawInputInit(void)
         for (int i = 0; i < raw.num_devices; i++) {
             close(raw.devices[i].fd);
         }
+        close(raw.control_fd);
         close(raw.epoll_fd);
-        raw.epoll_fd = -1;
+        raw.control_fd = raw.epoll_fd = -1;
         raw.num_devices = 0;
+        pthread_mutex_destroy(&raw.cb_mutex);
         return SDL_SetError("Could not start input worker thread");
     }
 
@@ -370,9 +397,43 @@ void SDLOP_RawInputQuit(void)
     pthread_mutex_destroy(&raw.cb_mutex);
 }
 
+void SDLOP_RawInputAttachConsole(int console_fd)
+{
+    /* called once the console keyboard belongs to us (K_OFF was set because a
+       raw keyboard exists): from here on key events are ours to deliver and
+       Ctrl+Alt+Fn is ours to forward */
+    chord.vt_fd = console_fd;
+    chord.kb_owns_off = (console_fd >= 0);
+    chord.modifiers = 0;
+    chord.fn_swallowed = 0;
+}
+
+void SDLOP_RawInputDetachConsole(void)
+{
+    /* the console is not ours any more: no key events, no chord handling */
+    if (chord.kb_owns_off) {
+        SDL_ResetKeyboard(); /* key releases may happen on the other VT */
+    }
+    chord.kb_owns_off = false;
+    chord.vt_fd = -1;
+    chord.modifiers = 0;
+}
+
+/* Console drivers ask before setting K_OFF. Start the worker here so we
+   only take keys away from the kernel after the actual input path works.
+   The driver's VT signal mask is already installed and inherited by it. */
+bool SDLOP_RawInputHasKeyboard(void)
+{
+    if (!raw.running && !SDLOP_RawInputInit()) {
+        SDL_ClearError(); /* optional: leave the console keyboard usable */
+        return false;
+    }
+    return raw.have_keyboard;
+}
+
 bool SDLOP_RawInputKeyboardActive(void)
 {
-    return raw.running && raw.have_keyboard;
+    return raw.running && raw.have_keyboard && chord.kb_owns_off;
 }
 
 bool SDLOP_RawInputMouseActive(void)
@@ -396,6 +457,63 @@ static Uint8 mouse_button_from_btn(Uint16 code)
     }
 }
 
+static bool raw_console_foreground(void)
+{
+    struct vt_stat state;
+    unsigned int dev = 0;
+    return chord.kb_owns_off && chord.vt_fd >= 0 &&
+           ioctl(chord.vt_fd, TIOCGDEV, &dev) == 0 && major(dev) == 4 &&
+           ioctl(chord.vt_fd, VT_GETSTATE, &state) == 0 && state.v_active == minor(dev);
+}
+
+/* Ctrl+Alt+Fn: the kernel's own VT switch chord, but the console keyboard is
+   in K_OFF, so its events arrive here instead. Returns true when the event was
+   the chord and must not surface as an SDL key event. */
+static bool sdlop_vt_handle_chord(const SDLop_RawEvent *ev)
+{
+    if (!raw_console_foreground()) {
+        return false;
+    }
+    unsigned int modifier = 0;
+    switch (ev->code) {
+    case KEY_LEFTCTRL:  modifier = 1; break;
+    case KEY_RIGHTCTRL: modifier = 2; break;
+    case KEY_LEFTALT:   modifier = 4; break;
+    case KEY_RIGHTALT:  modifier = 8; break;
+    default: break;
+    }
+    if (modifier) {
+        if (ev->value) {
+            chord.modifiers |= modifier;
+        } else {
+            chord.modifiers &= ~modifier;
+        }
+        return false;
+    }
+    if (chord.fn_swallowed == ev->code) {
+        if (ev->value == 0) {
+            chord.fn_swallowed = 0;
+        }
+        return true;
+    }
+    const int fn = (ev->code == KEY_F11) ? 11 : (ev->code == KEY_F12) ? 12 :
+                   (ev->code >= KEY_F1 && ev->code <= KEY_F10) ? (int)ev->code - (int)KEY_F1 + 1 : 0;
+    if (!fn || !(chord.modifiers & 3) || !(chord.modifiers & 12) || ev->value != 1) {
+        return false;
+    }
+    chord.fn_swallowed = ev->code;
+    /* The kernel owns the switch protocol: we are in VT_PROCESS, so this
+       request makes the kernel send the release signal to us and remember the
+       target. The driver releases the console (master, mode, keyboard) and
+       acknowledges; the switch then completes. */
+    SDL_LogInfo(SDL_LOG_CATEGORY_INPUT, "SDLop raw input: Ctrl+Alt+F%d -> VT %d", fn, fn);
+    if (ioctl(chord.vt_fd, VT_ACTIVATE, fn) != 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_INPUT,
+                    "SDLop raw input: VT_ACTIVATE(%d) failed: %s", fn, strerror(errno));
+    }
+    return true;
+}
+
 static void pump_event(const SDLop_RawEvent *ev)
 {
     static float hi_res_x_acc, hi_res_y_acc;
@@ -409,7 +527,10 @@ static void pump_event(const SDLop_RawEvent *ev)
             }
             return;
         }
-        if (ev->code <= SDLOP_EVDEV_KEY_MAX) {
+        if (sdlop_vt_handle_chord(ev)) {
+            return;
+        }
+        if (ev->code <= SDLOP_EVDEV_KEY_MAX && raw_console_foreground()) {
             SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[ev->code];
             if (sc != SDL_SCANCODE_UNKNOWN) {
                 SDLOP_SendKeyboardKey(ev->value != 0, ev->value == 2, sc, ev->code, ev->timestamp_ns);

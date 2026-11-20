@@ -89,7 +89,9 @@ static const struct keyent *entry_for(SDL_Scancode sc)
 }
 
 /* Resolve key + text for a scancode. `key_event` mirrors SDL3's
- * SDL_GetKeyFromScancode semantics (false = polled base key). */
+ * SDL_GetKeyFromScancode: true = the keycode of a key event, which ignores
+ * modifiers ('w' even with shift); false = `mod` selects the shift level.
+ * Text always follows the modifiers. */
 static SDL_Keycode resolve(SDL_Scancode sc, SDL_Keymod mod, bool key_event, char *text, size_t text_size)
 {
     if (text && text_size) {
@@ -100,19 +102,20 @@ static SDL_Keycode resolve(SDL_Scancode sc, SDL_Keymod mod, bool key_event, char
         return sc == SDL_SCANCODE_UNKNOWN ? SDLK_UNKNOWN : (SDL_Keycode)(SDLK_SCANCODE_MASK | sc);
     }
 
-    bool shifted = key_event && (mod & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT)) != 0;
+    bool shifted = (mod & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT)) != 0;
     bool caps = (mod & SDL_KMOD_CAPS) != 0;
-    char ch = shifted ? e->shifted : e->base;
-    if (ch && caps && e->base >= 'a' && e->base <= 'z') {
-        ch = shifted ? e->base : (char)(e->base - 32); /* shift XOR caps for letters */
+    char typed = shifted ? e->shifted : e->base;
+    if (typed && caps && e->base >= 'a' && e->base <= 'z') {
+        typed = shifted ? e->base : (char)(e->base - 32); /* shift XOR caps for letters */
     }
+    char ch = key_event ? e->base : typed;
 
-    if (text && text_size && ch) {
+    if (text && text_size && typed) {
         bool printable_keypad = (sc >= SDL_SCANCODE_KP_DIVIDE && sc <= SDL_SCANCODE_KP_9);
         if (!printable_keypad || (mod & SDL_KMOD_NUM)) {
             /* ctrl/alt/gui/meta combos produce no text (xkb semantics) */
             if (!(mod & (SDL_KMOD_LCTRL | SDL_KMOD_RCTRL | SDL_KMOD_LALT | SDL_KMOD_RALT | SDL_KMOD_LGUI | SDL_KMOD_RGUI | SDL_KMOD_MODE))) {
-                text[0] = ch;
+                text[0] = typed;
                 text[1] = '\0';
             }
         }
@@ -308,6 +311,12 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
     return resolve(scancode, modstate, key_event, NULL, 0);
 }
 
+/* static US keymap: only ASCII letters have capitals */
+SDL_Keycode SDLOP_KeyboardKeyNameCapital(SDL_Keycode key)
+{
+    return (key >= 'a' && key <= 'z') ? key - 'a' + 'A' : key;
+}
+
 SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
 {
     if (modstate) {
@@ -330,7 +339,7 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
             const struct keyent *e = &key_table[i];
             if (e->base && (e->base == ch || e->shifted == ch)) {
                 if (modstate && e->shifted == ch && e->base != ch) {
-                    *modstate = SDL_KMOD_LSHIFT;
+                    *modstate = SDL_KMOD_SHIFT; /* SDL3 default keymap */
                 }
                 return e->sc;
             }

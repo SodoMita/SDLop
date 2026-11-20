@@ -1,6 +1,6 @@
 /*
   SDLop test: OpenGL ES 2 context via EGL (llvmpipe on headless systems).
-  Skips cleanly when no Wayland compositor is running.
+  Runs on Wayland or X11; skips cleanly when neither is available.
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
@@ -25,8 +25,8 @@
 int main(void)
 {
     int failures = 0;
-    if (!getenv("WAYLAND_DISPLAY")) {
-        printf("test_gl: SKIP (WAYLAND_DISPLAY not set)\n");
+    if (!getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY")) {
+        printf("test_gl: SKIP (neither WAYLAND_DISPLAY nor DISPLAY set)\n");
         return 0;
     }
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);

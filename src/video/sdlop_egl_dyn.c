@@ -72,3 +72,88 @@ void SDLOP_EGL_UnloadSymbols(void)
     dlclose(egl_lib);
     egl_lib = NULL;
 }
+
+/* ------------------------------------------------------------------ */
+/* SDL_EGL_SetAttributeCallbacks support (shared by the EGL drivers)   */
+/* ------------------------------------------------------------------ */
+
+EGLDisplay SDLOP_EGL_PlatformDisplay(EGLenum platform, void *native, const EGLint *sdl_attribs)
+{
+    SDL_EGLAttribArrayCallback platform_cb = NULL;
+    void *userdata = NULL;
+    SDLOP_GetEGLAttributeCallbacks(&platform_cb, NULL, NULL, &userdata);
+
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_ext =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)SDLOP_EGL_eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (!platform_cb) {
+        return get_ext ? get_ext(platform, native, sdl_attribs) : EGL_NO_DISPLAY;
+    }
+
+    SDL_EGLAttrib *user = platform_cb(userdata);
+    if (!user) {
+        SDL_SetError("EGL platform attribute callback returned NULL pointer");
+        return EGL_NO_DISPLAY;
+    }
+    /* SDL's own attributes (e.g. the X screen) first, then the app's */
+    EGLAttrib merged[64];
+    int n = 0;
+    for (const EGLint *a = sdl_attribs; a && *a != EGL_NONE && n + 3 < 64; a += 2) {
+        merged[n++] = a[0];
+        merged[n++] = a[1];
+    }
+    for (const SDL_EGLAttrib *a = user; *a != EGL_NONE; a += 2) {
+        if (n + 3 >= 64) {
+            SDL_free(user);
+            SDL_SetError("EGL platform attribute callback returned too many attributes");
+            return EGL_NO_DISPLAY;
+        }
+        merged[n++] = (EGLAttrib)a[0];
+        merged[n++] = (EGLAttrib)a[1];
+    }
+    merged[n] = EGL_NONE;
+    SDL_free(user);
+
+    /* EGL 1.5 core takes EGLAttrib lists; the EXT entry point EGLint ones */
+    typedef EGLDisplay (*PFN_getplatformdisplay)(EGLenum, void *, const EGLAttrib *);
+    PFN_getplatformdisplay get_core = (PFN_getplatformdisplay)SDLOP_EGL_eglGetProcAddress("eglGetPlatformDisplay");
+    if (get_core) {
+        return get_core(platform, native, merged);
+    }
+    if (get_ext) {
+        EGLint narrow[64];
+        for (int i = 0; i <= n; ++i) {
+            narrow[i] = (EGLint)merged[i];
+        }
+        return get_ext(platform, native, narrow);
+    }
+    return EGL_NO_DISPLAY;
+}
+
+int SDLOP_EGL_AppendUserAttribs(bool context, EGLDisplay display, EGLConfig config, EGLint *attribs, int n,
+                                int max)
+{
+    SDL_EGLIntArrayCallback surface_cb = NULL, context_cb = NULL;
+    void *userdata = NULL;
+    SDLOP_GetEGLAttributeCallbacks(NULL, &surface_cb, &context_cb, &userdata);
+    SDL_EGLIntArrayCallback cb = context ? context_cb : surface_cb;
+    if (cb) {
+        SDL_EGLint *user = cb(userdata, (SDL_EGLDisplay)display, (SDL_EGLConfig)config);
+        if (!user) {
+            SDL_SetError("EGL %s attribute callback returned NULL pointer", context ? "context" : "surface");
+            return -1;
+        }
+        for (const SDL_EGLint *a = user; *a != EGL_NONE; a += 2) {
+            if (n + 3 >= max) {
+                SDL_free(user);
+                SDL_SetError("EGL %s attribute callback returned too many attributes",
+                             context ? "context" : "surface");
+                return -1;
+            }
+            attribs[n++] = a[0];
+            attribs[n++] = a[1];
+        }
+        SDL_free(user);
+    }
+    attribs[n] = EGL_NONE;
+    return n;
+}

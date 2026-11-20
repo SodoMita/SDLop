@@ -26,7 +26,6 @@ SDLOP_WAYLAND_SYM(int, wl_display_flush, (struct wl_display *))
 SDLOP_WAYLAND_SYM(int, wl_display_get_error, (struct wl_display *))
 SDLOP_WAYLAND_SYM(uint32_t, wl_display_get_protocol_error, (struct wl_display *, const struct wl_interface **, uint32_t *))
 SDLOP_WAYLAND_SYM(struct wl_event_queue *, wl_display_create_queue, (struct wl_display *))
-SDLOP_WAYLAND_SYM(struct wl_event_queue *, wl_display_create_queue_with_name, (struct wl_display *, const char *))
 SDLOP_WAYLAND_SYM(void, wl_event_queue_destroy, (struct wl_event_queue *))
 
 /* --- proxies ------------------------------------------------------ */

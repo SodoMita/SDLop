@@ -77,7 +77,6 @@ static void test_dummy_opt_out(void)
               "dummy GetInstanceExtensions returns NULL when SDLOP_VULKAN_OFFLOAD=0");
 
         SDL_Window *w = SDL_CreateWindow("dummy vk optout", 64, 64, SDL_WINDOW_VULKAN);
-        CHECK(w != NULL, "dummy window created");
         if (w) {
             VkSurfaceKHR surf = 0;
             /* Dummy non-null instance check only when libvulkan exists; otherwise LoadLibrary fails cleanly. */
@@ -91,6 +90,8 @@ static void test_dummy_opt_out(void)
 
     unsetenv("SDLOP_VULKAN_OFFLOAD");
     unsetenv("SDL_VIDEODRIVER");
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDLOP_VULKAN_OFFLOAD");
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDL_VIDEODRIVER");
 }
 
 int main(void)

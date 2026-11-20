@@ -1,24 +1,69 @@
+/*
+  Simple DirectMedia Layer
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+ *
+ * SDLop: generated from SDL 3.4.20 by tools/gen_headers.py - declarations of
+ * functions SDLop does not implement are removed; everything else is
+ * upstream's text. Do not edit by hand.
+ */
+
+/**
+ * # CategoryScancode
+ *
+ * Defines keyboard scancodes.
+ *
+ * Please refer to the Best Keyboard Practices document for details on what
+ * this information means and how best to use it.
+ *
+ * https://wiki.libsdl.org/SDL3/BestKeyboardPractices
+ */
+
 #ifndef SDL_scancode_h_
 #define SDL_scancode_h_
 
-/*
-  SDLop - a lean, fast, SDL3-compatible windowing + input library.
+#include <SDL3/SDL_stdinc.h>
 
-  The SDL_Scancode / SDL_Keycode / SDL_Keymod definitions below are taken
-  from the SDL3 headers (Simple DirectMedia Layer, Copyright (C) 1997-2025
-  Sam Lantinga <slouken@libsdl.org>), which are provided under the zlib
-  license. Values are intentionally identical to SDL3 so that applications
-  and constants are drop-in compatible.
-*/
-
+/**
+ * The SDL keyboard scancode representation.
+ *
+ * An SDL scancode is the physical representation of a key on the keyboard,
+ * independent of language and keyboard mapping.
+ *
+ * Values of this type are used to represent keyboard keys, among other places
+ * in the `scancode` field of the SDL_KeyboardEvent structure.
+ *
+ * The values in this enumeration are based on the USB usage page standard:
+ * https://usb.org/sites/default/files/hut1_5.pdf
+ *
+ * \since This enum is available since SDL 3.2.0.
+ */
 typedef enum SDL_Scancode
 {
     SDL_SCANCODE_UNKNOWN = 0,
+
     /**
      *  \name Usage page 0x07
      *
      *  These values are from usage page 0x07 (USB keyboard page).
      */
+    /* @{ */
+
     SDL_SCANCODE_A = 4,
     SDL_SCANCODE_B = 5,
     SDL_SCANCODE_C = 6,
@@ -45,6 +90,7 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_X = 27,
     SDL_SCANCODE_Y = 28,
     SDL_SCANCODE_Z = 29,
+
     SDL_SCANCODE_1 = 30,
     SDL_SCANCODE_2 = 31,
     SDL_SCANCODE_3 = 32,
@@ -55,11 +101,13 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_8 = 37,
     SDL_SCANCODE_9 = 38,
     SDL_SCANCODE_0 = 39,
+
     SDL_SCANCODE_RETURN = 40,
     SDL_SCANCODE_ESCAPE = 41,
     SDL_SCANCODE_BACKSPACE = 42,
     SDL_SCANCODE_TAB = 43,
     SDL_SCANCODE_SPACE = 44,
+
     SDL_SCANCODE_MINUS = 45,
     SDL_SCANCODE_EQUALS = 46,
     SDL_SCANCODE_LEFTBRACKET = 47,
@@ -112,7 +160,9 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_COMMA = 54,
     SDL_SCANCODE_PERIOD = 55,
     SDL_SCANCODE_SLASH = 56,
+
     SDL_SCANCODE_CAPSLOCK = 57,
+
     SDL_SCANCODE_F1 = 58,
     SDL_SCANCODE_F2 = 59,
     SDL_SCANCODE_F3 = 60,
@@ -125,6 +175,7 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_F10 = 67,
     SDL_SCANCODE_F11 = 68,
     SDL_SCANCODE_F12 = 69,
+
     SDL_SCANCODE_PRINTSCREEN = 70,
     SDL_SCANCODE_SCROLLLOCK = 71,
     SDL_SCANCODE_PAUSE = 72,
@@ -139,6 +190,7 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_LEFT = 80,
     SDL_SCANCODE_DOWN = 81,
     SDL_SCANCODE_UP = 82,
+
     SDL_SCANCODE_NUMLOCKCLEAR = 83, /**< num lock on PC, clear on Mac keyboards
                                      */
     SDL_SCANCODE_KP_DIVIDE = 84,
@@ -157,9 +209,10 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_KP_9 = 97,
     SDL_SCANCODE_KP_0 = 98,
     SDL_SCANCODE_KP_PERIOD = 99,
+
     SDL_SCANCODE_NONUSBACKSLASH = 100, /**< This is the additional key that ISO
                                         *   keyboards have over ANSI ones,
-                                        *   located between left shift and Y.
+                                        *   located between left shift and Z.
                                         *   Produces GRAVE ACCENT and TILDE in a
                                         *   US or UK Mac layout, REVERSE SOLIDUS
                                         *   (backslash) and VERTICAL LINE in a
@@ -167,7 +220,7 @@ typedef enum SDL_Scancode
                                         *   LESS-THAN SIGN and GREATER-THAN SIGN
                                         *   in a Swiss German, German, or French
                                         *   layout. */
-    SDL_SCANCODE_APPLICATION = 101,
+    SDL_SCANCODE_APPLICATION = 101, /**< windows contextual menu, compose */
     SDL_SCANCODE_POWER = 102, /**< The USB document says this is a status flag,
                                *   not a physical key - but some Mac keyboards
                                *   do have a power key. */
@@ -185,43 +238,49 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_F23 = 114,
     SDL_SCANCODE_F24 = 115,
     SDL_SCANCODE_EXECUTE = 116,
-    SDL_SCANCODE_HELP = 117,
-    SDL_SCANCODE_MENU = 118,
+    SDL_SCANCODE_HELP = 117,    /**< AL Integrated Help Center */
+    SDL_SCANCODE_MENU = 118,    /**< Menu (show menu) */
     SDL_SCANCODE_SELECT = 119,
-    SDL_SCANCODE_STOP = 120,
-    SDL_SCANCODE_AGAIN = 121,
-    SDL_SCANCODE_UNDO = 122,
-    SDL_SCANCODE_CUT = 123,
-    SDL_SCANCODE_COPY = 124,
-    SDL_SCANCODE_PASTE = 125,
-    SDL_SCANCODE_FIND = 126,
+    SDL_SCANCODE_STOP = 120,    /**< AC Stop */
+    SDL_SCANCODE_AGAIN = 121,   /**< AC Redo/Repeat */
+    SDL_SCANCODE_UNDO = 122,    /**< AC Undo */
+    SDL_SCANCODE_CUT = 123,     /**< AC Cut */
+    SDL_SCANCODE_COPY = 124,    /**< AC Copy */
+    SDL_SCANCODE_PASTE = 125,   /**< AC Paste */
+    SDL_SCANCODE_FIND = 126,    /**< AC Find */
     SDL_SCANCODE_MUTE = 127,
     SDL_SCANCODE_VOLUMEUP = 128,
     SDL_SCANCODE_VOLUMEDOWN = 129,
+/* not sure whether there's a reason to enable these */
+/*     SDL_SCANCODE_LOCKINGCAPSLOCK = 130,  */
+/*     SDL_SCANCODE_LOCKINGNUMLOCK = 131, */
+/*     SDL_SCANCODE_LOCKINGSCROLLLOCK = 132, */
     SDL_SCANCODE_KP_COMMA = 133,
     SDL_SCANCODE_KP_EQUALSAS400 = 134,
+
     SDL_SCANCODE_INTERNATIONAL1 = 135, /**< used on Asian keyboards, see
                                             footnotes in USB doc */
     SDL_SCANCODE_INTERNATIONAL2 = 136,
-    SDL_SCANCODE_INTERNATIONAL3 = 137,
+    SDL_SCANCODE_INTERNATIONAL3 = 137, /**< Yen */
     SDL_SCANCODE_INTERNATIONAL4 = 138,
     SDL_SCANCODE_INTERNATIONAL5 = 139,
     SDL_SCANCODE_INTERNATIONAL6 = 140,
     SDL_SCANCODE_INTERNATIONAL7 = 141,
     SDL_SCANCODE_INTERNATIONAL8 = 142,
     SDL_SCANCODE_INTERNATIONAL9 = 143,
-    SDL_SCANCODE_LANG1 = 144,
-    SDL_SCANCODE_LANG2 = 145,
-    SDL_SCANCODE_LANG3 = 146,
-    SDL_SCANCODE_LANG4 = 147,
-    SDL_SCANCODE_LANG5 = 148,
-    SDL_SCANCODE_LANG6 = 149,
-    SDL_SCANCODE_LANG7 = 150,
-    SDL_SCANCODE_LANG8 = 151,
-    SDL_SCANCODE_LANG9 = 152,
-    SDL_SCANCODE_ALTERASE = 153,
+    SDL_SCANCODE_LANG1 = 144, /**< Hangul/English toggle */
+    SDL_SCANCODE_LANG2 = 145, /**< Hanja conversion */
+    SDL_SCANCODE_LANG3 = 146, /**< Katakana */
+    SDL_SCANCODE_LANG4 = 147, /**< Hiragana */
+    SDL_SCANCODE_LANG5 = 148, /**< Zenkaku/Hankaku */
+    SDL_SCANCODE_LANG6 = 149, /**< reserved */
+    SDL_SCANCODE_LANG7 = 150, /**< reserved */
+    SDL_SCANCODE_LANG8 = 151, /**< reserved */
+    SDL_SCANCODE_LANG9 = 152, /**< reserved */
+
+    SDL_SCANCODE_ALTERASE = 153,    /**< Erase-Eaze */
     SDL_SCANCODE_SYSREQ = 154,
-    SDL_SCANCODE_CANCEL = 155,
+    SDL_SCANCODE_CANCEL = 155,      /**< AC Cancel */
     SDL_SCANCODE_CLEAR = 156,
     SDL_SCANCODE_PRIOR = 157,
     SDL_SCANCODE_RETURN2 = 158,
@@ -231,6 +290,8 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_CLEARAGAIN = 162,
     SDL_SCANCODE_CRSEL = 163,
     SDL_SCANCODE_EXSEL = 164,
+    SDL_SCANCODE_FRONT = 165,   /**< Front (Sun keyboards) */
+
     SDL_SCANCODE_KP_00 = 176,
     SDL_SCANCODE_KP_000 = 177,
     SDL_SCANCODE_THOUSANDSSEPARATOR = 178,
@@ -277,18 +338,23 @@ typedef enum SDL_Scancode
     SDL_SCANCODE_KP_OCTAL = 219,
     SDL_SCANCODE_KP_DECIMAL = 220,
     SDL_SCANCODE_KP_HEXADECIMAL = 221,
+
     SDL_SCANCODE_LCTRL = 224,
     SDL_SCANCODE_LSHIFT = 225,
-    SDL_SCANCODE_LALT = 226,
-    SDL_SCANCODE_LGUI = 227,
+    SDL_SCANCODE_LALT = 226, /**< alt, option */
+    SDL_SCANCODE_LGUI = 227, /**< windows, command (apple), meta */
     SDL_SCANCODE_RCTRL = 228,
     SDL_SCANCODE_RSHIFT = 229,
-    SDL_SCANCODE_RALT = 230,
-    SDL_SCANCODE_RGUI = 231,
+    SDL_SCANCODE_RALT = 230, /**< alt gr, option */
+    SDL_SCANCODE_RGUI = 231, /**< windows, command (apple), meta */
+
     SDL_SCANCODE_MODE = 257,    /**< I'm not sure if this is really not covered
                                  *   by any of the above, but since there's a
                                  *   special SDL_KMOD_MODE for it I'm adding it here
                                  */
+
+    /* @} *//* Usage page 0x07 */
+
     /**
      *  \name Usage page 0x0C
      *
@@ -298,40 +364,52 @@ typedef enum SDL_Scancode
      *  current scancode range, so pick the ones that commonly come up in
      *  real world usage.
      */
-    SDL_SCANCODE_SLEEP = 258,
-    SDL_SCANCODE_WAKE = 259,
-    SDL_SCANCODE_CHANNEL_INCREMENT = 260,
-    SDL_SCANCODE_CHANNEL_DECREMENT = 261,
-    SDL_SCANCODE_MEDIA_PLAY = 262,
-    SDL_SCANCODE_MEDIA_PAUSE = 263,
-    SDL_SCANCODE_MEDIA_RECORD = 264,
-    SDL_SCANCODE_MEDIA_FAST_FORWARD = 265,
-    SDL_SCANCODE_MEDIA_REWIND = 266,
-    SDL_SCANCODE_MEDIA_NEXT_TRACK = 267,
-    SDL_SCANCODE_MEDIA_PREVIOUS_TRACK = 268,
-    SDL_SCANCODE_MEDIA_STOP = 269,
-    SDL_SCANCODE_MEDIA_EJECT = 270,
-    SDL_SCANCODE_MEDIA_PLAY_PAUSE = 271,
-    SDL_SCANCODE_MEDIA_SELECT = 272,
-    SDL_SCANCODE_AC_NEW = 273,
-    SDL_SCANCODE_AC_OPEN = 274,
-    SDL_SCANCODE_AC_CLOSE = 275,
-    SDL_SCANCODE_AC_EXIT = 276,
-    SDL_SCANCODE_AC_SAVE = 277,
-    SDL_SCANCODE_AC_PRINT = 278,
-    SDL_SCANCODE_AC_PROPERTIES = 279,
-    SDL_SCANCODE_AC_SEARCH = 280,
-    SDL_SCANCODE_AC_HOME = 281,
-    SDL_SCANCODE_AC_BACK = 282,
-    SDL_SCANCODE_AC_FORWARD = 283,
-    SDL_SCANCODE_AC_STOP = 284,
-    SDL_SCANCODE_AC_REFRESH = 285,
-    SDL_SCANCODE_AC_BOOKMARKS = 286,
+    /* @{ */
+
+    SDL_SCANCODE_SLEEP = 258,                   /**< Sleep */
+    SDL_SCANCODE_WAKE = 259,                    /**< Wake */
+
+    SDL_SCANCODE_CHANNEL_INCREMENT = 260,       /**< Channel Increment */
+    SDL_SCANCODE_CHANNEL_DECREMENT = 261,       /**< Channel Decrement */
+
+    SDL_SCANCODE_MEDIA_PLAY = 262,          /**< Play */
+    SDL_SCANCODE_MEDIA_PAUSE = 263,         /**< Pause */
+    SDL_SCANCODE_MEDIA_RECORD = 264,        /**< Record */
+    SDL_SCANCODE_MEDIA_FAST_FORWARD = 265,  /**< Fast Forward */
+    SDL_SCANCODE_MEDIA_REWIND = 266,        /**< Rewind */
+    SDL_SCANCODE_MEDIA_NEXT_TRACK = 267,    /**< Next Track */
+    SDL_SCANCODE_MEDIA_PREVIOUS_TRACK = 268, /**< Previous Track */
+    SDL_SCANCODE_MEDIA_STOP = 269,          /**< Stop */
+    SDL_SCANCODE_MEDIA_EJECT = 270,         /**< Eject */
+    SDL_SCANCODE_MEDIA_PLAY_PAUSE = 271,    /**< Play / Pause */
+    SDL_SCANCODE_MEDIA_SELECT = 272,        /* Media Select */
+
+    SDL_SCANCODE_AC_NEW = 273,              /**< AC New */
+    SDL_SCANCODE_AC_OPEN = 274,             /**< AC Open */
+    SDL_SCANCODE_AC_CLOSE = 275,            /**< AC Close */
+    SDL_SCANCODE_AC_EXIT = 276,             /**< AC Exit */
+    SDL_SCANCODE_AC_SAVE = 277,             /**< AC Save */
+    SDL_SCANCODE_AC_PRINT = 278,            /**< AC Print */
+    SDL_SCANCODE_AC_PROPERTIES = 279,       /**< AC Properties */
+
+    SDL_SCANCODE_AC_SEARCH = 280,           /**< AC Search */
+    SDL_SCANCODE_AC_HOME = 281,             /**< AC Home */
+    SDL_SCANCODE_AC_BACK = 282,             /**< AC Back */
+    SDL_SCANCODE_AC_FORWARD = 283,          /**< AC Forward */
+    SDL_SCANCODE_AC_STOP = 284,             /**< AC Stop */
+    SDL_SCANCODE_AC_REFRESH = 285,          /**< AC Refresh */
+    SDL_SCANCODE_AC_BOOKMARKS = 286,        /**< AC Bookmarks */
+
+    /* @} *//* Usage page 0x0C */
+
+
     /**
      *  \name Mobile keys
      *
      *  These are values that are often used on mobile phones.
      */
+    /* @{ */
+
     SDL_SCANCODE_SOFTLEFT = 287, /**< Usually situated below the display on phones and
                                       used as a multi-function feature key for selecting
                                       a software defined function shown on the bottom left
@@ -340,10 +418,17 @@ typedef enum SDL_Scancode
                                        used as a multi-function feature key for selecting
                                        a software defined function shown on the bottom right
                                        of the display. */
-    SDL_SCANCODE_CALL = 289,
-    SDL_SCANCODE_ENDCALL = 290,
-    SDL_SCANCODE_RESERVED = 400,
-    SDL_SCANCODE_COUNT = 512
+    SDL_SCANCODE_CALL = 289, /**< Used for accepting phone calls. */
+    SDL_SCANCODE_ENDCALL = 290, /**< Used for rejecting phone calls. */
+
+    /* @} *//* Mobile keys */
+
+    /* Add any other keys here. */
+
+    SDL_SCANCODE_RESERVED = 400,    /**< 400-500 reserved for dynamic keycodes */
+
+    SDL_SCANCODE_COUNT = 512 /**< not a key, just marks the number of scancodes for array bounds */
+
 } SDL_Scancode;
 
 #endif /* SDL_scancode_h_ */

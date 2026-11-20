@@ -18,3 +18,7 @@
 #include "xdg-shell-protocol.c"
 #include "pointer-constraints-protocol.c"
 #include "relative-pointer-protocol.c"
+#include "xdg-decoration-protocol.c"
+#include "idle-inhibit-protocol.c"
+#include "keyboard-shortcuts-inhibit-protocol.c"
+#include "xdg-activation-protocol.c"

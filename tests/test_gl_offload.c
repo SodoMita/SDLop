@@ -208,7 +208,6 @@ static void test_dummy_opt_out(void)
     setenv("SDLOP_GL_OFFLOAD", "0", 1);
     if (SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Window *w = SDL_CreateWindow("dummy no offload", 64, 64, SDL_WINDOW_OPENGL);
-        CHECK(w != NULL, "dummy window created");
         if (w) {
             CHECK(SDL_GL_CreateContext(w) == NULL, "dummy GL fails when SDLOP_GL_OFFLOAD=0");
             SDL_DestroyWindow(w);
@@ -217,6 +216,8 @@ static void test_dummy_opt_out(void)
     }
     unsetenv("SDLOP_GL_OFFLOAD");
     unsetenv("SDL_VIDEODRIVER");
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDLOP_GL_OFFLOAD");
+    SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), "SDL_VIDEODRIVER");
 }
 
 int main(void)
@@ -225,8 +226,8 @@ int main(void)
     test_software_renderer_detection();
     test_flip_copy();
     test_gl_attrs();
-    test_dummy_opt_out();
     test_live_backend();
+    test_dummy_opt_out();
 
     if (failures) {
         printf("test_gl_offload: FAIL (%d checks)\n", failures);

@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.wm }}${{ matrix.sanitizers == 'ON' && ', ASan+UBSan' || '' }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - wm: no WM           # bare Xvfb: exercises the legacy/no-EWMH paths
+            sanitizers: 'OFF'
+          - wm: openbox         # EWMH window manager: _NET_WM_STATE paths
+            sanitizers: 'OFF'
+          - wm: openbox
+            sanitizers: 'ON'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkgconf \
+            libwayland-dev libwayland-bin wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl-dev libgbm-dev libdrm-dev libgles-dev \
+            libvulkan-dev mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri \
+            libxcb1-dev libxcb-shm0-dev libxcb-xkb-dev libxcb-xinput-dev \
+            libxcb-randr0-dev libxcb-render0-dev libxcb-xtest0-dev libx11-6 \
+            xkb-data libx11-data x11-xkb-utils \
+            xvfb xauth openbox
+
+      - name: Build SDL 3.4.20 reference (abi_check, api_subset_check, surface_diff)
+        run: |
+          git clone -q --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL /tmp/sdl3-ref
+          # headless core library only: pixels/surfaces/blitters are what the
+          # differential test compares; every optional subsystem is off
+          off=""
+          for o in TEST_LIBRARY TESTS EXAMPLES AUDIO X11 WAYLAND KMSDRM OPENGL OPENGLES VULKAN GPU RENDER \
+                   CAMERA JOYSTICK HAPTIC HIDAPI SENSOR POWER DIALOG TRAY DBUS IBUS PIPEWIRE PULSEAUDIO \
+                   ALSA JACK SNDIO LIBUDEV; do
+            off="$off -DSDL_$o=OFF"
+          done
+          cmake -S /tmp/sdl3-ref -B /tmp/sdl3-ref-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_SHARED=ON -DSDL_STATIC=OFF $off > /tmp/sdl3-ref-cfg.log \
+            || { tail -n 40 /tmp/sdl3-ref-cfg.log; exit 1; }
+          cmake --build /tmp/sdl3-ref-build -j"$(nproc)"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSDLOP_SANITIZERS=${{ matrix.sanitizers }} \
+            -DSDL3_REFERENCE_INCLUDE=/tmp/sdl3-ref/include \
+            -DSDL3_REFERENCE_LIB=/tmp/sdl3-ref-build/libSDL3.so
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: No link-time dependencies on optional libraries
+        run: |
+          objdump -p build/libSDLop.so | grep NEEDED
+          # sanitizer builds legitimately pull in the ASan/UBSan runtimes
+          if objdump -p build/libSDLop.so | grep NEEDED | grep -Ev 'lib(c|m|dl|pthread|asan|ubsan|gcc_s|stdc\+\+)\.so|ld-linux'; then
+            echo "::error::libSDLop.so links an optional library - everything must be dlopen'ed"
+            exit 1
+          fi
+
+      - name: Test (Xvfb, ${{ matrix.wm }})
+        env:
+          XDG_RUNTIME_DIR: /tmp/xdg
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          # layout/compose/touch tests fail instead of skipping without
+          # xkb-data, libx11-data (Compose), setxkbmap or XI 2.2
+          SDLOP_TEST_STRICT: '1'
+        run: |
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp +extension RANDR +extension MIT-SHM &
+          export DISPLAY=:99
+          for i in $(seq 100); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
+          if [ "${{ matrix.wm }}" = openbox ]; then
+            openbox --sm-disable &
+            sleep 2
+          fi
+          cd build
+          if ! ctest --output-on-failure --timeout 120 -j"$(nproc)"; then
+            # surface the failing checks as one annotation (visible via the
+            # check-runs API / PR UI without downloading logs)
+            {
+              echo "failed: $(cut -d: -f2 Testing/Temporary/LastTestsFailed.log | tr '\n' ' ')"
+              grep -hE 'FAIL|Assertion|timeout' Testing/Temporary/LastTest.log | grep -v Sanitizer | head -30
+              # sanitizer reports: the frames are what matters
+              awk '/ERROR: (Leak|Address|Undefined)Sanitizer|runtime error/{p=1} p&&/^ *#[0-9]+ /{n++; if(n<=24) print} /SUMMARY:/{if(p) print; p=0; n=0}' Testing/Temporary/LastTest.log | head -60
+            } | sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}' > /tmp/annot
+            echo "::error title=ctest failures::$(cat /tmp/annot)"
+            exit 1
+          fi

@@ -84,7 +84,18 @@ int main(void)
     /* --- memory-safety regressions (audit round 2026-09) --- */
     /* width*bpp must not overflow int; huge surfaces are rejected cleanly */
     assert(!SDL_CreateSurface(0x40000001, 1, SDL_PIXELFORMAT_RGBA8888)); /* 4 GiB row */
-    assert(!SDL_CreateSurface(1, 0x40000001, SDL_PIXELFORMAT_RGBA8888)); /* 16 GiB total */
+    /* 16 GiB total: must be rejected where it can't be addressed (32-bit,
+     * wasm32); on 64-bit it is legal like in SDL3 and may succeed on hosts
+     * that overcommit (calloc pages stay untouched) - just free it */
+    {
+        SDL_Surface *huge = SDL_CreateSurface(1, 0x40000001, SDL_PIXELFORMAT_RGBA8888);
+        if (sizeof(size_t) < 8) {
+            assert(!huge);
+        } else if (huge) {
+            assert(huge->pitch == 4 && huge->h == 0x40000001);
+            SDL_DestroySurface(huge);
+        }
+    }
     /* CreateSurfaceFrom must reject rows that don't fit in the pitch */
     {
         Uint32 small[32];

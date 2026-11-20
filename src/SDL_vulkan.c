@@ -84,6 +84,26 @@ void SDLOP_Vulkan_Quit(void)
 #endif
 }
 
+bool SDLOP_Vulkan_CanCreateWindow(void)
+{
+    if (!sdlop.video) {
+        return false;
+    }
+    if (sdlop.video->Vulkan_CreateSurface) {
+        return true;
+    }
+#ifndef __EMSCRIPTEN__
+    if (sdlop.video->CreateWindowFramebuffer &&
+        SDLOP_VulkanOffload_GetPolicy() != SDLOP_VK_OFFLOAD_NEVER) {
+        if (vk_get_instance_proc_addr) {
+            return SDLOP_VulkanOffload_ShouldUseOffload(vk_get_instance_proc_addr);
+        }
+        return true;
+    }
+#endif
+    return false;
+}
+
 /* Default for drivers that don't override it (wayland keeps this for
  * compatibility with apps built against the previous hardcoded list). */
 static const char *const sdlop_vulkan_extensions[] = {
@@ -183,15 +203,29 @@ void SDL_Vulkan_DestroySurface(VkInstance instance, VkSurfaceKHR surface, const 
     }
 }
 
-bool SDL_Vulkan_GetPresentationSupport(VkInstance instance, Uint32 queueFamilyIndex)
+bool SDL_Vulkan_GetPresentationSupport(VkInstance instance, VkPhysicalDevice physicalDevice, Uint32 queueFamilyIndex)
 {
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem has not been initialized");
+    }
     if (!instance) {
-        SDL_SetError("Invalid VkInstance");
-        return false;
+        return SDL_InvalidParamError("instance");
+    }
+    if (!physicalDevice) {
+        return SDL_InvalidParamError("physicalDevice");
     }
     if (!vulkan_handle && !SDL_Vulkan_LoadLibrary(NULL)) {
         return false;
     }
-    (void)queueFamilyIndex;
-    return vk_get_instance_proc_addr != NULL;
+#ifndef __EMSCRIPTEN__
+    if (SDLOP_VulkanOffload_IsActive()) {
+        return true;
+    }
+#endif
+    if (sdlop.video->Vulkan_GetPresentationSupport) {
+        return sdlop.video->Vulkan_GetPresentationSupport(sdlop.video, instance, physicalDevice, queueFamilyIndex);
+    }
+    /* SDL3: a backend without a WSI query (KMSDRM's display surfaces) always
+     * supports presentation */
+    return true;
 }

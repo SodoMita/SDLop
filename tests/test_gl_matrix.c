@@ -9,7 +9,7 @@
     - SDL_GL_SHARE_WITH_CURRENT_CONTEXT: a texture created in context A
       is readable through an FBO in shared context B
 
-  Skips cleanly when no Wayland compositor is running.
+  Runs on Wayland or X11; skips cleanly when neither is available.
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
@@ -106,8 +106,8 @@ static bool version_at_least(const char *ver, int major, int minor)
 
 int main(void)
 {
-    if (!getenv("WAYLAND_DISPLAY")) {
-        printf("test_gl_matrix: SKIP (WAYLAND_DISPLAY not set)\n");
+    if (!getenv("WAYLAND_DISPLAY") && !getenv("DISPLAY")) {
+        printf("test_gl_matrix: SKIP (neither WAYLAND_DISPLAY nor DISPLAY set)\n");
         return 0;
     }
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);

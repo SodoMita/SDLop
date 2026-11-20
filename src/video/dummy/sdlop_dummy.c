@@ -195,6 +195,90 @@ static void dummy_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     }
 }
 
+/* ---- SDL 3.4 window management: a virtual window system, so the state
+ * lives in the core and every request simply succeeds ---- */
+static void dummy_WindowNoop(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+}
+
+static void dummy_WindowNoopBool(SDLop_VideoDevice *device, SDL_Window *window, bool on)
+{
+    (void)device;
+    (void)window;
+    (void)on;
+}
+
+static bool dummy_WindowOkBool(SDLop_VideoDevice *device, SDL_Window *window, bool on)
+{
+    (void)device;
+    (void)window;
+    (void)on;
+    return true;
+}
+
+static bool dummy_GetWindowBordersSize(SDLop_VideoDevice *device, SDL_Window *window, int *top, int *left, int *bottom, int *right)
+{
+    (void)device;
+    (void)window;
+    *top = *left = *bottom = *right = 0;
+    return true;
+}
+
+static bool dummy_SetWindowOpacity(SDLop_VideoDevice *device, SDL_Window *window, float opacity)
+{
+    (void)device;
+    (void)window;
+    (void)opacity;
+    return true;
+}
+
+static bool dummy_SetWindowParent(SDLop_VideoDevice *device, SDL_Window *window, SDL_Window *parent)
+{
+    (void)device;
+    (void)window;
+    (void)parent;
+    return true;
+}
+
+static bool dummy_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon)
+{
+    (void)device;
+    (void)window;
+    (void)icon;
+    return true;
+}
+
+static bool dummy_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    return true;
+}
+
+static bool dummy_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL_FlashOperation operation)
+{
+    (void)device;
+    (void)window;
+    (void)operation;
+    return true;
+}
+
+static bool dummy_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    (void)cursor;
+    return true;
+}
+
+static bool dummy_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    (void)cursor;
+    return true;
+}
+
 SDLop_VideoDevice SDLop_dummy_device = {
     "dummy",
     dummy_Init,
@@ -227,4 +311,25 @@ SDLop_VideoDevice SDLop_dummy_device = {
     NULL, /* GL_GetSwapInterval */
     NULL, /* Vulkan_CreateSurface: generic VK_EXT_headless_surface offload in SDL_vulkan.c */
     NULL, /* Vulkan_GetInstanceExtensions */
+    /* optional hooks */
+    .Vulkan_GetPresentationSupport = NULL,
+    .supports_popups = true,
+    .SetWindowMinimumSize = dummy_WindowNoop,
+    .SetWindowMaximumSize = dummy_WindowNoop,
+    .SetWindowAspectRatio = dummy_WindowNoop,
+    .GetWindowBordersSize = dummy_GetWindowBordersSize,
+    .SetWindowOpacity = dummy_SetWindowOpacity,
+    .SetWindowParent = dummy_SetWindowParent,
+    .SetWindowModal = dummy_WindowOkBool,
+    .SetWindowBordered = dummy_WindowNoopBool,
+    .SetWindowResizable = dummy_WindowNoopBool,
+    .SetWindowAlwaysOnTop = dummy_WindowNoopBool,
+    .SetWindowIcon = dummy_SetWindowIcon,
+    .SetWindowMouseGrab = dummy_WindowOkBool,
+    .SetWindowKeyboardGrab = dummy_WindowOkBool,
+    .SetWindowMouseRect = dummy_SetWindowMouseRect,
+    .FlashWindow = dummy_FlashWindow,
+    .SetWindowFocusable = dummy_WindowOkBool,
+    .CreateCursor = dummy_CreateCursor,
+    .ShowCursor = dummy_ShowCursor,
 };

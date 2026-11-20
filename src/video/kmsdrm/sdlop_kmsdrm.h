@@ -91,6 +91,11 @@ typedef struct KMSDRM_DisplayData
 
     /* hardware cursor */
     struct gbm_bo *cursor_bo;
+    /* cursor buffer when GBM is unavailable: a dumb buffer of our own, so a
+       host without libgbm/Mesa still gets a hardware cursor */
+    uint32_t cursor_dumb;
+    uint32_t cursor_dumb_size;
+    uint8_t *cursor_map;
     uint64_t cursor_w, cursor_h;
     int32_t cursor_hot_x, cursor_hot_y;
     bool cursor_visible;
@@ -232,6 +237,9 @@ void KMSDRM_GL_DeleteContext(SDLop_VideoDevice *device, void *context);
 SDL_FunctionPointer KMSDRM_GL_GetProcAddress(SDLop_VideoDevice *device, const char *proc);
 bool KMSDRM_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval);
 bool KMSDRM_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval);
+void *KMSDRM_EGL_GetDisplay(SDLop_VideoDevice *device);
+void *KMSDRM_EGL_GetConfig(SDLop_VideoDevice *device);
+void *KMSDRM_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window);
 
 /* Vulkan WSI (VK_KHR_surface + VK_KHR_display) - sdlop_kmsdrm_vulkan.c */
 bool SDLOP_KMSDRM_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window,

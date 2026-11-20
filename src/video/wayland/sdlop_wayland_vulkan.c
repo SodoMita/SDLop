@@ -59,3 +59,22 @@ bool SDLOP_Wayland_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *w
     }
     return true;
 }
+
+typedef uint32_t (*PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR_)(void *, uint32_t, struct wl_display *);
+
+bool SDLOP_Wayland_Vulkan_GetPresentationSupport(SDLop_VideoDevice *device, void *instance,
+                                                 void *physical_device, Uint32 queue_family)
+{
+    (void)device;
+    PFN_vkGetInstanceProcAddr_ gipa = (PFN_vkGetInstanceProcAddr_)SDL_Vulkan_GetVkGetInstanceProcAddr();
+    if (!gipa) {
+        return SDL_SetError("Vulkan loader not loaded");
+    }
+    PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR_ query =
+        (PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR_)gipa((VkInstance_)instance,
+                                                                    "vkGetPhysicalDeviceWaylandPresentationSupportKHR");
+    if (!query) {
+        return SDL_SetError("vkGetPhysicalDeviceWaylandPresentationSupportKHR not available (missing VK_KHR_wayland_surface?)");
+    }
+    return query(physical_device, queue_family, SDLOP_Wayland_GetDisplay()) != 0;
+}

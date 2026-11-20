@@ -59,9 +59,20 @@ typedef struct
     SDL_Event last;
 } finger_expect;
 
+/* synthesized mouse events (SDL_TOUCH_MOUSE_EVENTS default on) */
+static SDL_Event mouse_log[32];
+static int mouse_log_n = 0;
+
 static bool pred_finger(const SDL_Event *e, void *user)
 {
     finger_expect *f = (finger_expect *)user;
+    /* (the compositor's real pointer enter is which == 0) */
+    if (((e->type == SDL_EVENT_MOUSE_MOTION && e->motion.which == SDL_TOUCH_MOUSEID) ||
+         ((e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+          e->button.which == SDL_TOUCH_MOUSEID)) &&
+        mouse_log_n < (int)(sizeof(mouse_log) / sizeof(mouse_log[0]))) {
+        mouse_log[mouse_log_n++] = *e;
+    }
     if (e->type != f->type) {
         return false;
     }
@@ -114,6 +125,7 @@ int main(int argc, char *argv[])
 
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     setenv("WAYLAND_DISPLAY", "wayland-mini", 1);
+    setenv("SDL_VIDEODRIVER", "wayland", 1); /* never fall back to x11 */
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -168,6 +180,35 @@ int main(int argc, char *argv[])
         finger_expect cancel = { SDL_EVENT_FINGER_CANCELED, 140.0f / 320, 160.0f / 240, 0, 0, 0.0f, { 0 } };
         CHECK(pump_until(pred_finger, &cancel, 3000), "no FINGER_CANCELED (finger 8)");
         CHECK(cancel.last.tfinger.fingerID == 8, "cancel fingerID != 8");
+
+        /* the first finger (7) drove a left-button mouse, SDL3-style:
+         * motion+down at (50,60), motion to (70,80), up; finger 8 none */
+        static const struct
+        {
+            Uint32 type;
+            float x, y;
+        } want[] = {
+            { SDL_EVENT_MOUSE_MOTION, 50, 60 },
+            { SDL_EVENT_MOUSE_BUTTON_DOWN, 50, 60 },
+            { SDL_EVENT_MOUSE_MOTION, 70, 80 },
+            { SDL_EVENT_MOUSE_BUTTON_UP, 70, 80 },
+        };
+        CHECK(mouse_log_n == 4, "touch -> mouse: %d mouse events, want 4", mouse_log_n);
+        for (int i = 0; i < mouse_log_n && i < 4; i++) {
+            const SDL_Event *e = &mouse_log[i];
+            float x = e->type == SDL_EVENT_MOUSE_MOTION ? e->motion.x : e->button.x;
+            float y = e->type == SDL_EVENT_MOUSE_MOTION ? e->motion.y : e->button.y;
+            SDL_MouseID which = e->type == SDL_EVENT_MOUSE_MOTION ? e->motion.which : e->button.which;
+            SDL_WindowID wid = e->type == SDL_EVENT_MOUSE_MOTION ? e->motion.windowID : e->button.windowID;
+            CHECK(e->type == want[i].type && fabsf(x - want[i].x) < 0.01f && fabsf(y - want[i].y) < 0.01f,
+                  "touch -> mouse #%d: type 0x%x at (%g,%g), want 0x%x at (%g,%g)", i, (unsigned)e->type, x, y,
+                  (unsigned)want[i].type, want[i].x, want[i].y);
+            CHECK(which == SDL_TOUCH_MOUSEID && wid == SDL_GetWindowID(w), "touch -> mouse #%d: which/window", i);
+            if (e->type != SDL_EVENT_MOUSE_MOTION) {
+                CHECK(e->button.button == SDL_BUTTON_LEFT, "touch -> mouse #%d: left button", i);
+            }
+        }
+        CHECK(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK), "touch -> mouse: left released");
 
         SDL_DestroyWindowSurface(w);
         SDL_DestroyWindow(w);

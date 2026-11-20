@@ -19,8 +19,14 @@ static SDLop_VideoDevice *const video_drivers[] = {
 #if SDLop_VIDEO_WAYLAND
     &SDLop_wayland_device,
 #endif
+#if SDLop_VIDEO_X11
+    &SDLop_x11_device,
+#endif
 #if SDLop_VIDEO_KMSDRM
     &SDLop_kmsdrm_device,
+#endif
+#if SDLop_VIDEO_FBDEV
+    &SDLop_fbdev_device,
 #endif
     &SDLop_dummy_device,
 };
@@ -29,8 +35,21 @@ static SDLop_VideoDevice *const video_drivers[] = {
 
 static const char *default_driver_order(void)
 {
-    const char *hint = getenv("SDL_VIDEODRIVER");
+    const char *hint = SDL_GetHint(SDL_HINT_VIDEO_DRIVER);
     return hint;
+}
+
+static void video_post_init(void)
+{
+    sdlop.grabbed_window = NULL;
+    sdlop.suspend_screensaver = false;
+    /* stock SDL3 inhibits the screensaver unless the app opts in */
+    if (!SDL_GetHintBoolean(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, false)) {
+        sdlop.suspend_screensaver = true;
+        if (sdlop.video->SuspendScreenSaver) {
+            sdlop.video->SuspendScreenSaver(sdlop.video);
+        }
+    }
 }
 
 bool SDLOP_VideoInit(void)
@@ -42,6 +61,7 @@ bool SDLOP_VideoInit(void)
             if (strcasecmp(video_drivers[i]->name, driver) == 0) {
                 if (video_drivers[i]->Init(video_drivers[i])) {
                     sdlop.video = video_drivers[i];
+                    video_post_init();
                     return true;
                 }
                 return false;
@@ -54,6 +74,8 @@ bool SDLOP_VideoInit(void)
     for (int i = 0; i < SDLOP_NUM_VIDEO_DRIVERS; i++) {
         if (video_drivers[i]->Init(video_drivers[i])) {
             sdlop.video = video_drivers[i];
+            SDL_ClearError(); /* drop errors of drivers tried before */
+            video_post_init();
             return true;
         }
     }
@@ -68,6 +90,9 @@ void SDLOP_VideoQuit(void)
     }
     SDLOP_GL_Quit();
     SDLOP_Vulkan_Quit();
+    SDLOP_MouseQuit(); /* cursors hold driver resources */
+    sdlop.grabbed_window = NULL;
+    sdlop.suspend_screensaver = false;
     if (sdlop.video) {
         sdlop.video->Quit(sdlop.video);
         sdlop.video = NULL;
@@ -629,17 +654,165 @@ float SDL_GetWindowPixelDensity(SDL_Window *window)
 /* Public window API                                                   */
 /* ------------------------------------------------------------------ */
 
-SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags flags)
+static struct
+{
+    const char *property_name;
+    SDL_WindowFlags flag;
+    bool invert_value;
+} window_flag_props[] = {
+    { SDL_PROP_WINDOW_CREATE_ALWAYS_ON_TOP_BOOLEAN, SDL_WINDOW_ALWAYS_ON_TOP, false },
+    { SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN, SDL_WINDOW_BORDERLESS, false },
+    { SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN, SDL_WINDOW_NOT_FOCUSABLE, true },
+    { SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, SDL_WINDOW_FULLSCREEN, false },
+    { SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, SDL_WINDOW_HIDDEN, false },
+    { SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN, SDL_WINDOW_HIGH_PIXEL_DENSITY, false },
+    { SDL_PROP_WINDOW_CREATE_MAXIMIZED_BOOLEAN, SDL_WINDOW_MAXIMIZED, false },
+    { SDL_PROP_WINDOW_CREATE_MENU_BOOLEAN, SDL_WINDOW_POPUP_MENU, false },
+    { SDL_PROP_WINDOW_CREATE_METAL_BOOLEAN, SDL_WINDOW_METAL, false },
+    { SDL_PROP_WINDOW_CREATE_MINIMIZED_BOOLEAN, SDL_WINDOW_MINIMIZED, false },
+    { SDL_PROP_WINDOW_CREATE_MODAL_BOOLEAN, SDL_WINDOW_MODAL, false },
+    { SDL_PROP_WINDOW_CREATE_MOUSE_GRABBED_BOOLEAN, SDL_WINDOW_MOUSE_GRABBED, false },
+    { SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, SDL_WINDOW_OPENGL, false },
+    { SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, SDL_WINDOW_RESIZABLE, false },
+    { SDL_PROP_WINDOW_CREATE_TRANSPARENT_BOOLEAN, SDL_WINDOW_TRANSPARENT, false },
+    { SDL_PROP_WINDOW_CREATE_TOOLTIP_BOOLEAN, SDL_WINDOW_TOOLTIP, false },
+    { SDL_PROP_WINDOW_CREATE_UTILITY_BOOLEAN, SDL_WINDOW_UTILITY, false },
+    { SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, SDL_WINDOW_VULKAN, false },
+};
+
+static SDL_WindowFlags window_flags_from_props(SDL_PropertiesID props)
+{
+    SDL_WindowFlags flags = (SDL_WindowFlags)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, 0);
+    for (size_t i = 0; i < SDL_arraysize(window_flag_props); ++i) {
+        if (window_flag_props[i].invert_value) {
+            if (!SDL_GetBooleanProperty(props, window_flag_props[i].property_name, true)) {
+                flags |= window_flag_props[i].flag;
+            }
+        } else if (SDL_GetBooleanProperty(props, window_flag_props[i].property_name, false)) {
+            flags |= window_flag_props[i].flag;
+        }
+    }
+    return flags;
+}
+
+bool SDLOP_WindowValid(SDL_Window *window)
+{
+    if (window) {
+        for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+            if (w == window) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* CHECK_WINDOW_MAGIC */
+#define CHECK_WINDOW(window, retval)                     \
+    if (!sdlop.video) {                                  \
+        SDL_SetError("Video subsystem has not been initialized"); \
+        return retval;                                   \
+    }                                                    \
+    if (!SDLOP_WindowValid(window)) {                    \
+        SDL_SetError("Invalid window");                  \
+        return retval;                                   \
+    }
+#define CHECK_WINDOW_NOT_POPUP(window, retval)           \
+    if (SDLOP_WINDOW_IS_POPUP(window)) {                 \
+        SDL_SetError("Operation invalid on popup windows"); \
+        return retval;                                   \
+    }
+
+SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
 {
     if (!sdlop.init_done || !sdlop.video) {
         SDL_SetError("Video subsystem not initialized");
         return NULL;
     }
-    if (w <= 0) {
-        w = 640;
+    const char *title = SDL_GetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, NULL);
+    int x = (int)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_UNDEFINED);
+    int y = (int)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_UNDEFINED);
+    int w = (int)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, 0);
+    int h = (int)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, 0);
+    SDL_Window *parent = (SDL_Window *)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_CREATE_PARENT_POINTER, NULL);
+    SDL_WindowFlags flags = window_flags_from_props(props);
+    bool undefined_x = false, undefined_y = false;
+
+    if ((flags & SDL_WINDOW_MODAL) && !SDLOP_WindowValid(parent)) {
+        SDL_SetError("Modal windows must specify a parent window");
+        return NULL;
     }
-    if (h <= 0) {
-        h = 480;
+    bool popup = (flags & (SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU)) != 0;
+    if (popup) {
+        if (!sdlop.video->supports_popups) {
+            SDL_Unsupported();
+            return NULL;
+        }
+        if (!SDLOP_WindowValid(parent)) {
+            SDL_SetError("Tooltip and popup menu windows must specify a parent window");
+            return NULL;
+        }
+        flags &= ~(SDL_WINDOW_MINIMIZED | SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS);
+    }
+    SDL_WindowFlags type_flags = flags & (SDL_WINDOW_UTILITY | SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU | SDL_WINDOW_MODAL);
+    if (type_flags & (type_flags - 1)) {
+        SDL_SetError("Conflicting window type flags specified: 0x%.8x", (unsigned int)type_flags);
+        return NULL;
+    }
+    SDL_WindowFlags graphics_flags = flags & (SDL_WINDOW_OPENGL | SDL_WINDOW_METAL | SDL_WINDOW_VULKAN);
+    if (graphics_flags & (graphics_flags - 1)) {
+        SDL_SetError("Conflicting window graphics flags specified: 0x%.8x", (unsigned int)graphics_flags);
+        return NULL;
+    }
+    if (flags & SDL_WINDOW_METAL) {
+        SDL_SetError("Metal support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
+        return NULL;
+    }
+    if ((flags & SDL_WINDOW_OPENGL) && !SDLOP_GL_CanCreateWindow()) {
+        SDL_SetError("OpenGL support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
+        return NULL;
+    }
+    if ((flags & SDL_WINDOW_VULKAN) && !SDLOP_Vulkan_CanCreateWindow()) {
+        SDL_SetError("Vulkan support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
+        return NULL;
+    }
+
+    if (w < 1) {
+        w = 1;
+    }
+    if (h < 1) {
+        h = 1;
+    }
+    int popup_x = x, popup_y = y;
+    if (popup) {
+        /* x/y are relative to the parent */
+        x = parent->x + popup_x;
+        y = parent->y + popup_y;
+    } else if (SDL_WINDOWPOS_ISUNDEFINED(x) || SDL_WINDOWPOS_ISUNDEFINED(y) ||
+               SDL_WINDOWPOS_ISCENTERED(x) || SDL_WINDOWPOS_ISCENTERED(y)) {
+        SDL_DisplayID displayID = 0;
+        SDL_Rect bounds;
+        if ((SDL_WINDOWPOS_ISUNDEFINED(x) || SDL_WINDOWPOS_ISCENTERED(x)) && (x & 0xFFFF)) {
+            displayID = (SDL_DisplayID)(x & 0xFFFF);
+        } else if ((SDL_WINDOWPOS_ISUNDEFINED(y) || SDL_WINDOWPOS_ISCENTERED(y)) && (y & 0xFFFF)) {
+            displayID = (SDL_DisplayID)(y & 0xFFFF);
+        }
+        if (displayID == 0 || SDLOP_GetDisplayIndexById(displayID) < 0) {
+            displayID = SDL_GetPrimaryDisplay();
+        }
+        SDL_zero(bounds);
+        SDL_GetDisplayUsableBounds(displayID, &bounds);
+        if (w > bounds.w || h > bounds.h) {
+            SDL_GetDisplayBounds(displayID, &bounds);
+        }
+        if (SDL_WINDOWPOS_ISCENTERED(x) || SDL_WINDOWPOS_ISUNDEFINED(x)) {
+            undefined_x = SDL_WINDOWPOS_ISUNDEFINED(x);
+            x = bounds.x + (bounds.w - w) / 2;
+        }
+        if (SDL_WINDOWPOS_ISCENTERED(y) || SDL_WINDOWPOS_ISUNDEFINED(y)) {
+            undefined_y = SDL_WINDOWPOS_ISUNDEFINED(y);
+            y = bounds.y + (bounds.h - h) / 2;
+        }
     }
 
     SDL_Window *window = (SDL_Window *)calloc(1, sizeof(*window));
@@ -651,9 +824,18 @@ SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags fl
     window->title = strdup(title ? title : "");
     window->w = w;
     window->h = h;
-    window->x = 0;
-    window->y = 0;
+    window->x = x;
+    window->y = y;
+    window->undefined_x = undefined_x;
+    window->undefined_y = undefined_y;
+    window->popup_offset_x = popup_x;
+    window->popup_offset_y = popup_y;
     window->display_scale = 1.0f;
+    window->opacity = 1.0f;
+    window->parent = parent;
+    /* grabs are applied once the window is shown (SDL_FinishWindowCreation) */
+    window->pending_flags = flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED);
+    flags &= ~(SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED);
     window->flags = flags | SDL_WINDOW_HIDDEN; /* shown below unless HIDDEN */
     window->clear_r = 0x20;
     window->clear_g = 0x20;
@@ -671,14 +853,64 @@ SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags fl
     if (!(flags & SDL_WINDOW_HIDDEN)) {
         SDL_ShowWindow(window);
     }
+    SDL_ClearError();
+    return window;
+}
+
+SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags flags)
+{
+    SDL_PropertiesID props = SDL_CreateProperties();
+    if (title && *title) {
+        SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
+    }
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, (Sint64)flags);
+    SDL_Window *window = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
+    return window;
+}
+
+SDL_Window *SDL_CreatePopupWindow(SDL_Window *parent, int offset_x, int offset_y, int w, int h, SDL_WindowFlags flags)
+{
+    if (!(flags & (SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU))) {
+        SDL_SetError("Popup windows must specify either the 'SDL_WINDOW_TOOLTIP' or the 'SDL_WINDOW_POPUP_MENU' flag");
+        return NULL;
+    }
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_PARENT_POINTER, parent);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, offset_x);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, offset_y);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, (Sint64)flags);
+    SDL_Window *window = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
     return window;
 }
 
 void SDL_DestroyWindow(SDL_Window *window)
 {
-    if (!window) {
+    if (!SDLOP_WindowValid(window)) {
         return;
     }
+    window->is_destroying = true;
+
+    /* children (popups, transient windows) go first */
+    for (;;) {
+        SDL_Window *child = NULL;
+        for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+            if (w->parent == window) {
+                child = w;
+                break;
+            }
+        }
+        if (!child) {
+            break;
+        }
+        SDL_DestroyWindow(child);
+    }
+
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DESTROYED, 0, 0);
     SDLOP_GL_NotifyWindowDestroyed(window);
     SDLOP_Vulkan_NotifyWindowDestroyed(window);
@@ -688,10 +920,21 @@ void SDL_DestroyWindow(SDL_Window *window)
         SDL_DestroySurface(window->surface);
         window->surface = NULL;
     }
+    if (sdlop.video && sdlop.video->SetWindowModal && (window->flags & SDL_WINDOW_MODAL)) {
+        sdlop.video->SetWindowModal(sdlop.video, window, false);
+    }
+    if (sdlop.grabbed_window == window) {
+        sdlop.grabbed_window = NULL;
+    }
     if (sdlop.video) {
         sdlop.video->DestroyWindow(sdlop.video, window);
     }
     SDLOP_RemoveWindow(window);
+    SDL_DestroyProperties(window->props);
+    if (window->text_input_props) {
+        SDL_DestroyProperties(window->text_input_props);
+    }
+    SDL_DestroySurface(window->icon);
     free(window->title);
     free(window);
 }
@@ -743,8 +986,30 @@ bool SDL_SetWindowSize(SDL_Window *window, int w, int h)
     if (!window) {
         return SDL_SetError("Invalid window");
     }
-    if (w <= 0 || h <= 0) {
-        return SDL_SetError("Invalid window size");
+    if (w <= 0) {
+        return SDL_InvalidParamError("w");
+    }
+    if (h <= 0) {
+        return SDL_InvalidParamError("h");
+    }
+    /* aspect first, then the size limits win (stock order) */
+    float new_aspect = w / (float)h;
+    if (window->max_aspect > 0.0f && new_aspect > window->max_aspect) {
+        w = (int)SDL_roundf(h * window->max_aspect);
+    } else if (window->min_aspect > 0.0f && new_aspect < window->min_aspect) {
+        h = (int)SDL_roundf(w / window->min_aspect);
+    }
+    if (window->min_w && w < window->min_w) {
+        w = window->min_w;
+    }
+    if (window->max_w && w > window->max_w) {
+        w = window->max_w;
+    }
+    if (window->min_h && h < window->min_h) {
+        h = window->min_h;
+    }
+    if (window->max_h && h > window->max_h) {
+        h = window->max_h;
     }
     window->w = w;
     window->h = h;
@@ -781,6 +1046,13 @@ bool SDL_SetWindowPosition(SDL_Window *window, int x, int y)
         SDL_WINDOWPOS_ISCENTERED(x) || SDL_WINDOWPOS_ISCENTERED(y)) {
         return true; /* compositor decides placement */
     }
+    if (SDLOP_WINDOW_IS_POPUP(window) && window->parent) {
+        /* popup coordinates are relative to the parent (stock) */
+        window->popup_offset_x = x;
+        window->popup_offset_y = y;
+        x += window->parent->x;
+        y += window->parent->y;
+    }
     window->x = x;
     window->y = y;
     bool ok = true;
@@ -798,13 +1070,41 @@ bool SDL_GetWindowPosition(SDL_Window *window, int *x, int *y)
     if (!window) {
         return SDL_SetError("Invalid window");
     }
+    int px = 0, py = 0;
+    if (SDLOP_WINDOW_IS_POPUP(window) && window->parent) {
+        px = window->parent->x;
+        py = window->parent->y;
+    }
     if (x) {
-        *x = window->x;
+        *x = window->x - px;
     }
     if (y) {
-        *y = window->y;
+        *y = window->y - py;
     }
     return true;
+}
+
+void SDLOP_OnWindowMoved(SDL_Window *window)
+{
+    if (SDLOP_WINDOW_IS_POPUP(window) && window->parent) {
+        window->popup_offset_x = window->x - window->parent->x;
+        window->popup_offset_y = window->y - window->parent->y;
+    }
+    /* popups follow their parent (stock X11/Wayland behaviour) */
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        if (w->parent == window && SDLOP_WINDOW_IS_POPUP(w) && !w->is_destroying) {
+            const int nx = window->x + w->popup_offset_x;
+            const int ny = window->y + w->popup_offset_y;
+            if (nx != w->x || ny != w->y) {
+                w->x = nx;
+                w->y = ny;
+                if (sdlop.video && sdlop.video->SetWindowPosition) {
+                    sdlop.video->SetWindowPosition(sdlop.video, w);
+                }
+                SDLOP_OnWindowMoved(w);
+            }
+        }
+    }
 }
 
 bool SDL_ShowWindow(SDL_Window *window)
@@ -818,6 +1118,18 @@ bool SDL_ShowWindow(SDL_Window *window)
             sdlop.video->ShowWindow(sdlop.video, window);
         }
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_SHOWN, 0, 0);
+        if ((window->flags & SDL_WINDOW_MODAL) && sdlop.video && sdlop.video->SetWindowModal) {
+            sdlop.video->SetWindowModal(sdlop.video, window, true);
+        }
+        /* grabs requested while hidden take effect now */
+        SDL_WindowFlags pending = window->pending_flags;
+        window->pending_flags = 0;
+        if (pending & SDL_WINDOW_MOUSE_GRABBED) {
+            SDL_SetWindowMouseGrab(window, true);
+        }
+        if (pending & SDL_WINDOW_KEYBOARD_GRABBED) {
+            SDL_SetWindowKeyboardGrab(window, true);
+        }
     }
     return true;
 }
@@ -828,6 +1140,12 @@ bool SDL_HideWindow(SDL_Window *window)
         return SDL_SetError("Invalid window");
     }
     if (!(window->flags & SDL_WINDOW_HIDDEN)) {
+        /* grabs come back when the window is shown again */
+        window->pending_flags |= window->flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED);
+        if (window->flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED)) {
+            window->flags &= ~(SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED);
+            SDLOP_UpdateWindowGrab(window);
+        }
         window->flags |= SDL_WINDOW_HIDDEN;
         if (sdlop.video && sdlop.video->HideWindow) {
             sdlop.video->HideWindow(sdlop.video, window);
@@ -991,4 +1309,665 @@ float SDLCALL SDL_GetWindowDisplayScale(SDL_Window *window)
         return 1.0f;
     }
     return window->display_scale;
+}
+
+/* ------------------------------------------------------------------ */
+/* SDL 3.4 window management                                           */
+/* ------------------------------------------------------------------ */
+
+SDL_Window **SDLCALL SDL_GetWindows(int *count)
+{
+    if (count) {
+        *count = 0;
+    }
+    if (!sdlop.video) {
+        SDL_SetError("Video subsystem has not been initialized");
+        return NULL;
+    }
+    int n = 0;
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        ++n;
+    }
+    SDL_Window **list = (SDL_Window **)SDL_malloc((size_t)(n + 1) * sizeof(*list));
+    if (!list) {
+        return NULL;
+    }
+    int i = 0;
+    for (SDL_Window *w = sdlop.windows; w && i < n; w = w->next) {
+        list[i++] = w;
+    }
+    list[i] = NULL;
+    if (count) {
+        *count = i;
+    }
+    return list;
+}
+
+SDL_PropertiesID SDL_GetWindowProperties(SDL_Window *window)
+{
+    CHECK_WINDOW(window, 0);
+    if (window->props == 0) {
+        window->props = SDL_CreateProperties();
+    }
+    return window->props;
+}
+
+SDL_Window *SDL_GetWindowParent(SDL_Window *window)
+{
+    CHECK_WINDOW(window, NULL);
+    return window->parent;
+}
+
+SDL_PixelFormat SDL_GetWindowPixelFormat(SDL_Window *window)
+{
+    CHECK_WINDOW(window, SDL_PIXELFORMAT_UNKNOWN);
+    const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
+    return mode ? mode->format : SDL_PIXELFORMAT_UNKNOWN;
+}
+
+bool SDL_GetWindowSafeArea(SDL_Window *window, SDL_Rect *rect)
+{
+    if (rect) {
+        SDL_zerop(rect);
+    }
+    CHECK_WINDOW(window, false);
+    if (rect) {
+        if (SDL_RectEmpty(&window->safe_rect)) {
+            rect->w = window->w;
+            rect->h = window->h;
+        } else {
+            *rect = window->safe_rect;
+        }
+    }
+    return true;
+}
+
+void *SDL_GetWindowICCProfile(SDL_Window *window, size_t *size)
+{
+    CHECK_WINDOW(window, NULL);
+    if (!sdlop.video->GetWindowICCProfile) {
+        SDL_Unsupported();
+        return NULL;
+    }
+    return sdlop.video->GetWindowICCProfile(sdlop.video, window, size);
+}
+
+bool SDL_GetWindowSizeInPixels(SDL_Window *window, int *w, int *h)
+{
+    int filter;
+    CHECK_WINDOW(window, false);
+    if (!w) {
+        w = &filter;
+    }
+    if (!h) {
+        h = &filter;
+    }
+    SDL_GetWindowSize(window, w, h);
+    const SDL_DisplayMode *mode;
+    SDL_DisplayID displayID = SDL_GetDisplayForWindow(window);
+    if ((window->flags & SDL_WINDOW_FULLSCREEN) && SDL_GetWindowFullscreenMode(window)) {
+        mode = SDL_GetCurrentDisplayMode(displayID);
+    } else {
+        mode = SDL_GetDesktopDisplayMode(displayID);
+    }
+    if (mode) {
+        *w = (int)SDL_ceilf(*w * mode->pixel_density);
+        *h = (int)SDL_ceilf(*h * mode->pixel_density);
+    }
+    return true;
+}
+
+bool SDL_SetWindowIcon(SDL_Window *window, SDL_Surface *icon)
+{
+    CHECK_WINDOW(window, false);
+    if (!icon) {
+        return SDL_InvalidParamError("icon");
+    }
+    SDL_DestroySurface(window->icon);
+    window->icon = SDL_ConvertSurface(icon, SDL_PIXELFORMAT_ARGB8888);
+    if (!window->icon) {
+        return false;
+    }
+    if (!sdlop.video->SetWindowIcon) {
+        return SDL_Unsupported();
+    }
+    return sdlop.video->SetWindowIcon(sdlop.video, window, window->icon);
+}
+
+static bool toggle_flag(SDL_Window *window, SDL_WindowFlags flag, bool on)
+{
+    bool have = (window->flags & flag) != 0;
+    if (have == on) {
+        return false;
+    }
+    if (on) {
+        window->flags |= flag;
+    } else {
+        window->flags &= ~flag;
+    }
+    return true;
+}
+
+bool SDL_SetWindowBordered(SDL_Window *window, bool bordered)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (!sdlop.video->SetWindowBordered) {
+        return SDL_Unsupported();
+    }
+    if (toggle_flag(window, SDL_WINDOW_BORDERLESS, !bordered)) {
+        sdlop.video->SetWindowBordered(sdlop.video, window, bordered);
+    }
+    return true;
+}
+
+bool SDL_SetWindowResizable(SDL_Window *window, bool resizable)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (!sdlop.video->SetWindowResizable) {
+        return SDL_Unsupported();
+    }
+    if (toggle_flag(window, SDL_WINDOW_RESIZABLE, resizable)) {
+        sdlop.video->SetWindowResizable(sdlop.video, window, resizable);
+    }
+    return true;
+}
+
+bool SDL_SetWindowAlwaysOnTop(SDL_Window *window, bool on_top)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (!sdlop.video->SetWindowAlwaysOnTop) {
+        return SDL_Unsupported();
+    }
+    if (toggle_flag(window, SDL_WINDOW_ALWAYS_ON_TOP, on_top)) {
+        sdlop.video->SetWindowAlwaysOnTop(sdlop.video, window, on_top);
+    }
+    return true;
+}
+
+bool SDL_SetWindowAspectRatio(SDL_Window *window, float min_aspect, float max_aspect)
+{
+    CHECK_WINDOW(window, false);
+    window->min_aspect = min_aspect;
+    window->max_aspect = max_aspect;
+    if (sdlop.video->SetWindowAspectRatio) {
+        sdlop.video->SetWindowAspectRatio(sdlop.video, window);
+    }
+    return SDL_SetWindowSize(window, window->w, window->h);
+}
+
+bool SDL_GetWindowAspectRatio(SDL_Window *window, float *min_aspect, float *max_aspect)
+{
+    CHECK_WINDOW(window, false);
+    if (min_aspect) {
+        *min_aspect = window->min_aspect;
+    }
+    if (max_aspect) {
+        *max_aspect = window->max_aspect;
+    }
+    return true;
+}
+
+bool SDL_GetWindowBordersSize(SDL_Window *window, int *top, int *left, int *bottom, int *right)
+{
+    int dummy = 0;
+    if (!top) {
+        top = &dummy;
+    }
+    if (!left) {
+        left = &dummy;
+    }
+    if (!right) {
+        right = &dummy;
+    }
+    if (!bottom) {
+        bottom = &dummy;
+    }
+    *top = *left = *bottom = *right = 0;
+    CHECK_WINDOW(window, false);
+    if (!sdlop.video->GetWindowBordersSize) {
+        return SDL_Unsupported();
+    }
+    return sdlop.video->GetWindowBordersSize(sdlop.video, window, top, left, bottom, right);
+}
+
+bool SDL_SetWindowMinimumSize(SDL_Window *window, int min_w, int min_h)
+{
+    CHECK_WINDOW(window, false);
+    if (min_w < 0) {
+        return SDL_InvalidParamError("min_w");
+    }
+    if (min_h < 0) {
+        return SDL_InvalidParamError("min_h");
+    }
+    if ((window->max_w && min_w > window->max_w) || (window->max_h && min_h > window->max_h)) {
+        return SDL_SetError("SDL_SetWindowMinimumSize(): Tried to set minimum size larger than maximum size");
+    }
+    window->min_w = min_w;
+    window->min_h = min_h;
+    if (sdlop.video->SetWindowMinimumSize) {
+        sdlop.video->SetWindowMinimumSize(sdlop.video, window);
+    }
+    return SDL_SetWindowSize(window, window->w, window->h);
+}
+
+bool SDL_GetWindowMinimumSize(SDL_Window *window, int *min_w, int *min_h)
+{
+    CHECK_WINDOW(window, false);
+    if (min_w) {
+        *min_w = window->min_w;
+    }
+    if (min_h) {
+        *min_h = window->min_h;
+    }
+    return true;
+}
+
+bool SDL_SetWindowMaximumSize(SDL_Window *window, int max_w, int max_h)
+{
+    CHECK_WINDOW(window, false);
+    if (max_w < 0) {
+        return SDL_InvalidParamError("max_w");
+    }
+    if (max_h < 0) {
+        return SDL_InvalidParamError("max_h");
+    }
+    if ((max_w && max_w < window->min_w) || (max_h && max_h < window->min_h)) {
+        return SDL_SetError("SDL_SetWindowMaximumSize(): Tried to set maximum size smaller than minimum size");
+    }
+    window->max_w = max_w;
+    window->max_h = max_h;
+    if (sdlop.video->SetWindowMaximumSize) {
+        sdlop.video->SetWindowMaximumSize(sdlop.video, window);
+    }
+    return SDL_SetWindowSize(window, window->w, window->h);
+}
+
+bool SDL_GetWindowMaximumSize(SDL_Window *window, int *max_w, int *max_h)
+{
+    CHECK_WINDOW(window, false);
+    if (max_w) {
+        *max_w = window->max_w;
+    }
+    if (max_h) {
+        *max_h = window->max_h;
+    }
+    return true;
+}
+
+bool SDL_SyncWindow(SDL_Window *window)
+{
+    CHECK_WINDOW(window, false);
+    if (sdlop.video->SyncWindow) {
+        return sdlop.video->SyncWindow(sdlop.video, window);
+    }
+    return true;
+}
+
+bool SDL_SetWindowSurfaceVSync(SDL_Window *window, int vsync)
+{
+    CHECK_WINDOW(window, false);
+    if (!sdlop.video->SetWindowFramebufferVSync) {
+        return SDL_Unsupported();
+    }
+    return sdlop.video->SetWindowFramebufferVSync(sdlop.video, window, vsync);
+}
+
+bool SDL_GetWindowSurfaceVSync(SDL_Window *window, int *vsync)
+{
+    CHECK_WINDOW(window, false);
+    if (!sdlop.video->GetWindowFramebufferVSync) {
+        return SDL_Unsupported();
+    }
+    return sdlop.video->GetWindowFramebufferVSync(sdlop.video, window, vsync);
+}
+
+bool SDL_SetWindowOpacity(SDL_Window *window, float opacity)
+{
+    CHECK_WINDOW(window, false);
+    if (!sdlop.video->SetWindowOpacity) {
+        return SDL_Unsupported();
+    }
+    if (opacity < 0.0f) {
+        opacity = 0.0f;
+    } else if (opacity > 1.0f) {
+        opacity = 1.0f;
+    }
+    bool result = sdlop.video->SetWindowOpacity(sdlop.video, window, opacity);
+    if (result) {
+        window->opacity = opacity;
+    }
+    return result;
+}
+
+float SDL_GetWindowOpacity(SDL_Window *window)
+{
+    CHECK_WINDOW(window, -1.0f);
+    return window->opacity;
+}
+
+bool SDL_SetWindowParent(SDL_Window *window, SDL_Window *parent)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (parent) {
+        CHECK_WINDOW(parent, false);
+        CHECK_WINDOW_NOT_POPUP(parent, false);
+    }
+    if (window == parent) {
+        return SDL_SetError("Cannot set the parent of a window to itself.");
+    }
+    if (!sdlop.video->SetWindowParent) {
+        return SDL_Unsupported();
+    }
+    if (window->flags & SDL_WINDOW_MODAL) {
+        return SDL_SetError("Modal windows cannot change parents; call SDL_SetWindowModal() to clear modal status first.");
+    }
+    if (window->parent == parent) {
+        return true;
+    }
+    const bool ret = sdlop.video->SetWindowParent(sdlop.video, window, parent);
+    window->parent = ret ? parent : NULL;
+    return ret;
+}
+
+bool SDL_SetWindowModal(SDL_Window *window, bool modal)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (!sdlop.video->SetWindowModal) {
+        return SDL_Unsupported();
+    }
+    if (modal) {
+        if (!window->parent) {
+            return SDL_SetError("Window must have a parent to enable the modal state; use SDL_SetWindowParent() to set the parent first.");
+        }
+        window->flags |= SDL_WINDOW_MODAL;
+    } else if (window->flags & SDL_WINDOW_MODAL) {
+        window->flags &= ~SDL_WINDOW_MODAL;
+    } else {
+        return true;
+    }
+    if (window->flags & SDL_WINDOW_HIDDEN) {
+        return true;
+    }
+    return sdlop.video->SetWindowModal(sdlop.video, window, modal);
+}
+
+bool SDL_SetWindowFocusable(SDL_Window *window, bool focusable)
+{
+    CHECK_WINDOW(window, false);
+    const bool have = !(window->flags & SDL_WINDOW_NOT_FOCUSABLE);
+    if (focusable != have && sdlop.video->SetWindowFocusable) {
+        toggle_flag(window, SDL_WINDOW_NOT_FOCUSABLE, !focusable);
+        if (!sdlop.video->SetWindowFocusable(sdlop.video, window, focusable)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SDL_SetWindowFillDocument(SDL_Window *window, bool fill)
+{
+    CHECK_WINDOW(window, false);
+    /* emscripten-only in stock SDL3; a no-op everywhere else */
+    (void)fill;
+    return true;
+}
+
+void SDLOP_UpdateWindowGrab(SDL_Window *window)
+{
+    bool mouse_grabbed = false, keyboard_grabbed = false;
+    if (window->flags & SDL_WINDOW_INPUT_FOCUS) {
+        mouse_grabbed = (window->flags & (SDL_WINDOW_MOUSE_RELATIVE_MODE | SDL_WINDOW_MOUSE_GRABBED)) != 0;
+        keyboard_grabbed = (window->flags & SDL_WINDOW_KEYBOARD_GRABBED) != 0;
+    }
+    SDLop_VideoDevice *dev = sdlop.video;
+    if (!dev) {
+        return;
+    }
+    if (mouse_grabbed || keyboard_grabbed) {
+        if (sdlop.grabbed_window && sdlop.grabbed_window != window) {
+            /* stealing a grab from another window */
+            SDL_Window *old = sdlop.grabbed_window;
+            old->flags &= ~(SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED);
+            if (dev->SetWindowMouseGrab) {
+                dev->SetWindowMouseGrab(dev, old, false);
+            }
+            if (dev->SetWindowKeyboardGrab) {
+                dev->SetWindowKeyboardGrab(dev, old, false);
+            }
+        }
+        sdlop.grabbed_window = window;
+    } else if (sdlop.grabbed_window == window) {
+        sdlop.grabbed_window = NULL;
+    }
+    if (dev->SetWindowMouseGrab && !dev->SetWindowMouseGrab(dev, window, mouse_grabbed)) {
+        window->flags &= ~SDL_WINDOW_MOUSE_GRABBED;
+    }
+    if (dev->SetWindowKeyboardGrab && !dev->SetWindowKeyboardGrab(dev, window, keyboard_grabbed)) {
+        window->flags &= ~SDL_WINDOW_KEYBOARD_GRABBED;
+    }
+    if (sdlop.grabbed_window &&
+        !(sdlop.grabbed_window->flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED))) {
+        sdlop.grabbed_window = NULL;
+    }
+}
+
+static bool set_grab(SDL_Window *window, SDL_WindowFlags flag, bool grabbed)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (window->flags & SDL_WINDOW_HIDDEN) {
+        if (grabbed) {
+            window->pending_flags |= flag;
+        } else {
+            window->pending_flags &= ~flag;
+        }
+        return true;
+    }
+    if (!toggle_flag(window, flag, grabbed)) {
+        return true;
+    }
+    SDLOP_UpdateWindowGrab(window);
+    if (grabbed && !(window->flags & flag)) {
+        return false;
+    }
+    return true;
+}
+
+bool SDL_SetWindowKeyboardGrab(SDL_Window *window, bool grabbed)
+{
+    return set_grab(window, SDL_WINDOW_KEYBOARD_GRABBED, grabbed);
+}
+
+bool SDL_SetWindowMouseGrab(SDL_Window *window, bool grabbed)
+{
+    return set_grab(window, SDL_WINDOW_MOUSE_GRABBED, grabbed);
+}
+
+bool SDL_GetWindowKeyboardGrab(SDL_Window *window)
+{
+    CHECK_WINDOW(window, false);
+    return window == sdlop.grabbed_window && (window->flags & SDL_WINDOW_KEYBOARD_GRABBED);
+}
+
+bool SDL_GetWindowMouseGrab(SDL_Window *window)
+{
+    CHECK_WINDOW(window, false);
+    return window == sdlop.grabbed_window && (window->flags & SDL_WINDOW_MOUSE_GRABBED);
+}
+
+SDL_Window *SDL_GetGrabbedWindow(void)
+{
+    if (sdlop.grabbed_window &&
+        (sdlop.grabbed_window->flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_KEYBOARD_GRABBED))) {
+        return sdlop.grabbed_window;
+    }
+    return NULL;
+}
+
+bool SDL_SetWindowMouseRect(SDL_Window *window, const SDL_Rect *rect)
+{
+    CHECK_WINDOW(window, false);
+    if (!sdlop.video->SetWindowMouseRect) {
+        return SDL_Unsupported();
+    }
+    SDL_Rect zero = { 0, 0, 0, 0 };
+    if (!rect) {
+        rect = &zero;
+    }
+    if (SDL_memcmp(&window->mouse_rect, rect, sizeof(*rect)) == 0) {
+        return true;
+    }
+    window->mouse_rect = *rect;
+    return sdlop.video->SetWindowMouseRect(sdlop.video, window);
+}
+
+const SDL_Rect *SDL_GetWindowMouseRect(SDL_Window *window)
+{
+    CHECK_WINDOW(window, NULL);
+    return SDL_RectEmpty(&window->mouse_rect) ? NULL : &window->mouse_rect;
+}
+
+bool SDL_FlashWindow(SDL_Window *window, SDL_FlashOperation operation)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (sdlop.video->FlashWindow) {
+        return sdlop.video->FlashWindow(sdlop.video, window, operation);
+    }
+    return SDL_Unsupported();
+}
+
+bool SDL_SetWindowProgressState(SDL_Window *window, SDL_ProgressState state)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (state < SDL_PROGRESS_STATE_NONE || state > SDL_PROGRESS_STATE_ERROR) {
+        return SDL_InvalidParamError("state");
+    }
+    window->progress_state = state;
+    return true; /* stock SDL3 forwards this over DBus (Unity launcher API) */
+}
+
+SDL_ProgressState SDL_GetWindowProgressState(SDL_Window *window)
+{
+    CHECK_WINDOW(window, SDL_PROGRESS_STATE_INVALID);
+    CHECK_WINDOW_NOT_POPUP(window, SDL_PROGRESS_STATE_INVALID);
+    return window->progress_state;
+}
+
+bool SDL_SetWindowProgressValue(SDL_Window *window, float value)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    window->progress_value = SDL_clamp(value, 0.0f, 1.0f);
+    return true;
+}
+
+float SDL_GetWindowProgressValue(SDL_Window *window)
+{
+    CHECK_WINDOW(window, -1.0f);
+    CHECK_WINDOW_NOT_POPUP(window, -1.0f);
+    return window->progress_value;
+}
+
+bool SDL_ShowWindowSystemMenu(SDL_Window *window, int x, int y)
+{
+    CHECK_WINDOW(window, false);
+    CHECK_WINDOW_NOT_POPUP(window, false);
+    if (sdlop.video->ShowWindowSystemMenu) {
+        sdlop.video->ShowWindowSystemMenu(sdlop.video, window, x, y);
+        return true;
+    }
+    return SDL_Unsupported();
+}
+
+bool SDL_SetWindowHitTest(SDL_Window *window, SDL_HitTest callback, void *callback_data)
+{
+    CHECK_WINDOW(window, false);
+    if (!sdlop.video->SetWindowHitTest) {
+        return SDL_Unsupported();
+    }
+    window->hit_test = callback;
+    window->hit_test_data = callback_data;
+    return sdlop.video->SetWindowHitTest(sdlop.video, window, callback != NULL);
+}
+
+static void SDLCALL cleanup_surface_property(void *userdata, void *value)
+{
+    (void)userdata;
+    SDL_DestroySurface((SDL_Surface *)value);
+}
+
+bool SDL_SetWindowShape(SDL_Window *window, SDL_Surface *shape)
+{
+    CHECK_WINDOW(window, false);
+    if (!(window->flags & SDL_WINDOW_TRANSPARENT)) {
+        return SDL_SetError("Window must be created with SDL_WINDOW_TRANSPARENT");
+    }
+    SDL_PropertiesID props = SDL_GetWindowProperties(window);
+    if (!props) {
+        return false;
+    }
+    SDL_Surface *surface = NULL;
+    if (shape) {
+        surface = SDL_ConvertSurface(shape, SDL_PIXELFORMAT_ARGB32);
+        if (!surface) {
+            return false;
+        }
+    }
+    if (!SDL_SetPointerPropertyWithCleanup(props, SDL_PROP_WINDOW_SHAPE_POINTER, surface, cleanup_surface_property, NULL)) {
+        return false;
+    }
+    if (sdlop.video->UpdateWindowShape) {
+        if (!sdlop.video->UpdateWindowShape(sdlop.video, window, surface)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SDL_ScreenSaverEnabled(void)
+{
+    if (!sdlop.video) {
+        return true;
+    }
+    return !sdlop.suspend_screensaver;
+}
+
+static bool set_screensaver(bool suspend)
+{
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem has not been initialized");
+    }
+    if (sdlop.suspend_screensaver == suspend) {
+        return true;
+    }
+    sdlop.suspend_screensaver = suspend;
+    if (sdlop.video->SuspendScreenSaver) {
+        return sdlop.video->SuspendScreenSaver(sdlop.video);
+    }
+    return SDL_Unsupported();
+}
+
+bool SDL_EnableScreenSaver(void)
+{
+    return set_screensaver(false);
+}
+
+bool SDL_DisableScreenSaver(void)
+{
+    return set_screensaver(true);
+}
+
+SDL_SystemTheme SDL_GetSystemTheme(void)
+{
+    if (sdlop.video && sdlop.video->GetSystemTheme) {
+        return sdlop.video->GetSystemTheme(sdlop.video);
+    }
+    return SDL_SYSTEM_THEME_UNKNOWN;
 }

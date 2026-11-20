@@ -440,11 +440,7 @@ static bool ensure_egl_display(void)
         return false;
     }
 
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
-        (PFNEGLGETPLATFORMDISPLAYEXTPROC)SDLOP_EGL_eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (get_platform_display) {
-        egl_display = get_platform_display(EGL_PLATFORM_GBM_MESA, dev->gbm_dev, NULL);
-    }
+    egl_display = SDLOP_EGL_PlatformDisplay(EGL_PLATFORM_GBM_MESA, dev->gbm_dev, NULL);
     if (egl_display == EGL_NO_DISPLAY) {
         egl_display = SDLOP_EGL_eglGetDisplay((EGLNativeDisplayType)(uintptr_t)dev->gbm_dev);
     }
@@ -640,8 +636,15 @@ static bool kmsdrm_gl_create_surfaces(SDLop_VideoDevice *device, SDL_Window *win
             }
         }
 
+        EGLint surf_attribs[64];
+        if (SDLOP_EGL_AppendUserAttribs(false, egl_display, config, surf_attribs, 0,
+                                        (int)SDL_arraysize(surf_attribs)) < 0) {
+            SDLOP_GBM_gbm_surface_destroy(windata->gs);
+            windata->gs = NULL;
+            return false;
+        }
         windata->egl_surface = SDLOP_EGL_eglCreateWindowSurface(egl_display, config,
-                                                                (EGLNativeWindowType)windata->gs, NULL);
+                                                                (EGLNativeWindowType)windata->gs, surf_attribs);
         if (windata->egl_surface == EGL_NO_SURFACE) {
             SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
                         "KMSDRM: eglCreateWindowSurface(0x%08x) failed: 0x%x",
@@ -855,7 +858,7 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         return NULL;
     }
 
-    EGLint ctx_attribs[16];
+    EGLint ctx_attribs[64];
     int n = 0;
     if (api == EGL_OPENGL_API) {
         ctx_attribs[n++] = EGL_CONTEXT_MAJOR_VERSION_KHR; ctx_attribs[n++] = sdlop_glattrs.major_version;
@@ -864,17 +867,22 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         ctx_attribs[n++] = (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
             ? EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR
             : EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR;
+        /* EGL 1.5 boolean attributes (the *_BIT_KHR values belong to
+         * EGL_CONTEXT_FLAGS_KHR and are not attribute names) */
         if (sdlop_glattrs.flags & SDL_GL_CONTEXT_DEBUG_FLAG) {
-            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
+            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_DEBUG; ctx_attribs[n++] = EGL_TRUE;
         }
         if (sdlop_glattrs.flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) {
-            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR;
+            ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE; ctx_attribs[n++] = EGL_TRUE;
         }
     } else {
         ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
         ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
     }
-    ctx_attribs[n++] = EGL_NONE;
+    n = SDLOP_EGL_AppendUserAttribs(true, egl_display, config, ctx_attribs, n, (int)SDL_arraysize(ctx_attribs));
+    if (n < 0) {
+        return NULL;
+    }
 
     EGLContext share = EGL_NO_CONTEXT;
     if (sdlop_glattrs.share_with_current_context) {
@@ -1495,4 +1503,25 @@ void KMSDRM_GL_Deinit(void)
     kmsdrm_use_offload = false;
     kmsdrm_prime_disabled = false;
     swap_interval = 1;
+}
+
+/* SDL_EGL_GetCurrentDisplay / GetCurrentConfig / GetWindowSurface */
+void *KMSDRM_EGL_GetDisplay(SDLop_VideoDevice *device)
+{
+    (void)device;
+    return egl_initialized ? (void *)egl_display : NULL;
+}
+
+void *KMSDRM_EGL_GetConfig(SDLop_VideoDevice *device)
+{
+    (void)device;
+    KMSDRMGLContext *cur = (KMSDRMGLContext *)SDLOP_GL_CurrentContext();
+    return (egl_initialized && cur) ? (void *)config_for_context(cur) : NULL;
+}
+
+void *KMSDRM_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    KMSDRM_WindowData *windata = window ? (KMSDRM_WindowData *)window->driverdata : NULL;
+    return (windata && windata->egl_surface != EGL_NO_SURFACE) ? (void *)windata->egl_surface : NULL;
 }

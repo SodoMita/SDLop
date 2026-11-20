@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.13)
 option(SDLOP_SANITIZERS "Build with ASan+UBSan and tune leak checks for GPU tests" OFF)
 
-project(SDLop VERSION 0.1.0 LANGUAGES C)
+project(SDLop VERSION 0.2.0 LANGUAGES C)
 
 if (SDLOP_SANITIZERS)
   string(APPEND CMAKE_C_FLAGS " -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer")
@@ -30,14 +30,28 @@ add_compile_options(-Wall -Wextra)
 if(EMSCRIPTEN)
   set(SDLop_WEB_SOURCES
     src/SDLop_core.c
+    src/SDL_stdlib.c
     src/SDL_error.c
     src/SDL_log.c
     src/SDL_timer.c
     src/SDL_events.c
     src/SDL_properties.c
+    src/SDL_hints.c
+    src/SDL_events_desc.c
+    src/SDL_events_categories.c
+    src/SDL_clipboard.c
+    src/SDL_thread.c
+    src/SDL_misc.c
+    src/SDL_main.c
+    src/SDL_rect.c
+    src/SDL_pixels.c
+    src/SDL_blit.c
+    src/SDL_blit_float.c
+    src/SDL_rotate.c
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
+    src/SDL_devices.c
     src/SDL_video.c
     src/SDL_surface.c
     src/SDL_gl.c
@@ -102,6 +116,10 @@ endif()
 #   gbm            - gbm.h
 #   libdrm         - xf86drm.h + xf86drmMode.h (headers only: the libdrm
 #                    library itself is dlopen'ed at run time - never linked)
+#   xcb, xcb-shm, xcb-xkb, xcb-xinput, xcb-randr, xkbcommon-x11
+#                  - X11 driver headers (optional: the driver is skipped when
+#                    they are missing; SDLOP_VIDEO_X11=OFF disables it). The
+#                    libraries are dlopen'ed when the driver initializes.
 # libvulkan / glesv2 / wayland-server are needed ONLY by tests, examples and
 # benchmarks; those targets are skipped (with a message) when absent - see
 # below.
@@ -112,6 +130,14 @@ pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 pkg_check_modules(EGL REQUIRED egl)
 pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
+option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
+if(SDLOP_VIDEO_X11)
+  pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
+  if(NOT X11_XCB_FOUND)
+    message(STATUS "xcb headers not found - building without the X11 driver")
+    set(SDLOP_VIDEO_X11 OFF)
+  endif()
+endif()
 # GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
 pkg_check_modules(GLESV2 glesv2)
 find_package(Vulkan QUIET)
@@ -165,6 +191,32 @@ add_custom_command(
           ${WL_GEN_DIR}/relative-pointer-protocol.c
   DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
 
+# optional window-management protocols (bound when the compositor offers
+# them): server-side decorations, idle inhibit, keyboard-shortcuts inhibit,
+# activation/attention
+set(SDLOP_WL_EXTRA_PROTOCOLS
+  "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
+  "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
+  "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
+  "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml")
+set(SDLOP_WL_EXTRA_OUTPUTS)
+foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
+  string(REPLACE "|" ";" parts "${entry}")
+  list(GET parts 0 proto_name)
+  list(GET parts 1 proto_xml)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+            ${WL_GEN_DIR}/${proto_name}-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+            ${WL_GEN_DIR}/${proto_name}-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/${proto_xml})
+  list(APPEND SDLOP_WL_EXTRA_OUTPUTS
+    ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c)
+endforeach()
+
 # server-side codegen (used only by tests/test_pointer_lock's mini compositor)
 add_custom_command(
   OUTPUT ${WL_GEN_DIR}/xdg-shell-server-protocol.h ${WL_GEN_DIR}/xdg-shell-server-protocol.c
@@ -209,21 +261,36 @@ add_custom_target(sdlop_wayland_protocols
           ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
           ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
           ${WL_GEN_DIR}/relative-pointer-server-protocol.h
-          ${WL_GEN_DIR}/relative-pointer-server-protocol.c)
+          ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+          ${SDLOP_WL_EXTRA_OUTPUTS})
 
 # ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
 set(SDLop_SOURCES
   src/SDLop_core.c
+  src/SDL_stdlib.c
   src/SDL_error.c
   src/SDL_log.c
   src/SDL_timer.c
   src/SDL_events.c
   src/SDL_properties.c
+  src/SDL_hints.c
+  src/SDL_events_desc.c
+  src/SDL_events_categories.c
+  src/SDL_clipboard.c
+  src/SDL_thread.c
+  src/SDL_misc.c
+  src/SDL_main.c
+  src/SDL_rect.c
+  src/SDL_pixels.c
+  src/SDL_blit.c
+  src/SDL_blit_float.c
+  src/SDL_rotate.c
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
+  src/SDL_devices.c
   src/SDL_video.c
   src/SDL_surface.c
   src/SDL_gl.c
@@ -244,8 +311,18 @@ set(SDLop_SOURCES
   src/video/kmsdrm/sdlop_kmsdrm_gl.c
   src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
   src/video/kmsdrm/sdlop_xcursor.c
+  src/video/fbdev/sdlop_fbdev.c
   src/video/dummy/sdlop_dummy.c
 )
+set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
+if(SDLOP_VIDEO_X11)
+  list(APPEND SDLop_SOURCES
+    src/video/x11/sdlop_x11.c
+    src/video/x11/sdlop_x11_dyn.c
+    src/video/x11/sdlop_x11_gl.c
+    src/video/x11/sdlop_x11_vulkan.c)
+  list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+endif()
 
 # SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
 # at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
@@ -261,7 +338,8 @@ set(SDLop_LIB_INCS
   ${XKBCOMMON_INCLUDE_DIRS}
   ${EGL_INCLUDE_DIRS}
   ${GBM_INCLUDE_DIRS}
-  ${LIBDRM_INCLUDE_DIRS})
+  ${LIBDRM_INCLUDE_DIRS}
+  ${X11_XCB_INCLUDE_DIRS})
 
 add_library(sdlop STATIC ${SDLop_SOURCES})
 add_library(SDLop::SDLop ALIAS sdlop)
@@ -276,7 +354,7 @@ target_include_directories(sdlop PRIVATE
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
 
 add_library(sdlop_shared SHARED ${SDLop_SOURCES})
 add_dependencies(sdlop_shared sdlop_wayland_protocols)
@@ -290,7 +368,7 @@ target_include_directories(sdlop_shared PRIVATE
   ${WL_GEN_DIR}
   ${SDLop_LIB_INCS})
 target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop_shared PUBLIC SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1)
+target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
 
 # ---------------------------------------------------------------------------
 # Examples
@@ -323,13 +401,42 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
+  target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
+  # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
+  # below, verified from a second xcb connection)
+  add_executable(test_window_api tests/test_window_api.c)
+  target_link_libraries(test_window_api PRIVATE sdlop)
+  target_compile_options(test_window_api PRIVATE -UNDEBUG)
+  add_test(NAME test_window_api COMMAND test_window_api dummy)
+  # Wayland run: needs a compositor (WAYLAND_DISPLAY), skips otherwise
+  add_test(NAME test_window_api_wayland COMMAND test_window_api wayland)
+  # SDL_EGL_* / SDL_GL_ExtensionSupported against Mesa (skips without a
+  # display server; the X11 run is registered with the X11 tests)
+  add_executable(test_egl_api tests/test_egl_api.c)
+  target_link_libraries(test_egl_api PRIVATE sdlop)
+  target_compile_options(test_egl_api PRIVATE -UNDEBUG)
+  add_test(NAME test_egl_api_wayland COMMAND test_egl_api wayland)
+  # the generated headers must be valid C++ with C linkage
+  include(CheckLanguage)
+  check_language(CXX)
+  if(CMAKE_CXX_COMPILER)
+    enable_language(CXX)
+    add_executable(test_cxx_link tests/test_cxx_link.cpp)
+    target_link_libraries(test_cxx_link PRIVATE sdlop)
+    set_target_properties(test_cxx_link PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED ON)
+    target_compile_options(test_cxx_link PRIVATE -Wall -Wextra -pedantic -Werror -UNDEBUG)
+    add_test(NAME test_cxx_link COMMAND test_cxx_link)
+  endif()
+  # same keycode checks through the built-in US table (no libxkbcommon)
+  add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
+  set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
 
   # Manual, externally driven trace tool. It is intentionally not registered
   # with CTest: it waits for a compositor-side input script after READY-INPUT.
@@ -360,6 +467,69 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(test_wayland PRIVATE src)
   target_compile_options(test_wayland PRIVATE -UNDEBUG)
   add_test(NAME test_wayland COMMAND test_wayland)
+
+  # X11 driver integration test (needs a running X server, e.g. xvfb-run;
+  # skips without DISPLAY). Only the *test* links xcb/xcb-xtest - it drives
+  # input through XTest and verifies state from its own connection.
+  if(SDLOP_VIDEO_X11)
+    pkg_check_modules(X11_TEST_DEPS xcb xcb-xtest)
+    if(X11_TEST_DEPS_FOUND)
+      add_executable(test_x11 tests/test_x11.c)
+      target_link_libraries(test_x11 PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+      target_include_directories(test_x11 PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11 PRIVATE -UNDEBUG)
+      add_test(NAME test_x11 COMMAND test_x11)
+      target_compile_definitions(test_window_api PRIVATE SDLOP_TEST_HAVE_XCB=1)
+      target_link_libraries(test_window_api PRIVATE ${X11_TEST_DEPS_LIBRARIES})
+      target_include_directories(test_window_api PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      add_test(NAME test_window_api_x11 COMMAND test_window_api x11)
+      set_tests_properties(test_window_api_x11 PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      add_test(NAME test_egl_api_x11 COMMAND test_egl_api x11)
+      # same suite through the xcb_put_image fallback (no MIT-SHM)
+      add_test(NAME test_x11_noshm COMMAND test_x11)
+      # and with only libxcb itself: no SHM / XKB / XInput2 / RandR, i.e.
+      # put_image, core keymap + timestamp repeat detection, warp-based
+      # relative mode and a single root-window display
+      add_test(NAME test_x11_minimal COMMAND test_x11)
+      set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
+      set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
+        "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none")
+    endif()
+    # keyboard layouts end-to-end (setxkbmap + XKB group locking; the test
+    # restores the server layout). Skips where the keymap cannot be set.
+    pkg_check_modules(X11_LAYOUT_DEPS xcb xcb-xtest xcb-xkb)
+    if(X11_LAYOUT_DEPS_FOUND)
+      add_executable(test_x11_layout tests/test_x11_layout.c)
+      target_link_libraries(test_x11_layout PRIVATE sdlop ${X11_LAYOUT_DEPS_LIBRARIES})
+      target_include_directories(test_x11_layout PRIVATE ${X11_LAYOUT_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_layout PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_layout COMMAND test_x11_layout)
+      set_tests_properties(test_x11_layout PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endif()
+    # XI2.2 multitouch: an in-test X protocol proxy injects touch events
+    # (Xvfb has no touch devices)
+    pkg_check_modules(X11_TOUCH_DEPS xcb xcb-xinput)
+    if(X11_TOUCH_DEPS_FOUND)
+      add_executable(test_x11_touch tests/test_x11_touch.c)
+      target_link_libraries(test_x11_touch PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} pthread m)
+      target_include_directories(test_x11_touch PRIVATE ${X11_TOUCH_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_touch PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_touch COMMAND test_x11_touch)
+      set_tests_properties(test_x11_touch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endif()
+  endif()
+
+  # framebuffer (fbdev) driver: needs no device - SDLOP_FBDEV_DUMP makes the
+  # driver render into RAM and dump each presented frame as a PPM we check
+  add_executable(test_fbdev tests/test_fbdev.c)
+  target_link_libraries(test_fbdev PRIVATE sdlop)
+  target_include_directories(test_fbdev PRIVATE src)
+  target_compile_options(test_fbdev PRIVATE -UNDEBUG)
+  add_test(NAME test_fbdev COMMAND test_fbdev)
+  set_tests_properties(test_fbdev PROPERTIES
+    ENVIRONMENT "SDLOP_DISABLE_RAW_INPUT=1;SDLOP_TEST_STRICT=1;SDLOP_FBDEV_SIZE=320x240;SDLOP_FBDEV_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test_fbdev_frame.ppm"
+    TIMEOUT 60)
 
   add_executable(test_kmsdrm tests/test_kmsdrm.c)
   target_link_libraries(test_kmsdrm PRIVATE sdlop)
@@ -536,6 +706,36 @@ if (NOT EMSCRIPTEN AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND)
   target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
 endif()
 
+# Export gate: every function declared in include/SDL3 is exported by the
+# shared library and nothing undeclared is exported.
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_test(NAME api_exports_check
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_exports_check.sh
+                   $<TARGET_FILE:sdlop_shared> ${CMAKE_CURRENT_SOURCE_DIR}/include)
+endif()
+
+# Surface differential test: tests/surface_diff.c hashes the result of every
+# blit / conversion / fill / transform case. Built against stock SDL3 as well
+# when both -DSDL3_REFERENCE_INCLUDE and -DSDL3_REFERENCE_LIB are given, the
+# outputs must match exactly; otherwise it runs as a smoke test.
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_executable(surface_diff tests/surface_diff.c)
+  target_link_libraries(surface_diff PRIVATE sdlop)
+  if (SDL3_REFERENCE_INCLUDE AND SDL3_REFERENCE_LIB)
+    add_executable(surface_diff_ref tests/surface_diff.c)
+    target_include_directories(surface_diff_ref BEFORE PRIVATE ${SDL3_REFERENCE_INCLUDE})
+    target_link_libraries(surface_diff_ref PRIVATE ${SDL3_REFERENCE_LIB})
+    get_filename_component(_sdl3_ref_dir ${SDL3_REFERENCE_LIB} DIRECTORY)
+    set_target_properties(surface_diff_ref PROPERTIES BUILD_RPATH ${_sdl3_ref_dir})
+    add_test(NAME surface_diff
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh
+                     $<TARGET_FILE:surface_diff> $<TARGET_FILE:surface_diff_ref>)
+  else()
+    add_test(NAME surface_diff
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh $<TARGET_FILE:surface_diff>)
+  endif()
+endif()
+
 # API subset gate: every SDL_* symbol exported by SDLop must also be exported
 # by stock SDL3 (strict-subset property). Skipped when no reference .so given.
 if (SDL3_REFERENCE_LIB AND NOT EMSCRIPTEN)
@@ -548,9 +748,17 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
   # only - every other test keeps full leak checking
-  foreach(t test_gl test_gl_matrix test_vulkan_compute)
-    if (TARGET ${t})
+  foreach(t test_gl test_gl_matrix test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
+    if (TEST ${t})
       set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endif()
+  endforeach()
+  # test_vulkan / test_vk_offload_live / test_gl_offload keep leak checking,
+  # minus allocations made inside Mesa / the Vulkan loader (tests/lsan_gpu.supp)
+  foreach(t test_vulkan test_vk_offload_live test_gl_offload)
+    if (TARGET ${t})
+      set_tests_properties(${t} PROPERTIES ENVIRONMENT
+        "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
     endif()
   endforeach()
   # test_surface asserts the alloc-failure contract (CreateSurface must

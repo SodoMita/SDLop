@@ -555,7 +555,10 @@ int main(void)
 
     wl_global_create(M.display, &wl_compositor_interface, 4, NULL, compositor_bind);
     wl_global_create(M.display, &wl_shm_interface, 1, NULL, shm_bind);
-    wl_global_create(M.display, &wl_seat_interface, 9, NULL, seat_bind);
+    /* v9 needs libwayland >= 1.22; clamp to what the library implements */
+    wl_global_create(M.display, &wl_seat_interface,
+                     wl_seat_interface.version < 9 ? wl_seat_interface.version : 9,
+                     NULL, seat_bind);
     wl_global_create(M.display, &xdg_wm_base_interface, 2, NULL, wm_base_bind);
     wl_global_create(M.display, &zwp_pointer_constraints_v1_interface, 1, NULL, pc_bind);
     wl_global_create(M.display, &zwp_relative_pointer_manager_v1_interface, 1, NULL, rpm_bind);

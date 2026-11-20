@@ -163,8 +163,11 @@ extern void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb);
  * Poll raw events (asyncinput-style ni_poll equivalent).
  *
  * Non-blocking. Drains up to max_events raw events from the lock-free
- * ring buffer. Raw events are also forwarded to the SDL event queue as
- * SDL3 events; polling raw events does not consume those.
+ * ring buffer. This API is global and not window/VT-focus filtered.
+ * Raw keyboard events become SDL key events only on an owned foreground
+ * console; X11/Wayland SDL key events use native window-system input instead.
+ * Raw pointer events may also feed the SDL queue. Polling this ring does not
+ * consume SDL events.
  *
  * \returns the number of events written into events, or -1 on error.
  */
