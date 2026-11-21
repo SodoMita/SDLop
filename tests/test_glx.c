@@ -326,9 +326,10 @@ static void request_fb(int alpha, int depth, int stencil)
 }
 
 /* a context with the current attributes on w: the GLX config honours
- * alpha / depth / stencil (exactly, when the server has such a config), and
- * SDL_GL_GetAttribute reports what the config has */
-static void check_fb(const char *label, SDL_Window *w, int alpha, int depth, int stencil, bool core)
+ * alpha / depth / stencil (exactly when `exact` and the server has such a
+ * config, else as minimums - GLX sizes are minimums and drivers prefer the
+ * larger depth), and SDL_GL_GetAttribute reports what the config has */
+static void check_fb(const char *label, SDL_Window *w, int alpha, int depth, int stencil, bool core, bool exact)
 {
     if (core) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -348,14 +349,16 @@ static void check_fb(const char *label, SDL_Window *w, int alpha, int depth, int
     CHECK(p_glXGetCurrentContext() != NULL && current_fb_sizes(&fb), "%s: GLX config of the context", label);
     printf("%s: requested a%d d%d s%d -> GLX config a%d d%d s%d (visual 0x%x)\n", label, alpha, depth, stencil,
            fb.alpha, fb.depth, fb.stencil, (unsigned)fb.visual);
-    if (server_has_config(alpha, depth, stencil)) {
+    if (!exact) {
+        CHECK(fb.alpha >= alpha && fb.depth >= depth && fb.stencil >= stencil, "%s: minimums", label);
+    } else if (server_has_config(alpha, depth, stencil)) {
         CHECK(fb.alpha == alpha && fb.depth == depth && fb.stencil == stencil,
               "%s: request a%d d%d s%d realised as a%d d%d s%d", label, alpha, depth, stencil, fb.alpha, fb.depth,
               fb.stencil);
     } else {
         /* Mesa (CI: Xvfb + llvmpipe) has every combination used here */
         const char *strict = getenv("SDLOP_TEST_STRICT");
-        CHECK(!(strict && *strict == '1') || (alpha == 0 && depth == 16),
+        CHECK(!(strict && *strict == '1'),
               "%s: server has no exact a%d d%d s%d config (SDLOP_TEST_STRICT)", label, alpha, depth, stencil);
         printf("%s: server has no exact a%d d%d s%d config\n", label, alpha, depth, stencil);
         CHECK(fb.alpha >= alpha && fb.depth >= depth && fb.stencil >= stencil, "%s: minimums", label);
@@ -395,12 +398,14 @@ static void check_fb_attributes(void)
     if (!w) {
         return;
     }
-    check_fb("fb 8880/0/0 legacy", w, 0, 0, 0, false);
+    check_fb("fb 8880/0/0 legacy", w, 0, 0, 0, false, true);
     request_fb(0, 0, 0);
-    check_fb("fb 8880/0/0 core", w, 0, 0, 0, true);
-    /* attributes changed after the window was created */
+    check_fb("fb 8880/0/0 core", w, 0, 0, 0, true, true);
+    /* attributes changed after the window was created: a config of the
+     * window's visual cannot satisfy them, so the driver's best match on
+     * another visual of the same depth is used (stock: first config) */
     request_fb(8, 24, 8);
-    check_fb("fb 8888/24/8 on the 8880 window", w, 8, 24, 8, false);
+    check_fb("fb 8888/24/8 on the 8880 window", w, 8, 24, 8, false, true);
     SDL_DestroyWindow(w);
 
     reset_attrs();
@@ -408,11 +413,14 @@ static void check_fb_attributes(void)
     w = SDL_CreateWindow("test_glx fb", 32, 32, SDL_WINDOW_OPENGL);
     CHECK(w != NULL, "fb: window 2");
     if (w) {
-        check_fb("fb 8888/24/8 legacy", w, 8, 24, 8, false);
+        check_fb("fb 8888/24/8 legacy", w, 8, 24, 8, false, true);
         request_fb(8, 24, 8);
-        check_fb("fb 8888/24/8 core", w, 8, 24, 8, true);
+        check_fb("fb 8888/24/8 core", w, 8, 24, 8, true, true);
+        /* smaller minimums than the window's config: its config still
+         * satisfies them and is kept (stock's legacy-context path keeps the
+         * window's visual too); set attributes before SDL_CreateWindow */
         request_fb(0, 16, 0);
-        check_fb("fb 8880/16/0 on the 8888 window", w, 0, 16, 0, true);
+        check_fb("fb a0/d16/s0 on the 8888 window", w, 0, 16, 0, true, false);
         SDL_DestroyWindow(w);
     }
 
