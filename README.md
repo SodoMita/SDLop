@@ -24,8 +24,9 @@ int main(void) {
   - empty `SDL_PumpEvents`: **~9× faster** (4.5 ns vs 41 ns)
   - raw input: **~5–9 µs** kernel-timestamp → your code, via a dedicated
     worker thread (asyncinput-style)
-- **Lean**: windowing + input only. No audio, renderer, GPU, joystick, HID,
-  camera, filesystem, iostream, … (~39k lines of C including the X11,
+- **Lean**: windowing + input only. No audio, renderer, GPU, HID, camera,
+  iostream, … (the joystick/gamepad API is exported but reports no devices,
+  so unmodified SDL3 apps still link and run; ~39k lines of C including the X11,
   Wayland, KMSDRM and web drivers; the SDL surface/blit code is ported).
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
@@ -43,7 +44,8 @@ int main(void) {
 | Linux / X11 (pure XCB; MIT-SHM, XKB, XInput2 raw motion, RandR 1.5 — all `dlopen`-ed) | ✅ done, tested on Xvfb with and without a WM (openbox) |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
 | Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
-| OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
+| OpenGL / OpenGL ES: GLX on X11 for desktop GL (as stock SDL3), EGL for GLES / Wayland / KMSDRM (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
+| Drop-in for binaries built against stock SDL3 (`libSDL3.so.0`, symbol version `SDL3_0.0.0`) | ✅ done, tested with Dear ImGui and Nuklear SDL3+OpenGL3 examples |
 | Vulkan WSI (`SDL_Vulkan_*`, lavapipe) | ✅ done, verified by swapchain read-back |
 | Pointer lock (`zwp_pointer_constraints` + `zwp_relative_pointer`) | ✅ done, tested against a mini compositor |
 | Linux / KMSDRM (dumb buffers, GBM/EGL, VK_KHR_display, hardware cursor) | ✅ done (no DRM device in CI; build-tested) |
@@ -145,6 +147,8 @@ false, anything else true.
 | `SDLOP_X11_NO_SHM`, `_NO_RENDER`, `_NO_TOUCH` | don't use MIT-SHM / XRender / XInput2 touch |
 | `SDLOP_X11_RELATIVE_WARP` | relative mode by warping instead of XInput2 raw motion |
 | `SDLOP_X11_EGL_PLATFORM` | `x11` skips the EGL xcb platform |
+| `SDL_VIDEO_FORCE_EGL` (`SDL_HINT_VIDEO_FORCE_EGL`) | X11: desktop GL through EGL instead of GLX (stock SDL3 hint) |
+| `SDL_OPENGL_LIBRARY` (`SDL_HINT_OPENGL_LIBRARY`) | X11: library to load GLX from (default `libGL.so.1`, then `libGLX.so.0`) |
 | `SDLOP_KMSDRM_*` | `DEVICE`, `CONNECTOR`, `ATOMIC`, `ATOMIC_CURSOR`, `DOUBLE_BUFFER`, `FLIP_TIMEOUT_MS`, `HOTPLUG`, `KEEP_MASTER`, `NOFLIP`, `REQUIRE_MASTER`, `VT_SWITCH` (see `sdlop_kmsdrm.c`) |
 | `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
 | `SDLOP_LIB_*` | dlopen name for `X11`, `XCB`, `XCB_RANDR`, `XCB_RENDER`, `XCB_SHM`, `XCB_XINPUT`, `XCB_XKB`, `XKB`, `XKBCOMMON_X11`, `WAYLAND`, `EGL`, `DRM`, `GBM` (`none` disables an optional X11 extension library) |
@@ -198,7 +202,7 @@ and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
 
 ## API surface (SDL3-compatible)
 
-596 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+737 SDL3 functions; every one is declared in `include/SDL3/` (generated from
 the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
 with the same signature as SDL3, and checked by the `api_exports` test.
 
@@ -210,13 +214,15 @@ with the same signature as SDL3, and checked by the `api_exports` test.
 | Events | queue, `SDL_PeepEvents`, filters + watches, `SDL_WaitEvent*`, user events, `SDL_GetEventDescription` |
 | Keyboard / text | keymaps with xkb layouts, key names, text input start/stop, compose |
 | Surfaces | create/convert/duplicate/scale/flip/rotate, palettes, colorspaces, blend modes, color keys, `SDL_BlitSurface*` incl. scaled/tiled/9-grid, float/HDR (PQ, 10-bit) conversions, premultiplied alpha, rects |
-| OpenGL / Vulkan | EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks), Vulkan WSI (`SDL_Vulkan_*`) |
+| OpenGL / Vulkan | GLX (X11 desktop GL) and EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks; NULL for GLX contexts, as stock), Vulkan WSI (`SDL_Vulkan_*`) |
+| Filesystem | `SDL_GetBasePath`, `SDL_GetPrefPath`, `SDL_GetUserFolder` (XDG), `SDL_CreateDirectory`, `SDL_EnumerateDirectory`, `SDL_GetPathInfo`, `SDL_CopyFile`, `SDL_RenamePath`, `SDL_RemovePath`, `SDL_GetCurrentDirectory` (no `SDL_GlobDirectory`) |
+| Joystick / gamepad | the whole `SDL_joystick.h` / `SDL_gamepad.h` API, behaving like stock SDL3 with no controller attached: empty device lists, opens fail with an error, NULL handles are harmless, string/label helpers work |
 | Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings |
 
 Unsupported with an SDL error (like a stock SDL3 build without that feature):
 FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).
-Out of scope by design: audio, renderer, GPU, joystick/gamepad, haptics,
-sensors, camera, filesystem, iostream.
+Out of scope by design: audio, renderer, GPU, haptics, sensors, camera,
+iostream, and real game controller support.
 
 `struct`/enum/constant ABI is byte-identical to SDL3 3.4.20 (verified by an
 offset/value harness compiled against both header sets), and SDLop's exported
@@ -294,8 +300,8 @@ Runtime loading is SDL3-style dynamic: `libwayland-client.so.0`,
 `libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1`, `libvulkan.so.1`
 and the X11 libraries (`libxcb.so.1`, `libxcb-shm.so.0`, `libxcb-xkb.so.1`,
 `libxkbcommon-x11.so.0`, `libxcb-xinput.so.0`, `libxcb-randr.so.0`, and
-`libX11.so.6` only for EGL stacks without
-`EGL_EXT_platform_xcb`) are all `dlopen`-ed on demand — nothing optional is linked
+`libX11.so.6` + `libGL.so.1` for GLX, `libX11.so.6` also for EGL stacks
+without `EGL_EXT_platform_xcb`) are all `dlopen`-ed on demand — nothing optional is linked
 (`objdump -p libSDLop.so` shows NEEDED: libc and libm only). Apps link just
 `-lsdlop` (plus `-lpthread -ldl -lm` where the toolchain doesn't fold them
 into libc). Missing libs degrade gracefully: no wayland-client -> dummy
@@ -320,6 +326,32 @@ WAYLAND_DISPLAY=wayland-0 ctest --test-dir build   # wayland integration test
 xvfb-run -s "-screen 0 1280x1024x24" ctest --test-dir build  # X11 suite
 sudo ./build/test_evdev_uinput                     # raw evdev end-to-end
 ```
+
+### Drop-in use with binaries built against stock SDL3
+
+`libSDLop.so` exports only `SDL_*`, every symbol tagged with stock SDL3's
+version node `SDL3_0.0.0` (`tools/sdlop.sym`, CMake option
+`SDLOP_SYMBOL_VERSIONING`, default ON). That makes two setups work:
+
+```sh
+# 1. alias: no rebuild of SDLop needed
+mkdir -p dropin && ln -sf "$PWD/build/libSDLop.so" dropin/libSDL3.so.0
+LD_LIBRARY_PATH=$PWD/dropin ./app-built-against-SDL3
+
+# 2. real SDL3 file names: libSDL3.so.0.4.20, SONAME libSDL3.so.0 (opt-in,
+#    because it collides with an installed SDL3)
+cmake -S . -B build-sdl3 -DSDLOP_SDL3_SONAME=ON && cmake --build build-sdl3
+LD_LIBRARY_PATH=$PWD/build-sdl3 ./app-built-against-SDL3
+```
+
+Both load without the "no version information available" warning. Things
+stock SDL3 apps rely on that SDLop now matches: `SDL_CreateWindow` without
+`SDL_Init` initializes video + events (`SDL_WasInit` = `0x4020`), init flag
+dependencies (`GAMEPAD` → `JOYSTICK` → `EVENTS`), GLX contexts on X11, the
+gamepad/joystick API (no devices) and the `SDL_filesystem.h` helpers
+(`tests/test_dropin_compat.c`, `tests/test_glx.c`). An app that calls an
+SDL3 function outside SDLop's subset still fails to load with "undefined
+symbol": run it with `LD_BIND_NOW=1` to see all of them at once.
 
 ### Web (Emscripten)
 
@@ -406,8 +438,12 @@ Highlights:
   client-side like on Wayland. Relative mouse mode = XInput2 raw motion +
   confined pointer grab + blank cursor; warp-to-center without XInput2.
   Content scale follows `SDL_VIDEO_X11_SCALING_FACTOR`, `Xft.dpi`, then
-  `GDK_SCALE`. GL goes through EGL (`EGL_PLATFORM_XCB_EXT`, else
-  `EGL_PLATFORM_X11_EXT` on a private Xlib connection; GLX is not used).
+  `GDK_SCALE`. Desktop OpenGL uses GLX like stock SDL3 (loaders such as
+  GLEW need `glXGetCurrentDisplay()`), on a private Xlib connection;
+  OpenGL ES profiles, `SDL_VIDEO_FORCE_EGL=1`, and systems without usable
+  GLX use EGL (`EGL_PLATFORM_XCB_EXT`, else `EGL_PLATFORM_X11_EXT`). As in
+  stock SDL3, `SDL_GL_SetSwapInterval` fails with "not supported" when the
+  GLX stack has no swap-control extension (e.g. Xvfb).
   `SDLOP_X11_NO_SHM=1` disables MIT-SHM. Layout switches (`setxkbmap`, XKB
   group changes) are followed live and reported as
   `SDL_EVENT_KEYMAP_CHANGED`; without libxcb-xkb only full keymap changes

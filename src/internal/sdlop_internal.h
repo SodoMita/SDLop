@@ -477,6 +477,7 @@ void SDLOP_FreeTemporaryMemory(void);
 void SDLOP_QuitTimers(void);
 void SDLOP_QuitEvents(void);
 void SDLOP_QuitClipboard(void);
+void SDLOP_QuitFilesystem(void); /* SDL_filesystem.c: drop path caches */
 void SDLOP_QuitLog(void);
 void SDLOP_QuitHints(void);
 void SDLOP_QuitProperties(void);

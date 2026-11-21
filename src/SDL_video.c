@@ -726,8 +726,14 @@ bool SDLOP_WindowValid(SDL_Window *window)
 SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
 {
     if (!sdlop.init_done || !sdlop.video) {
-        SDL_SetError("Video subsystem not initialized");
-        return NULL;
+        /* stock SDL3 initializes the video subsystem on demand here */
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            return NULL;
+        }
+        if (!sdlop.video) {
+            SDL_SetError("Video subsystem not initialized");
+            return NULL;
+        }
     }
     const char *title = SDL_GetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, NULL);
     int x = (int)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_UNDEFINED);
@@ -912,6 +918,11 @@ void SDL_DestroyWindow(SDL_Window *window)
     }
 
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DESTROYED, 0, 0);
+    /* as stock SDL: a GL context current on this window is released (the
+     * context itself stays valid for another window) */
+    if (SDL_GL_GetCurrentWindow() == window) {
+        SDL_GL_MakeCurrent(window, NULL);
+    }
     if (window->surface) {
         /* drivers that own the pixel storage null this out themselves;
          * otherwise (dummy RAM buffers) free it here */

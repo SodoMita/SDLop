@@ -42,6 +42,8 @@ if(EMSCRIPTEN)
     src/SDL_clipboard.c
     src/SDL_thread.c
     src/SDL_misc.c
+    src/SDL_joystick.c
+    src/SDL_filesystem.c
     src/SDL_main.c
     src/SDL_rect.c
     src/SDL_pixels.c
@@ -281,6 +283,8 @@ set(SDLop_SOURCES
   src/SDL_clipboard.c
   src/SDL_thread.c
   src/SDL_misc.c
+  src/SDL_joystick.c
+  src/SDL_filesystem.c
   src/SDL_main.c
   src/SDL_rect.c
   src/SDL_pixels.c
@@ -368,6 +372,30 @@ target_include_directories(sdlop_shared PRIVATE
 target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
 target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
 
+# Drop-in packaging for applications built against stock SDL3.
+#  - SDLOP_SYMBOL_VERSIONING (default ON): export only SDL_*, tagged with
+#    stock SDL3's version node SDL3_0.0.0 (tools/sdlop.sym). With it, a
+#    libSDL3.so.0 -> libSDLop.so symlink loads without the dynamic loader's
+#    "no version information available" warning.
+#  - SDLOP_SDL3_SONAME (default OFF): build the shared library as
+#    libSDL3.so.0.<minor>.<micro> with SONAME libSDL3.so.0, exactly like
+#    stock SDL3, so it can replace it in a library path. Opt-in because it
+#    conflicts with an installed SDL3.
+option(SDLOP_SYMBOL_VERSIONING "Tag exports with SDL3's version node SDL3_0.0.0 and hide internals" ON)
+option(SDLOP_SDL3_SONAME "Name the shared library libSDL3.so.0 (SONAME) like stock SDL3" OFF)
+if (SDLOP_SYMBOL_VERSIONING AND NOT APPLE)
+  target_link_options(sdlop_shared PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tools/sdlop.sym")
+  set_property(TARGET sdlop_shared APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/sdlop.sym)
+endif()
+if (SDLOP_SDL3_SONAME)
+  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/include/SDL3/SDL_version.h _sdl_minor REGEX "^#define SDL_MINOR_VERSION +[0-9]+")
+  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/include/SDL3/SDL_version.h _sdl_micro REGEX "^#define SDL_MICRO_VERSION +[0-9]+")
+  string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _sdl_minor "${_sdl_minor}")
+  string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _sdl_micro "${_sdl_micro}")
+  set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDL3 SOVERSION 0 VERSION 0.${_sdl_minor}.${_sdl_micro})
+  message(STATUS "SDLop shared library: libSDL3.so.0.${_sdl_minor}.${_sdl_micro} (SONAME libSDL3.so.0)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Examples
 # ---------------------------------------------------------------------------
@@ -399,7 +427,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device test_options)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device test_options test_dropin_compat)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
@@ -497,6 +525,13 @@ if(SDLop_BUILD_TESTS)
       target_compile_options(test_x11_raw_source PRIVATE -UNDEBUG)
       add_test(NAME test_x11_raw_source COMMAND test_x11_raw_source)
       set_tests_properties(test_x11_raw_source PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # desktop GL on X11 is GLX (GLEW & co. need glXGetCurrentDisplay);
+      # GLES / SDL_VIDEO_FORCE_EGL use EGL. libGL is dlopen-ed at run time.
+      add_executable(test_glx tests/test_glx.c)
+      target_link_libraries(test_glx PRIVATE sdlop ${CMAKE_DL_LIBS})
+      target_compile_options(test_glx PRIVATE -UNDEBUG)
+      add_test(NAME test_glx COMMAND test_glx)
+      set_tests_properties(test_glx PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
       set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
         "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none")
@@ -687,7 +722,7 @@ endif()
 # Wayland behaviour injector (virtual pointer + keyboard script driver);
 # pairs with the shared behaviour_probe_wayland on the agent branch and
 # tests/run_behaviour_wayland.sh
-if (NOT EMSCRIPTEN AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND)
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND)
   add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
   target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
   target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
@@ -735,7 +770,7 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
   # only - every other test keeps full leak checking
-  foreach(t test_gl test_gl_matrix test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
+  foreach(t test_gl test_gl_matrix test_glx test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
     if (TEST ${t})
       set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endif()

@@ -1,0 +1,16 @@
+/* SDLop shared library version script (GNU ld / lld / gold).
+ *
+ * Stock SDL3 tags every export with the version node SDL3_0.0.0
+ * (src/dynapi/SDL_dynapi.sym), so binaries built against it record
+ * "SDL_Init@SDL3_0.0.0". Using the same node makes libSDLop a clean
+ * libSDL3.so.0 drop-in (no "no version information available" warning),
+ * and exporting only SDL_* keeps SDLop's internals out of the dynamic
+ * symbol table. tools/api_exports_check.sh verifies that the exported SDL_*
+ * set is exactly the set declared in include/SDL3.
+ */
+SDL3_0.0.0 {
+  global:
+    SDL_*;
+  local:
+    *;
+};

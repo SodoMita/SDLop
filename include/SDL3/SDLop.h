@@ -83,7 +83,7 @@
 #define SDLOP_HINT_FBDEV_TAKEOVER        "SDLOP_FBDEV_TAKEOVER"    /**< bool: own the console (graphics mode, VT_PROCESS; default on) */
 #define SDLOP_HINT_FBDEV_VT_SWITCH       "SDLOP_FBDEV_VT_SWITCH"   /**< bool: activate a VT at startup */
 /* libraries (dlopen names, or "none") */
-#define SDLOP_HINT_LIB_X11               "SDLOP_LIB_X11"   /**< libX11, only for EGL without EGL_EXT_platform_xcb */
+#define SDLOP_HINT_LIB_X11               "SDLOP_LIB_X11"   /**< libX11: GLX, and EGL without EGL_EXT_platform_xcb */
 #define SDLOP_HINT_LIB_XCB               "SDLOP_LIB_XCB"
 #define SDLOP_HINT_LIB_XCB_RANDR         "SDLOP_LIB_XCB_RANDR"
 #define SDLOP_HINT_LIB_XCB_RENDER        "SDLOP_LIB_XCB_RENDER"
