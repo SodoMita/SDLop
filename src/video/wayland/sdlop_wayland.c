@@ -403,6 +403,22 @@ static void shm_copy_from_shadow(WaylandWindowData *wd, WaylandShmBuffer *b)
     }
 }
 
+/* SDLop's own buffers (the shm cycle, the 1x1 clear colour) are always 1:1
+ * surface pixels. The app can reach the wl_surface
+ * (SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER) and may have left a buffer
+ * scale or transform pending or committed (e.g. for its own rendering), so
+ * reset both with every attach of ours: a 1x1 buffer at scale 2 is even a
+ * protocol error (size not a multiple of the scale). */
+static void surface_reset_buffer_geometry(WaylandWindowData *wd)
+{
+    if (wl_data.compositor_version >= 3) {
+        wl_surface_set_buffer_scale(wd->surface, 1);
+    }
+    if (wl_data.compositor_version >= 2) {
+        wl_surface_set_buffer_transform(wd->surface, WL_OUTPUT_TRANSFORM_NORMAL);
+    }
+}
+
 /* attach + damage + commit one buffer of the cycle */
 static void shm_commit(WaylandWindowData *wd, WaylandShmBuffer *b, const SDL_Rect *rects, int numrects)
 {
@@ -413,6 +429,7 @@ static void shm_commit(WaylandWindowData *wd, WaylandShmBuffer *b, const SDL_Rec
         wp_viewport_set_destination(wd->viewport, -1, -1);
         wd->viewport_scaled = false;
     }
+    surface_reset_buffer_geometry(wd);
     wl_surface_attach(wd->surface, b->buffer, 0, 0);
     if (full) {
         wl_surface_damage_buffer(wd->surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -434,6 +451,7 @@ static bool window_attach_clear(SDL_Window *window, WaylandWindowData *wd)
     const uint32_t color = window_clear_xrgb(window);
     const int w = window->w > 0 ? window->w : 1;
     const int h = window->h > 0 ? window->h : 1;
+    surface_reset_buffer_geometry(wd);
     if (wd->viewport) {
         if (!wd->clear_buffer || wd->clear_buffer_color != color) {
             /* immutable once created: a new colour gets a new buffer */
@@ -2035,6 +2053,32 @@ static void apply_size_limits(SDL_Window *window)
     xdg_toplevel_set_max_size(wd->toplevel, max_w, max_h);
 }
 
+/* SDL3 window properties: the native Wayland objects, as stock SDL
+ * publishes them (apps with their own renderer: wgpu, bgfx, ...). The xdg
+ * role objects follow hide/show and popup re-creation. */
+static void wayland_update_window_props(SDL_Window *window)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    /* window->props directly: SDL_GetWindowProperties() rejects a window
+     * that is still being created */
+    if (!window->props) {
+        if (!wd) {
+            return;
+        }
+        window->props = SDL_CreateProperties();
+    }
+    const SDL_PropertiesID props = window->props;
+    if (!props) {
+        return;
+    }
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, wd ? wl_data.display : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, wd ? wd->surface : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_VIEWPORT_POINTER, wd ? wd->viewport : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_XDG_SURFACE_POINTER, wd ? wd->xsurface : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_POINTER, wd ? wd->toplevel : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_XDG_POPUP_POINTER, wd ? wd->popup : NULL);
+}
+
 static void destroy_role_objects(WaylandWindowData *wd)
 {
     if (wd->decoration) {
@@ -2137,7 +2181,7 @@ static bool create_popup_role(SDL_Window *window)
     return true;
 }
 
-static bool wayland_create_role_objects(SDL_Window *window)
+static bool wayland_create_role_objects_raw(SDL_Window *window)
 {
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     wd->xsurface = xdg_wm_base_get_xdg_surface(wl_data.wm_base, wd->surface);
@@ -2180,6 +2224,13 @@ static bool wayland_create_role_objects(SDL_Window *window)
     return true;
 }
 
+static bool wayland_create_role_objects(SDL_Window *window)
+{
+    const bool ok = wayland_create_role_objects_raw(window);
+    wayland_update_window_props(window);
+    return ok;
+}
+
 static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -2210,6 +2261,7 @@ static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (sdlop.suspend_screensaver && wl_data.idle_inhibit_manager) {
         wd->idle_inhibitor = zwp_idle_inhibit_manager_v1_create_inhibitor(wl_data.idle_inhibit_manager, wd->surface);
     }
+    wayland_update_window_props(window);
     wl_display_roundtrip(wl_data.display);
     return true;
 }
@@ -2254,6 +2306,7 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     window_destroy_buffers(wd);
     free(wd);
     window->driverdata = NULL;
+    wayland_update_window_props(window);
 }
 
 static void wayland_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
@@ -2287,6 +2340,7 @@ static void wayland_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
      * next buffer attach is a protocol error, and a bare commit alone will
      * not restart the configure handshake. */
     destroy_role_objects(wd);
+    wayland_update_window_props(window);
     wl_surface_attach(wd->surface, NULL, 0, 0);
     wl_surface_commit(wd->surface);
     wd->configured = false;

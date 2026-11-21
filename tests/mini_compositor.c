@@ -8,6 +8,8 @@
 
   With MINI_BUFFER_CHECK=1 it is instead a strict wl_shm compositor for
   tests/test_wayland_buffers.c (see "buffer check mode" below).
+  MINI_VIEWPORTER=1 also offers wp_viewporter (SDLop then shows the clear
+  colour as a 1x1 buffer scaled by a viewport).
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -25,6 +27,7 @@
 #include "xdg-shell-server-protocol.h"
 #include "pointer-constraints-server-protocol.h"
 #include "relative-pointer-server-protocol.h"
+#include "viewporter-server-protocol.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -104,6 +107,19 @@ static int B_last = -1;
 static int B_checked, B_commits, B_releases, B_max_held;
 static bool B_stalled;
 static struct wl_event_source *B_repaint;
+/* double-buffered wl_surface / wp_viewport state of the toplevel: SDLop's
+ * buffers are 1:1, so every buffer it commits must have scale 1 and the
+ * normal transform, whatever the app left pending on the surface; the 1x1
+ * clear buffer needs a viewport destination, full-size frames must not
+ * have one */
+static bool B_viewporter;
+static int32_t B_scale = 1, B_scale_pending;
+static int32_t B_transform, B_transform_pending;
+static bool B_scale_set, B_transform_set;
+static int32_t B_dest_w = -1, B_dest_h = -1, B_dest_pending_w, B_dest_pending_h;
+static bool B_dest_set;
+static int32_t B_clear_w, B_clear_h; /* last 1x1 clear destination */
+static int B_clears, B_clears_1x1, B_app_geometry;
 
 static uint32_t frame_color(int k)
 {
@@ -174,9 +190,18 @@ static void B_check_content(mini_buffer *b)
     const uint32_t *px = mb_pixels(b);
     const uint32_t marker = px[0] & 0xffffffu;
     if ((marker & 0xff0000u) != MINI_TAG) {
+        B_clears++;
         return; /* clear colour (e.g. a resized surface before the app draws) */
     }
     const int k = (int)(marker & 0xffffu);
+    if (B_clear_w > 0) {
+        /* the clear colour covered the window the app now draws into */
+        if (B_clear_w != b->w || B_clear_h != b->h) {
+            fprintf(stderr, "mini: clear destination %dx%d, next frame %dx%d\n", B_clear_w, B_clear_h, b->w, b->h);
+            B_fail(6, "1x1 clear colour was not scaled to the window size");
+        }
+        B_clear_w = B_clear_h = 0;
+    }
     if (k <= B_last && B_last >= 0) {
         B_fail(4, "frame number went backwards");
     }
@@ -376,8 +401,48 @@ static void surface_attach(struct wl_client *client, struct wl_resource *res,
     }
 }
 
+static void B_commit_geometry(void)
+{
+    if (B_scale_set) {
+        B_scale = B_scale_pending;
+        B_scale_set = false;
+    }
+    if (B_transform_set) {
+        B_transform = B_transform_pending;
+        B_transform_set = false;
+    }
+    if (B_dest_set) {
+        B_dest_w = B_dest_pending_w;
+        B_dest_h = B_dest_pending_h;
+        B_dest_set = false;
+    }
+}
+
+static void B_check_geometry(const mini_buffer *b)
+{
+    if (B_scale != 1) {
+        fprintf(stderr, "mini: %dx%d buffer committed at buffer scale %d\n", b->w, b->h, B_scale);
+        B_fail(6, "SDLop buffer committed with a buffer scale other than 1");
+    }
+    if (B_transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+        fprintf(stderr, "mini: %dx%d buffer committed with transform %d\n", b->w, b->h, B_transform);
+        B_fail(6, "SDLop buffer committed with a buffer transform");
+    }
+    if (b->w == 1 && b->h == 1) {
+        if (B_dest_w <= 0 || B_dest_h <= 0) {
+            B_fail(6, "1x1 clear buffer committed without a viewport destination");
+        }
+        B_clear_w = B_dest_w;
+        B_clear_h = B_dest_h;
+        B_clears_1x1++;
+    } else if (B_dest_w != -1 || B_dest_h != -1) {
+        B_fail(6, "full-size buffer committed with a viewport destination still set");
+    }
+}
+
 static void B_commit(void)
 {
+    B_commit_geometry();
     if (!B_pending_set) {
         return;
     }
@@ -389,6 +454,7 @@ static void B_commit(void)
         return;
     }
     mini_buffer *b = wl_resource_get_user_data(B_pending);
+    B_check_geometry(b);
     B_check_content(b);
     b->sum = mb_sum(b);
     b->held = true;
@@ -457,6 +523,30 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
     }
 }
 
+static void surface_set_buffer_transform(struct wl_client *client, struct wl_resource *res, int32_t transform)
+{
+    (void)client;
+    if (B_mode && res == M.surface_res) {
+        B_transform_pending = transform;
+        B_transform_set = true;
+        if (transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+            B_app_geometry++;
+        }
+    }
+}
+
+static void surface_set_buffer_scale(struct wl_client *client, struct wl_resource *res, int32_t scale)
+{
+    (void)client;
+    if (B_mode && res == M.surface_res) {
+        B_scale_pending = scale;
+        B_scale_set = true;
+        if (scale != 1) {
+            B_app_geometry++;
+        }
+    }
+}
+
 static void surface_frame(struct wl_client *client, struct wl_resource *res, uint32_t callback_id)
 {
     (void)res;
@@ -479,8 +569,8 @@ static const struct wl_surface_interface surface_impl = {
     .set_opaque_region = (void *)noop,
     .set_input_region = (void *)noop,
     .commit = surface_commit,
-    .set_buffer_transform = (void *)noop,
-    .set_buffer_scale = (void *)noop,
+    .set_buffer_transform = surface_set_buffer_transform,
+    .set_buffer_scale = surface_set_buffer_scale,
     .damage_buffer = (void *)noop,
 };
 
@@ -729,6 +819,66 @@ static void seat_bind(struct wl_client *client, void *data, uint32_t version, ui
     }
 }
 
+/* ---------------- wp_viewporter (MINI_VIEWPORTER=1) ---------------- */
+
+static void viewport_destroy(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    if (B_mode && wl_resource_get_user_data(res) == M.surface_res) {
+        B_dest_pending_w = B_dest_pending_h = -1;
+        B_dest_set = true;
+    }
+    wl_resource_destroy(res);
+}
+
+static void viewport_set_source(struct wl_client *client, struct wl_resource *res,
+                                wl_fixed_t x, wl_fixed_t y, wl_fixed_t w, wl_fixed_t h)
+{
+    (void)client; (void)res; (void)x; (void)y; (void)w; (void)h;
+}
+
+static void viewport_set_destination(struct wl_client *client, struct wl_resource *res, int32_t w, int32_t h)
+{
+    (void)client;
+    if (B_mode && wl_resource_get_user_data(res) == M.surface_res) {
+        B_dest_pending_w = w;
+        B_dest_pending_h = h;
+        B_dest_set = true;
+    }
+}
+
+static const struct wp_viewport_interface viewport_impl = {
+    .destroy = viewport_destroy,
+    .set_source = viewport_set_source,
+    .set_destination = viewport_set_destination,
+};
+
+static void viewporter_destroy(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    wl_resource_destroy(res);
+}
+
+static void viewporter_get_viewport(struct wl_client *client, struct wl_resource *res, uint32_t id,
+                                    struct wl_resource *surface)
+{
+    (void)res;
+    struct wl_resource *v = wl_resource_create(client, &wp_viewport_interface, 1, id);
+    wl_resource_set_implementation(v, &viewport_impl, surface, NULL);
+}
+
+static const struct wp_viewporter_interface viewporter_impl = {
+    .destroy = viewporter_destroy,
+    .get_viewport = viewporter_get_viewport,
+};
+
+static void viewporter_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wp_viewporter_interface, version, id);
+    wl_resource_set_implementation(r, &viewporter_impl, NULL, NULL);
+}
+
 /* ---------------- wl_compositor / globals ---------------- */
 
 static void compositor_create_surface(struct wl_client *client, struct wl_resource *res, uint32_t id)
@@ -799,9 +949,15 @@ static void client_destroyed(struct wl_listener *listener, void *data)
     (void)data;
     printf("mini: client disconnected, exiting\n");
     if (B_mode) {
-        printf("mini: buffer check: %d commits, %d frames verified, %d releases, max %d held\n",
-               B_commits, B_checked, B_releases, B_max_held);
+        printf("mini: buffer check: %d commits, %d frames verified, %d releases, max %d held, "
+               "%d clear-colour commits (%d as 1x1 viewport), %d app scale/transform requests\n",
+               B_commits, B_checked, B_releases, B_max_held, B_clears + B_clears_1x1, B_clears_1x1,
+               B_app_geometry);
         fflush(stdout);
+        if (B_viewporter && B_clears_1x1 == 0) {
+            fprintf(stderr, "mini: BUFFER CHECK FAILED: viewporter offered but no 1x1 clear colour committed\n");
+            exit(4);
+        }
         exit(B_checked > 0 ? 0 : 4);
     }
     fflush(stdout);
@@ -843,6 +999,10 @@ int main(void)
     wl_global_create(M.display, &xdg_wm_base_interface, 2, NULL, wm_base_bind);
     wl_global_create(M.display, &zwp_pointer_constraints_v1_interface, 1, NULL, pc_bind);
     wl_global_create(M.display, &zwp_relative_pointer_manager_v1_interface, 1, NULL, rpm_bind);
+    B_viewporter = getenv("MINI_VIEWPORTER") && atoi(getenv("MINI_VIEWPORTER"));
+    if (B_viewporter) {
+        wl_global_create(M.display, &wp_viewporter_interface, 1, NULL, viewporter_bind);
+    }
 
     wl_display_add_client_created_listener(M.display, &client_listener);
 

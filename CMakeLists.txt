@@ -233,6 +233,16 @@ add_custom_command(
   DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 
 add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/viewporter-server-protocol.h ${WL_GEN_DIR}/viewporter-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+          ${WL_GEN_DIR}/viewporter-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+          ${WL_GEN_DIR}/viewporter-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml)
+
+add_custom_command(
   OUTPUT ${WL_GEN_DIR}/pointer-constraints-server-protocol.h ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
   COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
           ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
@@ -622,7 +632,8 @@ if(SDLop_BUILD_TESTS)
     add_executable(mini_compositor tests/mini_compositor.c
       ${WL_GEN_DIR}/xdg-shell-server-protocol.c
       ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-      ${WL_GEN_DIR}/relative-pointer-server-protocol.c)
+      ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+      ${WL_GEN_DIR}/viewporter-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -643,10 +654,12 @@ if(SDLop_BUILD_TESTS)
 
     # wl_buffer release contract of software presentation
     add_executable(test_wayland_buffers tests/test_wayland_buffers.c)
-    target_link_libraries(test_wayland_buffers PRIVATE sdlop)
+    target_include_directories(test_wayland_buffers PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+    target_link_libraries(test_wayland_buffers PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
     target_compile_options(test_wayland_buffers PRIVATE -UNDEBUG)
     add_dependencies(test_wayland_buffers mini_compositor)
     add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
+    add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
   else()
     message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch, test_wayland_buffers")
   endif()

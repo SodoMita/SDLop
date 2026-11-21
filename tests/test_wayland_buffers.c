@@ -8,14 +8,23 @@
   (SDL_UpdateWindowSurfaceRects) updates, across two window resizes.
   The frame model is described in mini_compositor.c.
 
+  Like an app that renders on its own, the test leaves a buffer scale (2)
+  and transform (90) pending on SDLop's wl_surface before some presents and
+  before each resize (clear colour); SDLop's buffers must still be committed
+  at scale 1 / normal transform. With the "viewporter" argument the
+  compositor offers wp_viewporter, so the clear colour is the 1x1 buffer
+  scaled by a viewport.
+
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
 */
 
 #include <SDL3/SDL.h>
+#include <wayland-client.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -29,7 +38,7 @@ static int failures;
         }                                         \
     } while (0)
 
-#define FRAMES 120
+#define FRAMES 120 /* a multiple of 40: frame FRAMES is a full fill */
 
 static Uint32 frame_color(int k)
 {
@@ -44,10 +53,22 @@ static void frame_band(int k, int W, int H, SDL_Rect *r)
     r->y = (k * 37) % (H - 8);
 }
 
+/* what an app with its own renderer may leave on the surface */
+static void app_dirty_surface(SDL_Window *w)
+{
+    struct wl_surface *surf = (struct wl_surface *)SDL_GetPointerProperty(
+        SDL_GetWindowProperties(w), SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
+    CHECK(surf != NULL, "window has no wl_surface property");
+    if (surf) {
+        wl_surface_set_buffer_scale(surf, 2);
+        wl_surface_set_buffer_transform(surf, WL_OUTPUT_TRANSFORM_90);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s /path/to/mini_compositor\n", argv[0]);
+        fprintf(stderr, "usage: %s /path/to/mini_compositor [viewporter]\n", argv[0]);
         return 2;
     }
 
@@ -64,6 +85,9 @@ int main(int argc, char *argv[])
         setenv("XDG_RUNTIME_DIR", xdg, 1);
         setenv("WAYLAND_DISPLAY", "wayland-mini", 1);
         setenv("MINI_BUFFER_CHECK", "1", 1);
+        if (argc > 2 && strcmp(argv[2], "viewporter") == 0) {
+            setenv("MINI_VIEWPORTER", "1", 1);
+        }
         execl(argv[1], "mini_compositor", (char *)NULL);
         _exit(127);
     }
@@ -97,6 +121,7 @@ int main(int argc, char *argv[])
     Uint64 max_present = 0;
     for (int k = 0; w && k < FRAMES; k++) {
         if (k % 40 == 0 && k > 0) {
+            app_dirty_surface(w); /* the resize shows the clear colour */
             CHECK(SDL_SetWindowSize(w, sizes[k / 40][0], sizes[k / 40][1]), "resize: %s", SDL_GetError());
             SDL_SyncWindow(w);
         }
@@ -122,6 +147,9 @@ int main(int argc, char *argv[])
         rects[1].x = rects[1].y = 0;
         rects[1].w = rects[1].h = 1;
         SDL_FillSurfaceRect(s, &rects[1], 0xA50000u | (Uint32)k);
+        if (k % 40 == 10) {
+            app_dirty_surface(w);
+        }
         Uint64 t = SDL_GetTicksNS();
         bool ok = n ? SDL_UpdateWindowSurfaceRects(w, rects, n) : SDL_UpdateWindowSurface(w);
         t = SDL_GetTicksNS() - t;
@@ -132,6 +160,26 @@ int main(int argc, char *argv[])
         /* SDL3: the surface pixels stay put between presents */
         CHECK(SDL_GetWindowSurface(w)->pixels == pixels, "frame %d: surface pixels moved", k);
         SDL_PumpEvents();
+    }
+    /* the clear colour proper (window_attach_clear): without a window
+     * surface a resize shows it - the 1x1 viewport buffer when the
+     * compositor has wp_viewporter - and the app left scale/transform on
+     * the surface just before */
+    if (w) {
+        CHECK(SDL_DestroyWindowSurface(w), "destroy window surface: %s", SDL_GetError());
+        app_dirty_surface(w);
+        CHECK(SDL_SetWindowSize(w, 300, 220), "resize: %s", SDL_GetError());
+        SDL_SyncWindow(w);
+        SDL_PumpEvents();
+        /* then a full frame at the new size (the clear covered exactly it) */
+        SDL_Surface *s = SDL_GetWindowSurface(w);
+        CHECK(s && s->w == 300 && s->h == 220, "surface after clear: %dx%d", s ? s->w : 0, s ? s->h : 0);
+        if (s) {
+            SDL_FillSurfaceRect(s, NULL, frame_color(FRAMES));
+            SDL_Rect px = { 0, 0, 1, 1 };
+            SDL_FillSurfaceRect(s, &px, 0xA50000u | (Uint32)FRAMES);
+            CHECK(SDL_UpdateWindowSurface(w), "present after clear: %s", SDL_GetError());
+        }
     }
     /* the 300 ms compositor stall must have blocked a present, not failed it */
     CHECK(max_present > 200 * 1000000ull, "no present waited for the stalled compositor (max %llu us)",
