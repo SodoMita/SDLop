@@ -272,6 +272,7 @@ if(NOT WIN32)
   set(SDLop_SOURCES
     src/SDLop_core.c
     src/internal/sdlop_platform.c
+    src/internal/sdlop_win32_compat.c
     src/SDL_stdlib.c
     src/SDL_error.c
     src/SDL_log.c
@@ -298,6 +299,8 @@ if(NOT WIN32)
     src/SDL_surface.c
     src/SDL_gl.c
     src/SDL_vulkan.c
+    src/internal/sdlop_evdev.c
+    src/sdlop_xkb_dyn.c
     src/internal/sdlop_evdev.c
     src/sdlop_xkb_dyn.c
     src/video/wayland/sdlop_wayland.c
@@ -385,27 +388,26 @@ else()
     src/SDL_log.c
     src/SDL_timer.c
     src/SDL_events.c
-    src/SDL_events_desc.c
-    src/SDL_events_categories.c
     src/SDL_properties.c
     src/SDL_hints.c
+    src/SDL_events_desc.c
+    src/SDL_events_categories.c
     src/SDL_clipboard.c
     src/SDL_thread.c
     src/SDL_misc.c
     src/SDL_main.c
     src/SDL_rect.c
     src/SDL_pixels.c
-    src/SDL_surface.c
     src/SDL_blit.c
     src/SDL_blit_float.c
     src/SDL_rotate.c
     src/SDL_keyboard.c
     src/SDL_keynames.c
+    src/SDL_win32_keymap.c
     src/SDL_mouse.c
     src/SDL_devices.c
-    src/SDL_joystick.c
-    src/SDL_filesystem.c
     src/SDL_video.c
+    src/SDL_surface.c
     src/SDL_gl.c
     src/SDL_vulkan.c
     src/video/windows/sdlop_windows.c
@@ -721,7 +723,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Benchmarks (SDLop vs SDL3)
 # ---------------------------------------------------------------------------
-if(SDLop_BUILD_BENCHMARKS)
+if(SDLop_BUILD_BENCHMARKS AND NOT WIN32)
   pkg_check_modules(SDL3 sdl3)
   add_executable(bench_events bench/bench_events.c)
   target_link_libraries(bench_events PRIVATE sdlop)

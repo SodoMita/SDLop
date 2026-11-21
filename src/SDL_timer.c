@@ -12,9 +12,11 @@
 
 #include "internal/sdlop_internal.h"
 #include <errno.h>
+#include <time.h>
+#ifndef _WIN32
 #include <sched.h>
 #include <signal.h>
-#include <time.h>
+#endif
 
 /* CLOCK_MONOTONIC origin captured at first use (~library load). */
 static Uint64 timer_origin_ns(void)
@@ -22,9 +24,7 @@ static Uint64 timer_origin_ns(void)
     static Uint64 origin;
     static int inited;
     if (!inited) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        origin = (Uint64)ts.tv_sec * 1000000000ull + (Uint64)ts.tv_nsec;
+        origin = SDLOP_MonotonicNowNS();
         inited = 1;
     }
     return origin;
@@ -32,9 +32,7 @@ static Uint64 timer_origin_ns(void)
 
 Uint64 SDL_GetPerformanceCounter(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (Uint64)ts.tv_sec * 1000000000ull + (Uint64)ts.tv_nsec;
+    return (Uint64)SDLOP_MonotonicNowNS();
 }
 
 Uint64 SDL_GetPerformanceFrequency(void)
@@ -59,12 +57,7 @@ void SDL_Delay(Uint32 ms)
 
 void SDL_DelayNS(Uint64 ns)
 {
-    struct timespec req, rem;
-    req.tv_sec = (time_t)(ns / 1000000000ull);
-    req.tv_nsec = (long)(ns % 1000000000ull);
-    while (nanosleep(&req, &rem) != 0 && errno == EINTR) {
-        req = rem;
-    }
+    SDLOP_SLEEP_NS(ns);
 }
 
 static void ns_to_timespec(Uint64 ns, struct timespec *ts)
@@ -80,13 +73,10 @@ void SDL_DelayPrecise(Uint64 ns)
     const Uint64 SPIN_NS = 200000; /* 0.2 ms */
     const Uint64 target = SDL_GetPerformanceCounter() + ns;
     if (ns > SPIN_NS) {
-        struct timespec ts;
-        ns_to_timespec(target - SPIN_NS, &ts);
-        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
-        }
+        SDLOP_SLEEP_UNTIL_NS(target - SPIN_NS);
     }
     while (SDL_GetPerformanceCounter() < target) {
-        sched_yield();
+        SDLOP_YIELD();
     }
 }
 
@@ -106,10 +96,15 @@ typedef struct SDLOP_Timer
     struct SDLOP_Timer *next;
 } SDLOP_Timer;
 
-static pthread_mutex_t timer_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t timer_cond;
+static SDLOP_STATIC_MUTEX(timer_lock);
+static SDLOP_COND_T timer_cond;
 static bool timer_cond_inited;
+#ifdef _WIN32
+static HANDLE timer_thread;
+#else
 static pthread_t timer_thread;
+static SDL_ThreadID timer_thread_id; /* 0 = none; used to avoid self-join */
+#endif
 static bool timer_thread_running;
 static bool timer_quit;
 static SDLOP_Timer *timers;   /* sorted by deadline */
@@ -126,17 +121,25 @@ static void insert_sorted(SDLOP_Timer *t)
     *link = t;
 }
 
-static void *timer_thread_main(void *arg)
+static
+#ifdef _WIN32
+unsigned __stdcall
+#else
+void *
+#endif
+timer_thread_main(void *arg)
 {
     (void)arg;
+#ifndef _WIN32
     sigset_t all;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, NULL); /* signals belong to the app */
+#endif
 
-    pthread_mutex_lock(&timer_lock);
+    SDLOP_MUTEX_LOCK(&timer_lock.id);
     while (!timer_quit) {
         if (!timers) {
-            pthread_cond_wait(&timer_cond, &timer_lock);
+            SDLOP_COND_WAIT(&timer_cond, SDLOP_SM(&timer_lock));
             continue;
         }
         Uint64 now = SDL_GetPerformanceCounter();
@@ -144,7 +147,7 @@ static void *timer_thread_main(void *arg)
         if (t->deadline_ns > now) {
             struct timespec ts;
             ns_to_timespec(t->deadline_ns, &ts);
-            pthread_cond_timedwait(&timer_cond, &timer_lock, &ts);
+            SDLOP_COND_WAIT_UNTIL(&timer_cond, SDLOP_SM(&timer_lock), &ts);
             continue;
         }
         timers = t->next;
@@ -153,7 +156,7 @@ static void *timer_thread_main(void *arg)
             continue;
         }
         running = t;
-        pthread_mutex_unlock(&timer_lock);
+        SDLOP_MUTEX_UNLOCK(&timer_lock.id);
 
         Uint64 next_ns;
         if (t->callback_ns) {
@@ -162,7 +165,7 @@ static void *timer_thread_main(void *arg)
             next_ns = (Uint64)t->callback_ms(t->userdata, t->id, (Uint32)(t->interval_ns / 1000000ull)) * 1000000ull;
         }
 
-        pthread_mutex_lock(&timer_lock);
+        SDLOP_MUTEX_LOCK(&timer_lock.id);
         running = NULL;
         if (next_ns && !t->canceled && !timer_quit) {
             t->interval_ns = next_ns;
@@ -177,8 +180,12 @@ static void *timer_thread_main(void *arg)
             SDL_free(t);
         }
     }
-    pthread_mutex_unlock(&timer_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 static SDL_TimerID add_timer(Uint64 interval_ns, SDL_TimerCallback cb_ms, SDL_NSTimerCallback cb_ns, void *userdata)
@@ -197,19 +204,23 @@ static SDL_TimerID add_timer(Uint64 interval_ns, SDL_TimerCallback cb_ms, SDL_NS
     t->interval_ns = interval_ns;
     t->deadline_ns = SDL_GetPerformanceCounter() + interval_ns;
 
-    pthread_mutex_lock(&timer_lock);
+    SDLOP_MUTEX_LOCK(&timer_lock.id);
     if (!timer_cond_inited) {
-        pthread_condattr_t attr;
-        pthread_condattr_init(&attr);
-        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-        pthread_cond_init(&timer_cond, &attr);
-        pthread_condattr_destroy(&attr);
+        SDLOP_COND_INIT(&timer_cond);
         timer_cond_inited = true;
     }
     if (!timer_thread_running) {
         timer_quit = false;
-        if (pthread_create(&timer_thread, NULL, timer_thread_main, NULL) != 0) {
-            pthread_mutex_unlock(&timer_lock);
+        bool created;
+#ifdef _WIN32
+        timer_thread = (HANDLE)_beginthreadex(NULL, 0, timer_thread_main, NULL, 0, NULL);
+        created = (timer_thread != NULL);
+#else
+        created = (pthread_create(&timer_thread, NULL, timer_thread_main, NULL) == 0);
+        timer_thread_id = timer_thread;
+#endif
+        if (!created) {
+            SDLOP_MUTEX_UNLOCK(&timer_lock.id);
             SDL_free(t);
             SDL_SetError("Couldn't create timer thread");
             return 0;
@@ -222,8 +233,8 @@ static SDL_TimerID add_timer(Uint64 interval_ns, SDL_TimerCallback cb_ms, SDL_NS
     }
     SDL_TimerID id = t->id;
     insert_sorted(t);
-    pthread_cond_signal(&timer_cond);
-    pthread_mutex_unlock(&timer_lock);
+    SDLOP_COND_SIGNAL(&timer_cond);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
     return id;
 }
 
@@ -243,7 +254,7 @@ bool SDL_RemoveTimer(SDL_TimerID id)
         return SDL_InvalidParamError("id");
     }
     bool found = false;
-    pthread_mutex_lock(&timer_lock);
+    SDLOP_MUTEX_LOCK(&timer_lock.id);
     for (SDLOP_Timer *t = timers; t; t = t->next) {
         if (t->id == id && !t->canceled) {
             t->canceled = true;
@@ -255,7 +266,7 @@ bool SDL_RemoveTimer(SDL_TimerID id)
         running->canceled = true;
         found = true;
     }
-    pthread_mutex_unlock(&timer_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
     if (!found) {
         return SDL_SetError("Timer not found");
     }
@@ -265,25 +276,34 @@ bool SDL_RemoveTimer(SDL_TimerID id)
 /* SDL_Quit(): stop the thread, drop all timers */
 void SDLOP_QuitTimers(void)
 {
-    pthread_mutex_lock(&timer_lock);
+    SDLOP_MUTEX_LOCK(&timer_lock.id);
     if (!timer_thread_running) {
-        pthread_mutex_unlock(&timer_lock);
+        SDLOP_MUTEX_UNLOCK(&timer_lock.id);
         return;
     }
     timer_quit = true;
-    pthread_cond_signal(&timer_cond);
-    pthread_mutex_unlock(&timer_lock);
-    if (!pthread_equal(pthread_self(), timer_thread)) {
+    SDLOP_COND_SIGNAL(&timer_cond);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
+#ifdef _WIN32
+    if (SDL_GetCurrentThreadID() != SDLOP_ThreadIDOfHandle(timer_thread)) {
+        WaitForSingleObject(timer_thread, INFINITE);
+        CloseHandle(timer_thread);
+    } else {
+        CloseHandle(timer_thread); /* SDL_Quit() from a timer callback */
+    }
+#else
+    if (SDL_GetCurrentThreadID() != timer_thread_id) {
         pthread_join(timer_thread, NULL);
     } else {
         pthread_detach(timer_thread); /* SDL_Quit() from a timer callback */
     }
-    pthread_mutex_lock(&timer_lock);
+#endif
+    SDLOP_MUTEX_LOCK(&timer_lock.id);
     timer_thread_running = false;
     while (timers) {
         SDLOP_Timer *t = timers;
         timers = t->next;
         SDL_free(t);
     }
-    pthread_mutex_unlock(&timer_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
 }

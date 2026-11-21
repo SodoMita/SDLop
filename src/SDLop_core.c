@@ -23,7 +23,7 @@ bool sdlop_quitting;
 /* Main thread (SDL3: the thread that called SDL_Init first)           */
 /* ------------------------------------------------------------------ */
 
-static pthread_t main_thread;
+static SDL_ThreadID main_thread;
 static _Atomic bool main_thread_known;
 
 bool SDLOP_IsMainThread(void)
@@ -31,14 +31,14 @@ bool SDLOP_IsMainThread(void)
     if (!main_thread_known) {
         return true; /* SDL3: before SDL_Init every thread may act as main */
     }
-    return pthread_equal(pthread_self(), main_thread) != 0;
+    return SDL_GetCurrentThreadID() == main_thread;
 }
 
 /* SDL_SetMainReady() / first SDL_Init(): this thread is the main thread */
 void SDLOP_InitMainThread(void)
 {
     if (!main_thread_known) {
-        main_thread = pthread_self();
+        main_thread = SDL_GetCurrentThreadID();
         main_thread_known = true;
     }
 }
@@ -115,7 +115,15 @@ const char *SDLOP_GetExeName(void)
 {
     static char name[256];
     if (!name[0]) {
-#ifndef __EMSCRIPTEN__
+#if defined(_WIN32)
+        wchar_t wpath[1024];
+        char path[1024];
+        if (GetModuleFileNameW(NULL, wpath, (DWORD)SDL_arraysize(wpath)) > 0 &&
+            WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, (int)sizeof(path), NULL, NULL) > 0) {
+            const char *base = strrchr(path, '\\');
+            SDL_strlcpy(name, base ? base + 1 : path, sizeof(name));
+        }
+#elif !defined(__EMSCRIPTEN__)
         char path[1024];
         ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
         if (n > 0) {
@@ -174,6 +182,7 @@ Uint64 SDLOP_MonotonicNS(void)
 static bool subsystem_init(SDL_InitFlags flags)
 {
     if (flags & SDL_INIT_VIDEO) {
+#ifndef _WIN32
         if (!SDLOP_VideoInit()) {
             SDLOP_RawInputQuit(); /* a console driver may have started it */
             return false;
@@ -188,6 +197,13 @@ static bool subsystem_init(SDL_InitFlags flags)
             SDL_LogInfo(SDL_LOG_CATEGORY_INPUT, "SDLop raw input unavailable: %s", SDL_GetError());
             SDL_ClearError();
         }
+#else
+        /* Windows gets its keys through the window messages; there is no
+         * evdev worker and no xkb keymap to load. */
+        if (!SDLOP_VideoInit()) {
+            return false;
+        }
+#endif
     }
     return true;
 }
@@ -195,7 +211,9 @@ static bool subsystem_init(SDL_InitFlags flags)
 static void subsystem_quit(SDL_InitFlags flags)
 {
     if (flags & SDL_INIT_VIDEO) {
+#ifndef _WIN32
         SDLOP_RawInputQuit();
+#endif
         SDLOP_VideoQuit();
         SDLOP_KeyboardQuit();
         SDLOP_DevicesQuit();

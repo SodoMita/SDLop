@@ -241,6 +241,7 @@ void SDLOP_SendClipboardUpdate(bool owner, char **mime_types, size_t num_mime_ty
 const void *SDLCALL SDLOP_ClipboardTextCallback(void *userdata, const char *mime_type, size_t *size);
 
 /* Provided by backends */
+extern SDLop_VideoDevice SDLop_windows_device;
 extern SDLop_VideoDevice SDLop_emscripten_device;
 extern SDLop_VideoDevice SDLop_wayland_device;
 extern SDLop_VideoDevice SDLop_x11_device;

@@ -18,17 +18,24 @@
 
 #include "internal/sdlop_internal.h"
 
-#include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
+#ifdef _WIN32
+/* Win32 has no posix_spawn/dirent/unistd; the few places that need them
+ * (SDL_OpenURL, the file dialogs) use ShellExecuteExW instead. */
+#include <shellapi.h>
 #else
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#elif !defined(_WIN32)
 #include <spawn.h>
 #include <sys/wait.h>
 extern char **environ;
@@ -85,7 +92,7 @@ SDL_GUID SDL_StringToGUID(const char *pchGUID)
 /* Child processes (message boxes, URLs)                               */
 /* ------------------------------------------------------------------ */
 
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(_WIN32)
 /* is `prog` an executable in $PATH? (posix_spawnp would tell us too,
  * but glibc reports a missing program only through the exit status) */
 static bool program_in_path(const char *prog)
@@ -219,7 +226,7 @@ static int run_process(const char *const *argv, char **output, bool wait_for_exi
     }
     return -1;
 }
-#endif /* !__EMSCRIPTEN__ */
+#endif /* !__EMSCRIPTEN__ && !_WIN32 */
 
 /* ------------------------------------------------------------------ */
 /* Message boxes (zenity, as stock SDL3 does on Wayland)               */
@@ -229,7 +236,7 @@ static int run_process(const char *const *argv, char **output, bool wait_for_exi
 
 static SDL_AtomicInt sdlop_messagebox_count; /* stock tracks open boxes too */
 
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(_WIN32)
 static bool zenity_version(int *major, int *minor)
 {
     const char *argv[] = { "zenity", "--version", NULL };
@@ -324,7 +331,93 @@ static bool zenity_show(const SDL_MessageBoxData *data, int *buttonID)
     free(out);
     return !(code < 0 || code == 255);
 }
-#endif
+#endif /* !__EMSCRIPTEN__ && !_WIN32 */
+
+#ifdef _WIN32
+static wchar_t *utf8_to_wide(const char *text)
+{
+    if (!text) {
+        text = "";
+    }
+    const int len = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    if (len <= 0) {
+        return NULL;
+    }
+    wchar_t *wide = (wchar_t *)SDL_malloc((size_t)len * sizeof(wchar_t));
+    if (wide) {
+        MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, len);
+    }
+    return wide;
+}
+
+/* SDL_ShowMessageBox on Win32: MessageBoxW for the simple cases, and for
+ * multiple custom buttons a task dialog is the only way to label them, so
+ * the buttons are mapped onto the standard set when that is enough. */
+static bool win32_show_messagebox(const SDL_MessageBoxData *data, int *buttonID)
+{
+    UINT type = MB_OK;
+    if (data->flags & SDL_MESSAGEBOX_ERROR) {
+        type = MB_ICONERROR;
+    } else if (data->flags & SDL_MESSAGEBOX_WARNING) {
+        type = MB_ICONWARNING;
+    } else if (data->flags & SDL_MESSAGEBOX_INFORMATION) {
+        type = MB_ICONINFORMATION;
+    }
+    if (data->numbuttons >= 2 && (data->flags & SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT)) {
+        type |= MB_OKCANCEL;
+    } else if (data->numbuttons >= 2) {
+        type |= MB_OKCANCEL;
+    }
+    if (data->numbuttons == 3) {
+        type |= MB_YESNOCANCEL & ~(MB_OKCANCEL);
+    }
+
+    wchar_t *wtitle = utf8_to_wide(data->title);
+    wchar_t *wmessage = utf8_to_wide(data->message);
+    if (!wtitle || !wmessage) {
+        SDL_free(wtitle);
+        SDL_free(wmessage);
+        return SDL_OutOfMemory();
+    }
+    HWND parent = NULL;
+    if (data->window) {
+        SDL_PropertiesID props = SDL_GetWindowProperties(data->window);
+        parent = (HWND)(uintptr_t)SDL_GetNumberProperty(props, "SDL.window.win32.hwnd", 0);
+    }
+    const int rc = MessageBoxW(parent, wmessage, wtitle, type);
+    SDL_free(wtitle);
+    SDL_free(wmessage);
+    if (rc == 0) {
+        return SDL_SetError("MessageBox() failed: %lu", (unsigned long)GetLastError());
+    }
+    /* Map the Win32 answer back onto the caller's button list. */
+    int index = 0;
+    switch (rc) {
+    case IDOK:
+        index = 0;
+        break;
+    case IDCANCEL:
+        index = (data->numbuttons > 1) ? 1 : 0;
+        break;
+    case IDYES:
+        index = 0;
+        break;
+    case IDNO:
+        index = 1;
+        break;
+    default:
+        index = 0;
+        break;
+    }
+    if (index >= data->numbuttons) {
+        index = data->numbuttons - 1;
+    }
+    if (buttonID) {
+        *buttonID = data->buttons ? data->buttons[index].buttonID : index;
+    }
+    return true;
+}
+#endif /* _WIN32 */
 
 bool SDL_ShowMessageBox(const SDL_MessageBoxData *messageboxdata, int *buttonID)
 {
@@ -359,8 +452,10 @@ bool SDL_ShowMessageBox(const SDL_MessageBoxData *messageboxdata, int *buttonID)
     SDL_ResetKeyboard();
     SDL_ClearError();
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__)
     bool result = SDL_Unsupported();
+#elif defined(_WIN32)
+    bool result = win32_show_messagebox(&mb, buttonID);
 #else
     bool result = zenity_show(&mb, buttonID);
 #endif
@@ -410,8 +505,18 @@ bool SDL_OpenURL(const char *url)
     if (!url) {
         return SDL_SetError("Parameter '%s' is invalid", "url");
     }
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__)
     EM_ASM({ window.open(UTF8ToString($0), "_blank"); }, url);
+    return true;
+#elif defined(_WIN32)
+    wchar_t wurl[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, (int)SDL_arraysize(wurl)) <= 0) {
+        return SDL_SetError("Couldn't convert the URL to UTF-16");
+    }
+    const HINSTANCE rc = ShellExecuteW(NULL, L"open", wurl, NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)rc <= 32) {
+        return SDL_SetError("ShellExecute() failed: %ld", (long)(INT_PTR)rc);
+    }
     return true;
 #else
     if (!program_in_path("xdg-open")) {
@@ -449,7 +554,7 @@ bool SDL_OpenURL(const char *url)
 /* Power                                                                */
 /* ------------------------------------------------------------------ */
 
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(_WIN32)
 static bool read_power_file(const char *base, const char *node, const char *key, char *buf, size_t buflen)
 {
     char path[512];
@@ -558,7 +663,31 @@ SDL_PowerState SDL_GetPowerInfo(int *seconds, int *percent)
     if (!percent) {
         percent = &p_;
     }
-#ifndef __EMSCRIPTEN__
+#if defined(_WIN32)
+    /* GetSystemPowerStatus covers battery/AC; Win32 has no time estimate that
+     * SDL3 trusts, so seconds stays -1 like stock SDL's Windows backend. */
+    SYSTEM_POWER_STATUS status;
+    if (GetSystemPowerStatus(&status)) {
+        *seconds = -1;
+        *percent = status.BatteryLifePercent <= 100 ? (int)status.BatteryLifePercent : -1;
+        if (status.ACLineStatus == 255) {
+            return SDL_POWERSTATE_UNKNOWN;
+        }
+        if (status.BatteryFlag == 128) {
+            return SDL_POWERSTATE_NO_BATTERY;
+        }
+        if (status.BatteryFlag == 255) {
+            return SDL_POWERSTATE_UNKNOWN;
+        }
+        if (status.BatteryFlag & 8) {
+            return SDL_POWERSTATE_CHARGING;
+        }
+        if (status.ACLineStatus == 1) {
+            return SDL_POWERSTATE_CHARGED;
+        }
+        return SDL_POWERSTATE_ON_BATTERY;
+    }
+#elif !defined(__EMSCRIPTEN__)
     SDL_PowerState state;
     if (power_sys_class(&state, seconds, percent)) {
         return state;

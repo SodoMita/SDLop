@@ -13,6 +13,9 @@ static SDLop_Display *display_by_id(SDL_DisplayID displayID);
 static void finalize_display_mode(SDL_DisplayMode *mode);
 
 static SDLop_VideoDevice *const video_drivers[] = {
+#if SDLop_VIDEO_WINDOWS
+    &SDLop_windows_device,
+#endif
 #if SDLop_VIDEO_EMSCRIPTEN
     &SDLop_emscripten_device,
 #endif

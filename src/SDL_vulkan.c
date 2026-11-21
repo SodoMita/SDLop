@@ -9,7 +9,9 @@
 */
 
 #include "internal/sdlop_internal.h"
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 
 static void *vulkan_handle;
 static SDL_FunctionPointer vk_get_instance_proc_addr;
@@ -19,6 +21,18 @@ bool SDL_Vulkan_LoadLibrary(const char *path)
     if (vulkan_handle) {
         return true;
     }
+#ifdef _WIN32
+    const char *names[] = { path, "vulkan-1.dll" };
+    for (size_t i = 0; i < SDL_arraysize(names); i++) {
+        if (!names[i]) {
+            continue;
+        }
+        vulkan_handle = (void *)LoadLibraryA(names[i]);
+        if (vulkan_handle) {
+            break;
+        }
+    }
+#else
     const char *names[] = { path, "libvulkan.so.1", "libvulkan.so" };
     for (size_t i = 0; i < SDL_arraysize(names); i++) {
         if (!names[i]) {
@@ -29,12 +43,25 @@ bool SDL_Vulkan_LoadLibrary(const char *path)
             break;
         }
     }
+#endif
     if (!vulkan_handle) {
+#ifdef _WIN32
+        return SDL_SetError("Could not load Vulkan loader (vulkan-1.dll)");
+#else
         return SDL_SetError("Could not load Vulkan loader (libvulkan.so.1): %s", dlerror());
+#endif
     }
+#ifdef _WIN32
+    vk_get_instance_proc_addr = (SDL_FunctionPointer)GetProcAddress((HMODULE)vulkan_handle, "vkGetInstanceProcAddr");
+#else
     vk_get_instance_proc_addr = (SDL_FunctionPointer)dlsym(vulkan_handle, "vkGetInstanceProcAddr");
+#endif
     if (!vk_get_instance_proc_addr) {
+#ifdef _WIN32
+        FreeLibrary((HMODULE)vulkan_handle);
+#else
         dlclose(vulkan_handle);
+#endif
         vulkan_handle = NULL;
         return SDL_SetError("Vulkan loader has no vkGetInstanceProcAddr");
     }
@@ -49,7 +76,11 @@ SDL_FunctionPointer SDL_Vulkan_GetVkGetInstanceProcAddr(void)
 void SDL_Vulkan_UnloadLibrary(void)
 {
     if (vulkan_handle) {
+#ifdef _WIN32
+        FreeLibrary((HMODULE)vulkan_handle);
+#else
         dlclose(vulkan_handle);
+#endif
         vulkan_handle = NULL;
         vk_get_instance_proc_addr = NULL;
     }

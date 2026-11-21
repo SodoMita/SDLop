@@ -124,7 +124,7 @@ void SDL_LockSpinlock(SDL_SpinLock *lock)
             __builtin_ia32_pause();
 #endif
         } else {
-            sched_yield(); /* give the owner a chance to run */
+            SDLOP_YIELD(); /* give the owner a chance to run */
         }
     }
 }
@@ -321,15 +321,12 @@ void SDL_DestroySemaphore(SDL_Semaphore *sem)
     }
 }
 
-static void abs_timeout(clockid_t clock, Sint64 timeout_ns, struct timespec *ts)
+/* Absolute deadline `timeout_ns` from now, expressed on the platform's
+ * monotonic clock (clock_gettime on POSIX, QueryPerformanceCounter on
+ * Windows, which is why it goes through SDLOP_MonotonicNowNS()). */
+static void abs_timeout(Sint64 timeout_ns, struct timespec *ts)
 {
-    clock_gettime(clock, ts);
-    ts->tv_sec += (time_t)(timeout_ns / 1000000000);
-    ts->tv_nsec += (long)(timeout_ns % 1000000000);
-    while (ts->tv_nsec >= 1000000000) {
-        ts->tv_sec += 1;
-        ts->tv_nsec -= 1000000000;
-    }
+    SDLOP_DeadlineFromNS(ts, SDLOP_MonotonicNowNS() + timeout_ns);
 }
 
 bool SDL_WaitSemaphoreTimeout(SDL_Semaphore *sem, Sint32 timeoutMS)
@@ -340,7 +337,14 @@ bool SDL_WaitSemaphoreTimeout(SDL_Semaphore *sem, Sint32 timeoutMS)
     if (timeoutMS == 0) {
         return SDLOP_SEM_TRYWAIT(&sem->sem);
     }
-    return SDLOP_SemTimedWait(&sem->sem, timeoutMS);
+    /* Absolute CLOCK_MONOTONIC deadline; a negative timeout is still an
+     * infinite wait, exactly like SDL3. */
+    const Sint64 deadline_ns = timeoutMS < 0
+                                   ? (Sint64)0x7fffffffffffffffull / 2
+                                   : SDLOP_MonotonicNowNS() + (Sint64)timeoutMS * 1000000ll;
+    struct timespec ts;
+    SDLOP_DeadlineFromNS(&ts, deadline_ns);
+    return SDLOP_SemWaitUntil(&sem->sem, &ts);
 }
 
 void SDL_WaitSemaphore(SDL_Semaphore *sem)
@@ -356,11 +360,7 @@ bool SDL_TryWaitSemaphore(SDL_Semaphore *sem)
 void SDL_SignalSemaphore(SDL_Semaphore *sem)
 {
     if (sem) {
-#ifdef _WIN32
-        ReleaseSemaphore(sem->sem.handle, 1, NULL);
-#else
         SDLOP_SEM_POST(&sem->sem);
-#endif
     }
 }
 
@@ -410,7 +410,7 @@ bool SDL_WaitConditionTimeout(SDL_Condition *cond, SDL_Mutex *mutex, Sint32 time
         return SDLOP_COND_WAIT(&cond->cond, &mutex->id) == 0;
     }
     struct timespec ts;
-    abs_timeout(CLOCK_MONOTONIC, (Sint64)timeoutMS * 1000000, &ts);
+    abs_timeout((Sint64)timeoutMS * 1000000, &ts);
     int rc;
     do {
         rc = SDLOP_COND_WAIT_UNTIL(&cond->cond, &mutex->id, &ts);
@@ -645,7 +645,7 @@ void SDL_CleanupTLS(void)
  * joined/detached object is freed, so a magic field alone would be a
  * use-after-free read (the memory can be handed out again). Validity is
  * therefore "is this pointer still registered". (utils b0e7d28) */
-static SDLOP_MUTEX_T thread_registry_lock = SDLOP_MUTEX_INIT;
+static SDLOP_STATIC_MUTEX(thread_registry_lock);
 static SDL_Thread *thread_registry;
 
 struct SDL_Thread
@@ -670,15 +670,15 @@ struct SDL_Thread
 
 static void thread_register(SDL_Thread *thread)
 {
-    SDLOP_MUTEX_LOCK(&thread_registry_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&thread_registry_lock));
     thread->registry_next = thread_registry;
     thread_registry = thread;
-    SDLOP_MUTEX_UNLOCK(&thread_registry_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&thread_registry_lock));
 }
 
 static void thread_unregister(SDL_Thread *thread)
 {
-    SDLOP_MUTEX_LOCK(&thread_registry_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&thread_registry_lock));
     SDL_Thread **link = &thread_registry;
     while (*link) {
         if (*link == thread) {
@@ -687,7 +687,7 @@ static void thread_unregister(SDL_Thread *thread)
         }
         link = &(*link)->registry_next;
     }
-    SDLOP_MUTEX_UNLOCK(&thread_registry_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&thread_registry_lock));
 }
 
 static bool thread_valid(SDL_Thread *thread)
@@ -698,14 +698,14 @@ static bool thread_valid(SDL_Thread *thread)
     }
 
     bool found = false;
-    SDLOP_MUTEX_LOCK(&thread_registry_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&thread_registry_lock));
     for (SDL_Thread *t = thread_registry; t; t = t->registry_next) {
         if (t == thread) {
             found = true;
             break;
         }
     }
-    SDLOP_MUTEX_UNLOCK(&thread_registry_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&thread_registry_lock));
 
     if (!found) {
         SDL_InvalidParamError("thread");

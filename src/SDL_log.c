@@ -31,9 +31,9 @@ typedef struct SDL_LogLevel
 
 static void SDLCALL SDL_LogOutput(void *userdata, int category, SDL_LogPriority priority, const char *message);
 
-static pthread_mutex_t SDL_log_lock;
-static pthread_mutex_t SDL_log_function_lock;
-static pthread_once_t log_locks_once = PTHREAD_ONCE_INIT;
+static SDLOP_MUTEX_T SDL_log_lock;
+static SDLOP_MUTEX_T SDL_log_function_lock;
+static SDLOP_ONCE_T log_locks_once = SDLOP_ONCE_INIT;
 static _Atomic int SDL_log_initialized;
 static SDL_LogLevel *SDL_loglevels;
 static SDL_LogPriority SDL_log_priorities[SDL_LOG_CATEGORY_CUSTOM];
@@ -54,12 +54,8 @@ SDL_COMPILE_TIME_ASSERT(category_names, SDL_arraysize(SDL_category_names) == SDL
 
 static void init_locks(void)
 {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&SDL_log_lock, &attr);
-    pthread_mutex_init(&SDL_log_function_lock, &attr);
-    pthread_mutexattr_destroy(&attr);
+    SDLOP_MUTEX_INIT_RECURSIVE(&SDL_log_lock);
+    SDLOP_MUTEX_INIT_RECURSIVE(&SDL_log_function_lock);
 }
 
 static void SDLCALL SDL_LoggingChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
@@ -73,17 +69,17 @@ static void SDLCALL SDL_LoggingChanged(void *userdata, const char *name, const c
 
 static void SDL_CheckInitLog(void)
 {
-    pthread_once(&log_locks_once, init_locks);
+    SDLOP_ONCE(&log_locks_once, init_locks);
     if (SDL_log_initialized) {
         return;
     }
-    pthread_mutex_lock(&SDL_log_lock);
+    SDLOP_MUTEX_LOCK(&SDL_log_lock);
     if (!SDL_log_initialized) {
         SDL_log_initialized = 1;
         /* calls SDL_ResetLogPriorities() right away with the current value */
         SDL_AddHintCallback(SDL_HINT_LOGGING, SDL_LoggingChanged, NULL);
     }
-    pthread_mutex_unlock(&SDL_log_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_lock);
 }
 
 static void CleanupLogPriorities(void)
@@ -107,35 +103,35 @@ static void CleanupLogPrefixes(void)
  * hint (hint callbacks are dropped by SDL_Quit as well) */
 void SDLOP_QuitLog(void)
 {
-    pthread_once(&log_locks_once, init_locks);
-    pthread_mutex_lock(&SDL_log_lock);
+    SDLOP_ONCE(&log_locks_once, init_locks);
+    SDLOP_MUTEX_LOCK(&SDL_log_lock);
     if (SDL_log_initialized) {
         SDL_RemoveHintCallback(SDL_HINT_LOGGING, SDL_LoggingChanged, NULL);
         CleanupLogPriorities();
         SDL_log_initialized = 0;
     }
-    pthread_mutex_unlock(&SDL_log_lock);
-    pthread_mutex_lock(&SDL_log_function_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_lock);
+    SDLOP_MUTEX_LOCK(&SDL_log_function_lock);
     CleanupLogPrefixes();
-    pthread_mutex_unlock(&SDL_log_function_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_function_lock);
 }
 
 void SDL_SetLogPriorities(SDL_LogPriority priority)
 {
     SDL_CheckInitLog();
-    pthread_mutex_lock(&SDL_log_lock);
+    SDLOP_MUTEX_LOCK(&SDL_log_lock);
     CleanupLogPriorities();
     SDL_log_default_priority = priority;
     for (int i = 0; i < (int)SDL_arraysize(SDL_log_priorities); ++i) {
         SDL_log_priorities[i] = priority;
     }
-    pthread_mutex_unlock(&SDL_log_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_lock);
 }
 
 void SDL_SetLogPriority(int category, SDL_LogPriority priority)
 {
     SDL_CheckInitLog();
-    pthread_mutex_lock(&SDL_log_lock);
+    SDLOP_MUTEX_LOCK(&SDL_log_lock);
     if (category >= 0 && category < (int)SDL_arraysize(SDL_log_priorities)) {
         SDL_log_priorities[category] = priority;
     } else {
@@ -156,7 +152,7 @@ void SDL_SetLogPriority(int category, SDL_LogPriority priority)
             }
         }
     }
-    pthread_mutex_unlock(&SDL_log_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_lock);
 }
 
 SDL_LogPriority SDL_GetLogPriority(int category)
@@ -166,7 +162,7 @@ SDL_LogPriority SDL_GetLogPriority(int category)
         return SDL_log_priorities[category];
     }
     SDL_LogPriority priority = SDL_LOG_PRIORITY_INVALID;
-    pthread_mutex_lock(&SDL_log_lock);
+    SDLOP_MUTEX_LOCK(&SDL_log_lock);
     for (SDL_LogLevel *entry = SDL_loglevels; entry; entry = entry->next) {
         if (entry->category == category) {
             priority = entry->priority;
@@ -176,7 +172,7 @@ SDL_LogPriority SDL_GetLogPriority(int category)
     if (priority == SDL_LOG_PRIORITY_INVALID) {
         priority = SDL_log_default_priority;
     }
-    pthread_mutex_unlock(&SDL_log_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_lock);
     return priority;
 }
 
@@ -270,7 +266,7 @@ static void ParseLogPriorities(const char *hint)
 void SDL_ResetLogPriorities(void)
 {
     SDL_CheckInitLog();
-    pthread_mutex_lock(&SDL_log_lock);
+    SDLOP_MUTEX_LOCK(&SDL_log_lock);
 
     const char *env = SDL_getenv("DEBUG_INVOCATION");
     bool debug = (env && *env && *env != '0');
@@ -317,7 +313,7 @@ void SDL_ResetLogPriorities(void)
             break;
         }
     }
-    pthread_mutex_unlock(&SDL_log_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_lock);
 }
 
 static const char *GetLogPriorityPrefix(SDL_LogPriority priority)
@@ -348,11 +344,11 @@ bool SDL_SetLogPriorityPrefix(SDL_LogPriority priority, const char *prefix)
     if (!prefix_copy) {
         return false;
     }
-    pthread_once(&log_locks_once, init_locks);
-    pthread_mutex_lock(&SDL_log_function_lock);
+    SDLOP_ONCE(&log_locks_once, init_locks);
+    SDLOP_MUTEX_LOCK(&SDL_log_function_lock);
     SDL_free(SDL_priority_prefixes[priority]);
     SDL_priority_prefixes[priority] = prefix_copy;
-    pthread_mutex_unlock(&SDL_log_function_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_function_lock);
     return true;
 }
 
@@ -395,9 +391,9 @@ void SDL_LogMessageV(int category, SDL_LogPriority priority, const char *fmt, va
         }
     }
 
-    pthread_mutex_lock(&SDL_log_function_lock);
+    SDLOP_MUTEX_LOCK(&SDL_log_function_lock);
     SDL_log_function(SDL_log_userdata, category, priority, message);
-    pthread_mutex_unlock(&SDL_log_function_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_function_lock);
 
     if (message != stack_buf) {
         SDL_free(message);
@@ -451,22 +447,22 @@ SDL_LogOutputFunction SDL_GetDefaultLogOutputFunction(void)
 
 void SDL_GetLogOutputFunction(SDL_LogOutputFunction *callback, void **userdata)
 {
-    pthread_once(&log_locks_once, init_locks);
-    pthread_mutex_lock(&SDL_log_function_lock);
+    SDLOP_ONCE(&log_locks_once, init_locks);
+    SDLOP_MUTEX_LOCK(&SDL_log_function_lock);
     if (callback) {
         *callback = SDL_log_function;
     }
     if (userdata) {
         *userdata = SDL_log_userdata;
     }
-    pthread_mutex_unlock(&SDL_log_function_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_function_lock);
 }
 
 void SDL_SetLogOutputFunction(SDL_LogOutputFunction callback, void *userdata)
 {
-    pthread_once(&log_locks_once, init_locks);
-    pthread_mutex_lock(&SDL_log_function_lock);
+    SDLOP_ONCE(&log_locks_once, init_locks);
+    SDLOP_MUTEX_LOCK(&SDL_log_function_lock);
     SDL_log_function = callback;
     SDL_log_userdata = userdata;
-    pthread_mutex_unlock(&SDL_log_function_lock);
+    SDLOP_MUTEX_UNLOCK(&SDL_log_function_lock);
 }

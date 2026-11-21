@@ -58,7 +58,7 @@ static const char *hint_env(const char *name)
     return result;
 }
 
-static pthread_mutex_t hint_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDLOP_STATIC_MUTEX(hint_lock);
 static Hint *hints;
 static Retired *retired;
 
@@ -163,21 +163,21 @@ bool SDL_SetHintWithPriority(const char *name, const char *value, SDL_HintPriori
         return SDL_SetError("An environment variable is taking priority");
     }
 
-    pthread_mutex_lock(&hint_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&hint_lock));
     Hint *h = get_or_create(name);
     if (!h) {
-        pthread_mutex_unlock(&hint_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
         return false;
     }
     if (h->value && priority < h->priority) {
-        pthread_mutex_unlock(&hint_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
         return false;
     }
     const char *old_effective = (env && h->priority != SDL_HINT_OVERRIDE) ? env : h->value;
     char *old_value = h->value;
     char *new_value = value ? SDL_strdup(value) : NULL;
     if (value && !new_value) {
-        pthread_mutex_unlock(&hint_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
         return false;
     }
     h->value = new_value;
@@ -188,7 +188,7 @@ bool SDL_SetHintWithPriority(const char *name, const char *value, SDL_HintPriori
         wl = snapshot_callbacks(h);
     }
     retire(old_value); /* old_effective may point at it until the callbacks ran */
-    pthread_mutex_unlock(&hint_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
 
     run_callbacks(&wl, name, old_effective, new_effective);
     return true;
@@ -205,10 +205,10 @@ bool SDL_ResetHint(const char *name)
         return SDL_InvalidParamError("name");
     }
     const char *env = hint_env(name);
-    pthread_mutex_lock(&hint_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&hint_lock));
     Hint *h = find_hint(name);
     if (!h) {
-        pthread_mutex_unlock(&hint_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
         return false;
     }
     const char *old_effective = (env && h->priority != SDL_HINT_OVERRIDE) ? env : h->value;
@@ -219,7 +219,7 @@ bool SDL_ResetHint(const char *name)
     retire(h->value);
     h->value = NULL;
     h->priority = SDL_HINT_DEFAULT;
-    pthread_mutex_unlock(&hint_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
 
     run_callbacks(&wl, name, old_effective, env);
     return true;
@@ -228,7 +228,7 @@ bool SDL_ResetHint(const char *name)
 void SDL_ResetHints(void)
 {
     /* collect names first: callbacks may modify the list */
-    pthread_mutex_lock(&hint_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&hint_lock));
     int n = 0;
     for (Hint *h = hints; h; h = h->next) {
         n++;
@@ -245,7 +245,7 @@ void SDL_ResetHints(void)
             }
         }
     }
-    pthread_mutex_unlock(&hint_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
     for (int i = 0; i < count; i++) {
         SDL_ResetHint(names[i]);
         free(names[i]);
@@ -259,12 +259,12 @@ const char *SDL_GetHint(const char *name)
         return NULL;
     }
     const char *result = hint_env(name);
-    pthread_mutex_lock(&hint_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&hint_lock));
     Hint *h = find_hint(name);
     if (h && h->value && (!result || h->priority == SDL_HINT_OVERRIDE)) {
         result = h->value;
     }
-    pthread_mutex_unlock(&hint_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
     return result;
 }
 
@@ -301,16 +301,16 @@ bool SDL_AddHintCallback(const char *name, SDL_HintCallback callback, void *user
     w->callback = callback;
     w->userdata = userdata;
 
-    pthread_mutex_lock(&hint_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&hint_lock));
     Hint *h = get_or_create(name);
     if (!h) {
-        pthread_mutex_unlock(&hint_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
         SDL_free(w);
         return false;
     }
     w->next = h->callbacks;
     h->callbacks = w;
-    pthread_mutex_unlock(&hint_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
 
     /* SDL3: the callback is invoked right away with the current value */
     const char *value = SDL_GetHint(name);
@@ -323,7 +323,7 @@ void SDL_RemoveHintCallback(const char *name, SDL_HintCallback callback, void *u
     if (!name || !*name) {
         return;
     }
-    pthread_mutex_lock(&hint_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&hint_lock));
     Hint *h = find_hint(name);
     if (h) {
         for (HintWatch **pw = &h->callbacks; *pw; pw = &(*pw)->next) {
@@ -335,12 +335,12 @@ void SDL_RemoveHintCallback(const char *name, SDL_HintCallback callback, void *u
             }
         }
     }
-    pthread_mutex_unlock(&hint_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
 }
 
 void SDLOP_QuitHints(void)
 {
-    pthread_mutex_lock(&hint_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&hint_lock));
     while (hints) {
         Hint *h = hints;
         hints = h->next;
@@ -359,5 +359,5 @@ void SDLOP_QuitHints(void)
         SDL_free(r->value);
         free(r);
     }
-    pthread_mutex_unlock(&hint_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&hint_lock));
 }

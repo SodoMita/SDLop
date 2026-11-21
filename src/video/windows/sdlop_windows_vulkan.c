@@ -1,0 +1,107 @@
+/*
+  SDLop - Vulkan on Win32 (VK_KHR_win32_surface).
+
+  SDL_Vulkan_CreateSurface hands us the VkInstance the application created.
+  We need vkCreateWin32SurfaceKHR from that instance, so the loader
+  (vulkan-1.dll) is loaded directly rather than depending on a linked
+  Vulkan library, exactly like the other SDLop backends do.
+
+  Nothing here requires the Vulkan SDK to *build*: the two Win32 types and
+  the one struct below come straight from the Vulkan specification.
+
+  This software is provided 'as-is', without any express or implied
+  warranty (zlib license, see LICENSE).
+*/
+
+#include "internal/sdlop_internal.h"
+
+#ifdef _WIN32
+
+#include "sdlop_windows.h"
+
+/* --- the bits of vulkan.h we need (VK_KHR_win32_surface) --- */
+
+#define VK_SUCCESS 0
+#define VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR 1000009000
+#define VK_KHR_WIN32_SURFACE_EXTENSION_NAME "VK_KHR_win32_surface"
+
+typedef struct VkWin32SurfaceCreateInfoKHR
+{
+    int sType;
+    const void *pNext;
+    unsigned int flags;
+    HINSTANCE hinstance;
+    HWND hwnd;
+} VkWin32SurfaceCreateInfoKHR;
+
+typedef int (*PFN_vkCreateWin32SurfaceKHR)(void *instance, const VkWin32SurfaceCreateInfoKHR *create_info,
+                                           const void *allocator, VkSurfaceKHR *surface);
+
+/* SDL_vulkan.h already defines VkSurfaceKHR (a pointer on 64-bit builds, a
+ * 64-bit integer elsewhere), so the surface type comes from there. */
+
+static const char *const win32_vulkan_extensions[] = {
+    "VK_KHR_surface",
+    VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
+    NULL
+};
+
+const char *const *SDLOP_Win32VulkanGetInstanceExtensions(SDLop_VideoDevice *device, Uint32 *count)
+{
+    (void)device;
+    if (count) {
+        *count = (Uint32)(SDL_arraysize(win32_vulkan_extensions) - 1);
+    }
+    return win32_vulkan_extensions;
+}
+
+bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *window,
+                                   void *instance, const void *allocator, Uint64 *surface)
+{
+    (void)device;
+    if (!instance) {
+        return SDL_SetError("Vulkan instance is NULL");
+    }
+    if (!window || !window->driverdata) {
+        return SDL_SetError("No window to create a Vulkan surface for");
+    }
+    /* Keep the module loaded: Vulkan dispatch tables point into it, and
+     * unloading after creating a surface would leave dangling pointers. */
+    static HMODULE vulkan_lib;
+    if (!vulkan_lib) {
+        vulkan_lib = LoadLibraryW(L"vulkan-1.dll");
+        if (!vulkan_lib) {
+            return SDL_SetError("Vulkan isn't available (couldn't load vulkan-1.dll)");
+        }
+    }
+    PFN_vkCreateWin32SurfaceKHR create =
+        (PFN_vkCreateWin32SurfaceKHR)GetProcAddress(vulkan_lib, "vkCreateWin32SurfaceKHR");
+    if (!create) {
+        return SDL_SetError("vkCreateWin32SurfaceKHR is missing from the Vulkan loader");
+    }
+
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data->hwnd) {
+        return SDL_SetError("Window has no HWND");
+    }
+
+    VkWin32SurfaceCreateInfoKHR info;
+    SDL_zero(info);
+    info.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+    info.pNext = NULL;
+    info.flags = 0;
+    info.hinstance = GetModuleHandleW(NULL);
+    info.hwnd = data->hwnd;
+
+    VkSurfaceKHR created = (VkSurfaceKHR)0;
+    const int rc = create(instance, &info, allocator, &created);
+    if (rc != VK_SUCCESS) {
+        return SDL_SetError("vkCreateWin32SurfaceKHR() failed: %d", rc);
+    }
+    if (surface) {
+        *surface = (Uint64)created;
+    }
+    return true;
+}
+
+#endif /* _WIN32 */

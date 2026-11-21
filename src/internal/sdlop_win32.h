@@ -44,13 +44,28 @@
 #include <sys/types.h>
 #include <time.h>
 
+/* <windows.h> defines CreateWindow/CreateWindowEx as macros, which collide
+ * with the SDLop_VideoDevice members of the same name. SDL3 solves this with
+ * UNICODE + a pile of #undefs; one #undef here covers every use. */
+#ifdef CreateWindow
+#undef CreateWindow
+#endif
+#ifdef CreateWindowEx
+#undef CreateWindowEx
+#endif
+#ifdef LoadImage
+#undef LoadImage
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* POSIX typedefs the core uses in public-ish signatures */
+/* POSIX typedefs: MinGW's sys/types.h already provides them; only define
+ * them for a toolchain that does not. */
+#ifndef _SSIZE_T_DEFINED
 typedef intptr_t ssize_t;
-typedef int mode_t;
+#endif
 
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
@@ -71,6 +86,17 @@ typedef int mode_t;
 /* <strings.h> */
 int strcasecmp(const char *a, const char *b);
 int strncasecmp(const char *a, const char *b, size_t n);
+int wcscasecmp(const wchar_t *a, const wchar_t *b);
+int wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n);
+char *strcasestr(const char *haystack, const char *needle);
+
+/* stdlib.h POSIX additions */
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
+
+/* qsort_r with the glibc argument order (base, n, size, cmp, arg) */
+void qsort_r(void *base, size_t nmemb, size_t size,
+             int (*compar)(const void *, const void *, void *), void *arg);
 
 /* <unistd.h> spellings */
 char *strdup(const char *s);
