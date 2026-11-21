@@ -161,23 +161,31 @@ static void test_flip_copy(void)
     SDLOP_GLOffload_FlipCopyToXRGB8888(rgba_src, 2, 2, SDLOP_GL_OFFLOAD_RGBA8888, small, 4, 1, 1);
     CHECK(small[0] == 0xFF0000FFu, "clipped 1x1 gets top-left blue (got 0x%08x)", small[0]);
 
-    /* Wide row: exercises the 4-pixel SIMD loops in both RGB and RGBA paths. */
-    const uint8_t rgb4[4 * 3] = {
+    /* Wide row: exercises the SIMD loops in both RGB and RGBA paths. The
+     * RGB source is exactly sized so an overreading load would be caught. */
+    const uint8_t rgb8[8 * 3] = {
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
         0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
     };
-    const uint8_t rgba4[4 * 4] = {
+    const uint8_t rgba8[8 * 4] = {
         0x11, 0x22, 0x33, 0x80, 0x44, 0x55, 0x66, 0x80,
         0x77, 0x88, 0x99, 0x80, 0xAA, 0xBB, 0xCC, 0x80,
+        0x01, 0x02, 0x03, 0x80, 0x04, 0x05, 0x06, 0x80,
+        0x07, 0x08, 0x09, 0x80, 0x0A, 0x0B, 0x0C, 0x80,
     };
-    const uint32_t expected[4] = { 0xFF112233u, 0xFF445566u, 0xFF778899u, 0xFFAABBCCu };
-    uint32_t simd_dst[4];
-    SDLOP_GLOffload_FlipCopyToXRGB8888(rgb4, 4, 1, SDLOP_GL_OFFLOAD_RGB888, simd_dst, 16, 4, 1);
-    for (int i = 0; i < 4; i++) {
+    const uint32_t expected[8] = {
+        0xFF112233u, 0xFF445566u, 0xFF778899u, 0xFFAABBCCu,
+        0xFF010203u, 0xFF040506u, 0xFF070809u, 0xFF0A0B0Cu,
+    };
+    uint32_t simd_dst[8];
+    SDLOP_GLOffload_FlipCopyToXRGB8888(rgb8, 8, 1, SDLOP_GL_OFFLOAD_RGB888, simd_dst, 32, 8, 1);
+    for (int i = 0; i < 8; i++) {
         CHECK(simd_dst[i] == expected[i], "RGB SIMD pixel %d (got 0x%08x)", i, simd_dst[i]);
     }
-    SDLOP_GLOffload_FlipCopyToXRGB8888(rgba4, 4, 1, SDLOP_GL_OFFLOAD_RGBA8888, simd_dst, 16, 4, 1);
-    for (int i = 0; i < 4; i++) {
+    SDLOP_GLOffload_FlipCopyToXRGB8888(rgba8, 8, 1, SDLOP_GL_OFFLOAD_RGBA8888, simd_dst, 32, 8, 1);
+    for (int i = 0; i < 8; i++) {
         CHECK(simd_dst[i] == expected[i], "RGBA SIMD pixel %d (got 0x%08x)", i, simd_dst[i]);
     }
 }

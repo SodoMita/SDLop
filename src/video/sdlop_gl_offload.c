@@ -1292,7 +1292,11 @@ static void rgb_row_to_xrgb_ssse3(const uint8_t *src, uint32_t *dst, int n)
                                           8, 7, 6, -1, 11, 10, 9, -1);
     const __m128i alpha = _mm_set1_epi32((int)0xFF000000u);
     int x = 0;
-    for (; x + 4 <= n; x += 4) {
+    /* A 16-byte load for 4 RGB pixels reads 4 bytes past the group. Keep at
+     * least one following pixel in the row so the load stays in bounds (the
+     * last few pixels are handled scalar below). This also keeps ASan clean
+     * for callers that pass a tightly-sized source buffer. */
+    for (; x + 5 <= n; x += 4) {
         __m128i v = _mm_loadu_si128((const __m128i *)(src + (size_t)x * 3u));
         __m128i out = _mm_or_si128(_mm_shuffle_epi8(v, shuffle), alpha);
         _mm_storeu_si128((__m128i *)(dst + x), out);
