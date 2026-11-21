@@ -227,7 +227,8 @@ endforeach()
 # like stock SDL3 does (src/video/wayland/protocols)
 set(SDLOP_WL_VENDORED_DIR ${CMAKE_SOURCE_DIR}/src/video/wayland/protocols)
 set(SDLOP_WL_VENDORED_PROTOCOLS
-  fractional-scale-v1)
+  fractional-scale-v1
+  text-input-unstable-v3)
 foreach(proto_name ${SDLOP_WL_VENDORED_PROTOCOLS})
   set(proto_xml ${SDLOP_WL_VENDORED_DIR}/${proto_name}.xml)
   add_custom_command(
@@ -380,6 +381,7 @@ set(SDLop_SOURCES
   src/video/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland.c
   src/video/wayland/sdlop_wayland_clipboard.c
+  src/video/wayland/sdlop_wayland_textinput.c
   src/video/wayland/sdlop_wayland_dyn.c
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
@@ -401,6 +403,7 @@ if(SDLOP_VIDEO_X11)
     src/video/x11/sdlop_x11_gl.c
     src/video/x11/sdlop_x11_clipboard.c
     src/video/x11/sdlop_x11_dnd.c
+    src/video/x11/sdlop_x11_xim.c
     src/video/x11/sdlop_x11_vulkan.c)
   list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
 endif()
@@ -601,6 +604,19 @@ if(SDLop_BUILD_TESTS)
       target_compile_options(test_x11_dnd PRIVATE -UNDEBUG)
       add_test(NAME test_x11_dnd COMMAND test_x11_dnd)
       set_tests_properties(test_x11_dnd PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # XIM input method against a fake XIM server (xcb-imdkit, test only)
+      pkg_check_modules(XIM_TEST_DEPS xcb-imdkit)
+      if(XIM_TEST_DEPS_FOUND)
+        add_executable(test_x11_xim tests/test_x11_xim.c)
+        target_link_libraries(test_x11_xim PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${XIM_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_x11_xim PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS} ${XIM_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_xim PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_xim COMMAND test_x11_xim root)
+        add_test(NAME test_x11_xim_composition COMMAND test_x11_xim composition)
+        set_tests_properties(test_x11_xim test_x11_xim_composition PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      else()
+        message(STATUS "xcb-imdkit not found: test_x11_xim not built")
+      endif()
       # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
       add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
       target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
@@ -696,7 +712,8 @@ if(SDLop_BUILD_TESTS)
       ${WL_GEN_DIR}/relative-pointer-server-protocol.c
       ${WL_GEN_DIR}/viewporter-server-protocol.c
       ${WL_GEN_DIR}/primary-selection-server-protocol.c
-      ${WL_GEN_DIR}/fractional-scale-v1-server-protocol.c)
+      ${WL_GEN_DIR}/fractional-scale-v1-server-protocol.c
+      ${WL_GEN_DIR}/text-input-unstable-v3-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -738,6 +755,13 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_wayland_dnd PRIVATE -UNDEBUG)
     add_dependencies(test_wayland_dnd mini_compositor)
     # HiDPI: fractional / preferred buffer / output scales
+    add_executable(test_wayland_textinput tests/test_wayland_textinput.c)
+    target_link_libraries(test_wayland_textinput PRIVATE sdlop)
+    target_compile_options(test_wayland_textinput PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_textinput mini_compositor)
+    add_test(NAME test_wayland_textinput COMMAND test_wayland_textinput $<TARGET_FILE:mini_compositor>)
+    set_tests_properties(test_wayland_textinput PROPERTIES TIMEOUT 60)
+
     add_executable(test_wayland_hidpi tests/test_wayland_hidpi.c)
     target_link_libraries(test_wayland_hidpi PRIVATE sdlop)
     target_compile_options(test_wayland_hidpi PRIVATE -UNDEBUG)

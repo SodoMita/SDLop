@@ -1131,7 +1131,7 @@ static void handle_xkb_event(xcb_generic_event_t *ev)
     }
 }
 
-static void handle_key(xcb_key_press_event_t *kev, bool down)
+static void handle_key(const xcb_key_press_event_t *kev, bool down, bool from_im)
 {
     SDL_Window *window = window_from_xid(kev->event);
     (void)window;
@@ -1140,6 +1140,9 @@ static void handle_key(xcb_key_press_event_t *kev, bool down)
     }
     if (kev->detail < 8) {
         return;
+    }
+    if (!from_im && SDLOP_X11_XIM_FilterKey(kev)) {
+        return; /* taken by the input method: no key event (stock) */
     }
     Uint16 evdev = (Uint16)(kev->detail - 8);
     SDL_Scancode sc = SDL_SCANCODE_UNKNOWN;
@@ -1168,6 +1171,11 @@ static void handle_key(xcb_key_press_event_t *kev, bool down)
     SDLOP_SendKeyboardKey(down, false, sc, evdev, SDLOP_MonotonicNS());
 }
 
+void SDLOP_X11_HandleKeyFromIM(const xcb_key_press_event_t *kev)
+{
+    handle_key(kev, (kev->response_type & 0x7f) == XCB_KEY_PRESS, true);
+}
+
 /* ------------------------------------------------------------------ */
 /* focus / pointer                                                     */
 /* ------------------------------------------------------------------ */
@@ -1188,6 +1196,7 @@ static void set_keyboard_focus(SDL_Window *window)
         window->flags |= SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
     }
+    SDLOP_X11_XIM_Update();
 }
 
 static bool grab_pointer(SDL_Window *window)
@@ -1945,6 +1954,7 @@ static void x11_Quit(SDLop_VideoDevice *device)
     x11.num_monitors = 0;
     SDLOP_X11_Clipboard_Quit();
     SDLOP_X11_DnD_Quit();
+    SDLOP_X11_XIM_Quit();
     free(x11.peeked);
     x11.peeked = NULL;
     if (x11.conn) {
@@ -2221,6 +2231,7 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return;
     }
     SDLOP_X11_DnD_WindowDestroyed(window);
+    SDLOP_X11_XIM_WindowDestroyed(window);
     if (x11.relative_window == window) {
         if (x11.pointer_grabbed) {
             X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
@@ -3310,7 +3321,7 @@ static void x11_dispatch(xcb_generic_event_t *ev)
     switch (type) {
     case XCB_KEY_PRESS:
     case XCB_KEY_RELEASE:
-        handle_key((xcb_key_press_event_t *)ev, type == XCB_KEY_PRESS);
+        handle_key((xcb_key_press_event_t *)ev, type == XCB_KEY_PRESS, false);
         break;
     case XCB_BUTTON_PRESS:
     case XCB_BUTTON_RELEASE:
@@ -3512,8 +3523,9 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
          * roundtrips may have pulled events off the socket already */
         x11.peeked = X11_xcb_poll_for_queued_event(x11.conn);
         if (!x11.peeked) {
-            struct pollfd pfd = { X11_xcb_get_file_descriptor(x11.conn), POLLIN, 0 };
-            poll(&pfd, 1, timeout_ms);
+            struct pollfd pfd[2] = { { X11_xcb_get_file_descriptor(x11.conn), POLLIN, 0 },
+                                     { SDLOP_X11_XIM_GetFD(), POLLIN, 0 } };
+            poll(pfd, pfd[1].fd >= 0 ? 2 : 1, timeout_ms);
         }
     }
 
@@ -3539,6 +3551,7 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         SDLOP_SendQuitEvent();
         return;
     }
+    SDLOP_X11_XIM_Pump(); /* input method replies: commits, preedit, keys handed back */
     if (x11.keymap_dirty) {
         x11.keymap_dirty = false;
         x11_load_keymap();
@@ -3557,6 +3570,32 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
     }
     X11_xcb_flush(x11.conn);
     SDLOP_KeyboardProcessRepeats();
+}
+
+/* text input: XIM (sdlop_x11_xim.c) */
+static bool x11_StartTextInput(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props)
+{
+    (void)device;
+    (void)props;
+    return SDLOP_X11_XIM_Start(window);
+}
+
+static bool x11_StopTextInput(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_X11_XIM_Stop(window);
+}
+
+static bool x11_UpdateTextInputArea(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_X11_XIM_UpdateArea(window);
+}
+
+static bool x11_ClearComposition(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_X11_XIM_ClearComposition(window);
 }
 
 static int x11_GetEventFD(SDLop_VideoDevice *device)
@@ -3647,4 +3686,8 @@ SDLop_VideoDevice SDLop_x11_device = {
     .GetPrimarySelectionText = SDLOP_X11_GetPrimarySelectionText,
     .HasPrimarySelectionText = SDLOP_X11_HasPrimarySelectionText,
     .AcceptDragAndDrop = SDLOP_X11_AcceptDragAndDrop,
+    .StartTextInput = x11_StartTextInput,
+    .StopTextInput = x11_StopTextInput,
+    .UpdateTextInputArea = x11_UpdateTextInputArea,
+    .ClearComposition = x11_ClearComposition,
 };

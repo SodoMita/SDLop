@@ -61,6 +61,7 @@
 #define SDLOP_HINT_X11_EGL_PLATFORM      "SDLOP_X11_EGL_PLATFORM"  /**< "x11" to skip the EGL xcb platform */
 #define SDLOP_HINT_X11_NO_RENDER         "SDLOP_X11_NO_RENDER"     /**< bool: do not use XRender (cursors) */
 #define SDLOP_HINT_X11_NO_SHM            "SDLOP_X11_NO_SHM"        /**< bool: do not use MIT-SHM */
+#define SDLOP_HINT_X11_NO_XIM           "SDLOP_X11_NO_XIM"        /**< bool: no input method (XIM via libX11) for text input */
 #define SDLOP_HINT_X11_NO_TOUCH          "SDLOP_X11_NO_TOUCH"      /**< bool: no XInput2 touch */
 #define SDLOP_HINT_X11_RELATIVE_WARP     "SDLOP_X11_RELATIVE_WARP" /**< bool: relative mode by warping instead of XInput2 raw motion */
 /* GPU offload (headless GPU rendering presented through the window framebuffer) */
@@ -71,6 +72,7 @@
 #define SDLOP_HINT_GL_OFFLOAD_PRIME      "SDLOP_GL_OFFLOAD_PRIME"  /**< bool: kmsdrm: scan out offloaded GL frames via PRIME import (default on; "0" copies through dumb buffers) */
 /* Wayland */
 #define SDLOP_HINT_WAYLAND_NO_VIEWPORTER "SDLOP_WAYLAND_NO_VIEWPORTER" /**< bool: do not use wp_viewporter (the clear colour is then a filled full-size buffer); read at video init */
+#define SDLOP_HINT_WAYLAND_NO_TEXT_INPUT "SDLOP_WAYLAND_NO_TEXT_INPUT" /**< bool: do not use zwp_text_input_v3 (IME); read at video init */
 #define SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE "SDLOP_WAYLAND_NO_FRACTIONAL_SCALE" /**< bool: do not use wp_fractional_scale_v1 (integer preferred buffer / output scales only); read at video init */
 /* kmsdrm */
 #define SDLOP_HINT_KMSDRM_DEVICE         "SDLOP_KMSDRM_DEVICE"     /**< DRM device: card number or /dev/dri/cardN path (default: probe) */

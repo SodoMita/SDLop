@@ -29,6 +29,12 @@
   commit is checked (buffer size a multiple of the buffer scale, else exit
   7) and appended to MINI_GEOMETRY_LOG as
   "buffer=WxH scale=S dest=WxH" (dest -1x-1: no viewport destination).
+  MINI_TEXT_INPUT=<log> offers zwp_text_input_manager_v3 for
+  tests/test_wayland_textinput.c: once the window has a buffer it gets
+  keyboard (and text-input) focus; every text-input commit is appended to
+  <log> as "enabled=E hint=H purpose=P rect=X,Y,W,H". After the first
+  enabled commit the "IME" sends preedit "日本語" (cursor bytes 3..6), done,
+  then a long commit_string (MINI_TI_COMMIT), done.
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -49,6 +55,7 @@
 #include "viewporter-server-protocol.h"
 #include "fractional-scale-v1-server-protocol.h"
 #include "primary-selection-server-protocol.h"
+#include "text-input-unstable-v3-server-protocol.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -83,6 +90,8 @@ struct mini
 };
 
 static struct mini M;
+static struct wl_resource *T_keyboard; /* text-input mode: keyboard to focus */
+static void T_maybe_focus(void);
 
 /* ---------------- buffer check mode ----------------
  *
@@ -541,6 +550,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         fflush(stdout);
     }
     D_maybe_start();
+    T_maybe_focus();
     if (M.buffer_attached && !M.entered && M.pointer) {
         M.entered = true;
         uint32_t serial = wl_display_next_serial(M.display);
@@ -848,12 +858,15 @@ static void seat_get_touch(struct wl_client *client, struct wl_resource *res, ui
     M.touch = t;
 }
 
+
 static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res, uint32_t id)
 {
     (void)res;
     struct wl_resource *k = wl_resource_create(client, &wl_keyboard_interface,
                                                wl_resource_get_version(res), id);
     wl_resource_set_implementation(k, &keyboard_impl, NULL, NULL);
+    T_keyboard = k;
+    T_maybe_focus();
 }
 
 static const struct wl_seat_interface seat_impl = {
@@ -1589,6 +1602,148 @@ static void H_output_bind(struct wl_client *client, void *data, uint32_t version
     H_send_output_scale(o, H_value);
 }
 
+/* ---------------- text input mode (MINI_TEXT_INPUT) ---------------- */
+
+static const char *T_log;
+static struct wl_resource *T_ti;
+static bool T_focused, T_scripted;
+static uint32_t T_commits;
+static struct
+{
+    int enabled;
+    uint32_t hint, purpose;
+    int32_t x, y, w, h;
+} T_pending, T_state;
+
+static void T_maybe_focus(void)
+{
+    if (!T_log || T_focused || !T_keyboard || !T_ti || !M.buffer_attached || !M.surface_res) {
+        return;
+    }
+    T_focused = true;
+    struct wl_array keys = { 0, 0, NULL };
+    wl_keyboard_send_enter(T_keyboard, wl_display_next_serial(M.display), M.surface_res, &keys);
+    zwp_text_input_v3_send_enter(T_ti, M.surface_res);
+    printf("mini: sent keyboard + text-input enter\n");
+    fflush(stdout);
+}
+
+static void T_enable(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    (void)res;
+    /* enable resets the pending state (protocol) */
+    memset(&T_pending, 0, sizeof(T_pending));
+    T_pending.enabled = 1;
+}
+
+static void T_disable(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    (void)res;
+    T_pending.enabled = 0;
+}
+
+static void T_surrounding(struct wl_client *client, struct wl_resource *res, const char *text, int32_t cursor,
+                          int32_t anchor)
+{
+    (void)client;
+    (void)res;
+    (void)text;
+    (void)cursor;
+    (void)anchor;
+}
+
+static void T_change_cause(struct wl_client *client, struct wl_resource *res, uint32_t cause)
+{
+    (void)client;
+    (void)res;
+    (void)cause;
+}
+
+static void T_content_type(struct wl_client *client, struct wl_resource *res, uint32_t hint, uint32_t purpose)
+{
+    (void)client;
+    (void)res;
+    T_pending.hint = hint;
+    T_pending.purpose = purpose;
+}
+
+static void T_cursor_rect(struct wl_client *client, struct wl_resource *res, int32_t x, int32_t y, int32_t w,
+                          int32_t h)
+{
+    (void)client;
+    (void)res;
+    T_pending.x = x;
+    T_pending.y = y;
+    T_pending.w = w;
+    T_pending.h = h;
+}
+
+static void T_commit(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    T_commits++;
+    if (T_pending.enabled) {
+        T_state = T_pending;
+    } else {
+        memset(&T_state, 0, sizeof(T_state));
+    }
+    FILE *f = fopen(T_log, "a");
+    if (f) {
+        fprintf(f, "enabled=%d hint=%u purpose=%u rect=%d,%d,%d,%d\n", T_state.enabled, T_state.hint,
+                T_state.purpose, T_state.x, T_state.y, T_state.w, T_state.h);
+        fclose(f);
+    }
+    if (T_state.enabled && !T_scripted) {
+        T_scripted = true;
+        const char *commit = getenv("MINI_TI_COMMIT") ? getenv("MINI_TI_COMMIT") : "text";
+        zwp_text_input_v3_send_preedit_string(res, "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", 3, 6);
+        zwp_text_input_v3_send_done(res, T_commits);
+        zwp_text_input_v3_send_commit_string(res, commit);
+        zwp_text_input_v3_send_done(res, T_commits);
+    }
+}
+
+static void T_ti_destroyed(struct wl_resource *res)
+{
+    if (res == T_ti) {
+        T_ti = NULL;
+    }
+}
+
+static const struct zwp_text_input_v3_interface T_ti_impl = {
+    .destroy = res_destroy,
+    .enable = T_enable,
+    .disable = T_disable,
+    .set_surrounding_text = T_surrounding,
+    .set_text_change_cause = T_change_cause,
+    .set_content_type = T_content_type,
+    .set_cursor_rectangle = T_cursor_rect,
+    .commit = T_commit,
+};
+
+static void T_get_text_input(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *seat)
+{
+    (void)seat;
+    struct wl_resource *t = wl_resource_create(client, &zwp_text_input_v3_interface, wl_resource_get_version(res), id);
+    wl_resource_set_implementation(t, &T_ti_impl, NULL, T_ti_destroyed);
+    T_ti = t;
+    T_maybe_focus();
+}
+
+static const struct zwp_text_input_manager_v3_interface T_mgr_impl = {
+    .destroy = res_destroy,
+    .get_text_input = T_get_text_input,
+};
+
+static void T_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &zwp_text_input_manager_v3_interface, version, id);
+    wl_resource_set_implementation(r, &T_mgr_impl, NULL, NULL);
+}
+
 /* ---------------- lifecycle ---------------- */
 
 static int watchdog_cb(void *data)
@@ -1723,6 +1878,11 @@ int main(void)
         wl_list_init(&S_prim.devices);
         wl_global_create(M.display, &wl_data_device_manager_interface, 3, NULL, S_mgr_bind);
         wl_global_create(M.display, &zwp_primary_selection_device_manager_v1_interface, 1, NULL, S_prim_mgr_bind);
+    }
+
+    T_log = getenv("MINI_TEXT_INPUT");
+    if (T_log) {
+        wl_global_create(M.display, &zwp_text_input_manager_v3_interface, 1, NULL, T_mgr_bind);
     }
 
     wl_display_add_client_created_listener(M.display, &client_listener);

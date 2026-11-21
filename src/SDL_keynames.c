@@ -28,8 +28,8 @@
 bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID props)
 {
     CHECK_WINDOW(window, false);
-    /* kept for SDL_PROP_TEXTINPUT_* queries; there is no on-screen
-     * keyboard or IME backend that would consume them yet */
+    /* kept for SDL_PROP_TEXTINPUT_* queries; drivers with an IME read them
+     * in StartTextInput */
     if (window->text_input_props) {
         SDL_DestroyProperties(window->text_input_props);
         window->text_input_props = 0;
@@ -43,8 +43,49 @@ bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID props
             return false;
         }
     }
+    const bool was_active = window->text_input_active;
     window->text_input_active = true;
+    /* stock: (re)starting applies the new properties */
+    if (sdlop.video && sdlop.video->StartTextInput &&
+        !sdlop.video->StartTextInput(sdlop.video, window, window->text_input_props)) {
+        window->text_input_active = was_active;
+        return false;
+    }
     return true;
+}
+
+SDL_TextInputType SDLOP_GetTextInputType(SDL_PropertiesID props)
+{
+    return (SDL_TextInputType)SDL_GetNumberProperty(props, SDL_PROP_TEXTINPUT_TYPE_NUMBER, SDL_TEXTINPUT_TYPE_TEXT);
+}
+
+SDL_Capitalization SDLOP_GetTextInputCapitalization(SDL_PropertiesID props)
+{
+    if (SDL_HasProperty(props, SDL_PROP_TEXTINPUT_CAPITALIZATION_NUMBER)) {
+        return (SDL_Capitalization)SDL_GetNumberProperty(props, SDL_PROP_TEXTINPUT_CAPITALIZATION_NUMBER,
+                                                         SDL_CAPITALIZE_NONE);
+    }
+    switch (SDLOP_GetTextInputType(props)) {
+    case SDL_TEXTINPUT_TYPE_TEXT:
+        return SDL_CAPITALIZE_SENTENCES;
+    case SDL_TEXTINPUT_TYPE_TEXT_NAME:
+        return SDL_CAPITALIZE_WORDS;
+    default:
+        return SDL_CAPITALIZE_NONE;
+    }
+}
+
+bool SDLOP_GetTextInputAutocorrect(SDL_PropertiesID props)
+{
+    return SDL_GetBooleanProperty(props, SDL_PROP_TEXTINPUT_AUTOCORRECT_BOOLEAN, true);
+}
+
+bool SDLOP_GetTextInputMultiline(SDL_PropertiesID props)
+{
+    if (SDL_HasProperty(props, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN)) {
+        return SDL_GetBooleanProperty(props, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN, false);
+    }
+    return !SDL_GetHintBoolean(SDL_HINT_RETURN_KEY_HIDES_IME, false);
 }
 
 bool SDL_StartTextInput(SDL_Window *window)
@@ -55,7 +96,12 @@ bool SDL_StartTextInput(SDL_Window *window)
 bool SDL_StopTextInput(SDL_Window *window)
 {
     CHECK_WINDOW(window, false);
-    window->text_input_active = false;
+    if (window->text_input_active) {
+        window->text_input_active = false;
+        if (sdlop.video && sdlop.video->StopTextInput) {
+            sdlop.video->StopTextInput(sdlop.video, window);
+        }
+    }
     return true;
 }
 
@@ -96,8 +142,11 @@ bool SDL_GetTextInputArea(SDL_Window *window, SDL_Rect *rect, int *cursor)
 bool SDL_ClearComposition(SDL_Window *window)
 {
     CHECK_WINDOW(window, false);
-    /* compose sequences are resolved per key press; nothing is pending
-     * across calls that an application could clear (no IME) */
+    /* compose sequences are resolved per key press; an IME may hold a
+     * composition */
+    if (sdlop.video && sdlop.video->ClearComposition) {
+        return sdlop.video->ClearComposition(sdlop.video, window);
+    }
     return true;
 }
 
@@ -122,12 +171,89 @@ void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
     if (!sdlop.keyboard_focus || !sdlop.keyboard_focus->text_input_active) {
         return;
     }
+    /* the queue stores up to 63 bytes per event: longer text (IME commits)
+     * goes out in several events, split at character boundaries */
+    const size_t max_chunk = 63;
+    while (*utf8) {
+        char chunk[64];
+        size_t n = strlen(utf8);
+        if (n > max_chunk) {
+            n = max_chunk;
+            while (n > 0 && (((unsigned char)utf8[n]) & 0xC0) == 0x80) {
+                n--; /* don't split a UTF-8 sequence */
+            }
+            if (n == 0) {
+                n = max_chunk; /* malformed: avoid looping forever */
+            }
+        }
+        memcpy(chunk, utf8, n);
+        chunk[n] = '\0';
+        utf8 += n;
+        SDL_Event event;
+        SDL_zero(event);
+        event.text.type = SDL_EVENT_TEXT_INPUT;
+        event.text.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
+        event.text.windowID = SDLOP_FocusWindowID();
+        event.text.text = chunk; /* copied into slot storage by the queue */
+        SDLOP_PushEventInternal(&event);
+    }
+}
+
+void SDLOP_SendEditingText(const char *utf8, int start, int length)
+{
+    if (!utf8 || !sdlop.keyboard_focus || !sdlop.keyboard_focus->text_input_active ||
+        !SDL_EventEnabled(SDL_EVENT_TEXT_EDITING)) {
+        return;
+    }
+    const size_t n = strlen(utf8) + 1;
+    char *copy = (char *)SDLOP_AllocateTemporaryMemory(n); /* travels with the event */
+    if (!copy) {
+        return;
+    }
+    memcpy(copy, utf8, n);
     SDL_Event event;
     SDL_zero(event);
-    event.text.type = SDL_EVENT_TEXT_INPUT;
-    event.text.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
-    event.text.windowID = SDLOP_FocusWindowID();
-    event.text.text = utf8; /* copied into slot storage by the queue */
+    event.edit.type = SDL_EVENT_TEXT_EDITING;
+    event.edit.timestamp = SDL_GetTicksNS();
+    event.edit.windowID = SDLOP_FocusWindowID();
+    event.edit.text = copy;
+    event.edit.start = start;
+    event.edit.length = length;
+    SDLOP_PushEventInternal(&event);
+}
+
+void SDLOP_SendEditingTextCandidates(char **candidates, int num_candidates, int selected_candidate, bool horizontal)
+{
+    if (!sdlop.keyboard_focus || !sdlop.keyboard_focus->text_input_active ||
+        !SDL_EventEnabled(SDL_EVENT_TEXT_EDITING_CANDIDATES)) {
+        return;
+    }
+    /* one block: the pointer array (NULL-terminated) followed by the strings */
+    size_t total = (size_t)(num_candidates + 1) * sizeof(char *);
+    for (int i = 0; i < num_candidates; i++) {
+        total += strlen(candidates[i]) + 1;
+    }
+    const char **list = (const char **)SDLOP_AllocateTemporaryMemory(total);
+    if (!list) {
+        return;
+    }
+    char *strings = (char *)(list + num_candidates + 1);
+    for (int i = 0; i < num_candidates; i++) {
+        const size_t n = strlen(candidates[i]) + 1;
+        memcpy(strings, candidates[i], n);
+        list[i] = strings;
+        strings += n;
+    }
+    list[num_candidates] = NULL;
+    SDL_Event event;
+    SDL_zero(event);
+    event.edit_candidates.type = SDL_EVENT_TEXT_EDITING_CANDIDATES;
+    event.edit_candidates.timestamp = SDL_GetTicksNS();
+    event.edit_candidates.windowID = SDLOP_FocusWindowID();
+    event.edit_candidates.candidates = num_candidates > 0 ? list : NULL;
+    event.edit_candidates.num_candidates = num_candidates;
+    event.edit_candidates.selected_candidate = selected_candidate;
+    event.edit_candidates.horizontal = horizontal;
     SDLOP_PushEventInternal(&event);
 }
 

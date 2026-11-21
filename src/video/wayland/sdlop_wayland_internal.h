@@ -72,4 +72,17 @@ bool SDLOP_Wayland_SetPrimarySelectionText(SDLop_VideoDevice *device, const char
 char *SDLOP_Wayland_GetPrimarySelectionText(SDLop_VideoDevice *device);
 bool SDLOP_Wayland_HasPrimarySelectionText(SDLop_VideoDevice *device);
 
+/* text input module (sdlop_wayland_textinput.c) */
+bool SDLOP_Wayland_TextInput_Global(struct wl_registry *registry, uint32_t name, const char *interface,
+                                    uint32_t version); /* true = bound */
+void SDLOP_Wayland_TextInput_SeatAdded(struct wl_seat *seat);
+bool SDLOP_Wayland_TextInput_Available(void);
+void SDLOP_Wayland_TextInput_Update(void); /* keyboard focus changed */
+bool SDLOP_Wayland_TextInput_Start(SDL_Window *window);
+bool SDLOP_Wayland_TextInput_Stop(SDL_Window *window);
+bool SDLOP_Wayland_TextInput_UpdateArea(SDL_Window *window);
+bool SDLOP_Wayland_TextInput_ClearComposition(SDL_Window *window);
+void SDLOP_Wayland_TextInput_WindowDestroyed(SDL_Window *window);
+void SDLOP_Wayland_TextInput_Quit(void);
+
 #endif /* sdlop_wayland_internal_h_ */

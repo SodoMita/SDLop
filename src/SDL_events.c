@@ -103,6 +103,10 @@ static TempMem *claim_event_memory(const SDL_Event *event)
     case SDL_EVENT_DROP_COMPLETE:
     case SDL_EVENT_DROP_POSITION:
         return claim_pointer(event->drop.data, claim_pointer(event->drop.source, NULL));
+    case SDL_EVENT_TEXT_EDITING:
+        return claim_pointer(event->edit.text, NULL);
+    case SDL_EVENT_TEXT_EDITING_CANDIDATES:
+        return claim_pointer(event->edit_candidates.candidates, NULL);
     default:
         return NULL;
     }

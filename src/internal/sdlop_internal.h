@@ -208,8 +208,11 @@ struct SDLop_VideoDevice
     bool (*CaptureMouse)(SDLop_VideoDevice *device, SDL_Window *window); /* NULL window = release */
     SDL_MouseButtonFlags (*GetGlobalMouseState)(SDLop_VideoDevice *device, float *x, float *y);
 
-    /* Text input / IME */
+    /* Text input / IME (stock contracts; NULL = nothing to do) */
     bool (*UpdateTextInputArea)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*StartTextInput)(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props);
+    bool (*StopTextInput)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*ClearComposition)(SDLop_VideoDevice *device, SDL_Window *window);
 };
 
 /* Cursor object (SDL_mouse.c) */
@@ -353,6 +356,15 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
  * timestamp_ns: CLOCK_MONOTONIC ns (0 = now). */
 void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16 rawcode, Uint64 timestamp_ns);
 void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns);
+/* IME composition (stock SDL_SendEditingText / ...Candidates): only while
+ * the focused window has text input active; start/length in characters */
+void SDLOP_SendEditingText(const char *utf8, int start, int length);
+void SDLOP_SendEditingTextCandidates(char **candidates, int num_candidates, int selected_candidate, bool horizontal);
+/* SDL_PROP_TEXTINPUT_* with stock defaults (props 0 = all defaults) */
+SDL_TextInputType SDLOP_GetTextInputType(SDL_PropertiesID props);
+SDL_Capitalization SDLOP_GetTextInputCapitalization(SDL_PropertiesID props);
+bool SDLOP_GetTextInputAutocorrect(SDL_PropertiesID props);
+bool SDLOP_GetTextInputMultiline(SDL_PropertiesID props);
 
 /* Mouse. Absolute x/y are window-relative; pass SDLOP_NO_POS to leave
  * the stored position untouched (relative-only motion). */

@@ -1095,6 +1095,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
         window->flags |= SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
     }
+    SDLOP_Wayland_TextInput_Update();
 }
 
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface)
@@ -1109,6 +1110,7 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
         sdlop.keyboard_focus = NULL;
         SDL_ResetKeyboard();
     }
+    SDLOP_Wayland_TextInput_Update();
 }
 
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
@@ -1869,6 +1871,32 @@ static void wayland_GetWindowSizeInPixels(SDLop_VideoDevice *device, SDL_Window 
     SDLOP_Wayland_GetWindowPixelSize(window, w, h);
 }
 
+/* text input: zwp_text_input_v3 (sdlop_wayland_textinput.c) */
+static bool wayland_StartTextInput(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props)
+{
+    (void)device;
+    (void)props; /* read from window->text_input_props */
+    return SDLOP_Wayland_TextInput_Start(window);
+}
+
+static bool wayland_StopTextInput(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_Wayland_TextInput_Stop(window);
+}
+
+static bool wayland_UpdateTextInputArea(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_Wayland_TextInput_UpdateArea(window);
+}
+
+static bool wayland_ClearComposition(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_Wayland_TextInput_ClearComposition(window);
+}
+
 static void window_forget_output(SDL_Window *window, struct wl_output *output)
 {
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
@@ -2026,6 +2054,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         d->seat = wl_registry_bind(registry, name, &wl_seat_interface, d->seat_version);
         wl_seat_add_listener(d->seat, &seat_listener, d);
         SDLOP_Wayland_Clipboard_SeatAdded(d->seat);
+        SDLOP_Wayland_TextInput_SeatAdded(d->seat);
     } else if (strcmp(interface, wl_output_interface.name) == 0 && d->num_outputs < SDLOP_MAX_OUTPUTS) {
         struct wl_output *o = wl_registry_bind(registry, name, &wl_output_interface, version < 4 ? version : 4);
         d->outputs[d->num_outputs].output = o;
@@ -2058,7 +2087,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
                !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE, false)) {
         d->fractional_manager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
     } else {
-        SDLOP_Wayland_Clipboard_Global(registry, name, interface, version);
+        if (!SDLOP_Wayland_TextInput_Global(registry, name, interface, version)) {
+            SDLOP_Wayland_Clipboard_Global(registry, name, interface, version);
+        }
     }
 }
 
@@ -2125,12 +2156,16 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     wl_registry_add_listener(wl_data.registry, &registry_listener, &wl_data);
     if (wl_display_roundtrip(wl_data.display) < 0) {
         SDLOP_Wayland_Clipboard_Quit();
+    SDLOP_Wayland_TextInput_Quit();
+        SDLOP_Wayland_TextInput_Quit();
         wl_display_disconnect(wl_data.display);
         wl_data.display = NULL;
         return SDL_SetError("Wayland registry roundtrip failed");
     }
     if (!wl_data.compositor || !wl_data.wm_base || !wl_data.shm) {
         SDLOP_Wayland_Clipboard_Quit();
+    SDLOP_Wayland_TextInput_Quit();
+        SDLOP_Wayland_TextInput_Quit();
         wl_display_disconnect(wl_data.display);
         wl_data.display = NULL;
         return SDL_SetError("Wayland compositor missing required globals (wl_compositor/xdg_wm_base/wl_shm)");
@@ -2148,6 +2183,10 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     const bool clip = SDLOP_Wayland_Clipboard_Available();
     const bool prim = SDLOP_Wayland_PrimarySelection_Available();
     device->GetWindowSizeInPixels = wayland_GetWindowSizeInPixels;
+    device->StartTextInput = wayland_StartTextInput;
+    device->StopTextInput = wayland_StopTextInput;
+    device->UpdateTextInputArea = wayland_UpdateTextInputArea;
+    device->ClearComposition = wayland_ClearComposition;
     device->SetClipboardData = clip ? SDLOP_Wayland_SetClipboardData : NULL;
     device->GetClipboardData = clip ? SDLOP_Wayland_GetClipboardData : NULL;
     device->HasClipboardData = clip ? SDLOP_Wayland_HasClipboardData : NULL;
@@ -2163,6 +2202,7 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     (void)device;
     SDLOP_Wayland_GL_Deinit();
     SDLOP_Wayland_Clipboard_Quit();
+    SDLOP_Wayland_TextInput_Quit();
     wayland_release_pointer_lock();
     if (wl_data.confined_pointer) {
         zwp_confined_pointer_v1_destroy(wl_data.confined_pointer);
@@ -2524,6 +2564,7 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
         zwp_keyboard_shortcuts_inhibitor_v1_destroy(wd->shortcuts_inhibitor);
     }
     SDLOP_Wayland_GL_WindowDestroyed(window);
+    SDLOP_Wayland_TextInput_WindowDestroyed(window);
     if (window->surface) {
         SDL_DestroySurface(window->surface);
         window->surface = NULL;

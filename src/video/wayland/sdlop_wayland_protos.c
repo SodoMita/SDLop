@@ -25,3 +25,4 @@
 #include "viewporter-protocol.c"
 #include "primary-selection-protocol.c"
 #include "fractional-scale-v1-protocol.c"
+#include "text-input-unstable-v3-protocol.c"

@@ -71,4 +71,18 @@ bool SDLOP_X11_DnD_HandleEvent(xcb_generic_event_t *ev); /* true = consumed */
 void SDLOP_X11_DnD_WindowDestroyed(SDL_Window *window);
 void SDLOP_X11_AcceptDragAndDrop(SDL_Window *window, bool accept);
 
+/* sdlop_x11_xim.c - input methods on a private Xlib connection */
+bool SDLOP_X11_XIM_Start(SDL_Window *window);
+bool SDLOP_X11_XIM_Stop(SDL_Window *window);
+bool SDLOP_X11_XIM_UpdateArea(SDL_Window *window);
+bool SDLOP_X11_XIM_ClearComposition(SDL_Window *window);
+void SDLOP_X11_XIM_Update(void); /* keyboard focus / text input changed */
+bool SDLOP_X11_XIM_FilterKey(const xcb_key_press_event_t *kev); /* true = taken by the IM */
+void SDLOP_X11_XIM_Pump(void);
+int SDLOP_X11_XIM_GetFD(void); /* -1 = none */
+void SDLOP_X11_XIM_WindowDestroyed(SDL_Window *window);
+void SDLOP_X11_XIM_Quit(void);
+/* sdlop_x11.c: a key event the IM passed back (not filtered again) */
+void SDLOP_X11_HandleKeyFromIM(const xcb_key_press_event_t *kev);
+
 #endif /* sdlop_x11_internal_h_ */
