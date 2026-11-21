@@ -582,6 +582,12 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_win32_scancodes PRIVATE -UNDEBUG)
     add_test(NAME test_win32_scancodes COMMAND test_win32_scancodes)
     set_tests_properties(test_win32_scancodes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+    # cursors need a real window, so these run against the Windows driver
+    add_executable(test_win32_cursor tests/test_win32_cursor.c)
+    target_link_libraries(test_win32_cursor PRIVATE sdlop)
+    target_include_directories(test_win32_cursor PRIVATE src)
+    target_compile_options(test_win32_cursor PRIVATE -UNDEBUG)
+    add_test(NAME test_win32_cursor COMMAND test_win32_cursor)
   else()
   # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
   # below, verified from a second xcb connection)

@@ -1432,6 +1432,143 @@ static void win32_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *wind
     SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 }
 
+/* ------------------------------------------------------------------ */
+/* Cursors                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Map an SDL system cursor onto the Win32 stock cursor id. SDL3 does the same
+ * through WINCURSORTYPE; the diagonal resizes have no Win32 stock cursor, so
+ * they fall back to the double arrow pair, as SDL3 does. */
+static LPCTSTR win32_cursor_name(SDL_SystemCursor id)
+{
+    switch (id) {
+    case SDL_SYSTEM_CURSOR_TEXT: return IDC_IBEAM;
+    case SDL_SYSTEM_CURSOR_WAIT: return IDC_WAIT;
+    case SDL_SYSTEM_CURSOR_CROSSHAIR: return IDC_CROSS;
+    case SDL_SYSTEM_CURSOR_PROGRESS: return IDC_APPSTARTING;
+    case SDL_SYSTEM_CURSOR_NWSE_RESIZE: return IDC_SIZENWSE;
+    case SDL_SYSTEM_CURSOR_NESW_RESIZE: return IDC_SIZENESW;
+    case SDL_SYSTEM_CURSOR_EW_RESIZE: return IDC_SIZEWE;
+    case SDL_SYSTEM_CURSOR_NS_RESIZE: return IDC_SIZENS;
+    case SDL_SYSTEM_CURSOR_MOVE: return IDC_SIZEALL;
+    case SDL_SYSTEM_CURSOR_NOT_ALLOWED: return IDC_NO;
+    case SDL_SYSTEM_CURSOR_POINTER: return IDC_HAND;
+    case SDL_SYSTEM_CURSOR_NW_RESIZE:
+    case SDL_SYSTEM_CURSOR_SE_RESIZE: return IDC_SIZENWSE;
+    case SDL_SYSTEM_CURSOR_NE_RESIZE:
+    case SDL_SYSTEM_CURSOR_SW_RESIZE: return IDC_SIZENESW;
+    case SDL_SYSTEM_CURSOR_E_RESIZE:
+    case SDL_SYSTEM_CURSOR_W_RESIZE: return IDC_SIZEWE;
+    case SDL_SYSTEM_CURSOR_N_RESIZE:
+    case SDL_SYSTEM_CURSOR_S_RESIZE: return IDC_SIZENS;
+    case SDL_SYSTEM_CURSOR_DEFAULT:
+    default: return IDC_ARROW;
+    }
+}
+
+/* Build a Win32 cursor from the ARGB8888 image the core prepared. Win32 wants
+ * a 1-bit AND mask plus a 1-bit XOR mask, so alpha is thresholded: pixels that
+ * are more than half opaque become part of the image, the rest stay
+ * transparent (AND mask 1, XOR mask 0). */
+static HCURSOR win32_create_cursor_from_surface(SDL_Surface *surface, int hot_x, int hot_y)
+{
+    const int w = surface->w;
+    const int h = surface->h;
+    ICONINFO info;
+    HBITMAP color = NULL, mask = NULL;
+    HCURSOR cursor = NULL;
+    const size_t mask_stride = (((size_t)w + 15) / 16) * 2;
+    const size_t color_stride = (((size_t)w * 32 + 31) / 32) * 4;
+    Uint8 *mask_bits = (Uint8 *)SDL_calloc(mask_stride, (size_t)h);
+    Uint8 *color_bits = (Uint8 *)SDL_calloc(color_stride, (size_t)h);
+
+    if (!mask_bits || !color_bits) {
+        SDL_free(mask_bits);
+        SDL_free(color_bits);
+        return NULL;
+    }
+
+    for (int y = 0; y < h; y++) {
+        const Uint32 *row = (const Uint32 *)((const Uint8 *)surface->pixels + y * surface->pitch);
+        for (int x = 0; x < w; x++) {
+            const Uint32 argb = row[x];
+            const Uint8 alpha = (Uint8)(argb >> 24);
+            const Uint8 r = (Uint8)(argb >> 16);
+            const Uint8 g = (Uint8)(argb >> 8);
+            const Uint8 b = (Uint8)(argb);
+            /* 1bpp, MSB first, rows are DWORD-aligned */
+            const size_t bit = mask_stride * (size_t)y + (size_t)x / 8;
+            const Uint8 bit_mask = (Uint8)(0x80 >> (x % 8));
+            const size_t cbit = color_stride * (size_t)y + ((size_t)x * 4);
+            const Uint32 rgb = ((Uint32)r << 16) | ((Uint32)g << 8) | (Uint32)b;
+            if (alpha >= 0x80) {
+                mask_bits[bit] &= (Uint8)~bit_mask; /* opaque: AND 0 */
+                SDL_memcpy(&color_bits[cbit], &rgb, 4);
+            } else {
+                mask_bits[bit] |= bit_mask;        /* transparent: AND 1, XOR 0 */
+            }
+        }
+    }
+
+    color = CreateBitmap(w, h, 1, 32, color_bits);
+    mask = CreateBitmap(w, h, 1, 1, mask_bits);
+    if (color && mask) {
+        SDL_zero(info);
+        info.fIcon = FALSE;
+        info.xHotspot = (DWORD)hot_x;
+        info.yHotspot = (DWORD)hot_y;
+        info.hbmMask = mask;
+        info.hbmColor = color;
+        cursor = CreateIconIndirect(&info);
+    }
+    if (color) {
+        DeleteObject(color);
+    }
+    if (mask) {
+        DeleteObject(mask);
+    }
+    SDL_free(mask_bits);
+    SDL_free(color_bits);
+    return cursor;
+}
+
+static bool win32_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    HCURSOR hcursor;
+    if (cursor->surface) {
+        hcursor = win32_create_cursor_from_surface(cursor->surface, cursor->hot_x, cursor->hot_y);
+        if (!hcursor) {
+            return SDL_SetError("Couldn't create a Windows cursor from the image");
+        }
+    } else {
+        /* shared stock cursors are owned by the system: copy them so FreeCursor
+         * can treat every cursor the same way, as SDL3 does */
+        /* IDC_* are MAKEINTRESOURCE(), narrow unless UNICODE is defined, so
+         * go through the resource id rather than the macro's type. */
+        hcursor = CopyCursor(LoadCursorW(NULL,
+                                         (LPCWSTR)win32_cursor_name(cursor->system_id)));
+        if (!hcursor) {
+            return SDL_SetError("Couldn't load the Windows system cursor");
+        }
+    }
+    cursor->internal = (void *)hcursor;
+    return true;
+}
+
+static void win32_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    HCURSOR hcursor = (HCURSOR)cursor->internal;
+    if (hcursor && SDLOP_GetCurrentCursor() == cursor) {
+        SetCursor(NULL);
+    }
+    if (hcursor) {
+        DestroyCursor(hcursor);
+    }
+    cursor->internal = NULL;
+}
+
 static bool win32_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -1720,6 +1857,8 @@ SDLop_VideoDevice SDLop_windows_device = {
     .SetWindowMouseGrab = win32_SetWindowMouseGrab,
     .SetWindowKeyboardGrab = win32_SetWindowKeyboardGrab,
     .SetWindowMouseRect = win32_SetWindowMouseRect,
+    .CreateCursor = win32_CreateCursor,
+    .FreeCursor = win32_FreeCursor,
     .FlashWindow = win32_FlashWindow,
     .SyncWindow = win32_SyncWindow,
     .SetWindowFocusable = win32_SetWindowFocusable,
