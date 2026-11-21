@@ -477,14 +477,47 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device)
+  # Portable tests: these build and pass on every platform SDLop targets.
+  if(WIN32)
+    # The evdev/fbdev/KMS/X11/Wayland tests below are Linux-only, and so are
+    # the POSIX-only ones among these (test_scancode, test_vt_mask,
+    # test_fbdev_device); the rest run under Wine (see cmake/mingw-w64.cmake).
+    # test_misc drives the Linux sysfs power backend and xdg-open, and
+    # test_surface/test_scancode their Linux drivers, so they stay below.
+    # test_keycodes drives evdev rawcodes through the xkb path, which only
+    # exists on Linux; test_win32_keycodes covers the Windows equivalent.
+    set(SDLOP_PORTABLE_TESTS test_ring test_events test_layouts
+        test_core test_main_callbacks test_threads)
+  else()
+    set(SDLOP_PORTABLE_TESTS test_ring test_scancode test_events test_surface
+        test_web test_keycodes test_layouts test_core test_main_callbacks
+        test_misc test_threads test_vt_mask test_fbdev_device)
+  endif()
+  foreach(t ${SDLOP_PORTABLE_TESTS})
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
-  target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
+  if(NOT WIN32)
+    target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
+  endif()
+  if(WIN32)
+    # Everything below is POSIX/Linux-specific (X11, Wayland, EGL, Vulkan,
+    # fbdev, KMS, evdev); the Windows port runs the portable set above plus
+    # the dummy-driver window API test.
+    add_executable(test_window_api tests/test_window_api.c)
+    target_link_libraries(test_window_api PRIVATE sdlop)
+    target_compile_options(test_window_api PRIVATE -UNDEBUG)
+    add_test(NAME test_window_api COMMAND test_window_api dummy)
+    # the Win32 keyboard path: VK translation + driver-supplied text
+    add_executable(test_win32_keycodes tests/test_win32_keycodes.c)
+    target_link_libraries(test_win32_keycodes PRIVATE sdlop)
+    target_include_directories(test_win32_keycodes PRIVATE src)
+    target_compile_options(test_win32_keycodes PRIVATE -UNDEBUG)
+    add_test(NAME test_win32_keycodes COMMAND test_win32_keycodes)
+  else()
   # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
   # below, verified from a second xcb connection)
   add_executable(test_window_api tests/test_window_api.c)
@@ -718,7 +751,8 @@ if(SDLop_BUILD_TESTS)
   else()
     message(STATUS "wayland-client not found - skipping test_virtual_input")
   endif()
-endif()
+  endif()  # else() of if(WIN32): Linux-only tests above
+endif()    # SDLop_BUILD_TESTS
 
 # ---------------------------------------------------------------------------
 # Benchmarks (SDLop vs SDL3)

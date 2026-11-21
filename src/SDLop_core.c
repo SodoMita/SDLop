@@ -70,7 +70,9 @@ const char *SDL_GetRevision(void)
 
 const char *SDL_GetPlatform(void)
 {
-#ifdef __EMSCRIPTEN__
+#if defined(_WIN32)
+    return "Windows";
+#elif defined(__EMSCRIPTEN__)
     return "Emscripten";
 #else
     return "Linux";

@@ -260,10 +260,9 @@ int SDLOP_CondWaitUntilImpl(CONDITION_VARIABLE *cond, CRITICAL_SECTION *mutex,
 
 /* --- semaphore --------------------------------------------------- */
 
-/* SDL3 semaphores count up; Win32 semaphores count down. The struct keeps
- * the SDL-side count so SDL_GetSemaphoreValue is exact, and the handle is a
- * semaphore whose count is the number of *free slots*, i.e. INT_MAX - count.
- * That keeps the handle bounded while the reported count stays an int. */
+/* The Win32 handle's count is the SDL-side count (see SDLOP_SemInit);
+ * `count` mirrors it for SDL_GetSemaphoreValue() so polling never has to
+ * disturb a waiter. */
 typedef struct SDLOP_SEM_T
 {
     HANDLE handle;

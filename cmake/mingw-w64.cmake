@@ -26,5 +26,10 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-# Wine runs the tests here; see tests/README-Windows.md
-set(CMAKE_CROSSCOMPILING_EMULATOR "wine" CACHE STRING "")
+# Wine runs the tests on the build host (ctest can then execute the .exe
+# files); on a real Windows machine ctest runs them natively and this is
+# unused. WINEPREFIX/XDG_RUNTIME_DIR/WINEDEBUG come from the environment.
+find_program(SDLOP_WINE_EXECUTABLE NAMES wine wine64)
+if(SDLOP_WINE_EXECUTABLE AND NOT MINGW_NO_WINE)
+  set(CMAKE_CROSSCOMPILING_EMULATOR "${SDLOP_WINE_EXECUTABLE}" CACHE STRING "Wine runs the Windows test binaries")
+endif()

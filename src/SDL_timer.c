@@ -136,7 +136,7 @@ timer_thread_main(void *arg)
     pthread_sigmask(SIG_BLOCK, &all, NULL); /* signals belong to the app */
 #endif
 
-    SDLOP_MUTEX_LOCK(&timer_lock.id);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&timer_lock));
     while (!timer_quit) {
         if (!timers) {
             SDLOP_COND_WAIT(&timer_cond, SDLOP_SM(&timer_lock));
@@ -156,7 +156,7 @@ timer_thread_main(void *arg)
             continue;
         }
         running = t;
-        SDLOP_MUTEX_UNLOCK(&timer_lock.id);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
 
         Uint64 next_ns;
         if (t->callback_ns) {
@@ -165,7 +165,7 @@ timer_thread_main(void *arg)
             next_ns = (Uint64)t->callback_ms(t->userdata, t->id, (Uint32)(t->interval_ns / 1000000ull)) * 1000000ull;
         }
 
-        SDLOP_MUTEX_LOCK(&timer_lock.id);
+        SDLOP_MUTEX_LOCK(SDLOP_SM(&timer_lock));
         running = NULL;
         if (next_ns && !t->canceled && !timer_quit) {
             t->interval_ns = next_ns;
@@ -204,7 +204,7 @@ static SDL_TimerID add_timer(Uint64 interval_ns, SDL_TimerCallback cb_ms, SDL_NS
     t->interval_ns = interval_ns;
     t->deadline_ns = SDL_GetPerformanceCounter() + interval_ns;
 
-    SDLOP_MUTEX_LOCK(&timer_lock.id);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&timer_lock));
     if (!timer_cond_inited) {
         SDLOP_COND_INIT(&timer_cond);
         timer_cond_inited = true;
@@ -220,7 +220,7 @@ static SDL_TimerID add_timer(Uint64 interval_ns, SDL_TimerCallback cb_ms, SDL_NS
         timer_thread_id = timer_thread;
 #endif
         if (!created) {
-            SDLOP_MUTEX_UNLOCK(&timer_lock.id);
+            SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
             SDL_free(t);
             SDL_SetError("Couldn't create timer thread");
             return 0;
@@ -254,7 +254,7 @@ bool SDL_RemoveTimer(SDL_TimerID id)
         return SDL_InvalidParamError("id");
     }
     bool found = false;
-    SDLOP_MUTEX_LOCK(&timer_lock.id);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&timer_lock));
     for (SDLOP_Timer *t = timers; t; t = t->next) {
         if (t->id == id && !t->canceled) {
             t->canceled = true;
@@ -276,9 +276,9 @@ bool SDL_RemoveTimer(SDL_TimerID id)
 /* SDL_Quit(): stop the thread, drop all timers */
 void SDLOP_QuitTimers(void)
 {
-    SDLOP_MUTEX_LOCK(&timer_lock.id);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&timer_lock));
     if (!timer_thread_running) {
-        SDLOP_MUTEX_UNLOCK(&timer_lock.id);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&timer_lock));
         return;
     }
     timer_quit = true;
@@ -298,7 +298,7 @@ void SDLOP_QuitTimers(void)
         pthread_detach(timer_thread); /* SDL_Quit() from a timer callback */
     }
 #endif
-    SDLOP_MUTEX_LOCK(&timer_lock.id);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&timer_lock));
     timer_thread_running = false;
     while (timers) {
         SDLOP_Timer *t = timers;

@@ -73,14 +73,15 @@ Uint32 SDLOP_ThreadIDOfHandle(HANDLE h)
 /* Semaphore                                                           */
 /* ------------------------------------------------------------------ */
 
-/* SDL_Semaphore counts up from 0; a Win32 semaphore counts down from its
- * maximum. The handle therefore holds (SDLOP_SEM_MAX - count) "free slots",
- * so a signal releases one slot and a wait takes one. `count` mirrors the
- * SDL-side value so SDL_GetSemaphoreValue() is a plain read. */
+/* A Win32 semaphore with count n lets n waits through and blocks the next
+ * one, which is exactly SDL3's "count up from 0" SDL_Semaphore: the handle's
+ * count *is* the value SDL reports. `count` mirrors it so
+ * SDL_GetSemaphoreValue() is a plain read that does not disturb waiters. */
 bool SDLOP_SemInit(SDLOP_SEM_T *sem, Uint32 initial_value)
 {
-    sem->handle = CreateSemaphoreA(NULL, (LONG)(SDLOP_SEM_MAX - initial_value), SDLOP_SEM_MAX, NULL);
-    sem->count = (LONG)initial_value;
+    const LONG initial = initial_value > (Uint32)SDLOP_SEM_MAX ? SDLOP_SEM_MAX : (LONG)initial_value;
+    sem->handle = CreateSemaphoreA(NULL, initial, SDLOP_SEM_MAX, NULL);
+    sem->count = initial;
     return sem->handle != NULL;
 }
 

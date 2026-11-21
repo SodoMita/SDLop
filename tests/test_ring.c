@@ -6,9 +6,9 @@
   warranty (zlib license, see LICENSE).
 */
 
+#include <SDL3/SDL.h>
 #include "internal/sdlop_ring.h"
 #include <assert.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -18,7 +18,7 @@
 static uint64_t storage[CAPACITY];
 static SDLOP_Ring ring;
 
-static void *producer(void *arg)
+static int SDLCALL producer(void *arg)
 {
     (void)arg;
     for (uint64_t i = 0; i < TOTAL; i++) {
@@ -26,7 +26,7 @@ static void *producer(void *arg)
             /* spin: SPSC contract is that the consumer keeps up */
         }
     }
-    return NULL;
+    return 0;
 }
 
 int main(void)
@@ -34,8 +34,8 @@ int main(void)
     SDLOP_RingInit(&ring, storage, CAPACITY, sizeof(uint64_t));
     assert(SDLOP_RingEmpty(&ring));
 
-    pthread_t t;
-    assert(pthread_create(&t, NULL, producer, NULL) == 0);
+    SDL_Thread *t = SDL_CreateThread(producer, "ring-producer", NULL);
+    assert(t != NULL);
 
     uint64_t expected = 0;
     while (expected < TOTAL) {
@@ -45,7 +45,7 @@ int main(void)
             expected++;
         }
     }
-    pthread_join(t, NULL);
+    SDL_WaitThread(t, NULL);
     assert(SDLOP_RingEmpty(&ring));
     assert(expected == TOTAL);
 

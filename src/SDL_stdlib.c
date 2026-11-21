@@ -1271,6 +1271,12 @@ static SDLOP_IconvKind iconv_kind(const char *name)
     if (SDL_strcasecmp(name, "UCS-2") == 0) {
         return SDLOP_ICONV_UCS2;
     }
+    /* the Windows ANSI code page: SDL3 spells it "ACP", and an empty or
+     * "ANSI" name means the same in the Win32 iconv world */
+    if (SDL_strcasecmp(name, "ACP") == 0 || SDL_strcasecmp(name, "ANSI") == 0 ||
+        SDL_strcasecmp(name, "CP_ACP") == 0) {
+        return SDLOP_ICONV_ACP;
+    }
     return SDLOP_ICONV_UNSUPPORTED;
 }
 
@@ -1392,10 +1398,29 @@ static bool iconv_next(const SDLOP_IconvKind from, const char **in, size_t *left
         if (*left < 1) {
             return false;
         }
-        /* single-byte ANSI code page; the caller converts through UTF-16 */
-        *cp = p[0];
-        *in += 1;
-        *left -= 1;
+        /* The ANSI code page is not necessarily single-byte (and even CP1252
+         * differs from Latin-1 over 0x80..0x9F), so decode through UTF-16:
+         * a byte is one character unless it is a DBCS lead byte. */
+        wchar_t wbuf[2];
+        int used = 1;
+        int n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, (const char *)p, 1, wbuf, (int)SDL_arraysize(wbuf));
+        if (n == 0) {
+            if (*left < 2) {
+                return false; /* a lead byte at the end: incomplete */
+            }
+            used = 2;
+            n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, (const char *)p, 2, wbuf, (int)SDL_arraysize(wbuf));
+            if (n == 0) {
+                return false;
+            }
+        }
+        if (n == 2 && wbuf[0] >= 0xD800 && wbuf[0] <= 0xDBFF && wbuf[1] >= 0xDC00 && wbuf[1] <= 0xDFFF) {
+            *cp = 0x10000 + (((Uint32)wbuf[0] - 0xD800) << 10) + ((Uint32)wbuf[1] - 0xDC00);
+        } else {
+            *cp = (Uint32)wbuf[0];
+        }
+        *in += used;
+        *left -= (size_t)used;
         return true;
     }
     default:
@@ -1442,9 +1467,12 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
             char tmp[8];
             const int n = WideCharToMultiByte(CP_ACP, 0, wbuf, wlen, tmp, (int)sizeof(tmp), "?", NULL);
             if (n <= 0) {
+                /* iconv semantics on EILSEQ: *inbuf points at the offending
+                 * input, and *inbytesleft counts from there - so undo the
+                 * decode that iconv_next() already did. */
+                const size_t consumed = (size_t)(*inbuf - before);
                 *inbuf = before;
-                /* put the bytes back: iconv reports EILSEQ and consumes nothing */
-                *inbytesleft += (size_t)(*inbuf - before);
+                *inbytesleft += consumed;
                 return SDL_ICONV_EILSEQ;
             }
             if (*outbytesleft < (size_t)n) {
@@ -1571,6 +1599,10 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
     return r;
 }
 
+#endif /* _WIN32 */
+
+/* SDL_iconv_string is written against SDL_iconv_open/iconv/iconv_close only,
+ * so one implementation serves the native-iconv branch and the Windows one. */
 char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inbuf, size_t inbytesleft)
 {
     if (!tocode || !*tocode) {
@@ -1583,7 +1615,7 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
     if (cd == (SDL_iconv_t)-1) {
         return NULL;
     }
-    size_t stringsize = inbytesleft;
+    size_t stringsize = inbytesleft ? inbytesleft : 16;
     char *string = (char *)SDL_malloc(stringsize + sizeof(Uint32));
     if (!string) {
         SDL_iconv_close(cd);
@@ -1591,11 +1623,12 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
     }
     char *outbuf = string;
     size_t outbytesleft = stringsize;
-    memset(outbuf, 0, sizeof(Uint32));
+    SDL_memset(outbuf, 0, sizeof(Uint32));
 
     while (inbytesleft > 0) {
-        const size_t oldinbytesleft = inbytesleft;
-        size_t retCode = SDL_iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
+        size_t inbytesleft_save = inbytesleft;
+        size_t outbytesleft_save = outbytesleft;
+        const int retCode = SDL_iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
         if (retCode == SDL_ICONV_E2BIG) {
             const ptrdiff_t diff = outbuf - string;
             char *oldstring = string;
@@ -1608,7 +1641,7 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
             }
             outbuf = string + diff;
             outbytesleft = stringsize - (size_t)diff;
-            memset(outbuf, 0, sizeof(Uint32));
+            SDL_memset(outbuf, 0, sizeof(Uint32));
             continue;
         } else if (retCode == SDL_ICONV_EILSEQ) {
             ++inbuf;
@@ -1616,16 +1649,14 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
         } else if (retCode == SDL_ICONV_EINVAL || retCode == SDL_ICONV_ERROR) {
             inbytesleft = 0;
         }
-        if (oldinbytesleft == inbytesleft) {
+        if (inbytesleft_save == inbytesleft && outbytesleft_save == outbytesleft) {
             break;
         }
     }
-    memset(outbuf, 0, sizeof(Uint32));
+    SDL_memset(outbuf, 0, sizeof(Uint32));
     SDL_iconv_close(cd);
     return string;
 }
-
-#endif /* _WIN32 */
 
 /* ------------------------------------------------------------------ */
 /* Environment                                                         */

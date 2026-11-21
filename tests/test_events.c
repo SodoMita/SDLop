@@ -128,7 +128,10 @@ int main(void)
     SDL_FlushEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP);
 
     /* xkb-backed checks: skip gracefully when libxkbcommon (dlopen'd at
-     * run time) is not installed on this system */
+     * run time) is not installed on this system. Windows has no xkb at all -
+     * the driver gets key text from WM_CHAR/WM_UNICHAR instead - so the
+     * translation checks below are POSIX-only. */
+#ifndef _WIN32
     bool have_xkb = SDLOP_KeyboardSetDefaultKeymap();
     if (have_xkb) {
         /* text input must be enabled on the focused window (SDL3 semantics) */
@@ -181,6 +184,7 @@ int main(void)
                SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_KP_ENTER));
         assert(SDL_GetKeyFromScancode(SDL_SCANCODE_RETURN, SDL_KMOD_NONE, true) == SDLK_RETURN);
     }
+#endif /* !_WIN32 (xkb-backed checks) */
 
     /* --- mouse state --- */
     extern void SDLOP_SendMouseMotion(float x, float y, float xrel, float yrel, Uint64 ts);
@@ -329,7 +333,7 @@ int main(void)
     assert(SDL_GetKeyFromName("Space") == SDLK_SPACE);
     assert(SDL_GetKeyFromName("Return") == SDLK_RETURN);
 
-#ifndef __EMSCRIPTEN__ /* the web backend has no xkb keymaps */
+#if !defined(__EMSCRIPTEN__) && !defined(_WIN32) /* neither has xkb keymaps */
     /* --- stock parity: KEYMAP_CHANGED fires for a replaced keymap --- */
     if (have_xkb) {
     static const char minimal_keymap[] =
@@ -368,7 +372,7 @@ int main(void)
     }
     } /* have_xkb */
 
-#endif /* !__EMSCRIPTEN__ */
+#endif /* !__EMSCRIPTEN__ && !_WIN32 */
 
     /* --- destroy --- */
     SDL_WindowID saved_id = SDL_GetWindowID(w);

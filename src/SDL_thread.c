@@ -665,6 +665,7 @@ struct SDL_Thread
     SDL_ThreadFunction userfunc;
     void *userdata;
     SDL_Semaphore *started; /* creator waits until the name/id are set */
+    SDL_FunctionPointer pfnEndThread; /* Windows: the CRT's _endthreadex */
     struct SDL_Thread *registry_next;
 };
 
@@ -800,7 +801,12 @@ run_thread(void *arg)
         }
     }
 #ifdef _WIN32
-    return 0;
+    /* _beginthreadex wants an unsigned return; _endthreadex finishes the CRT's
+     * per-thread bookkeeping the same way a normal return does. */
+    if (thread->pfnEndThread) {
+        ((void (__stdcall *)(unsigned))thread->pfnEndThread)((unsigned)status);
+    }
+    return (unsigned)status;
 #else
     return NULL;
 #endif
@@ -809,10 +815,18 @@ run_thread(void *arg)
 SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_FunctionPointer pfnBeginThread,
                                                   SDL_FunctionPointer pfnEndThread)
 {
+#ifndef _WIN32
+    /* The POSIX side creates threads with pthread_create, so the C runtime
+     * hooks SDL3 passes on Windows have nothing to do. */
     if (pfnBeginThread || pfnEndThread) {
         SDL_SetError("_beginthreadex/_endthreadex not supported on this platform");
         return NULL;
     }
+#else
+    (void)pfnBeginThread; /* SDL3 always passes _beginthreadex, which is what
+                           * SDLOP uses for creation; the CRT's matching
+                           * _endthreadex is called from run_thread. */
+#endif
     SDL_ThreadFunction fn = (SDL_ThreadFunction)SDL_GetPointerProperty(props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER, NULL);
     const char *name = SDL_GetStringProperty(props, SDL_PROP_THREAD_CREATE_NAME_STRING, NULL);
     const size_t stacksize = (size_t)SDL_GetNumberProperty(props, SDL_PROP_THREAD_CREATE_STACKSIZE_NUMBER, 0);
@@ -840,6 +854,11 @@ SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_Fu
     thread->userfunc = fn;
     thread->userdata = userdata;
     thread->stacksize = stacksize;
+#ifdef _WIN32
+    thread->pfnEndThread = pfnEndThread;
+#else
+    (void)pfnEndThread;
+#endif
     thread->started = SDL_CreateSemaphore(0);
     if (!thread->started) {
         free_thread(thread);

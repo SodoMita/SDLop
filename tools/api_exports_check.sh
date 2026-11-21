@@ -23,8 +23,17 @@ for h in "$INC"/SDL3/*.h; do
         | sed -E 's/.*SDLCALL +(SDL_[A-Za-z0-9_]+) *\(/\1/' || true
 done | sort -u > "$tmp/declared"
 
-nm -D --defined-only "$SO" | awk '$2=="T" || $2=="i" {sub(/@.*/,"",$3); print $3}' \
-    | grep -E '^SDL_' | sort -u > "$tmp/exported"
+# ELF (.so/.dylib) or PE (.dll): a Windows DLL has no dynamic symbol table
+# in the ELF sense, so ask objdump for its export directory instead.
+if file -b "$SO" | grep -qi 'PE32'; then
+    objdump -p "$SO" | awk '/^\[Ordinal\/Name Pointer\] Table/ {t=1; next}
+                                 t && /^$/ {exit}
+                                 t {print $NF}' | sort -u > "$tmp/exported"
+else
+    nm -D --defined-only "$SO" | awk '$2=="T" || $2=="i" {sub(/@.*/,"",$3); print $3}' \
+        | sort -u > "$tmp/exported"
+fi
+grep -E '^SDL_' "$tmp/exported" > "$tmp/exported.sdl" && mv "$tmp/exported.sdl" "$tmp/exported"
 
 missing=$(comm -23 "$tmp/declared" "$tmp/exported")
 extra=$(comm -13 "$tmp/declared" "$tmp/exported")

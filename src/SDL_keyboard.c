@@ -365,11 +365,6 @@ static bool set_keymap(struct xkb_keymap *new_keymap)
 
 bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
 {
-#ifdef _WIN32
-    (void)keymap_string;
-    (void)length;
-    return true; /* nothing to install: the system provides key translation */
-#else
     if (!SDLOP_Xkb_LoadSymbols()) {
         return false;
     }
@@ -394,14 +389,10 @@ bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
         return SDL_SetError("Could not parse Wayland xkb keymap");
     }
     return set_keymap(km);
-#endif
 }
 
 bool SDLOP_KeyboardSetDefaultKeymap(void)
 {
-#ifdef _WIN32
-    return true;
-#else
     if (!SDLOP_Xkb_LoadSymbols()) {
         return false;
     }
@@ -420,7 +411,6 @@ bool SDLOP_KeyboardSetDefaultKeymap(void)
         return SDL_SetError("Could not create default xkb keymap");
     }
     return set_keymap(km);
-#endif
 }
 
 /* rebuild the caps/num/level5/mode bits (and cross-check the L/R bits)
@@ -478,26 +468,7 @@ void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 l
     SDLOP_KeyboardUpdateXkbState(depressed, latched, locked, 0, 0, 0);
 }
 
-#else /* _WIN32 */
-
-/* Windows has no xkb keymap and no compositor-supplied one: keys arrive as
- * virtual-key codes and text as WM_CHAR/WM_UNICHAR (see the driver), so the
- * whole xkb block above compiles away. The stubs below keep the internal
- * contract (see sdlop_internal.h) intact. */
-
-void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locked,
-                                  Uint32 group, Uint32 keycode, Uint32 mods)
-{
-    (void)depressed; (void)latched; (void)locked;
-    (void)group; (void)keycode; (void)mods;
-}
-
-void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
-{
-    (void)depressed; (void)latched; (void)locked;
-}
-
-#endif /* _WIN32 (xkb block) */
+#endif /* !_WIN32 (xkb keymap layer) */
 
 /* ------------------------------------------------------------------ */
 /* keysym -> SDL_Keycode                                               */
@@ -638,6 +609,39 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
 }
 
 #endif /* !_WIN32 (keysym mapping) */
+
+#ifdef _WIN32
+
+/* Windows has no xkb keymap and no compositor-supplied one: keys arrive as
+ * virtual-key codes (translated in src/SDL_win32_keymap.c) and text as
+ * WM_CHAR/WM_UNICHAR from the driver, so everything above compiles away.
+ * The stubs keep the internal contract (see sdlop_internal.h) intact. */
+
+bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
+{
+    (void)keymap_string; (void)length;
+    return true; /* the system provides key translation; nothing to install */
+}
+
+bool SDLOP_KeyboardSetDefaultKeymap(void)
+{
+    return true;
+}
+
+void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locked,
+                                  Uint32 group, Uint32 keycode, Uint32 mods)
+{
+    (void)depressed; (void)latched; (void)locked;
+    (void)group; (void)keycode; (void)mods;
+}
+
+void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 locked)
+{
+    (void)depressed; (void)latched; (void)locked;
+}
+
+#endif /* _WIN32 */
+
 
 /* SDL3's built-in US layout (SDL_GetDefaultKeyFromScancode): used when no
  * xkb keymap is available (no libxkbcommon), and as the Windows mapping, so
