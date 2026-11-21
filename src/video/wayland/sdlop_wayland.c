@@ -29,6 +29,9 @@
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #include "cursor-shape-v1-client-protocol.h"
+#include "xdg-toplevel-icon-v1-client-protocol.h"
+#include "xdg-dialog-v1-client-protocol.h"
+#include "alpha-modifier-v1-client-protocol.h"
 #include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
@@ -101,6 +104,11 @@ typedef struct WaylandWindowData
     struct zxdg_toplevel_decoration_v1 *decoration;
     struct zwp_idle_inhibitor_v1 *idle_inhibitor;
     struct zwp_keyboard_shortcuts_inhibitor_v1 *shortcuts_inhibitor;
+    struct xdg_dialog_v1 *dialog;      /* SDL_WINDOW_MODAL (xdg_wm_dialog_v1) */
+    struct wp_alpha_modifier_surface_v1 *alpha; /* SDL_SetWindowOpacity, created on first use */
+    struct xdg_toplevel_icon_v1 *icon; /* SDL_SetWindowIcon, kept for re-shown toplevels */
+    struct wl_buffer **icon_buffers;   /* must outlive the icon */
+    int num_icon_buffers;
 
     /* GL presentation state (managed by sdlop_wayland_gl.c) */
     void *gl_surface; /* EGLSurface or SDLOP_GLOffloadSurface* */
@@ -154,6 +162,9 @@ typedef struct WaylandDeviceData
     struct zwp_pointer_constraints_v1 *pointer_constraints;
     struct zwp_relative_pointer_manager_v1 *relative_manager;
     struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+    struct xdg_toplevel_icon_manager_v1 *toplevel_icon_manager;
+    struct xdg_wm_dialog_v1 *wm_dialog;
+    struct wp_alpha_modifier_v1 *alpha_modifier;
     struct wp_cursor_shape_device_v1 *cursor_shape_device; /* of `pointer` */
     struct zwp_locked_pointer_v1 *locked_pointer;
     struct zwp_relative_pointer_v1 *relative_pointer;
@@ -1254,15 +1265,17 @@ static uint32_t system_cursor_shape(SDL_SystemCursor id)
     }
 }
 
-/* premultiplied ARGB8888 wl_shm buffer (the pool is released right away;
- * the buffer keeps the memory alive) */
-static struct wl_buffer *create_shm_cursor_buffer(const uint32_t *argb, int w, int h, int pitch_px)
+/* premultiplied ARGB8888 wl_shm buffer of bw x bh holding the w x h
+ * straight-alpha image at (ox, oy), transparent elsewhere (the pool is
+ * released right away; the buffer keeps the memory alive) */
+static struct wl_buffer *create_shm_argb_buffer(const uint32_t *argb, int w, int h, int pitch_px, int bw, int bh,
+                                                int ox, int oy)
 {
     if (!wl_data.shm) {
         return NULL;
     }
-    const size_t size = (size_t)w * (size_t)h * 4;
-    int fd = memfd_create("sdlop-cursor", MFD_CLOEXEC);
+    const size_t size = (size_t)bw * (size_t)bh * 4;
+    int fd = memfd_create("sdlop-argb", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, (off_t)size) < 0) {
         if (fd >= 0) {
             close(fd);
@@ -1274,21 +1287,27 @@ static struct wl_buffer *create_shm_cursor_buffer(const uint32_t *argb, int w, i
         close(fd);
         return NULL;
     }
-    uint32_t *pix = (uint32_t *)map;
+    uint32_t *pix = (uint32_t *)map; /* memfd pages start zeroed */
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             const uint32_t p = argb[(size_t)y * (size_t)pitch_px + (size_t)x];
             const uint32_t a = p >> 24;
-            pix[y * w + x] = (a << 24) | ((((p >> 16) & 0xff) * a / 255) << 16) |
-                             ((((p >> 8) & 0xff) * a / 255) << 8) | ((p & 0xff) * a / 255);
+            pix[(size_t)(y + oy) * (size_t)bw + (size_t)(x + ox)] =
+                (a << 24) | ((((p >> 16) & 0xff) * a / 255) << 16) | ((((p >> 8) & 0xff) * a / 255) << 8) |
+                ((p & 0xff) * a / 255);
         }
     }
     struct wl_shm_pool *pool = wl_shm_create_pool(wl_data.shm, fd, (int32_t)size);
-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, w, h, w * 4, WL_SHM_FORMAT_ARGB8888);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, bw, bh, bw * 4, WL_SHM_FORMAT_ARGB8888);
     wl_shm_pool_destroy(pool);
     munmap(map, size);
     close(fd);
     return buffer;
+}
+
+static struct wl_buffer *create_shm_cursor_buffer(const uint32_t *argb, int w, int h, int pitch_px)
+{
+    return create_shm_argb_buffer(argb, w, h, pitch_px, w, h, 0, 0);
 }
 
 static bool builtin_arrow_pixels(uint32_t *pix)
@@ -2140,6 +2159,13 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0 && !d->cursor_shape_manager &&
                !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_CURSOR_SHAPE, false)) {
         d->cursor_shape_manager = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+    } else if (strcmp(interface, xdg_toplevel_icon_manager_v1_interface.name) == 0 && !d->toplevel_icon_manager) {
+        /* icon_size preferences are ignored (stock) */
+        d->toplevel_icon_manager = wl_registry_bind(registry, name, &xdg_toplevel_icon_manager_v1_interface, 1);
+    } else if (strcmp(interface, wp_alpha_modifier_v1_interface.name) == 0 && !d->alpha_modifier) {
+        d->alpha_modifier = wl_registry_bind(registry, name, &wp_alpha_modifier_v1_interface, 1);
+    } else if (strcmp(interface, xdg_wm_dialog_v1_interface.name) == 0 && !d->wm_dialog) {
+        d->wm_dialog = wl_registry_bind(registry, name, &xdg_wm_dialog_v1_interface, 1);
     } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
         d->has_dmabuf = true;
     } else if (strcmp(interface, "wl_drm") == 0) {
@@ -2205,6 +2231,8 @@ static const struct wl_registry_listener registry_listener = {
 /* ------------------------------------------------------------------ */
 
 static void wayland_Quit(SDLop_VideoDevice *device);
+static bool wayland_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon);
+static bool wayland_SetWindowOpacity(SDLop_VideoDevice *device, SDL_Window *window, float opacity);
 
 static bool wayland_Init(SDLop_VideoDevice *device)
 {
@@ -2257,6 +2285,8 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     const bool clip = SDLOP_Wayland_Clipboard_Available();
     const bool prim = SDLOP_Wayland_PrimarySelection_Available();
     device->GetWindowSizeInPixels = wayland_GetWindowSizeInPixels;
+    device->SetWindowIcon = wl_data.toplevel_icon_manager ? wayland_SetWindowIcon : NULL;
+    device->SetWindowOpacity = wl_data.alpha_modifier ? wayland_SetWindowOpacity : NULL;
     device->StartTextInput = wayland_StartTextInput;
     device->StopTextInput = wayland_StopTextInput;
     device->UpdateTextInputArea = wayland_UpdateTextInputArea;
@@ -2308,6 +2338,15 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     }
     if (wl_data.cursor_shape_manager) {
         wp_cursor_shape_manager_v1_destroy(wl_data.cursor_shape_manager);
+    }
+    if (wl_data.toplevel_icon_manager) {
+        xdg_toplevel_icon_manager_v1_destroy(wl_data.toplevel_icon_manager);
+    }
+    if (wl_data.wm_dialog) {
+        xdg_wm_dialog_v1_destroy(wl_data.wm_dialog);
+    }
+    if (wl_data.alpha_modifier) {
+        wp_alpha_modifier_v1_destroy(wl_data.alpha_modifier);
     }
     if (wl_data.pointer) {
         wl_pointer_destroy(wl_data.pointer);
@@ -2407,8 +2446,145 @@ static void wayland_update_window_props(SDL_Window *window)
     SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_XDG_POPUP_POINTER, wd ? wd->popup : NULL);
 }
 
+static void destroy_window_icon(WaylandWindowData *wd)
+{
+    if (wd->icon) {
+        xdg_toplevel_icon_v1_destroy(wd->icon); /* before its buffers */
+        wd->icon = NULL;
+    }
+    for (int i = 0; i < wd->num_icon_buffers; i++) {
+        wl_buffer_destroy(wd->icon_buffers[i]);
+    }
+    free(wd->icon_buffers);
+    wd->icon_buffers = NULL;
+    wd->num_icon_buffers = 0;
+}
+
+static int icon_size_compare(const void *a, const void *b)
+{
+    const SDL_Surface *s1 = *(SDL_Surface *const *)a, *s2 = *(SDL_Surface *const *)b;
+    return (s1->w * s1->h > s2->w * s2->h) - (s1->w * s1->h < s2->w * s2->h);
+}
+
+/* xdg_toplevel_icon_v1 (stock): one square buffer per integer scale of the
+ * icon's alternate images, non-square images centred; the icon object is
+ * immutable once set, so every call builds a new one */
+static bool wayland_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon)
+{
+    (void)device;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd) {
+        return SDL_SetError("Invalid window");
+    }
+    int count = 0;
+    SDL_Surface **images = SDL_GetSurfaceImages(icon, &count);
+    if (!images) {
+        return false;
+    }
+    /* ascending size: the largest image of each scale wins */
+    SDL_qsort(images, (size_t)count, sizeof(*images), icon_size_compare);
+    destroy_window_icon(wd);
+    wd->icon_buffers = (struct wl_buffer **)calloc((size_t)count, sizeof(*wd->icon_buffers));
+    if (!wd->icon_buffers) {
+        SDL_free(images);
+        return SDL_OutOfMemory();
+    }
+    wd->icon = xdg_toplevel_icon_manager_v1_create_icon(wl_data.toplevel_icon_manager);
+    const int base = SDL_max(icon->w, icon->h);
+    bool ok = base > 0;
+    for (int i = 0; ok && i < count; i++) {
+        const int size = SDL_max(images[i]->w, images[i]->h);
+        const int scale = size / base;
+        if (scale < 1) {
+            continue; /* smaller than the base image (stock) */
+        }
+        SDL_Surface *s = images[i]->format == SDL_PIXELFORMAT_ARGB8888
+                             ? images[i]
+                             : SDL_ConvertSurface(images[i], SDL_PIXELFORMAT_ARGB8888);
+        struct wl_buffer *b = NULL;
+        if (s) {
+            b = create_shm_argb_buffer((const uint32_t *)s->pixels, s->w, s->h, s->pitch / 4, size, size,
+                                       (size - s->w) / 2, (size - s->h) / 2);
+            if (s != images[i]) {
+                SDL_DestroySurface(s);
+            }
+        }
+        if (!b) {
+            ok = SDL_SetError("wayland: failed to create an icon buffer");
+            break;
+        }
+        wd->icon_buffers[wd->num_icon_buffers++] = b;
+        xdg_toplevel_icon_v1_add_buffer(wd->icon, b, scale);
+    }
+    SDL_free(images);
+    if (!ok) {
+        destroy_window_icon(wd);
+        return false;
+    }
+    if (wd->toplevel) {
+        xdg_toplevel_icon_manager_v1_set_icon(wl_data.toplevel_icon_manager, wd->toplevel, wd->icon);
+    }
+    wl_display_flush(wl_data.display);
+    return true;
+}
+
+/* xdg_dialog_v1 (stock): modal state of a toplevel with a parent; without
+ * the protocol the parent relation alone is all the compositor gets */
+static void apply_modal(SDL_Window *window, bool modal)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || !wd->toplevel || !wl_data.wm_dialog) {
+        return;
+    }
+    if (modal) {
+        if (!wd->dialog) {
+            wd->dialog = xdg_wm_dialog_v1_get_xdg_dialog(wl_data.wm_dialog, wd->toplevel);
+        }
+        xdg_dialog_v1_set_modal(wd->dialog);
+    } else if (wd->dialog) {
+        xdg_dialog_v1_unset_modal(wd->dialog);
+    }
+}
+
+static bool wayland_SetWindowModal(SDLop_VideoDevice *device, SDL_Window *window, bool modal)
+{
+    (void)device;
+    apply_modal(window, modal);
+    wl_display_flush(wl_data.display);
+    return true;
+}
+
+/* wp_alpha_modifier_v1 (stock): the compositor multiplies the surface
+ * alpha; double-buffered, so commit it now unless EGL commits every frame
+ * anyway (a bare commit does not touch the attached buffer) */
+static bool wayland_SetWindowOpacity(SDLop_VideoDevice *device, SDL_Window *window, float opacity)
+{
+    (void)device;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd) {
+        return SDL_SetError("Invalid window");
+    }
+    if (!wd->alpha) {
+        wd->alpha = wp_alpha_modifier_v1_get_surface(wl_data.alpha_modifier, wd->surface);
+    }
+    wp_alpha_modifier_surface_v1_set_multiplier(wd->alpha, (uint32_t)((double)UINT32_MAX * (double)opacity));
+    if (wd->configured) {
+        if (wd->gl_active && !wd->gl_offload_active) {
+            wl_surface_commit(wd->surface);
+        } else {
+            window_commit(window);
+        }
+    }
+    wl_display_flush(wl_data.display);
+    return true;
+}
+
 static void destroy_role_objects(WaylandWindowData *wd)
 {
+    if (wd->dialog) {
+        xdg_dialog_v1_destroy(wd->dialog); /* before its toplevel */
+        wd->dialog = NULL;
+    }
     if (wd->decoration) {
         zxdg_toplevel_decoration_v1_destroy(wd->decoration); /* before its toplevel */
         wd->decoration = NULL;
@@ -2529,6 +2705,10 @@ static bool wayland_create_role_objects_raw(SDL_Window *window)
     xdg_toplevel_add_listener(wd->toplevel, &toplevel_listener, window);
     xdg_toplevel_set_title(wd->toplevel, window->title ? window->title : "SDLop");
     xdg_toplevel_set_app_id(wd->toplevel, SDLOP_GetAppID());
+    if (wd->icon) {
+        /* re-shown window: a fresh toplevel (an icon can be set on many) */
+        xdg_toplevel_icon_manager_v1_set_icon(wl_data.toplevel_icon_manager, wd->toplevel, wd->icon);
+    }
     if (wl_data.decoration_manager) {
         wd->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(wl_data.decoration_manager, wd->toplevel);
         zxdg_toplevel_decoration_v1_set_mode(wd->decoration, (window->flags & SDL_WINDOW_BORDERLESS)
@@ -2539,6 +2719,9 @@ static bool wayland_create_role_objects_raw(SDL_Window *window)
     if (window->parent && window->parent->driverdata &&
         ((WaylandWindowData *)window->parent->driverdata)->toplevel) {
         xdg_toplevel_set_parent(wd->toplevel, ((WaylandWindowData *)window->parent->driverdata)->toplevel);
+    }
+    if ((window->flags & SDL_WINDOW_MODAL) && window->parent) {
+        apply_modal(window, true);
     }
     if (window->flags & SDL_WINDOW_FULLSCREEN) {
         xdg_toplevel_set_fullscreen(wd->toplevel, NULL);
@@ -2650,6 +2833,10 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
         window->surface = NULL;
     }
     destroy_role_objects(wd);
+    destroy_window_icon(wd);
+    if (wd->alpha) {
+        wp_alpha_modifier_surface_v1_destroy(wd->alpha);
+    }
     if (wd->fractional) {
         wp_fractional_scale_v1_destroy(wd->fractional);
     }
@@ -3227,6 +3414,7 @@ SDLop_VideoDevice SDLop_wayland_device = {
     .SetWindowMinimumSize = wayland_UpdateSizeLimits,
     .SetWindowMaximumSize = wayland_UpdateSizeLimits,
     .SetWindowParent = wayland_SetWindowParent,
+    .SetWindowModal = wayland_SetWindowModal,
     .SetWindowBordered = wayland_SetWindowBordered,
     .SetWindowResizable = wayland_SetWindowResizable,
     .SetWindowMouseGrab = wayland_SetWindowMouseGrab,

@@ -38,6 +38,12 @@
   MINI_CURSOR_LOG=<log> logs every cursor request for
   tests/test_wayland_cursor.c: "shape=N" (wp_cursor_shape_device_v1, offered
   unless MINI_CURSOR_SHAPE=0) and "cursor=surface|null" (wl_pointer).
+  MINI_TOPLEVEL_LOG=<log> offers xdg_toplevel_icon_manager_v1 and
+  xdg_wm_dialog_v1 for tests/test_wayland_toplevel.c and logs every
+  set_icon as "icon=null" or "icon SIZExSIZE@SCALE:CENTER/CORNER ..."
+  (pixels as 8-digit hex), and "dialog", "modal=1|0", "dialog destroyed".
+  It also offers wp_alpha_modifier_v1: "alpha=FACTOR" is logged when a
+  multiplier is committed.
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -60,6 +66,9 @@
 #include "primary-selection-server-protocol.h"
 #include "text-input-unstable-v3-server-protocol.h"
 #include "cursor-shape-v1-server-protocol.h"
+#include "xdg-toplevel-icon-v1-server-protocol.h"
+#include "xdg-dialog-v1-server-protocol.h"
+#include "alpha-modifier-v1-server-protocol.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -132,6 +141,10 @@ typedef struct
 } mini_buffer;
 
 static bool B_mode;
+static const char *TL_log; /* MINI_TOPLEVEL_LOG: icon buffers are read too */
+static struct wl_resource *TL_alpha_surface; /* surface with a pending multiplier */
+static uint32_t TL_alpha_pending;
+static void TL_logs(const char *line);
 static struct wl_resource *B_pending;     /* attached, not committed */
 static bool B_pending_set;
 static struct wl_resource *B_held[16];
@@ -368,7 +381,7 @@ static void pool_create_buffer(struct wl_client *client, struct wl_resource *res
     struct wl_resource *buf = wl_resource_create(client, &wl_buffer_interface, 1, id);
     mini_buffer *b = NULL;
     mini_pool *p = wl_resource_get_user_data(res);
-    if ((B_mode || H_mode) && p) {
+    if ((B_mode || H_mode || TL_log) && p) {
         b = calloc(1, sizeof(*b));
         b->pool = p;
         p->refs++;
@@ -406,12 +419,12 @@ static void shm_create_pool(struct wl_client *client, struct wl_resource *res,
 {
     (void)res;
     mini_pool *p = NULL;
-    if (B_mode || H_mode) {
+    if (B_mode || H_mode || TL_log) {
         p = calloc(1, sizeof(*p));
         p->refs = 1;
         p->size = (size_t)size;
     }
-    if (B_mode) { /* H_mode only needs buffer sizes */
+    if (B_mode || TL_log) { /* H_mode only needs buffer sizes */
         p->map = mmap(NULL, p->size, PROT_READ, MAP_SHARED, fd, 0);
         if (p->map == MAP_FAILED) {
             B_fail(5, "cannot map client shm pool");
@@ -537,6 +550,12 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
 
     if (H_mode && res == M.surface_res) {
         H_commit();
+    }
+    if (TL_alpha_surface && res == TL_alpha_surface) {
+        char line[32];
+        snprintf(line, sizeof(line), "alpha=%u", TL_alpha_pending);
+        TL_logs(line);
+        TL_alpha_surface = NULL;
     }
 
     if (B_mode) {
@@ -684,6 +703,7 @@ static void xdg_surface_get_toplevel(struct wl_client *client, struct wl_resourc
     wl_resource_set_implementation(tl, &toplevel_impl, res, NULL);
     M.xdg_surface = res;
     M.xdg_toplevel = tl;
+    M.configure_sent = false; /* every new toplevel (re-shown windows) gets its initial configure */
 }
 
 static const struct xdg_surface_interface xdg_surface_impl = {
@@ -895,6 +915,174 @@ static void C_mgr_bind(struct wl_client *client, void *data, uint32_t version, u
     (void)data;
     struct wl_resource *r = wl_resource_create(client, &wp_cursor_shape_manager_v1_interface, version, id);
     wl_resource_set_implementation(r, &C_mgr_impl, NULL, NULL);
+}
+
+/* ---------------- xdg_toplevel_icon_manager_v1 (MINI_TOPLEVEL_LOG) ---------------- */
+
+static void TL_logs(const char *line)
+{
+    FILE *f = TL_log ? fopen(TL_log, "a") : NULL;
+    if (f) {
+        fprintf(f, "%s\n", line);
+        fclose(f);
+    }
+}
+
+typedef struct
+{
+    char desc[512]; /* " WxH@S:center/corner" per buffer */
+} TL_Icon;
+
+static void TL_icon_free(struct wl_resource *res)
+{
+    free(wl_resource_get_user_data(res));
+}
+
+static void TL_icon_set_name(struct wl_client *client, struct wl_resource *res, const char *name)
+{
+    (void)client;
+    TL_Icon *icon = wl_resource_get_user_data(res);
+    const size_t n = strlen(icon->desc);
+    snprintf(icon->desc + n, sizeof(icon->desc) - n, " name=%s", name);
+}
+
+static void TL_icon_add_buffer(struct wl_client *client, struct wl_resource *res, struct wl_resource *buffer,
+                               int32_t scale)
+{
+    (void)client;
+    TL_Icon *icon = wl_resource_get_user_data(res);
+    const mini_buffer *b = wl_resource_get_user_data(buffer);
+    if (!b || !b->pool || !b->pool->map) {
+        return;
+    }
+    const int w = b->w, h = b->h;
+    const uint8_t *px = (const uint8_t *)b->pool->map + b->offset;
+    const uint32_t center = *(const uint32_t *)(px + (size_t)(h / 2) * (size_t)b->stride + (size_t)(w / 2) * 4);
+    const uint32_t corner = *(const uint32_t *)px;
+    const size_t n = strlen(icon->desc);
+    snprintf(icon->desc + n, sizeof(icon->desc) - n, " %dx%d@%d:%08x/%08x", w, h, scale, center, corner);
+}
+
+static const struct xdg_toplevel_icon_v1_interface TL_icon_impl = {
+    .destroy = res_destroy,
+    .set_name = TL_icon_set_name,
+    .add_buffer = TL_icon_add_buffer,
+};
+
+static void TL_create_icon(struct wl_client *client, struct wl_resource *res, uint32_t id)
+{
+    TL_Icon *icon = calloc(1, sizeof(*icon));
+    struct wl_resource *r = wl_resource_create(client, &xdg_toplevel_icon_v1_interface, wl_resource_get_version(res), id);
+    wl_resource_set_implementation(r, &TL_icon_impl, icon, TL_icon_free);
+}
+
+static void TL_set_icon(struct wl_client *client, struct wl_resource *res, struct wl_resource *toplevel,
+                        struct wl_resource *icon)
+{
+    (void)client;
+    (void)res;
+    (void)toplevel;
+    char line[600];
+    if (icon) {
+        snprintf(line, sizeof(line), "icon%s", ((TL_Icon *)wl_resource_get_user_data(icon))->desc);
+    } else {
+        snprintf(line, sizeof(line), "icon=null");
+    }
+    TL_logs(line);
+}
+
+static const struct xdg_toplevel_icon_manager_v1_interface TL_icon_mgr_impl = {
+    .destroy = res_destroy,
+    .create_icon = TL_create_icon,
+    .set_icon = TL_set_icon,
+};
+
+static void TL_icon_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &xdg_toplevel_icon_manager_v1_interface, version, id);
+    wl_resource_set_implementation(r, &TL_icon_mgr_impl, NULL, NULL);
+    xdg_toplevel_icon_manager_v1_send_icon_size(r, 48);
+    xdg_toplevel_icon_manager_v1_send_done(r);
+}
+
+static void TL_dialog_destroy(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    TL_logs("dialog destroyed");
+    wl_resource_destroy(res);
+}
+
+static void TL_dialog_set_modal(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    (void)res;
+    TL_logs("modal=1");
+}
+
+static void TL_dialog_unset_modal(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    (void)res;
+    TL_logs("modal=0");
+}
+
+static const struct xdg_dialog_v1_interface TL_dialog_impl = {
+    .destroy = TL_dialog_destroy,
+    .set_modal = TL_dialog_set_modal,
+    .unset_modal = TL_dialog_unset_modal,
+};
+
+static void TL_get_dialog(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *toplevel)
+{
+    (void)toplevel;
+    struct wl_resource *r = wl_resource_create(client, &xdg_dialog_v1_interface, wl_resource_get_version(res), id);
+    wl_resource_set_implementation(r, &TL_dialog_impl, NULL, NULL);
+    TL_logs("dialog");
+}
+
+static const struct xdg_wm_dialog_v1_interface TL_dialog_mgr_impl = {
+    .destroy = res_destroy,
+    .get_xdg_dialog = TL_get_dialog,
+};
+
+static void TL_dialog_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &xdg_wm_dialog_v1_interface, version, id);
+    wl_resource_set_implementation(r, &TL_dialog_mgr_impl, NULL, NULL);
+}
+
+static void TL_alpha_set(struct wl_client *client, struct wl_resource *res, uint32_t factor)
+{
+    (void)client;
+    TL_alpha_surface = wl_resource_get_user_data(res);
+    TL_alpha_pending = factor;
+}
+
+static const struct wp_alpha_modifier_surface_v1_interface TL_alpha_impl = {
+    .destroy = res_destroy,
+    .set_multiplier = TL_alpha_set,
+};
+
+static void TL_alpha_get_surface(struct wl_client *client, struct wl_resource *res, uint32_t id,
+                                 struct wl_resource *surface)
+{
+    struct wl_resource *r =
+        wl_resource_create(client, &wp_alpha_modifier_surface_v1_interface, wl_resource_get_version(res), id);
+    wl_resource_set_implementation(r, &TL_alpha_impl, surface, NULL);
+}
+
+static const struct wp_alpha_modifier_v1_interface TL_alpha_mgr_impl = {
+    .destroy = res_destroy,
+    .get_surface = TL_alpha_get_surface,
+};
+
+static void TL_alpha_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wp_alpha_modifier_v1_interface, version, id);
+    wl_resource_set_implementation(r, &TL_alpha_mgr_impl, NULL, NULL);
 }
 
 static const struct wl_keyboard_interface keyboard_impl = {
@@ -1948,6 +2136,12 @@ int main(void)
     C_log = getenv("MINI_CURSOR_LOG");
     if (C_log && !(getenv("MINI_CURSOR_SHAPE") && atoi(getenv("MINI_CURSOR_SHAPE")) == 0)) {
         wl_global_create(M.display, &wp_cursor_shape_manager_v1_interface, 1, NULL, C_mgr_bind);
+    }
+    TL_log = getenv("MINI_TOPLEVEL_LOG");
+    if (TL_log) {
+        wl_global_create(M.display, &xdg_toplevel_icon_manager_v1_interface, 1, NULL, TL_icon_mgr_bind);
+        wl_global_create(M.display, &xdg_wm_dialog_v1_interface, 1, NULL, TL_dialog_mgr_bind);
+        wl_global_create(M.display, &wp_alpha_modifier_v1_interface, 1, NULL, TL_alpha_mgr_bind);
     }
     T_log = getenv("MINI_TEXT_INPUT");
     if (T_log) {

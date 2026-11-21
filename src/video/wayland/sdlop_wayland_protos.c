@@ -28,3 +28,6 @@
 #include "text-input-unstable-v3-protocol.c"
 #include "tablet-v2-protocol.c"
 #include "cursor-shape-v1-protocol.c"
+#include "xdg-toplevel-icon-v1-protocol.c"
+#include "xdg-dialog-v1-protocol.c"
+#include "alpha-modifier-v1-protocol.c"
