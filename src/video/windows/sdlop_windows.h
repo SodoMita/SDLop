@@ -69,6 +69,18 @@ typedef struct SDLop_Win32State
     bool want_relative_mouse;
     SDLop_Win32Monitor *monitors;
     int monitor_count;
+
+    /* raw input (SDL_HINT_WINDOWS_RAW_KEYBOARD and friends). The registration
+     * is process-global even though it is triggered per window, so the state
+     * lives here rather than on the window. */
+    bool raw_keyboard_enabled;
+    bool raw_keyboard_nohotkeys;
+    bool raw_keyboard_inputsink;
+    bool raw_keyboard_registered;
+    DWORD raw_keyboard_flags; /* the flags last successfully registered */
+    HWND raw_keyboard_target; /* what the registration's hwndTarget is */
+    HWND raw_input_hwnd;      /* message-only window, only for RIDEV_INPUTSINK */
+    bool pending_e1_sequence; /* first key of a Ctrl+{key} pair */
 } SDLop_Win32State;
 
 extern SDLop_Win32State sdlop_win32;

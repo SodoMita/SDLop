@@ -513,6 +513,261 @@ static bool win32_run_hit_test(SDL_Window *window, LPARAM lparam, LRESULT *resul
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Raw keyboard input (SDL_HINT_WINDOWS_RAW_KEYBOARD)                  */
+/*                                                                     */
+/* Win32 delivers raw keyboard packets to the window with keyboard     */
+/* focus, as RIM_TYPEKEYBOARD WM_INPUT messages carrying the hardware  */
+/* make code and the E0/E1 prefix bits. That is the only way to tell   */
+/* left and right Shift/Ctrl/Alt apart by hardware scan code, and it   */
+/* is what SDL3 registers when the hint is on.                         */
+/*                                                                     */
+/* Registration is process-global: the hwndTarget is NULL, so packets */
+/* follow keyboard focus rather than one window. RIDEV_REMOVE is the   */
+/* documented way to deregister, and it is only issued when something  */
+/* is actually registered -- removing a registration that does not     */
+/* exist is not harmless.                                              */
+/* ------------------------------------------------------------------ */
+
+static void win32_handle_raw_keyboard(const RAWKEYBOARD *raw, Uint64 ts);
+
+/* RIDEV_INPUTSINK requires a real hwndTarget -- the API rejects NULL with
+ * ERROR_INVALID_PARAMETER, for the mouse as well as the keyboard. Background
+ * input therefore needs a window of its own, and a message-only window is the
+ * right one: it never shows, never takes focus. */
+static LRESULT CALLBACK win32_raw_input_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    if (msg == WM_INPUT) {
+        RAWINPUT packet;
+        UINT size = sizeof(packet);
+        if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, &packet, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+            if (packet.header.dwType == RIM_TYPEKEYBOARD) {
+                win32_handle_raw_keyboard(&packet.data.keyboard, SDLOP_Win32Timestamp());
+            }
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static HWND win32_raw_input_window(void)
+{
+    HWND hwnd;
+    WNDCLASSW wc;
+
+    if (sdlop_win32.raw_input_hwnd) {
+        return sdlop_win32.raw_input_hwnd;
+    }
+    SDL_zero(wc);
+    wc.lpfnWndProc = win32_raw_input_proc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = L"SDLopRawInput";
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return NULL;
+    }
+    hwnd = CreateWindowExW(0, L"SDLopRawInput", NULL, 0, 0, 0, 0, 0,
+                           HWND_MESSAGE, NULL, GetModuleHandleW(NULL), NULL);
+    if (hwnd) {
+        sdlop_win32.raw_input_hwnd = hwnd;
+    }
+    return hwnd;
+}
+
+static void win32_destroy_raw_input_window(void)
+{
+    if (sdlop_win32.raw_input_hwnd) {
+        DestroyWindow(sdlop_win32.raw_input_hwnd);
+        sdlop_win32.raw_input_hwnd = NULL;
+        UnregisterClassW(L"SDLopRawInput", GetModuleHandleW(NULL));
+    }
+}
+
+static void win32_register_raw_keyboard(void)
+{
+    RAWINPUTDEVICE rid;
+    DWORD flags = 0;
+    HWND target = NULL;
+
+    if (!sdlop_win32.raw_keyboard_enabled) {
+        if (sdlop_win32.raw_keyboard_registered) {
+            SDL_zero(rid);
+            rid.usUsagePage = 0x01; /* generic desktop */
+            rid.usUsage = 0x06;     /* keyboard */
+            /* RIDEV_REMOVE requires hwndTarget == NULL: the device is
+             * identified by usage page and usage alone. Passing the target
+             * back fails with ERROR_INVALID_PARAMETER and leaves the
+             * registration in place. */
+            rid.dwFlags = RIDEV_REMOVE;
+            rid.hwndTarget = NULL;
+            RegisterRawInputDevices(&rid, 1, sizeof(rid));
+            sdlop_win32.raw_keyboard_registered = false;
+            sdlop_win32.raw_keyboard_target = NULL;
+        }
+        /* The sink window exists only to receive background input. */
+        win32_destroy_raw_input_window();
+        sdlop_win32.pending_e1_sequence = false;
+        return;
+    }
+
+    if (sdlop_win32.raw_keyboard_nohotkeys) {
+        flags |= RIDEV_NOHOTKEYS;
+    }
+    if (sdlop_win32.raw_keyboard_inputsink) {
+        /* NULL is not allowed with INPUTSINK, so background delivery goes to
+         * the message-only window instead of following keyboard focus. */
+        flags |= RIDEV_INPUTSINK;
+        target = win32_raw_input_window();
+        if (!target) {
+            return; /* cannot deliver in the background; stay unregistered */
+        }
+    }
+
+    /* Nothing to do if the same registration is already in place. Without
+     * this, re-setting an unrelated hint would drop the OS device list. */
+    if (sdlop_win32.raw_keyboard_registered && flags == sdlop_win32.raw_keyboard_flags &&
+        target == sdlop_win32.raw_keyboard_target) {
+        return;
+    }
+
+    /* Deregister the old target first: the flags are read from the batch, and
+     * re-adding the same usage under a different target would otherwise leave
+     * both registrations alive. */
+    if (sdlop_win32.raw_keyboard_registered) {
+        SDL_zero(rid);
+        rid.usUsagePage = 0x01;
+        rid.usUsage = 0x06;
+        rid.dwFlags = RIDEV_REMOVE;
+        rid.hwndTarget = NULL; /* required by RIDEV_REMOVE */
+        RegisterRawInputDevices(&rid, 1, sizeof(rid));
+        sdlop_win32.raw_keyboard_registered = false;
+        sdlop_win32.raw_keyboard_target = NULL;
+    }
+
+    SDL_zero(rid);
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x06;
+    rid.dwFlags = flags;
+    rid.hwndTarget = target;
+    if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        sdlop_win32.raw_keyboard_registered = true;
+        sdlop_win32.raw_keyboard_flags = flags;
+        sdlop_win32.raw_keyboard_target = target;
+    } else {
+        /* Registration failed: do not keep a sink window around for it. */
+        sdlop_win32.raw_keyboard_registered = false;
+        sdlop_win32.raw_keyboard_target = NULL;
+        win32_destroy_raw_input_window();
+    }
+}
+
+static void win32_update_raw_keyboard_flags(void)
+{
+    win32_register_raw_keyboard();
+}
+
+static void SDLCALL win32_raw_keyboard_hint_changed(void *userdata, const char *name, const char *old_value, const char *new_value)
+{
+    (void)userdata;
+    (void)name;
+    (void)old_value;
+    sdlop_win32.raw_keyboard_enabled = SDLOP_GetStringBoolean(new_value, false);
+    win32_update_raw_keyboard_flags();
+}
+
+static void SDLCALL win32_raw_keyboard_nohotkeys_hint_changed(void *userdata, const char *name, const char *old_value, const char *new_value)
+{
+    (void)userdata;
+    (void)name;
+    (void)old_value;
+    sdlop_win32.raw_keyboard_nohotkeys = SDLOP_GetStringBoolean(new_value, false);
+    win32_update_raw_keyboard_flags();
+}
+
+static void SDLCALL win32_raw_keyboard_inputsink_hint_changed(void *userdata, const char *name, const char *old_value, const char *new_value)
+{
+    (void)userdata;
+    (void)name;
+    (void)old_value;
+    sdlop_win32.raw_keyboard_inputsink = SDLOP_GetStringBoolean(new_value, false);
+    win32_update_raw_keyboard_flags();
+}
+
+/* One RIM_TYPEKEYBOARD packet. Mirrors WIN_HandleRawKeyboardInput(). */
+static void win32_handle_raw_keyboard(const RAWKEYBOARD *raw, Uint64 ts)
+{
+    USHORT rawcode;
+    SDL_Scancode code;
+    bool down;
+
+    if (!sdlop_win32.raw_keyboard_enabled) {
+        return;
+    }
+
+    if (raw->Flags & RI_KEY_E1) {
+        /* First key of a Ctrl+{key} sequence: remember it and wait. */
+        sdlop_win32.pending_e1_sequence = true;
+        return;
+    }
+    if ((raw->Flags & RI_KEY_E0) && raw->MakeCode == 0x2A) {
+        /* 0xE02A make-code prefix carries no key of its own. */
+        return;
+    }
+
+    {
+        USHORT make = raw->MakeCode;
+        if (!make && raw->VKey) {
+            make = LOWORD(MapVirtualKeyW(raw->VKey, MAPVK_VK_TO_VSC_EX));
+        }
+        if (!make) {
+            return;
+        }
+        rawcode = make;
+    }
+
+    switch (raw->Message) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        down = true;
+        break;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        down = false;
+        break;
+    default:
+        down = (raw->Flags & RI_KEY_BREAK) == 0;
+        break;
+    }
+
+    if (sdlop_win32.pending_e1_sequence) {
+        sdlop_win32.pending_e1_sequence = false;
+        if ((rawcode & 0xFF) == 0x45) {
+            code = SDL_SCANCODE_PAUSE; /* Ctrl+NumLock */
+        } else {
+            code = SDL_SCANCODE_UNKNOWN; /* Ctrl+ScrollLock == Break */
+        }
+    } else {
+        /* SDLOP_Win32ScancodeFromScan() indexes two 128-entry banks, with bit
+         * 7 selecting the extended one. This is NOT "0xE000 | make": the
+         * table is indexed by the low byte plus the E0 prefix bit. */
+        code = SDLOP_Win32ScancodeFromScan((Uint16)((raw->Flags & RI_KEY_E0) ? (rawcode | 0xE000) : rawcode));
+    }
+
+    if (down) {
+        SDL_Window *focus = sdlop.keyboard_focus;
+        /* With RIDEV_INPUTSINK the packets arrive unfocused on purpose; while
+         * text input is active the IME owns the keyboard, so leave the keys
+         * to WM_KEYDOWN. */
+        if ((!sdlop_win32.raw_keyboard_inputsink && !focus) || (focus && focus->text_input_active)) {
+            return;
+        }
+    }
+
+    if (code == SDL_SCANCODE_UNKNOWN) {
+        return;
+    }
+    SDLOP_SendKeyboardKey(down, false, code, (Uint16)SDLOP_WIN32_RAWCODE(raw->VKey, rawcode & 0xFF), ts);
+}
+
 /* Keep SDL_GetWindowDisplayScale() honest: the core reads window->display_scale
  * and the other backends set it from their compositor's scale. Win32 gives us
  * the window's own DPI (it follows the monitor the window is on), so the scale
@@ -774,11 +1029,24 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         return 0;
 
     case WM_INPUT:
-        if (window && sdlop_win32.want_relative_mouse) {
-            send_mouse_motion(&m, true);
-            return 0;
+    {
+        /* One WM_INPUT carries one packet; its header says which kind. The
+         * mouse path only matters in relative mode, but keyboard packets must
+         * be answered whenever the hint turned them on. */
+        RAWINPUT packet;
+        UINT size = sizeof(packet);
+        if (GetRawInputData((HRAWINPUT)m.lParam, RID_INPUT, &packet, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+            if (packet.header.dwType == RIM_TYPEKEYBOARD) {
+                win32_handle_raw_keyboard(&packet.data.keyboard, SDLOP_Win32Timestamp());
+                return 0;
+            }
+            if (packet.header.dwType == RIM_TYPEMOUSE && window && sdlop_win32.want_relative_mouse) {
+                send_mouse_motion(&m, true);
+                return 0;
+            }
         }
         break;
+    }
 
     default:
         if (msg == WM_TASKBARBUTTONCREATED) {
@@ -903,12 +1171,27 @@ static bool win32_Init(SDLop_VideoDevice *device)
     }
     win32_add_displays(device);
     sdlop_win32.window_count = 0;
+
+    /* Raw keyboard input is opt-in, like SDL3: the hint defaults to off. The
+     * callbacks keep it in sync if the application sets the hint later. */
+    sdlop_win32.raw_keyboard_enabled = SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_WINDOWS_RAW_KEYBOARD), false);
+    sdlop_win32.raw_keyboard_nohotkeys = SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_WINDOWS_RAW_KEYBOARD_EXCLUDE_HOTKEYS), false);
+    sdlop_win32.raw_keyboard_inputsink = SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_WINDOWS_RAW_KEYBOARD_INPUTSINK), false);
+    SDL_AddHintCallback(SDL_HINT_WINDOWS_RAW_KEYBOARD, win32_raw_keyboard_hint_changed, device);
+    SDL_AddHintCallback(SDL_HINT_WINDOWS_RAW_KEYBOARD_EXCLUDE_HOTKEYS, win32_raw_keyboard_nohotkeys_hint_changed, device);
+    SDL_AddHintCallback(SDL_HINT_WINDOWS_RAW_KEYBOARD_INPUTSINK, win32_raw_keyboard_inputsink_hint_changed, device);
+    win32_register_raw_keyboard();
     return true;
 }
 
 static void win32_Quit(SDLop_VideoDevice *device)
 {
-    (void)device;
+    SDL_RemoveHintCallback(SDL_HINT_WINDOWS_RAW_KEYBOARD, win32_raw_keyboard_hint_changed, device);
+    SDL_RemoveHintCallback(SDL_HINT_WINDOWS_RAW_KEYBOARD_EXCLUDE_HOTKEYS, win32_raw_keyboard_nohotkeys_hint_changed, device);
+    SDL_RemoveHintCallback(SDL_HINT_WINDOWS_RAW_KEYBOARD_INPUTSINK, win32_raw_keyboard_inputsink_hint_changed, device);
+    /* Leave no process-global registration behind for the next SDL_Init(). */
+    sdlop_win32.raw_keyboard_enabled = false;
+    win32_register_raw_keyboard();
     if (sdlop_win32.class_registered) {
         UnregisterClassW(SDLOP_WIN32_CLASS, GetModuleHandleW(NULL));
         sdlop_win32.class_registered = false;
