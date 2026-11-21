@@ -101,8 +101,10 @@ either all from evdev (`/dev/input`) or all from the window system.
   foreground VT. A working raw keyboard is required before disabling the
   kernel keyboard handler. Ctrl+Alt+Fn is forwarded through `VT_ACTIVATE`.
   Switch-away detaches keyboard delivery and releases SDL's held key state.
-  With raw input disabled/unavailable the console retains its kernel handler;
-  that preserves VT switching but does not create an SDL keyboard event source.
+  fbdev takes the console keyboard by default (`K_OFF`), like kmsdrm; set
+  `SDLOP_FBDEV_CONSOLE_KEYS=0` to leave terminal input working. With raw input
+  disabled/unavailable the console also retains its kernel handler, because
+  Ctrl+Alt+Fn forwarding needs the evdev worker.
 - **The low-latency raw API needs the worker.** `SDLop_RegisterRawEventCallback`
   runs on the worker thread and `SDLop_PollRawEvents` drains a separate ring;
   on X11/Wayland they only receive events with `SDLOP_RAW_INPUT=1`. These
@@ -154,7 +156,7 @@ false, anything else true.
 | `SDL_OPENGL_ES_DRIVER` (`SDL_HINT_OPENGL_ES_DRIVER`) | X11: GLES contexts through EGL instead of GLX (stock SDL3 hint) |
 | `SDL_OPENGL_LIBRARY` (`SDL_HINT_OPENGL_LIBRARY`) | X11: library to load GLX from (default `libGL.so.1`, then `libGLX.so.0`) |
 | `SDLOP_KMSDRM_*` | `DEVICE`, `CONNECTOR`, `ATOMIC`, `ATOMIC_CURSOR`, `DOUBLE_BUFFER`, `FLIP_TIMEOUT_MS`, `HOTPLUG`, `KEEP_MASTER`, `NOFLIP`, `REQUIRE_MASTER`, `VT_SWITCH` (see `sdlop_kmsdrm.c`) |
-| `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
+| `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `CONSOLE_KEYS`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
 | `SDLOP_LIB_*` | dlopen name for `X11`, `XCB`, `XCB_RANDR`, `XCB_RENDER`, `XCB_SHM`, `XCB_XINPUT`, `XCB_XKB`, `XKB`, `XKBCOMMON_X11`, `WAYLAND`, `EGL`, `DRM`, `GBM` (`none` disables an optional X11 extension library) |
 
 ### fbdev arbitration
@@ -165,6 +167,12 @@ Window surfaces and presents remain usable in RAM; frames are not made visible.
 `SDLOP_FBDEV_TAKEOVER=0` explicitly requests direct framebuffer rendering without
 console arbitration, including on an owned VT. Use it only when external
 coordination makes those writes safe. It is not the default refusal behavior.
+
+The fbdev software cursor is composited into a private frame before the dirty
+region is copied to the card, and copies wait for `FBIO_WAITFORVSYNC` when the
+driver implements it. That avoids the cursor disappearing between the erase
+and redraw steps during motion. `SDLOP_FBDEV_CURSOR=0` disables the cursor;
+`SDLOP_FBDEV_CONSOLE_KEYS=0` keeps the console keyboard handler alive.
 
 Console drivers reserve their VT release/acquire signals until shutdown. They
 undo only signal blocks they introduced; unrelated application signal-mask

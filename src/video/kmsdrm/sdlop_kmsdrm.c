@@ -43,8 +43,9 @@
   restored to its saved state on quit. Panel orientation is logged when set.
   VT switching (Ctrl+Alt+Fn) is handled with VT_PROCESS mode: scanout is torn
   down, the console goes back to KD_TEXT with its keyboard handler and the
-  cursor plane is taken off on switch-away; all of it is restored on
-  switch-back. Starting never activates a VT on its own (SDLOP_KMSDRM_VT_SWITCH
+  cursor plane is taken off on switch-away; presents are dropped until the
+  acquire signal so the other VT keeps its terminal, and all of it is restored
+  on switch-back. Starting never activates a VT on its own (SDLOP_KMSDRM_VT_SWITCH
   or $TTYNO ask for that): the picture appears on the VT the user is on.
   Vulkan windows (SDL_WINDOW_VULKAN) get a VK_KHR_display surface and own the
   output; the dumb/GL paths re-acquire master in kmsdrm_CreateWindow().
@@ -733,7 +734,11 @@ static void kmsdrm_vt_release(void)
         }
         windata->crtc_programmed = false;
         windata->sw_front = -1;
+        /* Do not let a present between RELDISP and the acquire signal call
+         * drmSetMaster and program our framebuffer onto the other VT. */
+        windata->lost_master = true;
     }
+    vid->vt_active = false;
     if (SDLOP_DRM_drmDropMaster) {
         SDLOP_DRM_drmDropMaster(vid->drm_fd);
     }
@@ -771,6 +776,7 @@ static void kmsdrm_vt_acquire(void)
     KMSDRM_DeviceData *vid = &kmsdrm;
     kmsdrm_vt_console_take();
     kmsdrm_ensure_master(vid);
+    vid->vt_active = true;
     /* the cursor plane was taken down on switch-away: put the sprite back
        (kmsdrm_refresh_cursors re-uploads the image and shows it when the
        pointer belongs to us again) */
@@ -2052,6 +2058,12 @@ static bool kmsdrm_crtc_set(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windata, 
 static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
 {
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+    /* Between RELDISP and the acquire signal the other VT owns the screen.
+     * Presenting here would first fail with EPERM and then re-take master on
+     * the next frame, putting our graphics back on the terminal's VT. */
+    if (!vid->vt_active) {
+        return true; /* drop the frame; the acquire handler asks for a redraw */
+    }
     if (!windata->display || !windata->display->connected) {
         return SDL_SetError("KMSDRM: display disconnected (window has no live output)");
     }
@@ -3353,6 +3365,7 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
     vid->devindex = -1;
     vid->hotplug_fd = -1;
     vid->num_displays = 0;
+    vid->vt_active = true;
 
     if (!SDLOP_KMSDRM_LoadSymbols()) {
         return false; /* error set by the loader */
