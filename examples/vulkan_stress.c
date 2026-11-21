@@ -12,14 +12,18 @@
        checksum (useful when comparing native WSI vs shm/dumb offload).
 
   All Vulkan entry points are resolved through SDL_Vulkan_GetVkGetInstanceProcAddr
-  so SDLop can intercept them when --offload is used. That makes the same binary
+  so SDLop can intercept them when offload is active. That makes the same binary
   work with native WSI, Weston wl_shm, X11 shm, KMS dumb buffers and fbdev.
 
+  Offload is forced by default: native KMS Vulkan WSI hangs on some NVIDIA 470
+  setups, while the headless/shm path is reliable. Pass --native to opt out.
+
   Usage:
-    vulkan_stress [--offload] [--frames N] [--duration SECONDS]
+    vulkan_stress [--offload|--native] [--frames N] [--duration SECONDS]
                   [--size WxH] [--particles N]
 
-  Defaults: 300 frames, 1280x720, 4096 particles.
+  Defaults: 60 frames, 320x180, 256 particles (a deliberately modest preset;
+  use --frames 300 --size 1280x720 --particles 4096 for the full stress run).
 */
 
 #include <SDL3/SDL.h>
@@ -242,13 +246,14 @@ typedef struct ComputePC {
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s [--offload] [--frames N] [--duration SECONDS]\n"
+            "Usage: %s [--offload|--native] [--frames N] [--duration SECONDS]\n"
             "          [--size WxH] [--particles N]\n"
-            "  --offload       force SDLop headless/offload path\n"
-            "  --frames N      stop after N frames (default 300)\n"
+            "  --offload       force SDLop headless/offload path (default)\n"
+            "  --native        use the video driver's native Vulkan WSI instead\n"
+            "  --frames N      stop after N frames (default 60)\n"
             "  --duration S    run for S seconds instead of a fixed frame count\n"
-            "  --size WxH      window size (default 1280x720)\n"
-            "  --particles N   instanced quads driven by the compute pass (default 4096)\n",
+            "  --size WxH      window size (default 320x180)\n"
+            "  --particles N   instanced quads driven by the compute pass (default 256)\n",
             argv0);
 }
 
@@ -330,11 +335,11 @@ static uint32_t frame_checksum(const uint8_t *pixels, int w, int h, int pitch)
 
 int main(int argc, char *argv[])
 {
-    int frames_target = 300;
+    int frames_target = 60;
     double duration_sec = 0.0;
-    int win_w = 1280, win_h = 720;
-    uint32_t particle_count = 4096;
-    bool force_offload = false;
+    int win_w = 320, win_h = 180;
+    uint32_t particle_count = 256;
+    bool use_offload = true;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -342,7 +347,9 @@ int main(int argc, char *argv[])
             usage(argv[0]);
             return 0;
         } else if (!strcmp(a, "--offload")) {
-            force_offload = true;
+            use_offload = true;
+        } else if (!strcmp(a, "--native")) {
+            use_offload = false;
         } else if (!strcmp(a, "--frames") && i + 1 < argc) {
             frames_target = atoi(argv[++i]);
         } else if (!strcmp(a, "--duration") && i + 1 < argc) {
@@ -368,9 +375,9 @@ int main(int argc, char *argv[])
         frames_target = INT32_MAX;
     }
 
-    if (force_offload) {
-        SDL_SetHint("SDLOP_VK_OFFLOAD", "force");
-    }
+    /* CLI wins over the environment here. The default is forced offload so a
+     * bare invocation cannot select native KMS WSI on drivers where it hangs. */
+    SDL_SetHint("SDLOP_VK_OFFLOAD", use_offload ? "force" : "0");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
