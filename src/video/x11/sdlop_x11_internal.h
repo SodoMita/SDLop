@@ -64,4 +64,11 @@ bool SDLOP_X11_SetPrimarySelectionText(SDLop_VideoDevice *device, const char *te
 char *SDLOP_X11_GetPrimarySelectionText(SDLop_VideoDevice *device);
 bool SDLOP_X11_HasPrimarySelectionText(SDLop_VideoDevice *device);
 
+/* sdlop_x11_dnd.c */
+void SDLOP_X11_DnD_Init(void);
+void SDLOP_X11_DnD_Quit(void);
+bool SDLOP_X11_DnD_HandleEvent(xcb_generic_event_t *ev); /* true = consumed */
+void SDLOP_X11_DnD_WindowDestroyed(SDL_Window *window);
+void SDLOP_X11_AcceptDragAndDrop(SDL_Window *window, bool accept);
+
 #endif /* sdlop_x11_internal_h_ */

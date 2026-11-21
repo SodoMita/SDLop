@@ -59,6 +59,7 @@ struct SDL_Window
     SDL_WindowFlags pending_flags;    /* grabs requested while hidden */
     int popup_offset_x, popup_offset_y; /* tooltip / popup menu: offset from parent */
     bool is_destroying;
+    bool is_dropping;                 /* drag-and-drop in progress (SDL_dropevents.c) */
 };
 
 #define SDLOP_WINDOW_IS_POPUP(w) ((w) && ((w)->flags & (SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU)) != 0)
@@ -156,6 +157,9 @@ struct SDLop_VideoDevice
     char *(*GetPrimarySelectionText)(SDLop_VideoDevice *device);
     bool (*HasPrimarySelectionText)(SDLop_VideoDevice *device);
 
+    /* drag-and-drop target on/off (SDL_EVENT_DROP_FILE/TEXT enabled) */
+    void (*AcceptDragAndDrop)(SDL_Window *window, bool accept);
+
     /* SDL 3.4 window management (same contracts as SDL_sysvideo.h; NULL =
      * SDL_Unsupported() where stock SDL3 reports that) */
     bool supports_popups;            /* SDL_WINDOW_TOOLTIP / SDL_WINDOW_POPUP_MENU */
@@ -237,6 +241,18 @@ const char *const *SDLOP_GetClipboardOfferMimeTypes(size_t *count);
 void SDLOP_SendClipboardUpdate(bool owner, char **mime_types, size_t num_mime_types);
 /* the system took the clipboard from us: drop the app's offer (cleanup runs) */
 void SDLOP_CancelClipboardData(void);
+
+/* SDL_dropevents.c */
+bool SDLOP_SendDropFile(SDL_Window *window, const char *source, const char *file);
+bool SDLOP_SendDropPosition(SDL_Window *window, float x, float y);
+bool SDLOP_SendDropText(SDL_Window *window, const char *text);
+bool SDLOP_SendDropComplete(SDL_Window *window);
+/* text/uri-list (local files -> DROP_FILE) or text (DROP_TEXT per line),
+ * then DROP_COMPLETE; tokenizes `data` in place */
+void SDLOP_SendDropPayload(SDL_Window *window, bool uri_list, char *data);
+bool SDLOP_IsAcceptingDragAndDrop(void);
+void SDLOP_ToggleDragAndDropSupport(void);
+int SDLOP_URIToLocal(const char *src, char *dst); /* file: URI -> path (in place ok); -1 = not local */
 const void *SDLCALL SDLOP_ClipboardTextCallback(void *userdata, const char *mime_type, size_t *size);
 
 /* Provided by backends */

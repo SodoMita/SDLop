@@ -1,6 +1,6 @@
 /*
-  SDLop - Wayland clipboard (wl_data_device) and primary selection
-  (zwp_primary_selection_v1).
+  SDLop - Wayland clipboard (wl_data_device), primary selection
+  (zwp_primary_selection_v1) and drag-and-drop target.
 
   Same model as stock SDL3 (SDL_waylandclipboard.c / SDL_waylanddatamanager.c):
     - SDL_SetClipboardData creates a wl_data_source offering the app's mime
@@ -16,6 +16,13 @@
       round trip; a live (not yet cancelled) source says the same here.
   Primary selection is the same with zwp_primary_selection_*; it carries
   text only, as in stock.
+
+  Drag-and-drop (as stock): an offer entering one of our surfaces is
+  accepted with text/uri-list, else a text type (copy action);
+  enter/motion become SDL_EVENT_DROP_POSITION, drop reads the data into
+  SDL_EVENT_DROP_FILE (local file: URIs) / SDL_EVENT_DROP_TEXT (lines) +
+  SDL_EVENT_DROP_COMPLETE and finishes the offer; leave completes an
+  unfinished sequence.
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
@@ -61,6 +68,9 @@ static struct
 
     Offer *selection;     /* current CLIPBOARD offer (may be our echo) */
     Offer *dnd;           /* offer of a drag over one of our surfaces */
+    SDL_Window *dnd_window;
+    const char *dnd_mime; /* accepted type (points into dnd->mimes), NULL = refused */
+    uint32_t dnd_action;  /* last wl_data_offer.action for dnd */
     Offer *primary_offer; /* current PRIMARY offer */
 
     struct wl_data_source *source;                     /* our CLIPBOARD source, until cancelled */
@@ -351,9 +361,10 @@ static void offer_source_actions(void *data, struct wl_data_offer *offer, uint32
 
 static void offer_action(void *data, struct wl_data_offer *offer, uint32_t action)
 {
-    (void)data;
     (void)offer;
-    (void)action;
+    if ((Offer *)data == wc.dnd) {
+        wc.dnd_action = action;
+    }
 }
 
 static const struct wl_data_offer_listener offer_listener = {
@@ -396,29 +407,82 @@ static void device_data_offer(void *data, struct wl_data_device *device, struct 
     wl_data_offer_add_listener(id, &offer_listener, o);
 }
 
+static SDL_Window *window_from_surface(struct wl_surface *surface)
+{
+    for (SDL_Window *w = sdlop.windows; surface && w; w = w->next) {
+        if (SDLOP_Wayland_GetWindowSurfaceHandle(w) == surface) {
+            return w;
+        }
+    }
+    return NULL;
+}
+
+static bool window_alive(SDL_Window *window)
+{
+    for (SDL_Window *w = sdlop.windows; window && w; w = w->next) {
+        if (w == window) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* text/uri-list > text/plain;charset=utf-8 > the other text types */
+static const char *pick_dnd_mime(const Offer *o)
+{
+    static const char *const order[] = { "text/uri-list", "text/plain;charset=utf-8", "text/plain", "UTF8_STRING",
+                                         "TEXT", "STRING" };
+    for (size_t i = 0; o && i < SDL_arraysize(order); i++) {
+        for (size_t k = 0; k < o->num_mimes; k++) {
+            if (strcmp(o->mimes[k], order[i]) == 0) {
+                return o->mimes[k];
+            }
+        }
+    }
+    return NULL;
+}
+
+static void dnd_end(void)
+{
+    if (wc.dnd && wc.dnd != wc.selection) {
+        offer_destroy(wc.dnd);
+    }
+    wc.dnd = NULL;
+    wc.dnd_window = NULL;
+    wc.dnd_mime = NULL;
+    wc.dnd_action = 0;
+}
+
 static void device_enter(void *data, struct wl_data_device *device, uint32_t serial, struct wl_surface *surface,
                          wl_fixed_t x, wl_fixed_t y, struct wl_data_offer *id)
 {
     (void)data;
     (void)device;
-    (void)serial;
-    (void)surface;
-    (void)x;
-    (void)y;
-    if (wc.dnd && wc.dnd != wc.selection) {
-        offer_destroy(wc.dnd);
-    }
+    dnd_end();
     wc.dnd = id ? (Offer *)wl_data_offer_get_user_data(id) : NULL;
+    wc.dnd_window = window_from_surface(surface);
+    if (!wc.dnd) {
+        return; /* a drag of our own without data */
+    }
+    wc.dnd_mime = (wc.dnd_window && SDLOP_IsAcceptingDragAndDrop()) ? pick_dnd_mime(wc.dnd) : NULL;
+    wl_data_offer_accept(id, serial, wc.dnd_mime);
+    if (wc.manager_version >= 3) {
+        const uint32_t copy = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+        wl_data_offer_set_actions(id, wc.dnd_mime ? copy : 0, wc.dnd_mime ? copy : 0);
+    }
+    if (wc.dnd_mime) {
+        SDLOP_SendDropPosition(wc.dnd_window, (float)wl_fixed_to_double(x), (float)wl_fixed_to_double(y));
+    }
 }
 
 static void device_leave(void *data, struct wl_data_device *device)
 {
     (void)data;
     (void)device;
-    if (wc.dnd && wc.dnd != wc.selection) {
-        offer_destroy(wc.dnd);
+    if (window_alive(wc.dnd_window) && wc.dnd_window->is_dropping) {
+        SDLOP_SendDropComplete(wc.dnd_window);
     }
-    wc.dnd = NULL;
+    dnd_end();
 }
 
 static void device_motion(void *data, struct wl_data_device *device, uint32_t time, wl_fixed_t x, wl_fixed_t y)
@@ -426,13 +490,29 @@ static void device_motion(void *data, struct wl_data_device *device, uint32_t ti
     (void)data;
     (void)device;
     (void)time;
-    (void)x;
-    (void)y;
+    if (wc.dnd_mime && window_alive(wc.dnd_window)) {
+        SDLOP_SendDropPosition(wc.dnd_window, (float)wl_fixed_to_double(x), (float)wl_fixed_to_double(y));
+    }
 }
 
 static void device_drop(void *data, struct wl_data_device *device)
 {
-    device_leave(data, device);
+    (void)data;
+    (void)device;
+    SDL_Window *window = window_alive(wc.dnd_window) ? wc.dnd_window : NULL;
+    if (wc.dnd && wc.dnd_mime && window) {
+        size_t len = 0;
+        char *payload = (char *)offer_receive(wc.dnd, wc.dnd_mime, &len);
+        SDLOP_SendDropPayload(window, strcmp(wc.dnd_mime, "text/uri-list") == 0, payload);
+        SDL_free(payload);
+        /* finish is only valid with a negotiated action (v3) */
+        if (payload && wc.manager_version >= 3 && wc.dnd_action != 0) {
+            wl_data_offer_finish((struct wl_data_offer *)wc.dnd->proxy);
+        }
+    } else if (window && window->is_dropping) {
+        SDLOP_SendDropComplete(window);
+    }
+    dnd_end();
 }
 
 static void device_selection(void *data, struct wl_data_device *device, struct wl_data_offer *id)

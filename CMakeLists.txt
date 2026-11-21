@@ -41,6 +41,7 @@ if(EMSCRIPTEN)
     src/SDL_events_desc.c
     src/SDL_events_categories.c
     src/SDL_clipboard.c
+    src/SDL_dropevents.c
     src/SDL_thread.c
     src/SDL_misc.c
     src/SDL_joystick.c
@@ -331,6 +332,7 @@ set(SDLop_SOURCES
   src/SDL_events_desc.c
   src/SDL_events_categories.c
   src/SDL_clipboard.c
+  src/SDL_dropevents.c
   src/SDL_thread.c
   src/SDL_misc.c
   src/SDL_joystick.c
@@ -376,6 +378,7 @@ if(SDLOP_VIDEO_X11)
     src/video/x11/sdlop_x11_dyn.c
     src/video/x11/sdlop_x11_gl.c
     src/video/x11/sdlop_x11_clipboard.c
+    src/video/x11/sdlop_x11_dnd.c
     src/video/x11/sdlop_x11_vulkan.c)
   list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
 endif()
@@ -569,6 +572,13 @@ if(SDLop_BUILD_TESTS)
       add_test(NAME test_x11_clipboard_noxfixes COMMAND test_x11_clipboard)
       set_tests_properties(test_x11_clipboard test_x11_clipboard_noxfixes PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       set_tests_properties(test_x11_clipboard_noxfixes PROPERTIES ENVIRONMENT "SDLOP_LIB_XCB_XFIXES=none")
+      # XDND drag-and-drop target against a raw xcb drag source
+      add_executable(test_x11_dnd tests/test_x11_dnd.c)
+      target_link_libraries(test_x11_dnd PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+      target_include_directories(test_x11_dnd PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_dnd PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_dnd COMMAND test_x11_dnd)
+      set_tests_properties(test_x11_dnd PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
       add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
       target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
@@ -698,6 +708,16 @@ if(SDLop_BUILD_TESTS)
     add_dependencies(test_wayland_clipboard mini_compositor)
     add_test(NAME test_wayland_clipboard COMMAND test_wayland_clipboard $<TARGET_FILE:mini_compositor>)
     set_tests_properties(test_wayland_clipboard PROPERTIES TIMEOUT 60)
+
+    # drag-and-drop target (synthetic drags from the mini compositor)
+    add_executable(test_wayland_dnd tests/test_wayland_dnd.c)
+    target_link_libraries(test_wayland_dnd PRIVATE sdlop)
+    target_compile_options(test_wayland_dnd PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_dnd mini_compositor)
+    foreach(dnd_mode files text refuse disabled)
+      add_test(NAME test_wayland_dnd_${dnd_mode} COMMAND test_wayland_dnd $<TARGET_FILE:mini_compositor> ${dnd_mode})
+      set_tests_properties(test_wayland_dnd_${dnd_mode} PROPERTIES TIMEOUT 60)
+    endforeach()
   else()
     message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch, test_wayland_buffers")
   endif()

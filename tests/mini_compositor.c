@@ -14,6 +14,12 @@
   zwp_primary_selection_device_manager_v1 shared by any number of clients
   (selections go to every client, focus is not modelled) and exits when the
   last client disconnects - for tests/test_wayland_clipboard.c.
+  MINI_DND=<data> (implies the data device) drags <data> onto the client's
+  window once it has a buffer: data_offer with MINI_DND_MIMES (default
+  text/uri-list), enter(10.5,20.25), motion(30,40); after the client's
+  set_actions -> action(copy) and drop. The run fails (exit 6) unless the
+  client read the data and called wl_data_offer.finish - or, with
+  MINI_DND_REFUSE=1, unless it accepted nothing and read nothing.
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -475,6 +481,8 @@ static void B_commit(void)
     B_pending = NULL;
 }
 
+static void D_maybe_start(void);
+
 static void surface_commit(struct wl_client *client, struct wl_resource *res)
 {
     (void)client;
@@ -494,6 +502,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         printf("mini: sent initial configure\n");
         fflush(stdout);
     }
+    D_maybe_start();
     if (M.buffer_attached && !M.entered && M.pointer) {
         M.entered = true;
         uint32_t serial = wl_display_next_serial(M.display);
@@ -1264,6 +1273,141 @@ static void S_prim_mgr_bind(struct wl_client *client, void *data, uint32_t versi
     wl_resource_set_implementation(r, &S_prim_mgr_impl, NULL, NULL);
 }
 
+/* ---------------- synthetic drag (MINI_DND) ---------------- */
+
+static const char *D_data;
+static bool D_refuse_expected;
+static bool D_started, D_dropped, D_finished, D_accepted;
+static int D_received;
+static struct wl_resource *D_device, *D_offer;
+static struct wl_event_source *D_timer, *D_drop_timer;
+
+static void D_offer_accept(struct wl_client *client, struct wl_resource *res, uint32_t serial, const char *mime)
+{
+    (void)client;
+    (void)res;
+    (void)serial;
+    D_accepted = mime != NULL;
+    printf("mini: dnd accept %s\n", mime ? mime : "(none)");
+    fflush(stdout);
+}
+
+static void D_offer_receive(struct wl_client *client, struct wl_resource *res, const char *mime, int32_t fd)
+{
+    (void)client;
+    (void)res;
+    size_t len = strlen(D_data), off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, D_data + off, len - off);
+        if (n <= 0) {
+            break;
+        }
+        off += (size_t)n;
+    }
+    close(fd);
+    D_received++;
+    printf("mini: dnd receive %s (%zu bytes)\n", mime, off);
+    fflush(stdout);
+}
+
+static void D_offer_finish(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    (void)res;
+    D_finished = true;
+    printf("mini: dnd finish\n");
+    fflush(stdout);
+}
+
+static int D_drop_cb(void *data)
+{
+    (void)data;
+    if (D_device && !D_dropped) {
+        D_dropped = true;
+        if (D_accepted) {
+            wl_data_device_send_drop(D_device);
+        } else {
+            wl_data_device_send_leave(D_device); /* nothing accepted: the drag is cancelled */
+        }
+        printf("mini: dnd %s\n", D_accepted ? "drop" : "leave (cancelled)");
+        fflush(stdout);
+    }
+    return 0;
+}
+
+static void D_offer_set_actions(struct wl_client *client, struct wl_resource *res, uint32_t actions, uint32_t preferred)
+{
+    (void)client;
+    (void)preferred;
+    uint32_t action = (actions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY) ? WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY : 0;
+    wl_data_offer_send_action(res, action);
+    wl_event_source_timer_update(D_drop_timer, 50);
+}
+
+static void D_offer_destroyed(struct wl_resource *res)
+{
+    if (res == D_offer) {
+        D_offer = NULL;
+    }
+}
+
+static const struct wl_data_offer_interface D_offer_impl = {
+    .accept = D_offer_accept,
+    .receive = D_offer_receive,
+    .destroy = S_res_destroy,
+    .finish = D_offer_finish,
+    .set_actions = D_offer_set_actions,
+};
+
+static int D_timer_cb(void *data)
+{
+    (void)data;
+    struct wl_client *client = wl_resource_get_client(M.surface_res);
+    struct wl_resource *dev;
+    D_device = NULL;
+    wl_resource_for_each(dev, &S_clip.devices)
+    {
+        if (wl_resource_get_client(dev) == client) {
+            D_device = dev;
+        }
+    }
+    if (!D_device) {
+        fprintf(stderr, "mini: dnd: client has no wl_data_device\n");
+        exit(6);
+    }
+    const uint32_t version = (uint32_t)wl_resource_get_version(D_device);
+    D_offer = wl_resource_create(client, &wl_data_offer_interface, (int)version, 0);
+    wl_resource_set_implementation(D_offer, &D_offer_impl, NULL, D_offer_destroyed);
+    wl_data_device_send_data_offer(D_device, D_offer);
+    const char *mimes = getenv("MINI_DND_MIMES") ? getenv("MINI_DND_MIMES") : "text/uri-list";
+    char *list = strdup(mimes), *save = NULL;
+    for (char *m = strtok_r(list, ",", &save); m; m = strtok_r(NULL, ",", &save)) {
+        wl_data_offer_send_offer(D_offer, m);
+    }
+    free(list);
+    if (version >= 3) {
+        wl_data_offer_send_source_actions(D_offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                       WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+    }
+    wl_data_device_send_enter(D_device, wl_display_next_serial(M.display), M.surface_res, wl_fixed_from_double(10.5),
+                              wl_fixed_from_double(20.25), D_offer);
+    wl_data_device_send_motion(D_device, 1, wl_fixed_from_double(30.0), wl_fixed_from_double(40.0));
+    if (version < 3) {
+        wl_event_source_timer_update(D_drop_timer, 50);
+    }
+    printf("mini: dnd enter + motion (%s)\n", mimes);
+    fflush(stdout);
+    return 0;
+}
+
+static void D_maybe_start(void)
+{
+    if (D_data && !D_started && M.buffer_attached && M.surface_res) {
+        D_started = true;
+        wl_event_source_timer_update(D_timer, 100);
+    }
+}
+
 /* ---------------- lifecycle ---------------- */
 
 static int watchdog_cb(void *data)
@@ -1273,14 +1417,29 @@ static int watchdog_cb(void *data)
     exit(2);
 }
 
+static void client_destroyed(struct wl_listener *listener, void *data);
+static struct wl_listener client_destroy_listener = { .notify = client_destroyed };
+
 static void client_destroyed(struct wl_listener *listener, void *data)
 {
-    (void)listener;
     (void)data;
+    if (listener != &client_destroy_listener) {
+        /* the per-client listener of S_mode (already unlinked by the final
+         * destroy-signal emission) */
+        free(listener);
+    }
     if (S_mode && --S_clients > 0) {
         printf("mini: client disconnected, %d left\n", S_clients);
         fflush(stdout);
         return;
+    }
+    if (D_data) {
+        const bool ok = D_refuse_expected ? (D_dropped && !D_accepted && D_received == 0)
+                                          : (D_dropped && D_received > 0 && D_finished);
+        printf("mini: dnd %s (dropped=%d accepted=%d received=%d finished=%d)\n", ok ? "ok" : "FAILED", D_dropped,
+               D_accepted, D_received, D_finished);
+        fflush(stdout);
+        exit(ok ? 0 : 6);
     }
     printf("mini: client disconnected, exiting\n");
     if (B_mode) {
@@ -1298,8 +1457,6 @@ static void client_destroyed(struct wl_listener *listener, void *data)
     fflush(stdout);
     exit(0);
 }
-
-static struct wl_listener client_destroy_listener = { .notify = client_destroyed };
 
 static void client_connected(struct wl_listener *listener, void *data)
 {
@@ -1347,7 +1504,13 @@ int main(void)
         wl_global_create(M.display, &wp_viewporter_interface, 1, NULL, viewporter_bind);
     }
 
-    S_mode = getenv("MINI_SELECTION") && atoi(getenv("MINI_SELECTION"));
+    D_data = getenv("MINI_DND");
+    D_refuse_expected = getenv("MINI_DND_REFUSE") && atoi(getenv("MINI_DND_REFUSE"));
+    if (D_data) {
+        D_timer = wl_event_loop_add_timer(M.loop, D_timer_cb, NULL);
+        D_drop_timer = wl_event_loop_add_timer(M.loop, D_drop_cb, NULL);
+    }
+    S_mode = (getenv("MINI_SELECTION") && atoi(getenv("MINI_SELECTION"))) || D_data;
     if (S_mode) {
         wl_list_init(&S_clip.devices);
         wl_list_init(&S_prim.devices);

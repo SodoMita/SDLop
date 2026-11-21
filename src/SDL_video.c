@@ -857,6 +857,9 @@ SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
 
     SDLOP_AddWindow(window);
     SDLOP_UpdateWindowDisplay(window);
+    if (sdlop.video->AcceptDragAndDrop) {
+        sdlop.video->AcceptDragAndDrop(window, SDLOP_IsAcceptingDragAndDrop());
+    }
 
     if (!(flags & SDL_WINDOW_HIDDEN)) {
         SDL_ShowWindow(window);

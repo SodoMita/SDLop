@@ -1924,6 +1924,7 @@ static bool x11_Init(SDLop_VideoDevice *device)
     SDLOP_AddMouse(x11.mouse_id, NULL);
 
     SDLOP_X11_Clipboard_Init();
+    SDLOP_X11_DnD_Init();
 
     x11_flush();
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
@@ -1943,6 +1944,7 @@ static void x11_Quit(SDLop_VideoDevice *device)
     }
     x11.num_monitors = 0;
     SDLOP_X11_Clipboard_Quit();
+    SDLOP_X11_DnD_Quit();
     free(x11.peeked);
     x11.peeked = NULL;
     if (x11.conn) {
@@ -2218,6 +2220,7 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!wd) {
         return;
     }
+    SDLOP_X11_DnD_WindowDestroyed(window);
     if (x11.relative_window == window) {
         if (x11.pointer_grabbed) {
             X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
@@ -3295,7 +3298,7 @@ static void x11_dispatch(xcb_generic_event_t *ev)
         handle_xkb_event(ev);
         return;
     }
-    if (SDLOP_X11_Clipboard_HandleEvent(ev)) {
+    if (SDLOP_X11_Clipboard_HandleEvent(ev) || SDLOP_X11_DnD_HandleEvent(ev)) {
         return;
     }
     if (x11.has_randr && (type == x11.randr_event_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY ||
@@ -3643,4 +3646,5 @@ SDLop_VideoDevice SDLop_x11_device = {
     .SetPrimarySelectionText = SDLOP_X11_SetPrimarySelectionText,
     .GetPrimarySelectionText = SDLOP_X11_GetPrimarySelectionText,
     .HasPrimarySelectionText = SDLOP_X11_HasPrimarySelectionText,
+    .AcceptDragAndDrop = SDLOP_X11_AcceptDragAndDrop,
 };

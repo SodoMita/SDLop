@@ -75,25 +75,37 @@ void SDLOP_FreeTemporaryMemory(void)
     free_temp_list(list);
 }
 
-/* unlink the pushing thread's entry for the event's pointer, if any */
-static TempMem *claim_event_memory(const SDL_Event *event)
+static TempMem *claim_pointer(const void *ptr, TempMem *list)
 {
-    const void *ptr = NULL;
-    if (event->type == SDL_EVENT_CLIPBOARD_UPDATE) {
-        ptr = event->clipboard.mime_types;
-    }
     if (!ptr) {
-        return NULL;
+        return list;
     }
     for (TempMem **link = &thread_temp; *link; link = &(*link)->next) {
         if ((*link)->memory == ptr) {
             TempMem *e = *link;
             *link = e->next;
-            e->next = NULL;
+            e->next = list;
             return e;
         }
     }
-    return NULL;
+    return list;
+}
+
+/* unlink the pushing thread's entries for the event's pointers, if any */
+static TempMem *claim_event_memory(const SDL_Event *event)
+{
+    switch (event->type) {
+    case SDL_EVENT_CLIPBOARD_UPDATE:
+        return claim_pointer(event->clipboard.mime_types, NULL);
+    case SDL_EVENT_DROP_FILE:
+    case SDL_EVENT_DROP_TEXT:
+    case SDL_EVENT_DROP_BEGIN:
+    case SDL_EVENT_DROP_COMPLETE:
+    case SDL_EVENT_DROP_POSITION:
+        return claim_pointer(event->drop.data, claim_pointer(event->drop.source, NULL));
+    default:
+        return NULL;
+    }
 }
 
 static void give_memory_to_thread(TempMem *list)
@@ -473,6 +485,9 @@ void SDL_SetEventEnabled(Uint32 type, bool enabled)
     }
     if (type == SDL_EVENT_TEXT_INPUT || type == SDL_EVENT_TEXT_EDITING) {
         /* nothing else to toggle: SDLop has no IME to switch off */
+    }
+    if (type == SDL_EVENT_DROP_FILE || type == SDL_EVENT_DROP_TEXT) {
+        SDLOP_ToggleDragAndDropSupport();
     }
 }
 
