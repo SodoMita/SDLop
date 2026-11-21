@@ -447,8 +447,11 @@ if(SDLop_BUILD_EXAMPLES)
   if(Vulkan_FOUND)
     add_executable(vulkan_clear examples/vulkan_clear.c)
     target_link_libraries(vulkan_clear PRIVATE sdlop Vulkan::Vulkan m)
+
+    add_executable(vulkan_stress examples/vulkan_stress.c)
+    target_link_libraries(vulkan_stress PRIVATE sdlop Vulkan::Vulkan m)
   else()
-    message(STATUS "Vulkan not found - skipping vulkan_clear example")
+    message(STATUS "Vulkan not found - skipping Vulkan examples")
   endif()
 
   # GL example talks GLES2 directly

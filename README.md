@@ -444,9 +444,14 @@ Highlights:
   into the zero-copy shm window surface.
 - `examples/gl_triangle.c` — OpenGL ES 2 triangle via EGL (llvmpipe on
   GPU-less systems), with center-pixel read-back.
-- `examples/vulkan_clear.c` — full Vulkan swapchain loop (lavapipe) via
-  `SDL_Vulkan_*`, cycling clear color verified by `vkCmdCopyImageToBuffer`
-  read-back.
+- `examples/vulkan_clear.c` — full Vulkan swapchain loop via `SDL_Vulkan_*`,
+  cycling clear color verified by `vkCmdCopyImageToBuffer` read-back. With
+  `--offload` it runs on the offload GPU (NVIDIA included, via transparent
+  swapchain emulation) and reads back into shm/dumb framebuffers.
+- `examples/vulkan_stress.c` — heavier GPU workload: compute-updated instanced
+  particles, an offscreen scene pass and a post-process pass, with animated
+  frame checksums. Use `--offload` on shm/dumb-only targets, including
+  `SDL_VIDEODRIVER=kmsdrm`/`fbdev` from a TTY.
 - `tests/mini_compositor.c` — a tiny purpose-built Wayland compositor
   (wl_seat + pointer-constraints + relative-pointer) that makes the pointer
   lock integration testable without a seat-capable compositor.

@@ -1,0 +1,59 @@
+#version 450
+
+/* GPU-driven particle animation. Host writes the initial state once; this
+ * compute pass updates position/velocity every frame. */
+
+layout(local_size_x = 64) in;
+
+struct Particle {
+    vec2 pos;
+    vec2 vel;
+    vec3 color;
+    float size;
+};
+
+layout(set = 0, binding = 0) buffer Particles {
+    Particle particles[];
+};
+
+layout(push_constant) uniform ComputeParams {
+    float dt;
+    float time;
+    uint count;
+    float pad;
+} params;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.count) {
+        return;
+    }
+
+    vec2 pos = particles[i].pos;
+    vec2 vel = particles[i].vel;
+
+    /* Swirl around the origin plus a slowly rotating radial pulse. */
+    vec2 to_center = -pos;
+    float radius = max(length(to_center), 0.04);
+    vec2 tangent = vec2(-to_center.y, to_center.x) / radius;
+    float phase = params.time * 0.7 + float(i) * 0.017;
+    vec2 force = tangent * (0.55 + 0.20 * sin(phase)) +
+                 to_center * (0.35 + 0.25 * cos(phase * 0.7));
+
+    vel = (vel + force * params.dt) * 0.9985;
+    pos += vel * params.dt;
+
+    /* Wrap softly in the [-1.25, 1.25] square. */
+    if (pos.x > 1.25 || pos.x < -1.25) {
+        pos.x = clamp(pos.x, -1.25, 1.25);
+        vel.x = -vel.x * 0.85;
+    }
+    if (pos.y > 1.25 || pos.y < -1.25) {
+        pos.y = clamp(pos.y, -1.25, 1.25);
+        vel.y = -vel.y * 0.85;
+    }
+
+    particles[i].pos = pos;
+    particles[i].vel = vel;
+}
