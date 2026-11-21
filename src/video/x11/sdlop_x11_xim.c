@@ -19,6 +19,10 @@
       are processed like unfiltered ones
     - SDL_SetTextInputArea sets XNSpotLocation (cursor x, bottom of the
       area - stock); SDL_StopTextInput / SDL_ClearComposition reset the IC
+  Only an IM server named by XMODIFIERS (@im=ibus, fcitx, ...) is used.
+  Xlib's built-in "local" IM (no @im, @im=none/local) would only redo the
+  dead-key/Compose handling xkbcommon already does, and swallow the key
+  events of composed keys - so SDLop keeps its own compose there.
   Without libX11 or an IM, text input works as before (xkbcommon text).
   SDLOP_X11_NO_XIM disables all of it.
 
@@ -30,6 +34,7 @@
 
 #include <dlfcn.h>
 #include <locale.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -218,7 +223,20 @@ static struct
     XErrorHandler_ prev_error_handler;
     XimWindow *windows;
     Uint64 serial;  /* synthetic event serials: never a real one */
+    locale_t ctype; /* the user's LC_CTYPE: Xlib converts IM text with the
+                       C library's current locale (mblen), see LOCALE_ENTER */
 } xim;
+
+/* Xlib's XIM code runs C library conversions (mblen & co.) in the calling
+ * thread's locale, which in a typical SDL app is "C"; the IM was opened in
+ * the user's locale. Switch this thread over while inside Xlib. */
+#define LOCALE_ENTER() locale_t prev_locale_ = xim.ctype ? uselocale(xim.ctype) : (locale_t)0
+#define LOCALE_LEAVE()               \
+    do {                             \
+        if (prev_locale_) {          \
+            uselocale(prev_locale_); \
+        }                            \
+    } while (0)
 
 static void *xim_lib_keep; /* libX11 handle across SDL_Quit/SDL_Init */
 
@@ -348,6 +366,8 @@ static void preedit_draw_cb(XIC_ ic, XPointer_ client_data, XPointer_ call_data)
         memcpy(fb, w->feedback, (size_t)first * sizeof(*fb));
     }
     if (cd->text && cd->text->feedback) {
+        /* Xlib allocates text->length entries (counted with mblen in the
+         * thread locale, hence LOCALE_ENTER around every Xlib call) */
         const int n = SDL_min(ins_len, (int)cd->text->length);
         for (int i = 0; i < n; i++) {
             fb[first + i] = cd->text->feedback[i];
@@ -574,6 +594,20 @@ static bool load_xlib(void)
     return true;
 }
 
+/* whether XMODIFIERS selects an IM server (Xlib: "@im=<name>", where an
+ * empty name, "none" and "local" mean its built-in compose IM) */
+static bool im_server_configured(void)
+{
+    const char *mods = SDL_getenv("XMODIFIERS");
+    const char *im = mods ? strstr(mods, "@im=") : NULL;
+    if (!im) {
+        return false;
+    }
+    im += 4;
+    const size_t n = strcspn(im, "@");
+    return n > 0 && !(n == 4 && strncmp(im, "none", 4) == 0) && !(n == 5 && strncmp(im, "local", 5) == 0);
+}
+
 /* lazily on the first SDL_StartTextInput: costs nothing otherwise */
 static bool ensure_init(void)
 {
@@ -581,7 +615,7 @@ static bool ensure_init(void)
         return xim.dpy != NULL && !xim.dead;
     }
     xim.tried = true;
-    if (SDLOP_HintFlag(SDLOP_HINT_X11_NO_XIM, false) || !load_xlib()) {
+    if (SDLOP_HintFlag(SDLOP_HINT_X11_NO_XIM, false) || !im_server_configured() || !load_xlib()) {
         return false;
     }
     xim.dpy = X.XOpenDisplay(NULL);
@@ -593,6 +627,7 @@ static bool ensure_init(void)
         X.XSetIOErrorExitHandler(xim.dpy, xim_io_exit_handler, NULL);
     }
     xim.prev_error_handler = X.XSetErrorHandler(xim_error_handler);
+    xim.ctype = newlocale(LC_CTYPE_MASK, "", (locale_t)0);
     open_im();
     X.XFlush(xim.dpy);
     return true;
@@ -609,7 +644,9 @@ void SDLOP_X11_XIM_Update(void)
     for (XimWindow *w = xim.windows; w; w = w->next) {
         const bool want = w->window == focus && focus->text_input_active;
         if (want && !w->ic) {
+            LOCALE_ENTER();
             create_ic(w);
+            LOCALE_LEAVE();
         }
         if (!w->ic) {
             w->focused = false;
@@ -633,7 +670,9 @@ static void reset_ic(XimWindow *w)
 {
     if (w->ic) {
         /* drops pending dead keys / the IM's composition (stock) */
+        LOCALE_ENTER();
         char *contents = X.Xutf8ResetIC(w->ic);
+        LOCALE_LEAVE();
         if (contents) {
             X.XFree(contents);
         }
@@ -742,7 +781,9 @@ bool SDLOP_X11_XIM_FilterKey(const xcb_key_press_event_t *kev)
     ev.xkey.state = kev->state;
     ev.xkey.keycode = kev->detail;
     ev.xkey.same_screen = kev->same_screen;
+    LOCALE_ENTER();
     const bool filtered = X.XFilterEvent(&ev, 0) != 0;
+    LOCALE_LEAVE();
     if (filtered) {
         X.XFlush(xim.dpy);
     }
@@ -773,11 +814,20 @@ static void handle_commit(XimWindow *w, XEvent_ *ev)
     }
 }
 
+static void pump_events(void);
+
 void SDLOP_X11_XIM_Pump(void)
 {
     if (!xim.dpy || xim.dead) {
         return;
     }
+    LOCALE_ENTER();
+    pump_events();
+    LOCALE_LEAVE();
+}
+
+static void pump_events(void)
+{
     while (!xim.dead && X.XPending(xim.dpy) > 0) {
         XEvent_ ev;
         X.XNextEvent(xim.dpy, &ev);
@@ -866,6 +916,9 @@ void SDLOP_X11_XIM_Quit(void)
         if (cur != xim_error_handler) {
             X.XSetErrorHandler(cur);
         }
+    }
+    if (xim.ctype) {
+        freelocale(xim.ctype);
     }
     /* libX11 stays loaded (X.lib kept for the next init): its locale and IM
      * caches live in its globals, and unmapping them would only turn them
