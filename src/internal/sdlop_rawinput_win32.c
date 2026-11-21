@@ -104,9 +104,15 @@ typedef struct SDLOP_WinRawState
 
     atomic_uint_least64_t event_count;
 
-    /* callbacks: published by the app thread, read by the worker */
+    /* callbacks: published by the app thread, read by the worker.
+     *
+     * A read/write lock rather than an atomic pointer swap: the worker holds
+     * it shared while walking the list, so the publisher can free the old set
+     * once nobody is inside. The Linux worker publishes lock-free and leaks
+     * each superseded set instead (bounded, but a leak), and the cost of
+     * correctness here is one uncontended lock acquisition per event. */
     SDLOP_WinCallbackSet *callbacks;
-    CRITICAL_SECTION cb_lock;
+    SRWLOCK cb_lock;
 
     Uint64 qpc_freq;
     Uint64 qpc_base;
@@ -115,7 +121,9 @@ typedef struct SDLOP_WinRawState
     int wheel_acc;  /* per-axis wheel remainder, in 120-unit notches */
     int hwheel_acc;
 
-    Uint8 key_down[256]; /* evdev code -> held; suppresses report repeats */
+    /* Indexed by evdev key code, which reaches SDLOP_EVDEV_KEY_MAX (767),
+     * not by scan code (0..255). Sized from the table so it cannot drift. */
+    Uint8 key_down[SDLOP_EVDEV_KEY_MAX + 1]; /* 1 = held; suppresses repeats */
 } SDLOP_WinRawState;
 
 static SDLOP_WinRawState winraw;
@@ -179,12 +187,21 @@ static void dispatch_callbacks(const SDLop_RawEvent *event)
     SDLOP_WinCallbackSet *set = winraw.callbacks;
     int i;
 
-    if (!set || set->count == 0) {
+    if (!set) {
+        return;
+    }
+    /* Shared: many worker-thread dispatches may overlap; the publisher takes
+     * it exclusive and only then frees the superseded set. */
+    AcquireSRWLockShared(&winraw.cb_lock);
+    set = winraw.callbacks;
+    if (!set) {
+        ReleaseSRWLockShared(&winraw.cb_lock);
         return;
     }
     for (i = 0; i < set->count; i++) {
         set->entries[i].cb(event, set->entries[i].userdata);
     }
+    ReleaseSRWLockShared(&winraw.cb_lock);
 }
 
 static void publish(Uint32 device, Uint16 type, Uint16 code, Sint32 value, Uint64 ts)
@@ -510,13 +527,12 @@ bool SDLOP_RawInputInit(void)
     SDLOP_RingInit(&winraw.sdl_ring, winraw.sdl_ring_storage, SDLOP_WIN_SDL_RING_SIZE, sizeof(SDLop_RawEvent));
     SDLOP_RingInit(&winraw.poll_ring, winraw.poll_ring_storage, SDLOP_WIN_POLL_RING_SIZE, sizeof(SDLop_RawEvent));
     atomic_store(&winraw.event_count, 0);
-    InitializeCriticalSection(&winraw.cb_lock);
+    InitializeSRWLock(&winraw.cb_lock);
     winraw.callbacks = NULL;
 
     InterlockedExchange(&winraw.stop_requested, 0);
     winraw.thread = CreateThread(NULL, 0, raw_win_thread, NULL, 0, &winraw.thread_id);
     if (!winraw.thread) {
-        DeleteCriticalSection(&winraw.cb_lock);
         return SDL_SetError("could not start the raw input thread");
     }
 
@@ -528,7 +544,6 @@ bool SDLOP_RawInputInit(void)
             if (WaitForSingleObject(winraw.thread, 1) == WAIT_OBJECT_0) {
                 CloseHandle(winraw.thread);
                 winraw.thread = NULL;
-                DeleteCriticalSection(&winraw.cb_lock);
                 return SDL_SetError("could not register for raw input");
             }
             spins++;
@@ -552,9 +567,9 @@ void SDLOP_RawInputQuit(void)
     winraw.running = 0;
     winraw.hwnd = NULL;
 
+    /* The worker is joined by now, so nobody can be inside the list. */
     SDL_free((void *)winraw.callbacks);
     winraw.callbacks = NULL;
-    DeleteCriticalSection(&winraw.cb_lock);
 }
 
 /* Feed the ring into the SDL event queue. The worker sees every device that
@@ -724,16 +739,16 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
     if (!cb) {
         return SDL_SetError("NULL callback");
     }
-    EnterCriticalSection(&winraw.cb_lock);
+    AcquireSRWLockExclusive(&winraw.cb_lock);
     old = winraw.callbacks;
     count = old ? old->count : 0;
     if (count >= SDLOP_WIN_MAX_CALLBACKS) {
-        LeaveCriticalSection(&winraw.cb_lock);
+        ReleaseSRWLockExclusive(&winraw.cb_lock);
         return SDL_SetError("Too many raw event callbacks (max %d)", SDLOP_WIN_MAX_CALLBACKS);
     }
     set = (SDLOP_WinCallbackSet *)SDL_calloc(1, sizeof(*set));
     if (!set) {
-        LeaveCriticalSection(&winraw.cb_lock);
+        ReleaseSRWLockExclusive(&winraw.cb_lock);
         return SDL_OutOfMemory();
     }
     if (old) {
@@ -743,7 +758,7 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
     set->entries[count].userdata = userdata;
     set->count = count + 1;
     winraw.callbacks = set;
-    LeaveCriticalSection(&winraw.cb_lock);
+    ReleaseSRWLockExclusive(&winraw.cb_lock);
     SDL_free(old);
     return true;
 }
@@ -758,15 +773,15 @@ void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
     if (!cb) {
         return;
     }
-    EnterCriticalSection(&winraw.cb_lock);
+    AcquireSRWLockExclusive(&winraw.cb_lock);
     old = winraw.callbacks;
     if (!old) {
-        LeaveCriticalSection(&winraw.cb_lock);
+        ReleaseSRWLockExclusive(&winraw.cb_lock);
         return;
     }
     set = (SDLOP_WinCallbackSet *)SDL_calloc(1, sizeof(*set));
     if (!set) {
-        LeaveCriticalSection(&winraw.cb_lock);
+        ReleaseSRWLockExclusive(&winraw.cb_lock);
         return;
     }
     for (i = 0; i < old->count; i++) {
@@ -776,7 +791,7 @@ void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
     }
     set->count = n;
     winraw.callbacks = set;
-    LeaveCriticalSection(&winraw.cb_lock);
+    ReleaseSRWLockExclusive(&winraw.cb_lock);
     SDL_free(old);
 }
 

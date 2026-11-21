@@ -582,11 +582,45 @@ static void win32_destroy_raw_input_window(void)
     }
 }
 
+/* The raw input worker (src/internal/sdlop_rawinput_win32.c) registers the
+ * same Generic Desktop / Keyboard usage and all of its packets already reach
+ * the raw rings and callbacks. Windows keeps exactly one registration per
+ * usage, so the two features cannot both own it:
+ *
+ *   - worker on  -> the worker owns the registration; the hint-driven
+ *                   keyboard events would be a duplicate source, so they stop
+ *   - worker off -> the hint-driven registration is restored as the app asked
+ *
+ * Measured before this rule existed: registering the worker's sink silently
+ * replaced the hint's registration, and a single later RIDEV_REMOVE then
+ * wiped both, leaving no keyboard raw input at all. */
 static void win32_register_raw_keyboard(void)
 {
+
     RAWINPUTDEVICE rid;
     DWORD flags = 0;
     HWND target = NULL;
+
+    if (SDLOP_RawInputIsSource()) {
+        /* The worker owns the registration; remember what the hint wanted so
+         * it can be reinstated when the worker stops. */
+        if (sdlop_win32.raw_keyboard_registered) {
+            SDL_zero(rid);
+            rid.usUsagePage = 0x01;
+            rid.usUsage = 0x06;
+            rid.dwFlags = RIDEV_REMOVE;
+            rid.hwndTarget = NULL; /* RIDEV_REMOVE requires NULL */
+            RegisterRawInputDevices(&rid, 1, sizeof(rid));
+            sdlop_win32.prev_keyboard_registered = true;
+            sdlop_win32.raw_keyboard_registered = false;
+            sdlop_win32.raw_keyboard_target = NULL;
+        }
+        return;
+    }
+    if (sdlop_win32.prev_keyboard_registered) {
+        /* The worker has stopped: put the hint's registration back. */
+        sdlop_win32.prev_keyboard_registered = false;
+    }
 
     if (!sdlop_win32.raw_keyboard_enabled) {
         if (sdlop_win32.raw_keyboard_registered) {
@@ -1045,6 +1079,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
          * be answered whenever the hint turned them on. */
         RAWINPUT packet;
         UINT size = sizeof(packet);
+        /* The worker may have stopped since the last pump (SDL_SetHint or a
+         * window teardown). Restore whatever registration the app asked for
+         * before handling packets, so raw keyboard input is never silently
+         * lost when the two features hand the registration over. */
+        if (sdlop_win32.prev_keyboard_registered && !SDLOP_RawInputIsSource()) {
+            win32_register_raw_keyboard();
+        }
         if (GetRawInputData((HRAWINPUT)m.lParam, RID_INPUT, &packet, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
             if (packet.header.dwType == RIM_TYPEKEYBOARD) {
                 win32_handle_raw_keyboard(&packet.data.keyboard, SDLOP_Win32Timestamp());

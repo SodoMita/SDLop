@@ -80,6 +80,8 @@ typedef struct SDLop_Win32State
     DWORD raw_keyboard_flags; /* the flags last successfully registered */
     HWND raw_keyboard_target; /* what the registration's hwndTarget is */
     HWND raw_input_hwnd;      /* message-only window, only for RIDEV_INPUTSINK */
+    bool prev_keyboard_registered; /* what the keyboard registration was
+                                    * before the raw input worker took it over */
     bool pending_e1_sequence; /* first key of a Ctrl+{key} pair */
 } SDLop_Win32State;
 

@@ -84,7 +84,10 @@ static struct
 
     /* callbacks (RCU-style snapshot pointer swap) */
     SDLOP_CallbackSet *callbacks;
-    pthread_mutex_t cb_mutex;
+    /* read/write rather than a mutex: the worker holds it shared while
+     * dispatching, so superseded callback sets can be freed instead of
+     * leaked, and dispatching stays lock-free-fast in the uncontended case */
+    pthread_rwlock_t cb_lock;
 } raw;
 
 /* Console keyboard ownership and the Ctrl+Alt+Fn chord.
@@ -183,13 +186,16 @@ static int open_input_devices(void)
 
 static void dispatch_callbacks(const SDLop_RawEvent *event)
 {
-    SDLOP_CallbackSet *set = atomic_load_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, memory_order_acquire);
-    if (!set || set->count == 0) {
-        return;
+    SDLOP_CallbackSet *set;
+
+    pthread_rwlock_rdlock(&raw.cb_lock);
+    set = raw.callbacks;
+    if (set && set->count) {
+        for (int i = 0; i < set->count; i++) {
+            set->entries[i].cb(event, set->entries[i].userdata);
+        }
     }
-    for (int i = 0; i < set->count; i++) {
-        set->entries[i].cb(event, set->entries[i].userdata);
-    }
+    pthread_rwlock_unlock(&raw.cb_lock);
 }
 
 static void *worker_main(void *arg)
@@ -331,7 +337,7 @@ bool SDLOP_RawInputInit(void)
     }
     memset(&raw, 0, sizeof(raw));
     raw.winsys = winsys;
-    pthread_mutex_init(&raw.cb_mutex, NULL);
+    pthread_rwlock_init(&raw.cb_lock, NULL);
     atomic_store(&raw.event_count, 0);
 
     SDLOP_RingInit(&raw.sdl_ring, raw.sdl_ring_storage, SDLOP_SDL_RING_SIZE, sizeof(SDLop_RawEvent));
@@ -343,7 +349,7 @@ bool SDLOP_RawInputInit(void)
 
     raw.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (raw.epoll_fd < 0) {
-        pthread_mutex_destroy(&raw.cb_mutex);
+        pthread_rwlock_destroy(&raw.cb_lock);
         return SDL_SetError("epoll_create1 failed: %s", strerror(errno));
     }
 
@@ -351,7 +357,7 @@ bool SDLOP_RawInputInit(void)
     if (raw.control_fd < 0) {
         close(raw.epoll_fd);
         raw.epoll_fd = -1;
-        pthread_mutex_destroy(&raw.cb_mutex);
+        pthread_rwlock_destroy(&raw.cb_lock);
         return SDL_SetError("eventfd failed: %s", strerror(errno));
     }
     {
@@ -362,7 +368,7 @@ bool SDLOP_RawInputInit(void)
             close(raw.control_fd);
             close(raw.epoll_fd);
             raw.control_fd = raw.epoll_fd = -1;
-            pthread_mutex_destroy(&raw.cb_mutex);
+            pthread_rwlock_destroy(&raw.cb_lock);
             return SDL_SetError("epoll_ctl failed: %s", strerror(errno));
         }
     }
@@ -371,7 +377,7 @@ bool SDLOP_RawInputInit(void)
         close(raw.control_fd);
         close(raw.epoll_fd);
         raw.control_fd = raw.epoll_fd = -1;
-        pthread_mutex_destroy(&raw.cb_mutex);
+        pthread_rwlock_destroy(&raw.cb_lock);
         return SDL_SetError("No readable /dev/input devices (need root or the 'input' group); falling back to window-system input");
     }
 
@@ -386,7 +392,7 @@ bool SDLOP_RawInputInit(void)
         close(raw.epoll_fd);
         raw.control_fd = raw.epoll_fd = -1;
         raw.num_devices = 0;
-        pthread_mutex_destroy(&raw.cb_mutex);
+        pthread_rwlock_destroy(&raw.cb_lock);
         return SDL_SetError("SDLOP_RAW_INPUT needs a readable keyboard and pointer (no %s); using window-system input",
                             kb ? "pointer" : "keyboard");
     }
@@ -401,7 +407,7 @@ bool SDLOP_RawInputInit(void)
         close(raw.epoll_fd);
         raw.control_fd = raw.epoll_fd = -1;
         raw.num_devices = 0;
-        pthread_mutex_destroy(&raw.cb_mutex);
+        pthread_rwlock_destroy(&raw.cb_lock);
         return SDL_SetError("Could not start input worker thread");
     }
 
@@ -442,7 +448,7 @@ void SDLOP_RawInputQuit(void)
     raw.winsys = false;
     free((void *)raw.callbacks);
     raw.callbacks = NULL;
-    pthread_mutex_destroy(&raw.cb_mutex);
+    pthread_rwlock_destroy(&raw.cb_lock);
 }
 
 void SDLOP_RawInputAttachConsole(int console_fd)
@@ -701,16 +707,16 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
     if (!cb) {
         return SDL_SetError("NULL callback");
     }
-    pthread_mutex_lock(&raw.cb_mutex);
+    pthread_rwlock_wrlock(&raw.cb_lock);
     SDLOP_CallbackSet *old = raw.callbacks;
     int count = old ? old->count : 0;
     if (count >= SDLOP_MAX_CALLBACKS) {
-        pthread_mutex_unlock(&raw.cb_mutex);
+        pthread_rwlock_unlock(&raw.cb_lock);
         return SDL_SetError("Too many raw event callbacks (max %d)", SDLOP_MAX_CALLBACKS);
     }
     SDLOP_CallbackSet *set = (SDLOP_CallbackSet *)calloc(1, sizeof(*set));
     if (!set) {
-        pthread_mutex_unlock(&raw.cb_mutex);
+        pthread_rwlock_unlock(&raw.cb_lock);
         return SDL_OutOfMemory();
     }
     if (old) {
@@ -719,26 +725,25 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
     set->entries[count].cb = cb;
     set->entries[count].userdata = userdata;
     set->count = count + 1;
-    atomic_store_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, set, memory_order_release);
-    pthread_mutex_unlock(&raw.cb_mutex);
-    /* previous set intentionally not freed: worker thread may still read it.
-     * Bounded leak (one small struct per registration), like asyncinput's
-     * fixed callback table. */
-    (void)old;
+    raw.callbacks = set;
+    pthread_rwlock_unlock(&raw.cb_lock);
+    /* Safe to free: the worker only touches the list under the read lock, so
+     * once the write lock was taken no dispatch can still be inside `old`. */
+    free(old);
     return true;
 }
 
 void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
 {
-    pthread_mutex_lock(&raw.cb_mutex);
+    pthread_rwlock_wrlock(&raw.cb_lock);
     SDLOP_CallbackSet *old = raw.callbacks;
     if (!old) {
-        pthread_mutex_unlock(&raw.cb_mutex);
+        pthread_rwlock_unlock(&raw.cb_lock);
         return;
     }
     SDLOP_CallbackSet *set = (SDLOP_CallbackSet *)calloc(1, sizeof(*set));
     if (!set) {
-        pthread_mutex_unlock(&raw.cb_mutex);
+        pthread_rwlock_unlock(&raw.cb_lock);
         return;
     }
     set->count = 0;
@@ -747,8 +752,9 @@ void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
             set->entries[set->count++] = old->entries[i];
         }
     }
-    atomic_store_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, set, memory_order_release);
-    pthread_mutex_unlock(&raw.cb_mutex);
+    raw.callbacks = set;
+    pthread_rwlock_unlock(&raw.cb_lock);
+    free(old);
 }
 
 int SDLop_PollRawEvents(SDLop_RawEvent *events, int max_events)
