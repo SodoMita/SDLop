@@ -24,6 +24,14 @@
 #include <strings.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#include <emmintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+#include <tmmintrin.h>
+#define SDLOP_HAVE_SSSE3_TARGET 1
+#endif
+#endif
+
 #ifndef EGL_PLATFORM_DEVICE_EXT
 #define EGL_PLATFORM_DEVICE_EXT 0x313F
 #endif
@@ -92,9 +100,11 @@
 #define GL_PACK_ROW_LENGTH_            0x0D02u
 #define GL_PACK_ALIGNMENT_             0x0D05u
 #define GL_RGBA_                       0x1908u
+#define GL_RGB_                        0x1907u
 #define GL_UNSIGNED_BYTE_              0x1401u
 #define GL_RENDERER_                   0x1F01u
 #define GL_BGRA_                       0x80E1u
+#define GL_IMPLEMENTATION_COLOR_READ_FORMAT_ 0x8B9Bu
 #define GL_FRAMEBUFFER_BINDING_        0x8CA6u
 #define GL_READ_FRAMEBUFFER_           0x8CA8u
 #define GL_READ_FRAMEBUFFER_BINDING_   0x8CAAu
@@ -151,8 +161,8 @@ static struct
     /* GL proc cache for readback */
     void *gl_fallback_lib;
     bool gl_fallback_tried;
-    bool bgra_checked;
-    bool bgra_supported;
+    bool read_format_checked;
+    unsigned int read_format;
 
     /* Reusable CPU readback staging buffer */
     uint8_t *staging;
@@ -1249,9 +1259,78 @@ bool SDLOP_GLOffload_MakeCurrent(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSur
 /* Readback + top-down XRGB8888 copy                                   */
 /* ------------------------------------------------------------------ */
 
+static inline uint32_t rgba_word_to_xrgb(uint32_t v);
+static inline uint32_t rgb_bytes_to_xrgb(const uint8_t *p);
+
+#if defined(__x86_64__) || defined(_M_X64)
+static void rgba_row_to_xrgb_sse2(const uint8_t *src, uint32_t *dst, int n)
+{
+    const __m128i mask_r = _mm_set1_epi32(0x000000FF);
+    const __m128i mask_g = _mm_set1_epi32(0x0000FF00);
+    const __m128i mask_b = _mm_set1_epi32(0x00FF0000);
+    const __m128i alpha = _mm_set1_epi32((int)0xFF000000u);
+    int x = 0;
+    for (; x + 4 <= n; x += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(src + (size_t)x * 4u));
+        __m128i r = _mm_slli_epi32(_mm_and_si128(v, mask_r), 16);
+        __m128i g = _mm_and_si128(v, mask_g);
+        __m128i b = _mm_srli_epi32(_mm_and_si128(v, mask_b), 16);
+        __m128i out = _mm_or_si128(alpha, _mm_or_si128(r, _mm_or_si128(g, b)));
+        _mm_storeu_si128((__m128i *)(dst + x), out);
+    }
+    for (; x < n; x++) {
+        dst[x] = rgba_word_to_xrgb(((const uint32_t *)src)[x]);
+    }
+}
+#endif
+
+#if defined(SDLOP_HAVE_SSSE3_TARGET)
+__attribute__((target("ssse3")))
+static void rgb_row_to_xrgb_ssse3(const uint8_t *src, uint32_t *dst, int n)
+{
+    const __m128i shuffle = _mm_setr_epi8(2, 1, 0, -1, 5, 4, 3, -1,
+                                          8, 7, 6, -1, 11, 10, 9, -1);
+    const __m128i alpha = _mm_set1_epi32((int)0xFF000000u);
+    int x = 0;
+    for (; x + 4 <= n; x += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(src + (size_t)x * 3u));
+        __m128i out = _mm_or_si128(_mm_shuffle_epi8(v, shuffle), alpha);
+        _mm_storeu_si128((__m128i *)(dst + x), out);
+    }
+    for (; x < n; x++) {
+        dst[x] = rgb_bytes_to_xrgb(src + (size_t)x * 3u);
+    }
+}
+
+static bool have_ssse3(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = __builtin_cpu_supports("ssse3") ? 1 : 0;
+    }
+    return cached != 0;
+}
+#endif
+
+static inline uint32_t rgba_word_to_xrgb(uint32_t v)
+{
+    return 0xFF000000u |
+           ((v & 0x000000FFu) << 16) |
+           (v & 0x0000FF00u) |
+           ((v >> 16) & 0x000000FFu);
+}
+
+static inline uint32_t rgb_bytes_to_xrgb(const uint8_t *p)
+{
+    return 0xFF000000u |
+           ((uint32_t)p[0] << 16) |
+           ((uint32_t)p[1] << 8) |
+           (uint32_t)p[2];
+}
+
 void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
                                         int src_w, int src_h,
-                                        bool src_is_bgra,
+                                        SDLOP_GLOffloadPixelFormat src_format,
                                         void *dst_pixels, int dst_pitch,
                                         int dst_w, int dst_h)
 {
@@ -1261,7 +1340,8 @@ void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
     }
     int copy_w = src_w < dst_w ? src_w : dst_w;
     int copy_h = src_h < dst_h ? src_h : dst_h;
-    size_t src_stride = (size_t)src_w * 4u;
+    int src_bpp = (src_format == SDLOP_GL_OFFLOAD_RGB888) ? 3 : 4;
+    size_t src_stride = (size_t)src_w * (size_t)src_bpp;
     size_t row_bytes = (size_t)copy_w * 4u;
     uint8_t *dst_base = (uint8_t *)dst_pixels;
 
@@ -1270,15 +1350,30 @@ void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
         const uint8_t *src_row = src_bottom_up + (size_t)(src_h - 1 - y) * src_stride;
         uint8_t *dst_row = dst_base + (size_t)y * (size_t)dst_pitch;
 
-        if (src_is_bgra) {
+        if (src_format == SDLOP_GL_OFFLOAD_BGRA8888) {
             memcpy(dst_row, src_row, row_bytes);
-        } else {
+        } else if (src_format == SDLOP_GL_OFFLOAD_RGBA8888) {
+#if defined(__x86_64__) || defined(_M_X64)
+            rgba_row_to_xrgb_sse2(src_row, (uint32_t *)dst_row, copy_w);
+#else
+            const uint32_t *src32 = (const uint32_t *)src_row;
             uint32_t *dst32 = (uint32_t *)dst_row;
             for (int x = 0; x < copy_w; x++) {
-                uint32_t r = src_row[x * 4 + 0];
-                uint32_t g = src_row[x * 4 + 1];
-                uint32_t b = src_row[x * 4 + 2];
-                dst32[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                dst32[x] = rgba_word_to_xrgb(src32[x]);
+            }
+#endif
+        } else {
+#if defined(SDLOP_HAVE_SSSE3_TARGET)
+            if (have_ssse3()) {
+                rgb_row_to_xrgb_ssse3(src_row, (uint32_t *)dst_row, copy_w);
+            } else
+#endif
+            {
+                const uint8_t *src8 = src_row;
+                uint32_t *dst32 = (uint32_t *)dst_row;
+                for (int x = 0; x < copy_w; x++) {
+                    dst32[x] = rgb_bytes_to_xrgb(src8 + (size_t)x * 3u);
+                }
             }
         }
     }
@@ -1298,10 +1393,42 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
     SDLOP_PFN_glPixelStorei p_pixstore = (SDLOP_PFN_glPixelStorei)lookup_gl_proc("glPixelStorei");
     SDLOP_PFN_glBindFramebuffer p_bindfb = (SDLOP_PFN_glBindFramebuffer)lookup_gl_proc("glBindFramebuffer");
     SDLOP_PFN_glGetError p_geterr = (SDLOP_PFN_glGetError)lookup_gl_proc("glGetError");
-    SDLOP_PFN_glFinish p_finish = (SDLOP_PFN_glFinish)lookup_gl_proc("glFinish");
 
     if (!p_read) {
         return SDL_SetError("glReadPixels not available for offload readback");
+    }
+
+    /* Pick the driver's preferred read format when available. NVIDIA's
+     * GLES implementation reports GL_RGB, which moves 25% less data than
+     * RGBA. The hint is for benchmarking/tuning. */
+    unsigned int read_format = 0;
+    const char *fmt_hint = SDL_GetHint("SDLOP_GL_READ_FORMAT");
+    if (fmt_hint && *fmt_hint) {
+        if (strcasecmp(fmt_hint, "rgb") == 0) {
+            read_format = GL_RGB_;
+        } else if (strcasecmp(fmt_hint, "bgra") == 0) {
+            read_format = GL_BGRA_;
+        } else if (strcasecmp(fmt_hint, "rgba") == 0) {
+            read_format = GL_RGBA_;
+        }
+    }
+    if (!read_format) {
+        if (!offload.read_format_checked) {
+            offload.read_format_checked = true;
+            offload.read_format = GL_RGBA_;
+            if (p_getiv) {
+                int impl_fmt = 0;
+                if (p_geterr) {
+                    for (int i = 0; i < 16 && p_geterr() != GL_NO_ERROR_; i++) {}
+                }
+                p_getiv(GL_IMPLEMENTATION_COLOR_READ_FORMAT_, &impl_fmt);
+                if ((!p_geterr || p_geterr() == GL_NO_ERROR_) &&
+                    (impl_fmt == GL_RGB_ || impl_fmt == GL_RGBA_ || impl_fmt == GL_BGRA_)) {
+                    offload.read_format = (unsigned int)impl_fmt;
+                }
+            }
+        }
+        read_format = offload.read_format;
     }
 
     size_t needed = (size_t)surf->w * (size_t)surf->h * 4u;
@@ -1350,12 +1477,16 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
     }
 
     int prev_align = 4;
+    int cur_align = 4;
     int prev_rowlen = 0;
     bool restore_rowlen = false;
     if (p_getiv && p_pixstore) {
         p_getiv(GL_PACK_ALIGNMENT_, &prev_align);
-        if (prev_align != 4) {
-            p_pixstore(GL_PACK_ALIGNMENT_, 4);
+        cur_align = prev_align;
+        int want_align = (read_format == GL_RGB_) ? 1 : 4;
+        if (prev_align != want_align) {
+            p_pixstore(GL_PACK_ALIGNMENT_, want_align);
+            cur_align = want_align;
         }
         if (p_geterr) {
             for (int i = 0; i < 16 && p_geterr() != GL_NO_ERROR_; i++) {}
@@ -1367,33 +1498,34 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
         }
     }
 
-    if (p_finish) {
-        p_finish();
+    /* glReadPixels is a synchronizing operation: an explicit glFinish()
+     * only adds a redundant round trip. */
+    if (p_geterr) {
+        for (int i = 0; i < 16 && p_geterr() != GL_NO_ERROR_; i++) {}
     }
-
-    bool used_bgra = false;
-    if (!offload.bgra_checked || offload.bgra_supported) {
+    p_read(0, 0, surf->w, surf->h, read_format, GL_UNSIGNED_BYTE_, offload.staging);
+    unsigned int read_err = p_geterr ? p_geterr() : GL_NO_ERROR_;
+    if (read_err != GL_NO_ERROR_ && read_format != GL_RGBA_) {
+        /* Some drivers advertise/accept a format only for certain
+         * framebuffer configurations; fall back to the portable one. */
+        read_format = GL_RGBA_;
+        if (p_pixstore && cur_align != 4) {
+            p_pixstore(GL_PACK_ALIGNMENT_, 4);
+            cur_align = 4;
+        }
         if (p_geterr) {
             for (int i = 0; i < 16 && p_geterr() != GL_NO_ERROR_; i++) {}
         }
-        p_read(0, 0, surf->w, surf->h, GL_BGRA_, GL_UNSIGNED_BYTE_, offload.staging);
-        unsigned int err = p_geterr ? p_geterr() : GL_NO_ERROR_;
-        if (err == GL_NO_ERROR_) {
-            offload.bgra_checked = true;
-            offload.bgra_supported = true;
-            used_bgra = true;
-        } else if (!offload.bgra_checked) {
-            offload.bgra_checked = true;
-            offload.bgra_supported = false;
-            p_read(0, 0, surf->w, surf->h, GL_RGBA_, GL_UNSIGNED_BYTE_, offload.staging);
-        }
-    } else {
-        p_read(0, 0, surf->w, surf->h, GL_RGBA_, GL_UNSIGNED_BYTE_, offload.staging);
+        p_read(0, 0, surf->w, surf->h, read_format, GL_UNSIGNED_BYTE_, offload.staging);
+        read_err = p_geterr ? p_geterr() : GL_NO_ERROR_;
+    }
+    if (read_err != GL_NO_ERROR_) {
+        SDL_SetError("glReadPixels failed for offload readback: 0x%x", read_err);
     }
 
     /* Restore GL packing + FBO state cleanly. */
     if (p_pixstore) {
-        if (prev_align != 4) {
+        if (cur_align != prev_align) {
             p_pixstore(GL_PACK_ALIGNMENT_, prev_align);
         }
         if (restore_rowlen) {
@@ -1418,9 +1550,17 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
         restore_egl_state(&saved);
     }
 
-    SDLOP_GLOffload_FlipCopyToXRGB8888(offload.staging, surf->w, surf->h, used_bgra,
+    if (read_err != GL_NO_ERROR_) {
+        return false;
+    }
+
+    SDLOP_GLOffloadPixelFormat src_format =
+        (read_format == GL_BGRA_) ? SDLOP_GL_OFFLOAD_BGRA8888 :
+        (read_format == GL_RGB_)  ? SDLOP_GL_OFFLOAD_RGB888 :
+                                    SDLOP_GL_OFFLOAD_RGBA8888;
+    SDLOP_GLOffload_FlipCopyToXRGB8888(offload.staging, surf->w, surf->h, src_format,
                                         dst_pixels, dst_pitch, dst_w, dst_h);
-    return true;
+    return read_err == GL_NO_ERROR_;
 }
 
 void SDLOP_GLOffload_Shutdown(void)
@@ -1464,7 +1604,7 @@ void SDLOP_GLOffload_Shutdown(void)
     offload.is_pbuffer = false;
     offload.gbm_visual_id = 0;
     offload.gl_fallback_tried = false;
-    offload.bgra_checked = false;
-    offload.bgra_supported = false;
+    offload.read_format_checked = false;
+    offload.read_format = 0;
     offload.desc[0] = '\0';
 }

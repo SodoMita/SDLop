@@ -394,13 +394,19 @@ static SDLOP_GenericGLWin *ensure_generic_win(SDLOP_GenericGLCtx *gctx, SDL_Wind
 static bool can_use_generic_gl_offload(void)
 {
     if (!sdlop.video ||
-        sdlop.video->GL_CreateContext ||
         !sdlop.video->CreateWindowFramebuffer ||
         !sdlop.video->UpdateWindowFramebuffer) {
         return false;
     }
     SDLOP_GLOffloadPolicy policy = SDLOP_GLOffload_GetPolicy();
     if (policy == SDLOP_GL_OFFLOAD_NEVER) {
+        return false;
+    }
+    /* A forced offload applies to every platform, including drivers that have
+     * their own native GL path (e.g. X11). Otherwise only use the generic path
+     * when the driver has no GL support or selected a software visual. */
+    if (sdlop.video->GL_CreateContext && policy != SDLOP_GL_OFFLOAD_FORCE &&
+        sdlop_glattrs.accelerated_visual != 0) {
         return false;
     }
     if (sdlop_glattrs.accelerated_visual == 0 && policy != SDLOP_GL_OFFLOAD_FORCE) {

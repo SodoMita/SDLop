@@ -456,8 +456,12 @@ if(SDLop_BUILD_EXAMPLES)
     add_executable(gl_triangle examples/gl_triangle.c)
     target_link_libraries(gl_triangle PRIVATE sdlop ${GLESV2_LIBRARIES})
     target_include_directories(gl_triangle PRIVATE ${GLESV2_INCLUDE_DIRS})
+
+    add_executable(gl_gpu_stress examples/gl_gpu_stress.c)
+    target_link_libraries(gl_gpu_stress PRIVATE sdlop ${GLESV2_LIBRARIES})
+    target_include_directories(gl_gpu_stress PRIVATE ${GLESV2_INCLUDE_DIRS})
   else()
-    message(STATUS "GLESv2 not found - skipping gl_triangle example")
+    message(STATUS "GLESv2 not found - skipping GL examples")
   endif()
 endif()
 

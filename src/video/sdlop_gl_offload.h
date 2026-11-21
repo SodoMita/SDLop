@@ -98,11 +98,18 @@ bool SDLOP_GLOffload_MakeCurrent(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSur
 /* Resolve GL procedure via offload EGL + libGLESv2/libGL fallback. */
 SDL_FunctionPointer SDLOP_GLOffload_GetProcAddress(const char *proc);
 
-/* Pure pixel-copy helper: flip a bottom-up RGBA/BGRA8888 buffer into a
+typedef enum SDLOP_GLOffloadPixelFormat
+{
+    SDLOP_GL_OFFLOAD_RGBA8888 = 0,
+    SDLOP_GL_OFFLOAD_BGRA8888 = 1,
+    SDLOP_GL_OFFLOAD_RGB888 = 2,
+} SDLOP_GLOffloadPixelFormat;
+
+/* Pure pixel-copy helper: flip a bottom-up RGBA/BGRA/RGB buffer into a
  * top-down XRGB8888 buffer (respecting dst_pitch and clipping to min dims). */
 void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
                                         int src_w, int src_h,
-                                        bool src_is_bgra,
+                                        SDLOP_GLOffloadPixelFormat src_format,
                                         void *dst_pixels, int dst_pitch,
                                         int dst_w, int dst_h);
 
