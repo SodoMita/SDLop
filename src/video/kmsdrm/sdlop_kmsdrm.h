@@ -96,6 +96,8 @@ typedef struct KMSDRM_DisplayData
     uint32_t cursor_dumb;
     uint32_t cursor_dumb_size;
     uint8_t *cursor_map;
+    uint32_t *cursor_shadow;        /* premultiplied ARGB copy for software fallback */
+    size_t cursor_shadow_size;
     uint64_t cursor_w, cursor_h;
     int32_t cursor_hot_x, cursor_hot_y;
     bool cursor_visible;
@@ -130,6 +132,7 @@ typedef struct KMSDRM_WindowData
     void *sw_map[2];                /* mmap'd dumb buffers */
     int sw_draw;                    /* index of the buffer the app draws into */
     int sw_front;                   /* index of the buffer programmed/flipped to the CRTC (-1: none yet) */
+    bool sw_cursor_blended;         /* software cursor already drawn into sw_draw */
 
     /* ---- GL (GBM) scanout ---- */
     bool gl_active;
@@ -176,6 +179,7 @@ typedef struct KMSDRM_DeviceData
     struct gbm_device *gbm_dev;
     bool gbm_init;
     bool video_init;
+    bool vt_active;                 /* false between VT_RELDISP and the acquire signal */
     bool async_pageflip_support;
     bool no_flip;                   /* SDLOP_KMSDRM_NOFLIP=1: always modeset instead of page flip */
 } KMSDRM_DeviceData;

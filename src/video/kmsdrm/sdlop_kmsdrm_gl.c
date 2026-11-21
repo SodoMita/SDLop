@@ -960,6 +960,9 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
 static bool kmsdrm_present_fb(KMSDRM_DeviceData *dev, KMSDRM_WindowData *windata,
                               uint32_t fb_id, bool need_modeset)
 {
+    if (!dev->vt_active) {
+        return true; /* another VT owns the screen; drop the frame */
+    }
     KMSDRM_DisplayData *dd = windata->display;
     uint32_t flip_flags = DRM_MODE_PAGE_FLIP_EVENT;
     bool present_ok = true;

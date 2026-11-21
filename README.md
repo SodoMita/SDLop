@@ -101,8 +101,10 @@ either all from evdev (`/dev/input`) or all from the window system.
   foreground VT. A working raw keyboard is required before disabling the
   kernel keyboard handler. Ctrl+Alt+Fn is forwarded through `VT_ACTIVATE`.
   Switch-away detaches keyboard delivery and releases SDL's held key state.
-  With raw input disabled/unavailable the console retains its kernel handler;
-  that preserves VT switching but does not create an SDL keyboard event source.
+  fbdev takes the console keyboard by default (`K_OFF`), like kmsdrm; set
+  `SDLOP_FBDEV_CONSOLE_KEYS=0` to leave terminal input working. With raw input
+  disabled/unavailable the console also retains its kernel handler, because
+  Ctrl+Alt+Fn forwarding needs the evdev worker.
 - **The low-latency raw API needs the worker.** `SDLop_RegisterRawEventCallback`
   runs on the worker thread and `SDLop_PollRawEvents` drains a separate ring;
   on X11/Wayland they only receive events with `SDLOP_RAW_INPUT=1`. These
@@ -154,7 +156,7 @@ false, anything else true.
 | `SDL_OPENGL_ES_DRIVER` (`SDL_HINT_OPENGL_ES_DRIVER`) | X11: GLES contexts through EGL instead of GLX (stock SDL3 hint) |
 | `SDL_OPENGL_LIBRARY` (`SDL_HINT_OPENGL_LIBRARY`) | X11: library to load GLX from (default `libGL.so.1`, then `libGLX.so.0`) |
 | `SDLOP_KMSDRM_*` | `DEVICE`, `CONNECTOR`, `ATOMIC`, `ATOMIC_CURSOR`, `DOUBLE_BUFFER`, `FLIP_TIMEOUT_MS`, `HOTPLUG`, `KEEP_MASTER`, `NOFLIP`, `REQUIRE_MASTER`, `VT_SWITCH` (see `sdlop_kmsdrm.c`) |
-| `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
+| `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `CONSOLE_KEYS`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
 | `SDLOP_LIB_*` | dlopen name for `X11`, `XCB`, `XCB_RANDR`, `XCB_RENDER`, `XCB_SHM`, `XCB_XINPUT`, `XCB_XKB`, `XKB`, `XKBCOMMON_X11`, `WAYLAND`, `EGL`, `DRM`, `GBM` (`none` disables an optional X11 extension library) |
 
 ### fbdev arbitration
@@ -165,6 +167,23 @@ Window surfaces and presents remain usable in RAM; frames are not made visible.
 `SDLOP_FBDEV_TAKEOVER=0` explicitly requests direct framebuffer rendering without
 console arbitration, including on an owned VT. Use it only when external
 coordination makes those writes safe. It is not the default refusal behavior.
+
+The fbdev software cursor is composited into a private frame before the dirty
+region is copied to the card, and copies wait for `FBIO_WAITFORVSYNC` when the
+driver implements it. That avoids the cursor disappearing between the erase
+and redraw steps during motion. `SDLOP_FBDEV_CURSOR=0` disables the cursor;
+`SDLOP_FBDEV_CONSOLE_KEYS=0` keeps the console keyboard handler alive.
+
+KMSDRM prefers the hardware cursor plane (atomic when available, legacy ioctls
+otherwise) and now sets it up before a Vulkan window hands DRM master over.
+Drivers that expose no usable cursor plane (some NVIDIA KMS setups reject both
+cursor ioctls) get a software cursor composited into the dumb scanout, which
+keeps the pointer visible for Vulkan/GL offload presents. Native `VK_KHR_display`
+WSI still depends on the driver's own cursor support.
+
+Both console drivers use the same XCursor theme bitmap, hotspot and premultiplied
+alpha handling, so the pointer looks the same on KMSDRM and fbdev. When no theme
+is installed they fall back to the same built-in arrow.
 
 Console drivers reserve their VT release/acquire signals until shutdown. They
 undo only signal blocks they introduced; unrelated application signal-mask
@@ -444,9 +463,16 @@ Highlights:
   into the zero-copy shm window surface.
 - `examples/gl_triangle.c` — OpenGL ES 2 triangle via EGL (llvmpipe on
   GPU-less systems), with center-pixel read-back.
-- `examples/vulkan_clear.c` — full Vulkan swapchain loop (lavapipe) via
-  `SDL_Vulkan_*`, cycling clear color verified by `vkCmdCopyImageToBuffer`
-  read-back.
+- `examples/vulkan_clear.c` — full Vulkan swapchain loop via `SDL_Vulkan_*`,
+  cycling clear color verified by `vkCmdCopyImageToBuffer` read-back. With
+  `--offload` it runs on the offload GPU (NVIDIA included, via transparent
+  swapchain emulation) and reads back into shm/dumb framebuffers.
+- `examples/vulkan_stress.c` — heavier GPU workload: compute-updated instanced
+  particles, an offscreen scene pass and a post-process pass, with animated
+  frame checksums. It follows SDLop's capability-based offload policy by
+  default; `--offload` and `--native` force either path. Defaults are a modest
+  60 frames at 320x180 with 256 particles; the full stress preset is
+  `--frames 300 --size 1280x720 --particles 4096`.
 - `tests/mini_compositor.c` — a tiny purpose-built Wayland compositor
   (wl_seat + pointer-constraints + relative-pointer) that makes the pointer
   lock integration testable without a seat-capable compositor.
@@ -544,8 +570,12 @@ Highlights:
   DRM render node; Vulkan via `VK_EXT_headless_surface` with hardware GPU
   prioritization) activates automatically when the display backend lacks
   native hardware presentation (e.g. `dummy`, `wl_shm`-only Wayland, or
-  displayless KMSDRM), presenting frames back through the window
-  framebuffer (`wl_shm`, DRM dumb buffers, or `SDL_GetWindowSurface`).
+  KMSDRM where the `VK_KHR_display` display/mode/plane/surface probe fails),
+  presenting frames back through the window framebuffer (`wl_shm`, DRM dumb
+  buffers, or `SDL_GetWindowSurface`). On KMSDRM, auto mode prefers native
+  Vulkan WSI when that full capability probe succeeds; the NVIDIA proprietary
+  driver is kept on the safe offload path unless selected explicitly with
+  `0`/`off`.
   Configure via `SDLOP_OFFLOAD` (global default: `auto`, `0`/`off`/`false`/`no`,
   or `1`/`on`/`true`/`yes`/`force`), overridden per API by
   `SDLOP_GL_OFFLOAD` and `SDLOP_VULKAN_OFFLOAD` (or `SDLOP_VK_OFFLOAD`).

@@ -1,5 +1,5 @@
 /*
-  SDLop - XCursor file format / theme loading for the KMSDRM driver.
+  SDLop - shared XCursor file format / theme loading for console drivers.
 
   Adapted from swa (github.com/nyorain/swa, src/swa/kms/xcursor.c).
   swa in turn combined already-existing codebases:
@@ -38,6 +38,8 @@
 #include "sdlop_xcursor.h"
 
 #include <SDL3/SDL.h>
+
+#include "../internal/sdlop_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1357,4 +1359,206 @@ int sdlop_xcursor_frame_and_duration(struct sdlop_xcursor *cursor,
 
 int sdlop_xcursor_frame(struct sdlop_xcursor *_cursor, uint32_t time) {
 	return sdlop_xcursor_frame_and_duration(_cursor, time, NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared system-cursor bitmap                                         */
+/* ------------------------------------------------------------------ */
+
+/* Same 16x16 arrow for KMSDRM and fbdev when no theme is installed:
+ * 0 = transparent, 1 = black outline, 2 = white fill. */
+static const char sdlop_cursor_arrow[16][17] = {
+    "2...............",
+    "22..............",
+    "212.............",
+    "2112............",
+    "21112...........",
+    "211112..........",
+    "2111112.........",
+    "21111112........",
+    "211111112.......",
+    "2111111112......",
+    "21111111112.....",
+    "21111122222.....",
+    "2111212.........",
+    "212.1212........",
+    "22..1212........",
+    ".....112........",
+};
+
+struct sdlop_system_bitmap_slot {
+    bool loaded;
+    struct sdlop_cursor_bitmap bitmap;
+    uint32_t *pixels;
+};
+static struct sdlop_system_bitmap_slot sdlop_system_bitmaps[SDL_SYSTEM_CURSOR_COUNT];
+
+static struct sdlop_xcursor_theme *sdlop_system_theme = NULL;
+static bool sdlop_system_theme_tried = false;
+
+const struct sdlop_cursor_bitmap *sdlop_builtin_cursor_bitmap(void)
+{
+    static uint32_t pixels[16 * 16];
+    static struct sdlop_cursor_bitmap bitmap;
+    static bool ready = false;
+    if (!ready) {
+        for (int y = 0; y < 16; y++) {
+            for (int x = 0; x < 16; x++) {
+                char c = sdlop_cursor_arrow[y][x];
+                pixels[y * 16 + x] = c == '1' ? 0xFF000000u : (c == '2' ? 0xFFFFFFFFu : 0);
+            }
+        }
+        bitmap.w = 16;
+        bitmap.h = 16;
+        bitmap.hot_x = 0;
+        bitmap.hot_y = 0;
+        bitmap.pixels = pixels;
+        ready = true;
+    }
+    return &bitmap;
+}
+
+static struct sdlop_xcursor_theme *sdlop_system_theme_load_once(void)
+{
+    if (!sdlop_system_theme_tried) {
+        sdlop_system_theme_tried = true;
+        const char *theme_name = getenv("XCURSOR_THEME");
+        int size = 32;
+        const char *ss = getenv("XCURSOR_SIZE");
+        if (ss) {
+            long s = strtol(ss, NULL, 10);
+            if (s >= 8 && s <= 256) {
+                size = (int)s;
+            }
+        }
+        sdlop_system_theme = sdlop_xcursor_theme_load(theme_name, size);
+    }
+    return sdlop_system_theme;
+}
+
+static const struct sdlop_cursor_bitmap *sdlop_system_cursor_bitmap(SDL_SystemCursor id)
+{
+    if (id < 0 || id >= SDL_SYSTEM_CURSOR_COUNT) {
+        return sdlop_builtin_cursor_bitmap();
+    }
+    struct sdlop_system_bitmap_slot *slot = &sdlop_system_bitmaps[id];
+    if (slot->loaded) {
+        return &slot->bitmap;
+    }
+
+    struct sdlop_xcursor_theme *theme = sdlop_system_theme_load_once();
+    const char *fallback = NULL;
+    const char *names[5];
+    int count = 0;
+    if (id == SDL_SYSTEM_CURSOR_DEFAULT) {
+        /* Same first name KMSDRM's theme loader used before the code was
+         * shared, so the console pointer stays the familiar left_ptr. */
+        names[count++] = "left_ptr";
+        names[count++] = "default";
+        names[count++] = "arrow";
+        names[count++] = "top_left_arrow";
+    } else {
+        names[count++] = SDLOP_GetCSSCursorName(id, &fallback);
+        if (fallback) {
+            names[count++] = fallback;
+        }
+    }
+    names[count] = NULL;
+
+    for (int i = 0; theme && i < count; i++) {
+        struct sdlop_xcursor *xc = sdlop_xcursor_theme_get_cursor(theme, names[i]);
+        struct sdlop_xcursor_image *img =
+            (xc && xc->image_count > 0) ? xc->images[0] : NULL;
+        if (!img || !img->buffer || img->width == 0 || img->height == 0) {
+            continue;
+        }
+        const int w = (int)img->width, h = (int)img->height;
+        if (w <= 0 || h <= 0 || (size_t)w > SIZE_MAX / (size_t)h / 4u) {
+            continue;
+        }
+        uint32_t *pixels = (uint32_t *)SDL_malloc((size_t)w * (size_t)h * 4u);
+        if (!pixels) {
+            break;
+        }
+        if (!SDL_PremultiplyAlpha(w, h, SDL_PIXELFORMAT_ARGB8888, img->buffer, w * 4,
+                                  SDL_PIXELFORMAT_ARGB8888, pixels, w * 4, false)) {
+            SDL_free(pixels);
+            break;
+        }
+        slot->loaded = true;
+        slot->pixels = pixels;
+        slot->bitmap.w = w;
+        slot->bitmap.h = h;
+        slot->bitmap.hot_x = SDL_clamp((int)img->hotspot_x, 0, w - 1);
+        slot->bitmap.hot_y = SDL_clamp((int)img->hotspot_y, 0, h - 1);
+        slot->bitmap.pixels = pixels;
+        if (slot->bitmap.hot_x != (int)img->hotspot_x ||
+            slot->bitmap.hot_y != (int)img->hotspot_y) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "cursor theme '%s' hotspot (%u,%u) outside %dx%d; clamped",
+                         xc->name ? xc->name : names[i], img->hotspot_x, img->hotspot_y, w, h);
+        }
+        return &slot->bitmap;
+    }
+    return sdlop_builtin_cursor_bitmap();
+}
+
+const struct sdlop_cursor_bitmap *sdlop_system_cursor_bitmap_fit(SDL_SystemCursor id,
+                                                                 int max_w, int max_h)
+{
+    const struct sdlop_cursor_bitmap *bitmap = sdlop_system_cursor_bitmap(id);
+    if (!bitmap) {
+        return sdlop_builtin_cursor_bitmap();
+    }
+    if ((max_w > 0 && bitmap->w > max_w) || (max_h > 0 && bitmap->h > max_h)) {
+        return sdlop_builtin_cursor_bitmap();
+    }
+    return bitmap;
+}
+
+bool sdlop_cursor_bitmap_from_surface(SDL_Surface *surface, int hot_x, int hot_y,
+                                      struct sdlop_cursor_bitmap *out, uint32_t **owned)
+{
+    if (!owned || !out) {
+        return false;
+    }
+    *owned = NULL;
+    if (!surface || !surface->pixels || surface->format != SDL_PIXELFORMAT_ARGB8888 ||
+        surface->w <= 0 || surface->h <= 0 ||
+        (size_t)surface->w > SIZE_MAX / (size_t)surface->h / 4u) {
+        return false;
+    }
+
+    const int w = surface->w, h = surface->h;
+    uint32_t *pixels = (uint32_t *)SDL_malloc((size_t)w * (size_t)h * 4u);
+    if (!pixels) {
+        return false;
+    }
+    if (!SDL_PremultiplyAlpha(w, h, SDL_PIXELFORMAT_ARGB8888, surface->pixels,
+                              (size_t)surface->pitch, SDL_PIXELFORMAT_ARGB8888,
+                              pixels, (size_t)w * 4u, false)) {
+        SDL_free(pixels);
+        return false;
+    }
+
+    out->w = w;
+    out->h = h;
+    out->hot_x = SDL_clamp(hot_x, 0, w - 1);
+    out->hot_y = SDL_clamp(hot_y, 0, h - 1);
+    out->pixels = pixels;
+    *owned = pixels;
+    return true;
+}
+
+void sdlop_cursor_theme_quit(void)
+{
+    for (int i = 0; i < SDL_SYSTEM_CURSOR_COUNT; i++) {
+        SDL_free(sdlop_system_bitmaps[i].pixels);
+        memset(&sdlop_system_bitmaps[i], 0, sizeof(sdlop_system_bitmaps[i]));
+    }
+    if (sdlop_system_theme) {
+        sdlop_xcursor_theme_destroy(sdlop_system_theme);
+        sdlop_system_theme = NULL;
+    }
+    sdlop_system_theme_tried = false;
 }

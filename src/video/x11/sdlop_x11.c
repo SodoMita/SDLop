@@ -19,7 +19,7 @@
 #include "sdlop_x11_internal.h"
 #include "internal/scancode_evdev.h"
 #include "internal/sdlop_xkb_dyn.h"
-#include "../kmsdrm/sdlop_xcursor.h"
+#include "../sdlop_xcursor.h"
 
 #include <errno.h>
 #include <poll.h>
