@@ -24,15 +24,18 @@
 #endif
 #include "internal/sdlop_internal.h"
 #include <errno.h>
+#include <stdatomic.h>
+#include <time.h>
+
+#ifndef _WIN32
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Atomics                                                             */
@@ -137,22 +140,31 @@ void SDL_UnlockSpinlock(SDL_SpinLock *lock)
 
 struct SDL_Mutex
 {
-    pthread_mutex_t id;
+    SDLOP_MUTEX_T id;
+    bool initialized;
 };
 
 struct SDL_RWLock
 {
-    pthread_rwlock_t id;
+    SDLOP_RWLOCK_T id;
+    bool initialized;
+#ifdef _WIN32
+    /* SDL_UnlockRWLock() has no mode argument and SRW locks do: only the
+     * owner can unlock, so the owner's mode is tracked here. Recursive
+     * read-locking from one thread is not supported by SRWLOCK anyway
+     * (same restriction as pthread_rwlock under POSIX). */
+    volatile LONG rwmode; /* 0 = free, 1 = shared, 2 = exclusive */
+#endif
 };
 
 struct SDL_Semaphore
 {
-    sem_t sem;
+    SDLOP_SEM_T sem;
 };
 
 struct SDL_Condition
 {
-    pthread_cond_t cond;
+    SDLOP_COND_T cond;
 };
 
 SDL_Mutex *SDL_CreateMutex(void)
@@ -161,23 +173,17 @@ SDL_Mutex *SDL_CreateMutex(void)
     if (!mutex) {
         return NULL;
     }
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    if (pthread_mutex_init(&mutex->id, &attr) != 0) {
-        pthread_mutexattr_destroy(&attr);
-        SDL_SetError("pthread_mutex_init() failed");
-        SDL_free(mutex);
-        return NULL;
-    }
-    pthread_mutexattr_destroy(&attr);
+    SDLOP_MUTEX_INIT_ONCE(&mutex->id);
+    mutex->initialized = true;
     return mutex;
 }
 
 void SDL_DestroyMutex(SDL_Mutex *mutex)
 {
     if (mutex) {
-        pthread_mutex_destroy(&mutex->id);
+        if (mutex->initialized) {
+            SDLOP_MUTEX_DESTROY(&mutex->id);
+        }
         SDL_free(mutex);
     }
 }
@@ -185,7 +191,7 @@ void SDL_DestroyMutex(SDL_Mutex *mutex)
 void SDL_LockMutex(SDL_Mutex *mutex)
 {
     if (mutex) {
-        pthread_mutex_lock(&mutex->id);
+        SDLOP_MUTEX_LOCK(&mutex->id);
     }
 }
 
@@ -194,13 +200,17 @@ bool SDL_TryLockMutex(SDL_Mutex *mutex)
     if (!mutex) {
         return true;
     }
+#ifdef _WIN32
+    return TryEnterCriticalSection(&mutex->id) != 0;
+#else
     return pthread_mutex_trylock(&mutex->id) == 0;
+#endif
 }
 
 void SDL_UnlockMutex(SDL_Mutex *mutex)
 {
     if (mutex) {
-        pthread_mutex_unlock(&mutex->id);
+        SDLOP_MUTEX_UNLOCK(&mutex->id);
     }
 }
 
@@ -210,18 +220,17 @@ SDL_RWLock *SDL_CreateRWLock(void)
     if (!rw) {
         return NULL;
     }
-    if (pthread_rwlock_init(&rw->id, NULL) != 0) {
-        SDL_SetError("pthread_rwlock_init() failed");
-        SDL_free(rw);
-        return NULL;
-    }
+    SDLOP_RWLOCK_INIT_ONCE(&rw->id);
+    rw->initialized = true;
     return rw;
 }
 
 void SDL_DestroyRWLock(SDL_RWLock *rwlock)
 {
     if (rwlock) {
-        pthread_rwlock_destroy(&rwlock->id);
+        if (rwlock->initialized) {
+            SDLOP_RWLOCK_DESTROY(&rwlock->id);
+        }
         SDL_free(rwlock);
     }
 }
@@ -229,31 +238,64 @@ void SDL_DestroyRWLock(SDL_RWLock *rwlock)
 void SDL_LockRWLockForReading(SDL_RWLock *rwlock)
 {
     if (rwlock) {
-        pthread_rwlock_rdlock(&rwlock->id);
+        SDLOP_RWLOCK_RDLOCK(&rwlock->id);
+#ifdef _WIN32
+        rwlock->rwmode = 1;
+#endif
     }
 }
 
 void SDL_LockRWLockForWriting(SDL_RWLock *rwlock)
 {
     if (rwlock) {
-        pthread_rwlock_wrlock(&rwlock->id);
+        SDLOP_RWLOCK_WRLOCK(&rwlock->id);
+#ifdef _WIN32
+        rwlock->rwmode = 2;
+#endif
     }
 }
 
 bool SDL_TryLockRWLockForReading(SDL_RWLock *rwlock)
 {
-    return !rwlock || pthread_rwlock_tryrdlock(&rwlock->id) == 0;
+    if (!rwlock) {
+        return true;
+    }
+    if (!SDLOP_RWLOCK_RDLOCK_TRY(&rwlock->id)) {
+        return false;
+    }
+#ifdef _WIN32
+    rwlock->rwmode = 1;
+#endif
+    return true;
 }
 
 bool SDL_TryLockRWLockForWriting(SDL_RWLock *rwlock)
 {
-    return !rwlock || pthread_rwlock_trywrlock(&rwlock->id) == 0;
+    if (!rwlock) {
+        return true;
+    }
+    if (!SDLOP_RWLOCK_WRLOCK_TRY(&rwlock->id)) {
+        return false;
+    }
+#ifdef _WIN32
+    rwlock->rwmode = 2;
+#endif
+    return true;
 }
 
 void SDL_UnlockRWLock(SDL_RWLock *rwlock)
 {
     if (rwlock) {
-        pthread_rwlock_unlock(&rwlock->id);
+#ifdef _WIN32
+        if (rwlock->rwmode == 2) {
+            SDLOP_RWLOCK_WUNLOCK(&rwlock->id);
+        } else {
+            SDLOP_RWLOCK_RUNLOCK(&rwlock->id);
+        }
+        rwlock->rwmode = 0;
+#else
+        SDLOP_RWLOCK_UNLOCK(&rwlock->id);
+#endif
     }
 }
 
@@ -263,8 +305,8 @@ SDL_Semaphore *SDL_CreateSemaphore(Uint32 initial_value)
     if (!sem) {
         return NULL;
     }
-    if (sem_init(&sem->sem, 0, initial_value) < 0) {
-        SDL_SetError("sem_init() failed");
+    if (!SDLOP_SEM_INIT(&sem->sem, initial_value)) {
+        SDL_SetError("semaphore creation failed");
         SDL_free(sem);
         return NULL;
     }
@@ -274,7 +316,7 @@ SDL_Semaphore *SDL_CreateSemaphore(Uint32 initial_value)
 void SDL_DestroySemaphore(SDL_Semaphore *sem)
 {
     if (sem) {
-        sem_destroy(&sem->sem);
+        SDLOP_SEM_DESTROY(&sem->sem);
         SDL_free(sem);
     }
 }
@@ -296,21 +338,9 @@ bool SDL_WaitSemaphoreTimeout(SDL_Semaphore *sem, Sint32 timeoutMS)
         return true;
     }
     if (timeoutMS == 0) {
-        return sem_trywait(&sem->sem) == 0;
+        return SDLOP_SEM_TRYWAIT(&sem->sem);
     }
-    int rc;
-    if (timeoutMS < 0) {
-        do {
-            rc = sem_wait(&sem->sem);
-        } while (rc < 0 && errno == EINTR);
-        return rc == 0;
-    }
-    struct timespec ts;
-    abs_timeout(CLOCK_MONOTONIC, (Sint64)timeoutMS * 1000000, &ts);
-    do {
-        rc = sem_clockwait(&sem->sem, CLOCK_MONOTONIC, &ts);
-    } while (rc < 0 && errno == EINTR);
-    return rc == 0;
+    return SDLOP_SemTimedWait(&sem->sem, timeoutMS);
 }
 
 void SDL_WaitSemaphore(SDL_Semaphore *sem)
@@ -326,17 +356,17 @@ bool SDL_TryWaitSemaphore(SDL_Semaphore *sem)
 void SDL_SignalSemaphore(SDL_Semaphore *sem)
 {
     if (sem) {
-        sem_post(&sem->sem);
+#ifdef _WIN32
+        ReleaseSemaphore(sem->sem.handle, 1, NULL);
+#else
+        SDLOP_SEM_POST(&sem->sem);
+#endif
     }
 }
 
 Uint32 SDL_GetSemaphoreValue(SDL_Semaphore *sem)
 {
-    int value = 0;
-    if (sem) {
-        sem_getvalue(&sem->sem, &value);
-    }
-    return value < 0 ? 0 : (Uint32)value;
+    return sem ? SDLOP_SemValue(&sem->sem) : 0u;
 }
 
 SDL_Condition *SDL_CreateCondition(void)
@@ -345,23 +375,14 @@ SDL_Condition *SDL_CreateCondition(void)
     if (!cond) {
         return NULL;
     }
-    pthread_condattr_t attr;
-    pthread_condattr_init(&attr);
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-    if (pthread_cond_init(&cond->cond, &attr) != 0) {
-        pthread_condattr_destroy(&attr);
-        SDL_SetError("pthread_cond_init() failed");
-        SDL_free(cond);
-        return NULL;
-    }
-    pthread_condattr_destroy(&attr);
+    SDLOP_COND_INIT(&cond->cond);
     return cond;
 }
 
 void SDL_DestroyCondition(SDL_Condition *cond)
 {
     if (cond) {
-        pthread_cond_destroy(&cond->cond);
+        SDLOP_COND_DESTROY(&cond->cond);
         SDL_free(cond);
     }
 }
@@ -369,14 +390,14 @@ void SDL_DestroyCondition(SDL_Condition *cond)
 void SDL_SignalCondition(SDL_Condition *cond)
 {
     if (cond) {
-        pthread_cond_signal(&cond->cond);
+        SDLOP_COND_SIGNAL(&cond->cond);
     }
 }
 
 void SDL_BroadcastCondition(SDL_Condition *cond)
 {
     if (cond) {
-        pthread_cond_broadcast(&cond->cond);
+        SDLOP_COND_BROADCAST(&cond->cond);
     }
 }
 
@@ -386,15 +407,15 @@ bool SDL_WaitConditionTimeout(SDL_Condition *cond, SDL_Mutex *mutex, Sint32 time
         return true;
     }
     if (timeoutMS < 0) {
-        return pthread_cond_wait(&cond->cond, &mutex->id) == 0;
+        return SDLOP_COND_WAIT(&cond->cond, &mutex->id) == 0;
     }
     struct timespec ts;
     abs_timeout(CLOCK_MONOTONIC, (Sint64)timeoutMS * 1000000, &ts);
     int rc;
     do {
-        rc = pthread_cond_timedwait(&cond->cond, &mutex->id, &ts);
+        rc = SDLOP_COND_WAIT_UNTIL(&cond->cond, &mutex->id, &ts);
     } while (rc == EINTR);
-    return rc != ETIMEDOUT;
+    return rc != SDLOP_COND_TIMEDOUT;
 }
 
 void SDL_WaitCondition(SDL_Condition *cond, SDL_Mutex *mutex)
@@ -454,8 +475,56 @@ typedef struct TLSData
 #define TLS_ALLOC_CHUNKSIZE 4
 
 static SDL_AtomicInt tls_next_id;
-static pthread_key_t tls_key;
+
+/* Thread-local storage for SDL_SetTLS(). POSIX uses a pthread key with a
+ * destructor; Windows uses Fiber Local Storage, whose callback has the same
+ * shape (FlsAlloc with a destructor) — Get/SetTlsValue do not. */
+#ifdef _WIN32
+typedef DWORD sdlop_tls_key;
+static sdlop_tls_key tls_key;
+static INIT_ONCE tls_once = INIT_ONCE_STATIC_INIT;
+static void tls_thread_exit(void *ptr);
+static void tls_init(void)
+{
+    tls_key = FlsAlloc(tls_thread_exit);
+}
+#else
+typedef pthread_key_t sdlop_tls_key;
+static sdlop_tls_key tls_key;
 static pthread_once_t tls_once = PTHREAD_ONCE_INIT;
+static void tls_thread_exit(void *ptr);
+static void tls_init(void)
+{
+    pthread_key_create(&tls_key, tls_thread_exit);
+}
+#endif
+
+static void tls_ensure_init(void)
+{
+#ifdef _WIN32
+    InitOnceExecuteOnce(&tls_once, SDLOP_OnceTrampoline, (PVOID)tls_init, NULL);
+#else
+    pthread_once(&tls_once, tls_init);
+#endif
+}
+
+static void *tls_get(void)
+{
+#ifdef _WIN32
+    return FlsGetValue(tls_key);
+#else
+    return pthread_getspecific(tls_key);
+#endif
+}
+
+static int tls_set(void *value)
+{
+#ifdef _WIN32
+    return FlsSetValue(tls_key, value) ? 0 : (int)GetLastError();
+#else
+    return pthread_setspecific(tls_key, value);
+#endif
+}
 
 static void tls_run_destructors(TLSData *storage)
 {
@@ -476,23 +545,21 @@ static void tls_run_destructors(TLSData *storage)
         if (!any) {
             break;
         }
-        storage = (TLSData *)pthread_getspecific(tls_key);
+        storage = (TLSData *)tls_get();
     }
 }
 
 static void tls_thread_exit(void *ptr)
 {
     TLSData *storage = (TLSData *)ptr;
-    pthread_setspecific(tls_key, storage); /* destructors may call SDL_GetTLS */
+    if (!storage) {
+        return;
+    }
+    tls_set(storage); /* destructors may call SDL_GetTLS */
     tls_run_destructors(storage);
-    storage = (TLSData *)pthread_getspecific(tls_key);
-    pthread_setspecific(tls_key, NULL);
+    storage = (TLSData *)tls_get();
+    tls_set(NULL);
     SDL_free(storage);
-}
-
-static void tls_init(void)
-{
-    pthread_key_create(&tls_key, tls_thread_exit);
 }
 
 void *SDL_GetTLS(SDL_TLSID *id)
@@ -501,9 +568,9 @@ void *SDL_GetTLS(SDL_TLSID *id)
         SDL_InvalidParamError("id");
         return NULL;
     }
-    pthread_once(&tls_once, tls_init);
+    tls_ensure_init();
     int index = SDL_GetAtomicInt(id) - 1;
-    TLSData *storage = (TLSData *)pthread_getspecific(tls_key);
+    TLSData *storage = (TLSData *)tls_get();
     if (!storage || index < 0 || index >= storage->limit) {
         return NULL;
     }
@@ -515,7 +582,7 @@ bool SDL_SetTLS(SDL_TLSID *id, const void *value, SDL_TLSDestructorCallback dest
     if (!id) {
         return SDL_InvalidParamError("id");
     }
-    pthread_once(&tls_once, tls_init);
+    tls_ensure_init();
 
     int index = SDL_GetAtomicInt(id) - 1;
     if (index < 0) {
@@ -532,7 +599,7 @@ bool SDL_SetTLS(SDL_TLSID *id, const void *value, SDL_TLSDestructorCallback dest
         }
     }
 
-    TLSData *storage = (TLSData *)pthread_getspecific(tls_key);
+    TLSData *storage = (TLSData *)tls_get();
     if (!storage || index >= storage->limit) {
         int oldlimit = storage ? storage->limit : 0;
         int newlimit = index + TLS_ALLOC_CHUNKSIZE;
@@ -546,9 +613,9 @@ bool SDL_SetTLS(SDL_TLSID *id, const void *value, SDL_TLSDestructorCallback dest
             storage->array[i].data = NULL;
             storage->array[i].destructor = NULL;
         }
-        if (pthread_setspecific(tls_key, storage) != 0) {
+        if (tls_set(storage) != 0) {
             SDL_free(storage);
-            return SDL_SetError("pthread_setspecific() failed");
+            return SDL_SetError("thread-local storage allocation failed");
         }
     }
     storage->array[index].data = (void *)value;
@@ -558,12 +625,12 @@ bool SDL_SetTLS(SDL_TLSID *id, const void *value, SDL_TLSDestructorCallback dest
 
 void SDL_CleanupTLS(void)
 {
-    pthread_once(&tls_once, tls_init);
-    TLSData *storage = (TLSData *)pthread_getspecific(tls_key);
+    tls_ensure_init();
+    TLSData *storage = (TLSData *)tls_get();
     if (storage) {
         tls_run_destructors(storage);
-        storage = (TLSData *)pthread_getspecific(tls_key);
-        pthread_setspecific(tls_key, NULL);
+        storage = (TLSData *)tls_get();
+        tls_set(NULL);
         SDL_free(storage);
     }
 }
@@ -578,14 +645,19 @@ void SDL_CleanupTLS(void)
  * joined/detached object is freed, so a magic field alone would be a
  * use-after-free read (the memory can be handed out again). Validity is
  * therefore "is this pointer still registered". (utils b0e7d28) */
-static pthread_mutex_t thread_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDLOP_MUTEX_T thread_registry_lock = SDLOP_MUTEX_INIT;
 static SDL_Thread *thread_registry;
 
 struct SDL_Thread
 {
     Uint32 magic;
     SDL_ThreadID threadid;
+#ifdef _WIN32
+    HANDLE handle;
+    unsigned handle_id;
+#else
     pthread_t handle;
+#endif
     int status;
     SDL_AtomicInt state; /* SDL_ThreadState */
     char *name;
@@ -598,15 +670,15 @@ struct SDL_Thread
 
 static void thread_register(SDL_Thread *thread)
 {
-    pthread_mutex_lock(&thread_registry_lock);
+    SDLOP_MUTEX_LOCK(&thread_registry_lock);
     thread->registry_next = thread_registry;
     thread_registry = thread;
-    pthread_mutex_unlock(&thread_registry_lock);
+    SDLOP_MUTEX_UNLOCK(&thread_registry_lock);
 }
 
 static void thread_unregister(SDL_Thread *thread)
 {
-    pthread_mutex_lock(&thread_registry_lock);
+    SDLOP_MUTEX_LOCK(&thread_registry_lock);
     SDL_Thread **link = &thread_registry;
     while (*link) {
         if (*link == thread) {
@@ -615,7 +687,7 @@ static void thread_unregister(SDL_Thread *thread)
         }
         link = &(*link)->registry_next;
     }
-    pthread_mutex_unlock(&thread_registry_lock);
+    SDLOP_MUTEX_UNLOCK(&thread_registry_lock);
 }
 
 static bool thread_valid(SDL_Thread *thread)
@@ -626,14 +698,14 @@ static bool thread_valid(SDL_Thread *thread)
     }
 
     bool found = false;
-    pthread_mutex_lock(&thread_registry_lock);
+    SDLOP_MUTEX_LOCK(&thread_registry_lock);
     for (SDL_Thread *t = thread_registry; t; t = t->registry_next) {
         if (t == thread) {
             found = true;
             break;
         }
     }
-    pthread_mutex_unlock(&thread_registry_lock);
+    SDLOP_MUTEX_UNLOCK(&thread_registry_lock);
 
     if (!found) {
         SDL_InvalidParamError("thread");
@@ -657,7 +729,11 @@ void SDLOP_ThreadsQuit(void)
 
 SDL_ThreadID SDL_GetCurrentThreadID(void)
 {
+#ifdef _WIN32
+    return (SDL_ThreadID)GetCurrentThreadId();
+#else
     return (SDL_ThreadID)pthread_self();
+#endif
 }
 
 static void free_thread(SDL_Thread *thread)
@@ -667,10 +743,17 @@ static void free_thread(SDL_Thread *thread)
     SDL_free(thread);
 }
 
-static void *run_thread(void *arg)
+static
+#ifdef _WIN32
+unsigned __stdcall
+#else
+void *
+#endif
+run_thread(void *arg)
 {
     SDL_Thread *thread = (SDL_Thread *)arg;
 
+#ifndef _WIN32
     /* Linux limits names to 15 chars + NUL; SDL3 truncates likewise */
     if (thread->name) {
         char name[16];
@@ -692,6 +775,16 @@ static void *run_thread(void *arg)
     sigaddset(&mask, SIGPROF);
     pthread_sigmask(SIG_BLOCK, &mask, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+#else
+    /* Windows has no signal mask to inherit; SDL3 sets the thread
+     * description so debuggers and the debugger's thread list show it. */
+    if (thread->name) {
+        wchar_t wname[64];
+        if (MultiByteToWideChar(CP_UTF8, 0, thread->name, -1, wname, (int)SDL_arraysize(wname)) > 0) {
+            SetThreadDescription(GetCurrentThread(), wname);
+        }
+    }
+#endif
 
     thread->threadid = SDL_GetCurrentThreadID();
     SDL_SignalSemaphore(thread->started);
@@ -706,7 +799,11 @@ static void *run_thread(void *arg)
             free_thread(thread);
         }
     }
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
 SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_FunctionPointer pfnBeginThread,
@@ -749,13 +846,24 @@ SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_Fu
         return NULL;
     }
 
+    SDL_Semaphore *started = thread->started;
+#ifdef _WIN32
+    thread->handle = (HANDLE)_beginthreadex(NULL, (unsigned)stacksize, run_thread, thread,
+                                            CREATE_SUSPENDED, &thread->handle_id);
+    if (!thread->handle) {
+        SDL_DestroySemaphore(started);
+        free_thread(thread);
+        SDL_SetError("Not enough resources to create thread");
+        return NULL;
+    }
+    ResumeThread(thread->handle);
+#else
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
     if (stacksize) {
         pthread_attr_setstacksize(&attr, stacksize);
     }
-    SDL_Semaphore *started = thread->started;
     if (pthread_create(&thread->handle, &attr, run_thread, thread) != 0) {
         pthread_attr_destroy(&attr);
         SDL_DestroySemaphore(started);
@@ -764,6 +872,7 @@ SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_Fu
         return NULL;
     }
     pthread_attr_destroy(&attr);
+#endif
     SDL_WaitSemaphore(started); /* threadid valid from here on */
     thread->started = NULL;
     SDL_DestroySemaphore(started);
@@ -813,7 +922,12 @@ void SDL_WaitThread(SDL_Thread *thread, int *status)
         }
         return;
     }
+#ifdef _WIN32
+    WaitForSingleObject(thread->handle, INFINITE);
+    CloseHandle(thread->handle);
+#else
     pthread_join(thread->handle, NULL);
+#endif
     if (status) {
         *status = thread->status;
     }
@@ -830,7 +944,11 @@ void SDL_DetachThread(SDL_Thread *thread)
     /* Capture the handle now: the object can only be freed by the thread
        itself once it observes DETACHED, and only we can set DETACHED here,
        so reading it before the CAS is race-free. (utils b0e7d28) */
+#ifdef _WIN32
+    const HANDLE handle = thread->handle;
+#else
     const pthread_t handle = thread->handle;
+#endif
 
     /* The thread may vanish at any time once detached: the handle stops being
        valid for the caller from here on. */
@@ -840,20 +958,53 @@ void SDL_DetachThread(SDL_Thread *thread)
        once it observes DETACHED. */
     if (SDL_CompareAndSwapAtomicInt(&thread->state, SDL_THREAD_ALIVE, SDL_THREAD_DETACHED)) {
         /* After this point the thread may self-free; don't touch `thread`. */
+#ifdef _WIN32
+        CloseHandle(handle); /* Win32 has no detach: closing the handle is it */
+#else
         pthread_detach(handle);
+#endif
     } else if (SDL_GetAtomicInt(&thread->state) == SDL_THREAD_DETACHED) {
         /* already detached (calling twice is a no-op) */
         return;
     } else if (SDL_GetAtomicInt(&thread->state) == SDL_THREAD_COMPLETE) {
         /* the child has already exited, so it is not going to free anything:
-           reap the pthread and drop the object here */
+           reap the thread and drop the object here */
+#ifdef _WIN32
+        WaitForSingleObject(handle, INFINITE);
+        CloseHandle(handle);
+#else
         pthread_join(handle, NULL);
+#endif
         free_thread(thread);
     }
 }
 
 bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority priority)
 {
+#ifdef _WIN32
+    /* SDL3's Windows mapping: the hint asks for REALTIME_PRIORITY_CLASS-like
+     * behaviour, which needs a privilege SDL3 does not take either; it maps
+     * the four levels onto the Win32 thread priorities directly. */
+    int winprio;
+    switch (priority) {
+    case SDL_THREAD_PRIORITY_LOW:
+        winprio = THREAD_PRIORITY_LOWEST;
+        break;
+    case SDL_THREAD_PRIORITY_HIGH:
+        winprio = THREAD_PRIORITY_ABOVE_NORMAL;
+        break;
+    case SDL_THREAD_PRIORITY_TIME_CRITICAL:
+        winprio = THREAD_PRIORITY_TIME_CRITICAL;
+        break;
+    default:
+        winprio = THREAD_PRIORITY_NORMAL;
+        break;
+    }
+    if (SetThreadPriority(GetCurrentThread(), winprio)) {
+        return true;
+    }
+    return SDL_SetError("SetThreadPriority() failed: %lu", (unsigned long)GetLastError());
+#else
     const bool realtime = SDL_GetHintBoolean(SDL_HINT_THREAD_FORCE_REALTIME_TIME_CRITICAL, false);
     if (realtime && priority == SDL_THREAD_PRIORITY_TIME_CRITICAL) {
         struct sched_param sp;
@@ -884,4 +1035,5 @@ bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority priority)
         return true;
     }
     return SDL_SetError("setpriority() failed");
+#endif
 }

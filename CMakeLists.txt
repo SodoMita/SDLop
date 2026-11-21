@@ -30,6 +30,7 @@ add_compile_options(-Wall -Wextra)
 if(EMSCRIPTEN)
   set(SDLop_WEB_SOURCES
     src/SDLop_core.c
+    src/internal/sdlop_platform.c
     src/SDL_stdlib.c
     src/SDL_error.c
     src/SDL_log.c
@@ -124,249 +125,324 @@ endif()
 # benchmarks; those targets are skipped (with a message) when absent - see
 # below.
 # ---------------------------------------------------------------------------
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
-pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
-pkg_check_modules(EGL REQUIRED egl)
-pkg_check_modules(GBM REQUIRED gbm)
-pkg_check_modules(LIBDRM REQUIRED libdrm)
-option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
-if(SDLOP_VIDEO_X11)
-  pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
-  if(NOT X11_XCB_FOUND)
-    message(STATUS "xcb headers not found - building without the X11 driver")
-    set(SDLOP_VIDEO_X11 OFF)
+if(NOT WIN32)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+  pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
+  pkg_check_modules(EGL REQUIRED egl)
+  pkg_check_modules(GBM REQUIRED gbm)
+  pkg_check_modules(LIBDRM REQUIRED libdrm)
+  option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
+  if(SDLOP_VIDEO_X11)
+    pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
+    if(NOT X11_XCB_FOUND)
+      message(STATUS "xcb headers not found - building without the X11 driver")
+      set(SDLOP_VIDEO_X11 OFF)
+    endif()
   endif()
-endif()
-# GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
-pkg_check_modules(GLESV2 glesv2)
-find_package(Vulkan QUIET)
-pkg_check_modules(WAYLAND_SERVER wayland-server)
+  # GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
+  pkg_check_modules(GLESV2 glesv2)
+  find_package(Vulkan QUIET)
+  pkg_check_modules(WAYLAND_SERVER wayland-server)
 
-find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
-pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
-pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
-pkg_get_variable(WAYLAND_CLIENT_DIR wayland-client pkgdatadir)
+  find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
+  pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
+  pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+  pkg_get_variable(WAYLAND_CLIENT_DIR wayland-client pkgdatadir)
 
-set(WL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
-file(MAKE_DIRECTORY ${WL_GEN_DIR})
+  set(WL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
+  file(MAKE_DIRECTORY ${WL_GEN_DIR})
 
-add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/wayland-client-protocol.h ${WL_GEN_DIR}/wayland-client-protocol.c
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-          ${WAYLAND_CLIENT_DIR}/wayland.xml
-          ${WL_GEN_DIR}/wayland-client-protocol.h
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} code
-          ${WAYLAND_CLIENT_DIR}/wayland.xml
-          ${WL_GEN_DIR}/wayland-client-protocol.c
-  DEPENDS ${WAYLAND_CLIENT_DIR}/wayland.xml)
-
-add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/xdg-shell-client-protocol.h ${WL_GEN_DIR}/xdg-shell-protocol.c
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-          ${WL_GEN_DIR}/xdg-shell-client-protocol.h
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-          ${WL_GEN_DIR}/xdg-shell-protocol.c
-  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
-
-add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/pointer-constraints-client-protocol.h ${WL_GEN_DIR}/pointer-constraints-protocol.c
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-          ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-          ${WL_GEN_DIR}/pointer-constraints-protocol.c
-  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
-
-add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/relative-pointer-client-protocol.h ${WL_GEN_DIR}/relative-pointer-protocol.c
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-          ${WL_GEN_DIR}/relative-pointer-client-protocol.h
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-          ${WL_GEN_DIR}/relative-pointer-protocol.c
-  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
-
-# optional window-management protocols (bound when the compositor offers
-# them): server-side decorations, idle inhibit, keyboard-shortcuts inhibit,
-# activation/attention
-set(SDLOP_WL_EXTRA_PROTOCOLS
-  "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
-  "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
-  "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
-  "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml")
-set(SDLOP_WL_EXTRA_OUTPUTS)
-foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
-  string(REPLACE "|" ";" parts "${entry}")
-  list(GET parts 0 proto_name)
-  list(GET parts 1 proto_xml)
   add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    OUTPUT ${WL_GEN_DIR}/wayland-client-protocol.h ${WL_GEN_DIR}/wayland-client-protocol.c
     COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
-            ${WL_GEN_DIR}/${proto_name}-client-protocol.h
+            ${WAYLAND_CLIENT_DIR}/wayland.xml
+            ${WL_GEN_DIR}/wayland-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} code
+            ${WAYLAND_CLIENT_DIR}/wayland.xml
+            ${WL_GEN_DIR}/wayland-client-protocol.c
+    DEPENDS ${WAYLAND_CLIENT_DIR}/wayland.xml)
+
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/xdg-shell-client-protocol.h ${WL_GEN_DIR}/xdg-shell-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+            ${WL_GEN_DIR}/xdg-shell-client-protocol.h
     COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
-            ${WL_GEN_DIR}/${proto_name}-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/${proto_xml})
-  list(APPEND SDLOP_WL_EXTRA_OUTPUTS
-    ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c)
-endforeach()
+            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+            ${WL_GEN_DIR}/xdg-shell-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 
-# server-side codegen (used only by tests/test_pointer_lock's mini compositor)
-add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/xdg-shell-server-protocol.h ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
-          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-          ${WL_GEN_DIR}/xdg-shell-server-protocol.h
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-          ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/pointer-constraints-client-protocol.h ${WL_GEN_DIR}/pointer-constraints-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+            ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+            ${WL_GEN_DIR}/pointer-constraints-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
 
-add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/pointer-constraints-server-protocol.h ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-          ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-          ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/relative-pointer-client-protocol.h ${WL_GEN_DIR}/relative-pointer-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+            ${WL_GEN_DIR}/relative-pointer-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+            ${WL_GEN_DIR}/relative-pointer-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
 
-add_custom_command(
-  OUTPUT ${WL_GEN_DIR}/relative-pointer-server-protocol.h ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-          ${WL_GEN_DIR}/relative-pointer-server-protocol.h
-  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-          ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
+  # optional window-management protocols (bound when the compositor offers
+  # them): server-side decorations, idle inhibit, keyboard-shortcuts inhibit,
+  # activation/attention
+  set(SDLOP_WL_EXTRA_PROTOCOLS
+    "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
+    "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
+    "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
+    "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml")
+  set(SDLOP_WL_EXTRA_OUTPUTS)
+  foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 proto_name)
+    list(GET parts 1 proto_xml)
+    add_custom_command(
+      OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+              ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+              ${WL_GEN_DIR}/${proto_name}-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+              ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+              ${WL_GEN_DIR}/${proto_name}-protocol.c
+      DEPENDS ${WAYLAND_PROTOCOLS_DIR}/${proto_xml})
+    list(APPEND SDLOP_WL_EXTRA_OUTPUTS
+      ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c)
+  endforeach()
 
-add_custom_target(sdlop_wayland_protocols
-  DEPENDS ${WL_GEN_DIR}/wayland-client-protocol.h
-          ${WL_GEN_DIR}/xdg-shell-client-protocol.h
-          ${WL_GEN_DIR}/xdg-shell-protocol.c
-          ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
-          ${WL_GEN_DIR}/pointer-constraints-protocol.c
-          ${WL_GEN_DIR}/relative-pointer-client-protocol.h
-          ${WL_GEN_DIR}/relative-pointer-protocol.c
-          ${WL_GEN_DIR}/xdg-shell-server-protocol.h
-          ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-          ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
-          ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-          ${WL_GEN_DIR}/relative-pointer-server-protocol.h
-          ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-          ${SDLOP_WL_EXTRA_OUTPUTS})
+  # server-side codegen (used only by tests/test_pointer_lock's mini compositor)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/xdg-shell-server-protocol.h ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+            ${WL_GEN_DIR}/xdg-shell-server-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+            ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 
-# ---------------------------------------------------------------------------
-# Library
-# ---------------------------------------------------------------------------
-set(SDLop_SOURCES
-  src/SDLop_core.c
-  src/SDL_stdlib.c
-  src/SDL_error.c
-  src/SDL_log.c
-  src/SDL_timer.c
-  src/SDL_events.c
-  src/SDL_properties.c
-  src/SDL_hints.c
-  src/SDL_events_desc.c
-  src/SDL_events_categories.c
-  src/SDL_clipboard.c
-  src/SDL_thread.c
-  src/SDL_misc.c
-  src/SDL_main.c
-  src/SDL_rect.c
-  src/SDL_pixels.c
-  src/SDL_blit.c
-  src/SDL_blit_float.c
-  src/SDL_rotate.c
-  src/SDL_keyboard.c
-  src/SDL_keynames.c
-  src/SDL_mouse.c
-  src/SDL_devices.c
-  src/SDL_video.c
-  src/SDL_surface.c
-  src/SDL_gl.c
-  src/SDL_vulkan.c
-  src/internal/sdlop_evdev.c
-  src/sdlop_xkb_dyn.c
-  src/video/wayland/sdlop_wayland.c
-  src/video/wayland/sdlop_wayland_dyn.c
-  src/video/wayland/sdlop_egl_dyn.c
-  src/video/wayland/sdlop_wayland_gl.c
-  src/video/wayland/sdlop_wayland_vulkan.c
-  src/video/wayland/sdlop_wayland_protos.c
-  src/video/kmsdrm/sdlop_kmsdrm.c
-  src/video/kmsdrm/sdlop_kmsdrm_atomic.c
-  src/video/kmsdrm/sdlop_kmsdrm_dyn.c
-  src/video/kmsdrm/sdlop_kmsdrm_gl.c
-  src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
-  src/video/kmsdrm/sdlop_xcursor.c
-  src/video/fbdev/sdlop_fbdev.c
-  src/video/dummy/sdlop_dummy.c
-)
-set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
-if(SDLOP_VIDEO_X11)
-  list(APPEND SDLop_SOURCES
-    src/video/x11/sdlop_x11.c
-    src/video/x11/sdlop_x11_dyn.c
-    src/video/x11/sdlop_x11_gl.c
-    src/video/x11/sdlop_x11_vulkan.c)
-  list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/pointer-constraints-server-protocol.h ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+            ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+            ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
+
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/relative-pointer-server-protocol.h ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+            ${WL_GEN_DIR}/relative-pointer-server-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+            ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
+
+  add_custom_target(sdlop_wayland_protocols
+    DEPENDS ${WL_GEN_DIR}/wayland-client-protocol.h
+            ${WL_GEN_DIR}/xdg-shell-client-protocol.h
+            ${WL_GEN_DIR}/xdg-shell-protocol.c
+            ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
+            ${WL_GEN_DIR}/pointer-constraints-protocol.c
+            ${WL_GEN_DIR}/relative-pointer-client-protocol.h
+            ${WL_GEN_DIR}/relative-pointer-protocol.c
+            ${WL_GEN_DIR}/xdg-shell-server-protocol.h
+            ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+            ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
+            ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+            ${WL_GEN_DIR}/relative-pointer-server-protocol.h
+            ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+            ${SDLOP_WL_EXTRA_OUTPUTS})
+
+  # ---------------------------------------------------------------------------
+  # Library
+  # ---------------------------------------------------------------------------
+  set(SDLop_SOURCES
+    src/SDLop_core.c
+    src/internal/sdlop_platform.c
+    src/SDL_stdlib.c
+    src/SDL_error.c
+    src/SDL_log.c
+    src/SDL_timer.c
+    src/SDL_events.c
+    src/SDL_properties.c
+    src/SDL_hints.c
+    src/SDL_events_desc.c
+    src/SDL_events_categories.c
+    src/SDL_clipboard.c
+    src/SDL_thread.c
+    src/SDL_misc.c
+    src/SDL_main.c
+    src/SDL_rect.c
+    src/SDL_pixels.c
+    src/SDL_blit.c
+    src/SDL_blit_float.c
+    src/SDL_rotate.c
+    src/SDL_keyboard.c
+    src/SDL_keynames.c
+    src/SDL_mouse.c
+    src/SDL_devices.c
+    src/SDL_video.c
+    src/SDL_surface.c
+    src/SDL_gl.c
+    src/SDL_vulkan.c
+    src/internal/sdlop_evdev.c
+    src/sdlop_xkb_dyn.c
+    src/video/wayland/sdlop_wayland.c
+    src/video/wayland/sdlop_wayland_dyn.c
+    src/video/wayland/sdlop_egl_dyn.c
+    src/video/wayland/sdlop_wayland_gl.c
+    src/video/wayland/sdlop_wayland_vulkan.c
+    src/video/wayland/sdlop_wayland_protos.c
+    src/video/kmsdrm/sdlop_kmsdrm.c
+    src/video/kmsdrm/sdlop_kmsdrm_atomic.c
+    src/video/kmsdrm/sdlop_kmsdrm_dyn.c
+    src/video/kmsdrm/sdlop_kmsdrm_gl.c
+    src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
+    src/video/kmsdrm/sdlop_xcursor.c
+    src/video/fbdev/sdlop_fbdev.c
+    src/video/dummy/sdlop_dummy.c
+  )
+  set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
+  if(SDLOP_VIDEO_X11)
+    list(APPEND SDLop_SOURCES
+      src/video/x11/sdlop_x11.c
+      src/video/x11/sdlop_x11_dyn.c
+      src/video/x11/sdlop_x11_gl.c
+      src/video/x11/sdlop_x11_vulkan.c)
+    list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+  endif()
+
+  # SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
+  # at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
+  # where those libraries are absent.
+  set(SDLop_LIB_DEPS
+    pthread
+    dl
+    m)
+  # dlopen-ed at run time - the core targets link none of these libraries.
+  # Only their header search paths are needed.
+  set(SDLop_LIB_INCS
+    ${WAYLAND_CLIENT_INCLUDE_DIRS}
+    ${XKBCOMMON_INCLUDE_DIRS}
+    ${EGL_INCLUDE_DIRS}
+    ${GBM_INCLUDE_DIRS}
+    ${LIBDRM_INCLUDE_DIRS}
+    ${X11_XCB_INCLUDE_DIRS})
+
+  add_library(sdlop STATIC ${SDLop_SOURCES})
+  add_library(SDLop::SDLop ALIAS sdlop)
+  add_dependencies(sdlop sdlop_wayland_protocols)
+
+  target_include_directories(sdlop PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_include_directories(sdlop PRIVATE
+    src
+    src/video/wayland
+    src/video/kmsdrm
+    ${WL_GEN_DIR}
+    ${SDLop_LIB_INCS})
+  target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
+  target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
+
+  add_library(sdlop_shared SHARED ${SDLop_SOURCES})
+  add_dependencies(sdlop_shared sdlop_wayland_protocols)
+  set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
+  target_include_directories(sdlop_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_include_directories(sdlop_shared PRIVATE
+    src
+    src/video/wayland
+    src/video/kmsdrm
+    ${WL_GEN_DIR}
+    ${SDLop_LIB_INCS})
+  target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
+  target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
+else()
+  # -------------------------------------------------------------------
+  # Windows (MinGW-w64 / MSVC): core sources plus the Win32 video driver.
+  # There is no dlopen: the driver links user32/gdi32/opengl32/dwmapi
+  # directly, and Vulkan/WGL are loaded at run time by the driver itself.
+  # -------------------------------------------------------------------
+  set(SDLop_SOURCES
+    src/SDLop_core.c
+    src/internal/sdlop_platform.c
+    src/internal/sdlop_win32_compat.c
+    src/SDL_stdlib.c
+    src/SDL_error.c
+    src/SDL_log.c
+    src/SDL_timer.c
+    src/SDL_events.c
+    src/SDL_events_desc.c
+    src/SDL_events_categories.c
+    src/SDL_properties.c
+    src/SDL_hints.c
+    src/SDL_clipboard.c
+    src/SDL_thread.c
+    src/SDL_misc.c
+    src/SDL_main.c
+    src/SDL_rect.c
+    src/SDL_pixels.c
+    src/SDL_surface.c
+    src/SDL_blit.c
+    src/SDL_blit_float.c
+    src/SDL_rotate.c
+    src/SDL_keyboard.c
+    src/SDL_keynames.c
+    src/SDL_mouse.c
+    src/SDL_devices.c
+    src/SDL_joystick.c
+    src/SDL_filesystem.c
+    src/SDL_video.c
+    src/SDL_gl.c
+    src/SDL_vulkan.c
+    src/video/windows/sdlop_windows.c
+    src/video/windows/sdlop_windows_gl.c
+    src/video/windows/sdlop_windows_vulkan.c
+    src/video/dummy/sdlop_dummy.c)
+  set(SDLop_VIDEO_DEFS SDLop_VIDEO_WINDOWS=1)
+  set(SDLop_LIB_DEPS
+    user32
+    gdi32
+    shell32
+    ole32
+    uuid
+    version
+    imm32
+    winmm
+    opengl32
+    dwmapi
+    setupapi)
+  set(SDLop_LIB_INCS)
+
+  add_library(sdlop STATIC ${SDLop_SOURCES})
+  add_library(SDLop::SDLop ALIAS sdlop)
+  target_include_directories(sdlop PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_include_directories(sdlop PRIVATE src)
+  target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
+  target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
+
+  add_library(sdlop_shared SHARED ${SDLop_SOURCES})
+  set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
+  target_include_directories(sdlop_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_include_directories(sdlop_shared PRIVATE src)
+  target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
+  target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
 endif()
-
-# SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
-# at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
-# where those libraries are absent.
-set(SDLop_LIB_DEPS
-  pthread
-  dl
-  m)
-# dlopen-ed at run time - the core targets link none of these libraries.
-# Only their header search paths are needed.
-set(SDLop_LIB_INCS
-  ${WAYLAND_CLIENT_INCLUDE_DIRS}
-  ${XKBCOMMON_INCLUDE_DIRS}
-  ${EGL_INCLUDE_DIRS}
-  ${GBM_INCLUDE_DIRS}
-  ${LIBDRM_INCLUDE_DIRS}
-  ${X11_XCB_INCLUDE_DIRS})
-
-add_library(sdlop STATIC ${SDLop_SOURCES})
-add_library(SDLop::SDLop ALIAS sdlop)
-add_dependencies(sdlop sdlop_wayland_protocols)
-
-target_include_directories(sdlop PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_include_directories(sdlop PRIVATE
-  src
-  src/video/wayland
-  src/video/kmsdrm
-  ${WL_GEN_DIR}
-  ${SDLop_LIB_INCS})
-target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
-
-add_library(sdlop_shared SHARED ${SDLop_SOURCES})
-add_dependencies(sdlop_shared sdlop_wayland_protocols)
-set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
-target_include_directories(sdlop_shared PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_include_directories(sdlop_shared PRIVATE
-  src
-  src/video/wayland
-  src/video/kmsdrm
-  ${WL_GEN_DIR}
-  ${SDLop_LIB_INCS})
-target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
-target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
 
 # ---------------------------------------------------------------------------
 # Examples

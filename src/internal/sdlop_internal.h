@@ -11,12 +11,16 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDLop.h>
 #include <stdatomic.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* win32.h has to come before windows.h users and defines nothing on POSIX */
+#include "sdlop_win32.h"
+/* mutex / rwlock / condition / semaphore / clock primitives */
+#include "sdlop_platform.h"
 
 /* ------------------------------------------------------------------ */
 /* Window internal                                                     */

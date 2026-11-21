@@ -7,10 +7,14 @@
 
 #include "internal/sdlop_internal.h"
 #ifndef __EMSCRIPTEN__
+#ifndef _WIN32
 #include <sys/eventfd.h>
 #endif
+#endif
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 SDLop_Globals sdlop;
 bool sdlop_quitting;
@@ -164,9 +168,7 @@ const char *SDL_GetAppMetadataProperty(const char *name)
 
 Uint64 SDLOP_MonotonicNS(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (Uint64)ts.tv_sec * 1000000000ull + (Uint64)ts.tv_nsec;
+    return (Uint64)SDLOP_MonotonicNowNS();
 }
 
 static bool subsystem_init(SDL_InitFlags flags)
@@ -209,13 +211,14 @@ bool SDL_Init(SDL_InitFlags flags)
         sdlop.next_user_event = SDL_EVENT_USER;
         sdlop.repeat_delay_ms = 500;
         sdlop.repeat_interval_ms = 33;
-#ifndef __EMSCRIPTEN__ /* no fds to wake on the web */
+#if defined(__EMSCRIPTEN__) || defined(_WIN32)
+        /* no fd to wake on the web; Windows events have their own mechanism */
+        sdlop.wake_fd = -1;
+#else
         sdlop.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (sdlop.wake_fd < 0) {
             sdlop.wake_fd = -1;
         }
-#else
-        sdlop.wake_fd = -1;
 #endif
         sdlop.init_done = true;
     }

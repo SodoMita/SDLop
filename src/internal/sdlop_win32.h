@@ -1,0 +1,102 @@
+/*
+  SDLop - the handful of names POSIX gives C for free and Windows does not.
+
+  SDLop is written against a POSIX libc: strcasecmp, strncasecmp, strdup,
+  ssize_t, and the <unistd.h> spelling of "is this the same file". Rather than
+  rewrite every call site (and risk changing behaviour on Linux), this header
+  defines those names for Windows only. It is included by sdlop_internal.h
+  before anything else that might pull in <windows.h>.
+
+  Including this header on POSIX is a no-op, so a stray include never breaks a
+  Linux build.
+
+  This software is provided 'as-is', without any express or implied
+  warranty (zlib license, see LICENSE).
+*/
+
+#ifndef sdlop_win32_h_
+#define sdlop_win32_h_
+
+#ifndef _WIN32
+
+/* POSIX: nothing to do. */
+
+#else
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#include <process.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* POSIX typedefs the core uses in public-ish signatures */
+typedef intptr_t ssize_t;
+typedef int mode_t;
+
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
+#ifndef S_IRUSR
+#define S_IRUSR _S_IREAD
+#endif
+#ifndef S_IWUSR
+#define S_IWUSR _S_IWRITE
+#endif
+#ifndef S_IXUSR
+#define S_IXUSR _S_IEXEC
+#endif
+
+/* <strings.h> */
+int strcasecmp(const char *a, const char *b);
+int strncasecmp(const char *a, const char *b, size_t n);
+
+/* <unistd.h> spellings */
+char *strdup(const char *s);
+int unlink(const char *path);
+int rmdir(const char *path);
+int access(const char *path, int mode);
+int isatty(int fd);
+#define R_OK 4
+#define W_OK 2
+#define X_OK 1
+#define F_OK 0
+
+/* POSIX integer formatters SDL uses via SDL_PRI*; keep names available */
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+#endif
+
+/* POSIX file-descriptor I/O over Win32 handles (SDL_io) */
+typedef intptr_t sdlop_fd_t;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _WIN32 */
+
+#endif /* sdlop_win32_h_ */
