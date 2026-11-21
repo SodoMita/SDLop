@@ -1485,6 +1485,23 @@ static void kmsdrm_native_gl_deinit(void)
     }
     KMSDRM_DeviceData *dev = vid();
     if (dev->gbm_dev) {
+        /* Cursor BOs are created from this device but outlive GL contexts (they
+         * are display state, not window state). Drop them before the device so
+         * driver teardown does not call gbm_bo_destroy() on a dangling BO whose
+         * parent device is already gone. */
+        for (int i = 0; i < dev->num_displays; i++) {
+            KMSDRM_DisplayData *dd = &dev->displays[i];
+            if (!dd->cursor_bo) {
+                continue;
+            }
+            if (dd->atomic_cursor.fb_id && SDLOP_DRM_drmModeRmFB) {
+                SDLOP_DRM_drmModeRmFB(dev->drm_fd, dd->atomic_cursor.fb_id);
+            }
+            dd->atomic_cursor.fb_id = 0;
+            dd->cursor_visible = false;
+            SDLOP_GBM_gbm_bo_destroy(dd->cursor_bo);
+            dd->cursor_bo = NULL;
+        }
         SDLOP_GBM_gbm_device_destroy(dev->gbm_dev);
         dev->gbm_dev = NULL;
         dev->gbm_init = false;

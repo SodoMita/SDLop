@@ -43,6 +43,7 @@
 
 #include "sdlop_x11_internal.h"
 #include "../sdlop_egl_dyn.h"
+#include "../sdlop_gl_offload.h"
 
 #include <dlfcn.h>
 #include <string.h>
@@ -1005,6 +1006,13 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
     (void)window;
+    /* A forced GL offload must use the generic headless-GPU path in
+     * SDL_gl.c rather than GLX/EGL rendering into the X11 drawable. */
+    if (SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE &&
+        SDLOP_GLOffload_HasHardwareGPU()) {
+        SDL_SetError("GL offload forced; X11 native GL disabled");
+        return NULL;
+    }
     const bool es = sdlop_glattrs.profile_mask == SDL_GL_CONTEXT_PROFILE_ES;
     if (want_glx()) {
         GLXFBConfig_ probe = NULL;

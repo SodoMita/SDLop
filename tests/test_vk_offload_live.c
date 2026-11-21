@@ -42,13 +42,19 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL validation_callback(
     const VkDebugUtilsMessengerCallbackDataEXT *data,
     void *user_data)
 {
-    (void)types;
     ValidationState *st = (ValidationState *)user_data;
-    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+    /* ICD/loader diagnostics (e.g. an unusable system ICD JSON) come through
+     * as GENERAL messages: they are environment issues, not validation
+     * errors in our Vulkan usage. Count only validation messages. */
+    if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) &&
+        (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) {
         if (st) {
             st->error_count++;
         }
         fprintf(stderr, "VULKAN VALIDATION ERROR: %s\n",
+                (data && data->pMessage) ? data->pMessage : "(null)");
+    } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        fprintf(stderr, "VULKAN LOADER/DRIVER MESSAGE (not counted): %s\n",
                 (data && data->pMessage) ? data->pMessage : "(null)");
     } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         fprintf(stderr, "VULKAN VALIDATION WARNING: %s\n",

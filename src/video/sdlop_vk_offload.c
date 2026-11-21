@@ -538,8 +538,11 @@ typedef struct TrackedSwapchain
     VkCommandPool_ cmd_pool;
     VkCommandBuffer_ cmd_buf;
     VkFence_ fence;
-    VkSemaphore_ readback_sem;
-    bool readback_sem_pending;
+    /* A binary semaphore passed to vkQueuePresentKHR may only be signalled
+     * again once the presented image has been re-acquired. Keep one per image
+     * instead of rotating a single one on every present. */
+    VkSemaphore_ *readback_sems;
+    uint32_t readback_sem_count;
 
     /* Cross-family QFOT state (used only when present queue cannot transfer) */
     uint32_t pres_cmd_pool_qf;
@@ -943,6 +946,53 @@ static bool is_transfer_capable_flags(uint32_t qflags)
     return (qflags & (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
 }
 
+static bool ensure_readback_sems(TrackedSwapchain *sc)
+{
+    TrackedDevice *dev = sc->dev;
+    uint32_t n = sc->image_count;
+    if (!dev || !dev->p_create_sem || !dev->p_destroy_sem || n == 0) {
+        return false;
+    }
+    if (sc->readback_sems && sc->readback_sem_count == n) {
+        return true;
+    }
+    /* The image count is fixed for a swapchain; this only guards against a
+     * late vkGetSwapchainImagesKHR reporting a different count. */
+    if (sc->readback_sems) {
+        for (uint32_t i = 0; i < sc->readback_sem_count; i++) {
+            if (sc->readback_sems[i]) {
+                dev->p_destroy_sem(dev->device, sc->readback_sems[i], NULL);
+            }
+        }
+        free(sc->readback_sems);
+        sc->readback_sems = NULL;
+        sc->readback_sem_count = 0;
+    }
+    sc->readback_sems = (VkSemaphore_ *)calloc(n, sizeof(VkSemaphore_));
+    if (!sc->readback_sems) {
+        return false;
+    }
+    VkSemaphoreCreateInfo_ sci;
+    memset(&sci, 0, sizeof(sci));
+    sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    sc->readback_sem_count = n;
+    for (uint32_t i = 0; i < n; i++) {
+        if (dev->p_create_sem(dev->device, &sci, NULL, &sc->readback_sems[i]) != VK_SUCCESS ||
+            !sc->readback_sems[i]) {
+            for (uint32_t j = 0; j < i; j++) {
+                if (sc->readback_sems[j]) {
+                    dev->p_destroy_sem(dev->device, sc->readback_sems[j], NULL);
+                }
+            }
+            free(sc->readback_sems);
+            sc->readback_sems = NULL;
+            sc->readback_sem_count = 0;
+            return false;
+        }
+    }
+    return true;
+}
+
 static void destroy_swapchain_staging(TrackedSwapchain *ts)
 {
     if (!ts || !ts->dev) {
@@ -953,11 +1003,16 @@ static void destroy_swapchain_staging(TrackedSwapchain *ts)
         dev->p_unmap_mem(dev->device, ts->staging_mem);
         ts->staging_mapped = NULL;
     }
-    if (ts->readback_sem && dev->p_destroy_sem) {
-        dev->p_destroy_sem(dev->device, ts->readback_sem, NULL);
-        ts->readback_sem = 0;
+    if (ts->readback_sems && dev->p_destroy_sem) {
+        for (uint32_t i = 0; i < ts->readback_sem_count; i++) {
+            if (ts->readback_sems[i]) {
+                dev->p_destroy_sem(dev->device, ts->readback_sems[i], NULL);
+            }
+        }
+        free(ts->readback_sems);
+        ts->readback_sems = NULL;
+        ts->readback_sem_count = 0;
     }
-    ts->readback_sem_pending = false;
     if (ts->qfot_rel_sem && dev->p_destroy_sem) {
         dev->p_destroy_sem(dev->device, ts->qfot_rel_sem, NULL);
         ts->qfot_rel_sem = 0;
@@ -1258,31 +1313,14 @@ static bool ensure_swapchain_staging(TrackedSwapchain *sc,
             return false;
         }
 
-        VkSemaphoreCreateInfo_ sci;
-        memset(&sci, 0, sizeof(sci));
-        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        if (d->p_create_sem(d->device, &sci, NULL, &sc->readback_sem) != VK_SUCCESS || !sc->readback_sem) {
-            destroy_swapchain_staging(sc);
-            sc->staging_failed = true;
-            return false;
-        }
-
         sc->staging_size = bytes;
         sc->staging_init = true;
     }
 
-    if (sc->readback_sem_pending) {
-        d->p_destroy_sem(d->device, sc->readback_sem, NULL);
-        sc->readback_sem = 0;
-        sc->readback_sem_pending = false;
-        VkSemaphoreCreateInfo_ sci;
-        memset(&sci, 0, sizeof(sci));
-        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        if (d->p_create_sem(d->device, &sci, NULL, &sc->readback_sem) != VK_SUCCESS || !sc->readback_sem) {
-            destroy_swapchain_staging(sc);
-            sc->staging_failed = true;
-            return false;
-        }
+    if (!ensure_readback_sems(sc)) {
+        destroy_swapchain_staging(sc);
+        sc->staging_failed = true;
+        return false;
     }
 
     if (!ensure_cmd_pool_and_bufs(d, readback_qf, &sc->cmd_pool, &sc->cmd_pool_qf, 1, &sc->cmd_buf)) {
@@ -1412,6 +1450,10 @@ static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image
     if (!ensure_swapchain_staging(sc, readback_qf, need_qfot, present_qf)) {
         return false;
     }
+
+    /* Present-wait semaphores are per image: reusing one for another image
+     * would signal it while the previous present may still be using it. */
+    VkSemaphore_ rsem = sc->readback_sems[image_index];
 
     VkImage_ img = sc->images[image_index];
 
@@ -1605,7 +1647,7 @@ static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image
         si3.commandBufferCount = 1;
         si3.pCommandBuffers = &sc->pres_acq_cb;
         si3.signalSemaphoreCount = 1;
-        si3.pSignalSemaphores = &sc->readback_sem;
+        si3.pSignalSemaphores = &rsem;
         if (d->p_queue_submit(present_queue, 1, &si3, 0) != VK_SUCCESS) {
             return false;
         }
@@ -1619,7 +1661,7 @@ static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image
         si.commandBufferCount = 1;
         si.pCommandBuffers = &sc->cmd_buf;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &sc->readback_sem;
+        si.pSignalSemaphores = &rsem;
         VkResult_ sres = d->p_queue_submit(readback_queue, 1, &si, sc->fence);
         if (wait_stages && wait_stages != stack_stages) {
             free(wait_stages);
@@ -1629,8 +1671,7 @@ static bool readback_swapchain_to_window_fb(TrackedSwapchain *sc, uint32_t image
         }
     }
 
-    sc->readback_sem_pending = true;
-    *out_sem = sc->readback_sem;
+    *out_sem = rsem;
 
     if (d->p_wait_fences(d->device, 1, &sc->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
         return true; /* semaphore already chained; skip CPU blit */
@@ -1939,7 +1980,6 @@ static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ 
     uint32_t cur_wait_count = pPresentInfo->waitSemaphoreCount;
     const VkSemaphore_ *cur_wait_sems = pPresentInfo->pWaitSemaphores;
     VkSemaphore_ chained_sem = 0;
-    TrackedSwapchain *last_sc = NULL;
 
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
         TrackedSwapchain *sc = find_swapchain(pPresentInfo->pSwapchains[i]);
@@ -1947,13 +1987,9 @@ static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ 
             VkSemaphore_ out_sem = 0;
             if (readback_swapchain_to_window_fb(sc, pPresentInfo->pImageIndices[i], queue,
                                                 cur_wait_count, cur_wait_sems, &out_sem)) {
-                if (last_sc) {
-                    last_sc->readback_sem_pending = false;
-                }
                 chained_sem = out_sem;
                 cur_wait_count = 1;
                 cur_wait_sems = &chained_sem;
-                last_sc = sc;
             }
         }
     }
@@ -1962,11 +1998,7 @@ static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ 
     pi.waitSemaphoreCount = cur_wait_count;
     pi.pWaitSemaphores = cur_wait_sems;
 
-    VkResult_ res = p_present(queue, &pi);
-    if (last_sc && (res == VK_SUCCESS || res == 1000001003 /* VK_SUBOPTIMAL_KHR */)) {
-        last_sc->readback_sem_pending = false;
-    }
-    return res;
+    return p_present(queue, &pi);
 }
 
 static void wrap_vkGetDeviceQueue(VkDevice_ device,

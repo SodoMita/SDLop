@@ -117,7 +117,7 @@ static void test_flip_copy(void)
     /* Use pitch = 16 (4 extra padding bytes per row) with canary bytes. */
     uint8_t dst[2 * 16];
     memset(dst, 0xA5, sizeof(dst));
-    SDLOP_GLOffload_FlipCopyToXRGB8888(rgba_src, 2, 2, false, dst, 16, 2, 2);
+    SDLOP_GLOffload_FlipCopyToXRGB8888(rgba_src, 2, 2, SDLOP_GL_OFFLOAD_RGBA8888, dst, 16, 2, 2);
 
     const uint32_t *row0 = (const uint32_t *)(dst + 0);
     const uint32_t *row1 = (const uint32_t *)(dst + 16);
@@ -137,17 +137,57 @@ static void test_flip_copy(void)
         0x00, 0xFF, 0xFF, 0xFF,   /* Yellow */
     };
     memset(dst, 0x5A, sizeof(dst));
-    SDLOP_GLOffload_FlipCopyToXRGB8888(bgra_src, 2, 2, true, dst, 16, 2, 2);
+    SDLOP_GLOffload_FlipCopyToXRGB8888(bgra_src, 2, 2, SDLOP_GL_OFFLOAD_BGRA8888, dst, 16, 2, 2);
     CHECK(row0[0] == 0xFF0000FFu, "BGRA top-left blue (got 0x%08x)", row0[0]);
     CHECK(row0[1] == 0xFFFFFF00u, "BGRA top-right yellow (got 0x%08x)", row0[1]);
     CHECK(row1[0] == 0xFFFF0000u, "BGRA bottom-left red (got 0x%08x)", row1[0]);
     CHECK(row1[1] == 0xFF00FF00u, "BGRA bottom-right green (got 0x%08x)", row1[1]);
     CHECK(dst[8] == 0x5A && dst[24] == 0x5A, "BGRA padding untouched");
 
+    /* RGB path (driver-preferred format on NVIDIA) */
+    const uint8_t rgb_src[2 * 2 * 3] = {
+        0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00,
+        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00,
+    };
+    memset(dst, 0x3C, sizeof(dst));
+    SDLOP_GLOffload_FlipCopyToXRGB8888(rgb_src, 2, 2, SDLOP_GL_OFFLOAD_RGB888, dst, 16, 2, 2);
+    CHECK(row0[0] == 0xFF0000FFu, "RGB top-left blue (got 0x%08x)", row0[0]);
+    CHECK(row0[1] == 0xFFFFFF00u, "RGB top-right yellow (got 0x%08x)", row0[1]);
+    CHECK(row1[0] == 0xFFFF0000u, "RGB bottom-left red (got 0x%08x)", row1[0]);
+    CHECK(row1[1] == 0xFF00FF00u, "RGB bottom-right green (got 0x%08x)", row1[1]);
+
     /* Clipping: 2x2 source into 1x1 destination -> gets top-left pixel (Blue). */
     uint32_t small[1] = { 0 };
-    SDLOP_GLOffload_FlipCopyToXRGB8888(rgba_src, 2, 2, false, small, 4, 1, 1);
+    SDLOP_GLOffload_FlipCopyToXRGB8888(rgba_src, 2, 2, SDLOP_GL_OFFLOAD_RGBA8888, small, 4, 1, 1);
     CHECK(small[0] == 0xFF0000FFu, "clipped 1x1 gets top-left blue (got 0x%08x)", small[0]);
+
+    /* Wide row: exercises the SIMD loops in both RGB and RGBA paths. The
+     * RGB source is exactly sized so an overreading load would be caught. */
+    const uint8_t rgb8[8 * 3] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+        0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+    };
+    const uint8_t rgba8[8 * 4] = {
+        0x11, 0x22, 0x33, 0x80, 0x44, 0x55, 0x66, 0x80,
+        0x77, 0x88, 0x99, 0x80, 0xAA, 0xBB, 0xCC, 0x80,
+        0x01, 0x02, 0x03, 0x80, 0x04, 0x05, 0x06, 0x80,
+        0x07, 0x08, 0x09, 0x80, 0x0A, 0x0B, 0x0C, 0x80,
+    };
+    const uint32_t expected[8] = {
+        0xFF112233u, 0xFF445566u, 0xFF778899u, 0xFFAABBCCu,
+        0xFF010203u, 0xFF040506u, 0xFF070809u, 0xFF0A0B0Cu,
+    };
+    uint32_t simd_dst[8];
+    SDLOP_GLOffload_FlipCopyToXRGB8888(rgb8, 8, 1, SDLOP_GL_OFFLOAD_RGB888, simd_dst, 32, 8, 1);
+    for (int i = 0; i < 8; i++) {
+        CHECK(simd_dst[i] == expected[i], "RGB SIMD pixel %d (got 0x%08x)", i, simd_dst[i]);
+    }
+    SDLOP_GLOffload_FlipCopyToXRGB8888(rgba8, 8, 1, SDLOP_GL_OFFLOAD_RGBA8888, simd_dst, 32, 8, 1);
+    for (int i = 0; i < 8; i++) {
+        CHECK(simd_dst[i] == expected[i], "RGBA SIMD pixel %d (got 0x%08x)", i, simd_dst[i]);
+    }
 }
 
 static void test_gl_attrs(void)
