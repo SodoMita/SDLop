@@ -157,3 +157,52 @@ int SDLOP_EGL_AppendUserAttribs(bool context, EGLDisplay display, EGLConfig conf
     attribs[n] = EGL_NONE;
     return n;
 }
+
+#ifndef EGL_OPENGL_ES3_BIT
+#define EGL_OPENGL_ES3_BIT 0x0040
+#endif
+#ifndef EGL_CONTEXT_MAJOR_VERSION_KHR
+#define EGL_CONTEXT_MAJOR_VERSION_KHR 0x3098
+#endif
+#ifndef EGL_CONTEXT_MINOR_VERSION_KHR
+#define EGL_CONTEXT_MINOR_VERSION_KHR 0x30FB
+#endif
+
+static bool display_has_extension(EGLDisplay display, const char *ext)
+{
+    const char *list = SDLOP_EGL_eglQueryString(display, EGL_EXTENSIONS);
+    const size_t len = SDL_strlen(ext);
+    for (const char *p = list; p && (p = SDL_strstr(p, ext)) != NULL; p += len) {
+        if ((p == list || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+EGLint SDLOP_EGL_ESRenderableType(EGLDisplay display)
+{
+    if (sdlop_glattrs.major_version >= 3 && display_has_extension(display, "EGL_KHR_create_context")) {
+        return EGL_OPENGL_ES3_BIT;
+    }
+    if (sdlop_glattrs.major_version >= 2) {
+        return EGL_OPENGL_ES2_BIT;
+    }
+    return EGL_OPENGL_ES_BIT;
+}
+
+int SDLOP_EGL_AppendESVersion(EGLDisplay display, EGLint *attribs, int n)
+{
+    if (sdlop_glattrs.minor_version == 0) {
+        /* EGL 1.3 core: only the major version can be given */
+        attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
+        attribs[n++] = sdlop_glattrs.major_version > 1 ? sdlop_glattrs.major_version : 1;
+    } else if (display_has_extension(display, "EGL_KHR_create_context")) {
+        attribs[n++] = EGL_CONTEXT_MAJOR_VERSION_KHR; attribs[n++] = sdlop_glattrs.major_version;
+        attribs[n++] = EGL_CONTEXT_MINOR_VERSION_KHR; attribs[n++] = sdlop_glattrs.minor_version;
+    } else {
+        SDL_SetError("Could not create EGL context (context attributes are not supported)");
+        return -1;
+    }
+    return n;
+}

@@ -44,7 +44,7 @@ int main(void) {
 | Linux / X11 (pure XCB; MIT-SHM, XKB, XInput2 raw motion, RandR 1.5 — all `dlopen`-ed) | ✅ done, tested on Xvfb with and without a WM (openbox) |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
 | Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
-| OpenGL / OpenGL ES: GLX on X11 for desktop GL (as stock SDL3), EGL for GLES / Wayland / KMSDRM (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
+| OpenGL / OpenGL ES: GLX on X11 for desktop GL and for GLES when the server has `GLX_EXT_create_context_es_profile` (as stock SDL3), EGL otherwise and on Wayland / KMSDRM (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
 | Drop-in for binaries built against stock SDL3 (`libSDL3.so.0`, symbol version `SDL3_0.0.0`) | ✅ done, tested with Dear ImGui and Nuklear SDL3+OpenGL3 examples |
 | Vulkan WSI (`SDL_Vulkan_*`, lavapipe) | ✅ done, verified by swapchain read-back |
 | Pointer lock (`zwp_pointer_constraints` + `zwp_relative_pointer`) | ✅ done, tested against a mini compositor |
@@ -147,7 +147,8 @@ false, anything else true.
 | `SDLOP_X11_NO_SHM`, `_NO_RENDER`, `_NO_TOUCH` | don't use MIT-SHM / XRender / XInput2 touch |
 | `SDLOP_X11_RELATIVE_WARP` | relative mode by warping instead of XInput2 raw motion |
 | `SDLOP_X11_EGL_PLATFORM` | `x11` skips the EGL xcb platform |
-| `SDL_VIDEO_FORCE_EGL` (`SDL_HINT_VIDEO_FORCE_EGL`) | X11: desktop GL through EGL instead of GLX (stock SDL3 hint) |
+| `SDL_VIDEO_FORCE_EGL` (`SDL_HINT_VIDEO_FORCE_EGL`) | X11: all contexts (desktop GL and GLES) through EGL instead of GLX (stock SDL3 hint) |
+| `SDL_OPENGL_ES_DRIVER` (`SDL_HINT_OPENGL_ES_DRIVER`) | X11: GLES contexts through EGL instead of GLX (stock SDL3 hint) |
 | `SDL_OPENGL_LIBRARY` (`SDL_HINT_OPENGL_LIBRARY`) | X11: library to load GLX from (default `libGL.so.1`, then `libGLX.so.0`) |
 | `SDLOP_KMSDRM_*` | `DEVICE`, `CONNECTOR`, `ATOMIC`, `ATOMIC_CURSOR`, `DOUBLE_BUFFER`, `FLIP_TIMEOUT_MS`, `HOTPLUG`, `KEEP_MASTER`, `NOFLIP`, `REQUIRE_MASTER`, `VT_SWITCH` (see `sdlop_kmsdrm.c`) |
 | `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
@@ -439,11 +440,28 @@ Highlights:
   confined pointer grab + blank cursor; warp-to-center without XInput2.
   Content scale follows `SDL_VIDEO_X11_SCALING_FACTOR`, `Xft.dpi`, then
   `GDK_SCALE`. Desktop OpenGL uses GLX like stock SDL3 (loaders such as
-  GLEW need `glXGetCurrentDisplay()`), on a private Xlib connection;
-  OpenGL ES profiles, `SDL_VIDEO_FORCE_EGL=1`, and systems without usable
-  GLX use EGL (`EGL_PLATFORM_XCB_EXT`, else `EGL_PLATFORM_X11_EXT`). As in
-  stock SDL3, `SDL_GL_SetSwapInterval` fails with "not supported" when the
-  GLX stack has no swap-control extension (e.g. Xvfb).
+  GLEW need `glXGetCurrentDisplay()`), on a private Xlib connection.
+  OpenGL ES uses GLX as well when the server has
+  `GLX_EXT_create_context_es_profile` (any ES version; the older
+  `GLX_EXT_create_context_es2_profile` alone: ES 2.0) on top of
+  `GLX_ARB_create_context_profile`, which avoids an EGL detour on drivers
+  whose GLX path is the fast one. Unlike stock, the ES version is not capped
+  by `GL_ARB_ES3_compatibility`: the driver is asked, and a version it
+  refuses falls back to EGL (on every EGL path, X11/Wayland/KMSDRM, the ES
+  version is passed like stock: X.0 as `EGL_CONTEXT_CLIENT_VERSION`, X.Y
+  through `EGL_KHR_create_context`, so an unavailable version fails instead
+  of returning a different one). `SDL_VIDEO_FORCE_EGL=1` (everything),
+  `SDL_OPENGL_ES_DRIVER=1` (GLES only) and systems without usable GLX use
+  EGL (`EGL_PLATFORM_XCB_EXT`, else `EGL_PLATFORM_X11_EXT`); `SDL_EGL_*`
+  return NULL for GLX contexts, as in stock. GLX contexts honour
+  `SDL_GL_CONTEXT_NO_ERROR` (`GLX_ARB_create_context_no_error`),
+  `SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG` / `SDL_GL_CONTEXT_RESET_NOTIFICATION`
+  (`GLX_ARB_create_context_robustness`) and
+  `SDL_GL_CONTEXT_RELEASE_BEHAVIOR` (`GLX_ARB_context_flush_control`), each
+  only when the server has the extension (otherwise ignored). Swap control:
+  `GLX_EXT_swap_control` (+ `_tear` for adaptive vsync, interval -1), else
+  MESA, else SGI; as in stock SDL3, `SDL_GL_SetSwapInterval` fails with "not
+  supported" when there is none (e.g. Xvfb).
   `SDLOP_X11_NO_SHM=1` disables MIT-SHM. Layout switches (`setxkbmap`, XKB
   group changes) are followed live and reported as
   `SDL_EVENT_KEYMAP_CHANGED`; without libxcb-xkb only full keymap changes

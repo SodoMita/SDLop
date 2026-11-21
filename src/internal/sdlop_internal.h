@@ -437,6 +437,9 @@ typedef struct SDLOP_GLAttributes
     int share_with_current_context;
     int framebuffer_srgb_capable;
     int floatbuffers;
+    int release_behavior;   /* SDL_GL_CONTEXT_RELEASE_BEHAVIOR, default FLUSH */
+    int reset_notification; /* SDL_GL_CONTEXT_RESET_NOTIFICATION, default NO_NOTIFICATION */
+    int no_error;           /* SDL_GL_CONTEXT_NO_ERROR */
 } SDLOP_GLAttributes;
 
 extern SDLOP_GLAttributes sdlop_glattrs;

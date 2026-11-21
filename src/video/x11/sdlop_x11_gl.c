@@ -6,10 +6,25 @@
       applications built against stock SDL3 expect: GLEW and other loaders
       call glXGetCurrentDisplay()/glXGetProcAddress() and fail on an EGL
       context ("GLEW_ERROR_NO_GLX_DISPLAY").
-    - EGL for OpenGL ES profiles, when SDL_HINT_VIDEO_FORCE_EGL
-      ("SDL_VIDEO_FORCE_EGL", env or SDL_SetHint) is true, and as a
-      fallback when GLX is unusable (no libGL, no GLX extension, no
-      framebuffer config for SDLop's window visual).
+    - GLX also for OpenGL ES when the server has
+      GLX_EXT_create_context_es_profile (any ES version) or the older
+      GLX_EXT_create_context_es2_profile (ES 2.0 only), with
+      GLX_ARB_create_context(_profile): the ES bit goes into
+      GLX_CONTEXT_PROFILE_MASK_ARB. No EGL detour on drivers whose GLX
+      path is the fast one. ES requests the driver refuses fall back to
+      EGL, as do ES 1.x on es2-only servers.
+    - EGL when SDL_HINT_VIDEO_FORCE_EGL ("SDL_VIDEO_FORCE_EGL") is true,
+      for ES when SDL_HINT_OPENGL_ES_DRIVER ("SDL_OPENGL_ES_DRIVER") is
+      true (both env or SDL_SetHint, as in stock), and as a fallback when
+      GLX is unusable (no libGL, no GLX extension, no framebuffer config
+      for SDLop's window visual).
+
+  GLX context attributes, each sent only when the extension is present:
+  GLX_ARB_create_context_robustness (SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG,
+  SDL_GL_CONTEXT_RESET_NOTIFICATION), GLX_ARB_create_context_no_error
+  (SDL_GL_CONTEXT_NO_ERROR), GLX_ARB_context_flush_control
+  (SDL_GL_CONTEXT_RELEASE_BEHAVIOR). Swap control: EXT (+ _tear for
+  adaptive vsync, interval -1), MESA, SGI.
 
   GLX runs on a private Xlib connection (libX11 dlopen-ed on demand): X
   window ids are server-global, so it renders into SDLop's xcb windows.
@@ -181,10 +196,8 @@ static bool pick_config(EGLConfig *out, EGLenum api)
     EGLint renderable;
     if (api == EGL_OPENGL_API) {
         renderable = EGL_OPENGL_BIT;
-    } else if (sdlop_glattrs.major_version >= 3) {
-        renderable = EGL_OPENGL_ES3_BIT;
     } else {
-        renderable = EGL_OPENGL_ES2_BIT;
+        renderable = SDLOP_EGL_ESRenderableType(egl_display);
     }
     EGLint attribs[24];
     int n = 0;
@@ -255,8 +268,10 @@ static void *egl_CreateContext(void)
             ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE; ctx_attribs[n++] = EGL_TRUE;
         }
     } else {
-        ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
-        ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
+        n = SDLOP_EGL_AppendESVersion(egl_display, ctx_attribs, n);
+        if (n < 0) {
+            return NULL;
+        }
     }
     n = SDLOP_EGL_AppendUserAttribs(true, egl_display, config, ctx_attribs, n, (int)SDL_arraysize(ctx_attribs));
     if (n < 0) {
@@ -510,6 +525,14 @@ typedef void (*GLXProc_)(void);
 #define GLX_CONTEXT_PROFILE_MASK_ARB_        0x9126
 #define GLX_CONTEXT_CORE_PROFILE_BIT_ARB_    0x0001
 #define GLX_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB_ 0x0002
+#define GLX_CONTEXT_ES_PROFILE_BIT_EXT_      0x0004 /* == SDL_GL_CONTEXT_PROFILE_ES */
+#define GLX_CONTEXT_RELEASE_BEHAVIOR_ARB_    0x2097
+#define GLX_CONTEXT_RELEASE_BEHAVIOR_NONE_ARB_ 0
+#define GLX_CONTEXT_RELEASE_BEHAVIOR_FLUSH_ARB_ 0x2098
+#define GLX_CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB_ 0x8256
+#define GLX_NO_RESET_NOTIFICATION_ARB_       0x8261
+#define GLX_LOSE_CONTEXT_ON_RESET_ARB_       0x8252
+#define GLX_CONTEXT_OPENGL_NO_ERROR_ARB_     0x31B3
 
 typedef struct
 {
@@ -533,6 +556,8 @@ static struct
     bool has_create_context, has_create_context_profile;
     bool has_swap_ext, has_swap_tear, has_swap_mesa, has_swap_sgi;
     bool has_srgb, has_float;
+    bool has_es_profile, has_es2_profile;
+    bool has_robustness, has_no_error, has_flush_control;
 
     int (*QueryExtension)(XDisplay_ *, int *, int *);
     int (*QueryVersion)(XDisplay_ *, int *, int *);
@@ -688,9 +713,19 @@ static bool glx_init(void)
     }
     glx.has_srgb = has_extension(ext, "GLX_ARB_framebuffer_sRGB") || has_extension(ext, "GLX_EXT_framebuffer_sRGB");
     glx.has_float = has_extension(ext, "GLX_ARB_fbconfig_float");
+    if (glx.has_create_context) {
+        /* the ES bit and the other attributes are only meaningful through
+         * glXCreateContextAttribsARB (the ES bit also needs the profile mask) */
+        glx.has_es_profile = glx.has_create_context_profile && has_extension(ext, "GLX_EXT_create_context_es_profile");
+        glx.has_es2_profile = glx.has_create_context_profile && has_extension(ext, "GLX_EXT_create_context_es2_profile");
+        glx.has_robustness = has_extension(ext, "GLX_ARB_create_context_robustness");
+        glx.has_no_error = has_extension(ext, "GLX_ARB_create_context_no_error");
+        glx.has_flush_control = has_extension(ext, "GLX_ARB_context_flush_control");
+    }
     glx.usable = true;
-    SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop GLX %d.%d on X11 (create_context=%d swap=%s)", major, minor,
+    SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop GLX %d.%d on X11 (create_context=%d es=%s swap=%s)", major, minor,
                 glx.has_create_context,
+                glx.has_es_profile ? "all" : glx.has_es2_profile ? "2.0" : "none",
                 glx.has_swap_ext ? "EXT" : glx.has_swap_mesa ? "MESA" : glx.has_swap_sgi ? "SGI" : "none");
     return true;
 }
@@ -770,6 +805,7 @@ static bool glx_pick_config(GLXFBConfig_ *out)
 
 static void *glx_CreateContext(void)
 {
+    const bool es = sdlop_glattrs.profile_mask == SDL_GL_CONTEXT_PROFILE_ES;
     GLXFBConfig_ config = NULL;
     if (!glx_pick_config(&config)) {
         return NULL;
@@ -788,23 +824,50 @@ static void *glx_CreateContext(void)
      * flags get a legacy context, everything else goes through
      * GLX_ARB_create_context */
     const bool legacy = sdlop_glattrs.major_version < 3 && sdlop_glattrs.profile_mask == 0 &&
-                        sdlop_glattrs.flags == 0;
+                        sdlop_glattrs.flags == 0 && !sdlop_glattrs.no_error &&
+                        sdlop_glattrs.reset_notification == SDL_GL_CONTEXT_RESET_NO_NOTIFICATION &&
+                        sdlop_glattrs.release_behavior == SDL_GL_CONTEXT_RELEASE_BEHAVIOR_FLUSH;
     if (legacy || !glx.has_create_context) {
         ctx = glx.CreateNewContext(glx.dpy, config, GLX_RGBA_TYPE_, share, 1);
     } else {
-        int attribs[16];
+        int attribs[24];
         int n = 0;
         attribs[n++] = GLX_CONTEXT_MAJOR_VERSION_ARB_; attribs[n++] = sdlop_glattrs.major_version;
         attribs[n++] = GLX_CONTEXT_MINOR_VERSION_ARB_; attribs[n++] = sdlop_glattrs.minor_version;
-        if (sdlop_glattrs.profile_mask && glx.has_create_context_profile) {
+        if (es) {
+            attribs[n++] = GLX_CONTEXT_PROFILE_MASK_ARB_;
+            attribs[n++] = GLX_CONTEXT_ES_PROFILE_BIT_EXT_;
+        } else if (sdlop_glattrs.profile_mask && glx.has_create_context_profile) {
             attribs[n++] = GLX_CONTEXT_PROFILE_MASK_ARB_;
             attribs[n++] = (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
                                ? GLX_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB_
                                : GLX_CONTEXT_CORE_PROFILE_BIT_ARB_;
         }
-        if (sdlop_glattrs.flags) {
-            /* SDL_GL_CONTEXT_*_FLAG values equal the GLX_CONTEXT_*_BIT_ARB bits */
-            attribs[n++] = GLX_CONTEXT_FLAGS_ARB_; attribs[n++] = sdlop_glattrs.flags;
+        /* SDL_GL_CONTEXT_*_FLAG values equal the GLX_CONTEXT_*_BIT_ARB bits;
+         * ROBUST_ACCESS is only defined with the robustness extension and
+         * forward-compatible only for desktop GL 3.0+ */
+        int flags = sdlop_glattrs.flags;
+        if (!glx.has_robustness) {
+            flags &= ~SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG;
+        }
+        if (es) {
+            flags &= ~SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG;
+        }
+        if (flags) {
+            attribs[n++] = GLX_CONTEXT_FLAGS_ARB_; attribs[n++] = flags;
+        }
+        /* the rest only when the extension exists and the value is not the
+         * default, like stock */
+        if (glx.has_flush_control && sdlop_glattrs.release_behavior == SDL_GL_CONTEXT_RELEASE_BEHAVIOR_NONE) {
+            attribs[n++] = GLX_CONTEXT_RELEASE_BEHAVIOR_ARB_;
+            attribs[n++] = GLX_CONTEXT_RELEASE_BEHAVIOR_NONE_ARB_;
+        }
+        if (glx.has_robustness && sdlop_glattrs.reset_notification == SDL_GL_CONTEXT_RESET_LOSE_CONTEXT) {
+            attribs[n++] = GLX_CONTEXT_RESET_NOTIFICATION_STRATEGY_ARB_;
+            attribs[n++] = GLX_LOSE_CONTEXT_ON_RESET_ARB_;
+        }
+        if (glx.has_no_error && sdlop_glattrs.no_error) {
+            attribs[n++] = GLX_CONTEXT_OPENGL_NO_ERROR_ARB_; attribs[n++] = 1;
         }
         attribs[n++] = 0;
         ctx = glx.CreateContextAttribsARB(glx.dpy, config, share, 1, attribs);
@@ -814,8 +877,8 @@ static void *glx_CreateContext(void)
         if (ctx) {
             glx.DestroyContext(glx.dpy, ctx);
         }
-        SDL_SetError("Couldn't create GLX context for OpenGL %d.%d%s (X error %d)", sdlop_glattrs.major_version,
-                     sdlop_glattrs.minor_version,
+        SDL_SetError("Couldn't create GLX context for OpenGL%s %d.%d%s (X error %d)", es ? " ES" : "",
+                     sdlop_glattrs.major_version, sdlop_glattrs.minor_version,
                      (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) ? " core" : "", xerr);
         return NULL;
     }
@@ -904,6 +967,34 @@ static void glx_Quit(void)
 /* Backend dispatch (driver entry points)                              */
 /* ------------------------------------------------------------------ */
 
+/* Whether a new context with the current attributes goes to GLX (may load
+ * GLX). Same decision as stock's X11_GL_UseEGL, except that ES versions are
+ * not capped at what GL_ARB_ES{2,3}_compatibility suggests: the driver is
+ * asked, and a refused request falls back to EGL in CreateContext. */
+static bool want_glx(void)
+{
+    if (force_egl()) {
+        return false;
+    }
+    if (sdlop_glattrs.profile_mask != SDL_GL_CONTEXT_PROFILE_ES) {
+        return glx_init();
+    }
+    if (SDL_GetHintBoolean(SDL_HINT_OPENGL_ES_DRIVER, false)) {
+        return false;
+    }
+    if (!glx_init()) {
+        return false;
+    }
+    if (glx.has_es_profile) {
+        return true;
+    }
+    /* GLX_EXT_create_context_es2_profile alone only defines ES 2.0 */
+    if (glx.has_es2_profile && sdlop_glattrs.major_version == 2 && sdlop_glattrs.minor_version == 0) {
+        return true;
+    }
+    return SDL_SetError("GLX has no OpenGL ES %d.%d profile", sdlop_glattrs.major_version, sdlop_glattrs.minor_version);
+}
+
 static bool current_is_glx(void)
 {
     X11GLContext *cur = (X11GLContext *)SDLOP_GL_CurrentContext();
@@ -915,15 +1006,23 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     (void)device;
     (void)window;
     const bool es = sdlop_glattrs.profile_mask == SDL_GL_CONTEXT_PROFILE_ES;
-    if (!es && !force_egl()) {
-        if (glx_init()) {
-            GLXFBConfig_ probe = NULL;
-            if (glx_pick_config(&probe)) {
-                return glx_CreateContext();
+    if (want_glx()) {
+        GLXFBConfig_ probe = NULL;
+        if (glx_pick_config(&probe)) {
+            void *ctx = glx_CreateContext();
+            if (ctx || !es) {
+                /* desktop GL: a refused version is the answer, as in stock */
+                return ctx;
             }
+            /* the driver advertises ES over GLX but not this version */
+            SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop: %s, trying EGL", SDL_GetError());
+            SDL_ClearError();
+            return egl_CreateContext();
         }
+    }
+    if (!force_egl() && (!es || !SDL_GetHintBoolean(SDL_HINT_OPENGL_ES_DRIVER, false))) {
         /* GLX unusable here: say why, then try EGL */
-        SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop: GLX unavailable (%s), using EGL", SDL_GetError());
+        SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop: GLX not used (%s), using EGL", SDL_GetError());
         SDL_ClearError();
     }
     return egl_CreateContext();
@@ -1001,8 +1100,7 @@ SDL_FunctionPointer SDLOP_X11_GL_GetProcAddress(SDLop_VideoDevice *device, const
 {
     (void)device;
     X11GLContext *cur = (X11GLContext *)SDLOP_GL_CurrentContext();
-    bool use_glx = cur ? cur->backend == X11GL_BACKEND_GLX
-                       : (sdlop_glattrs.profile_mask != SDL_GL_CONTEXT_PROFILE_ES && !force_egl() && glx_init());
+    bool use_glx = cur ? cur->backend == X11GL_BACKEND_GLX : want_glx();
     if (use_glx) {
         SDL_FunctionPointer fn = (SDL_FunctionPointer)glx.GetProcAddress((const unsigned char *)proc);
         if (fn) {

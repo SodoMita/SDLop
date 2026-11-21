@@ -1,5 +1,6 @@
 /*
-  SDLop test: OpenGL ES 2 context via EGL (llvmpipe on headless systems).
+  SDLop test: OpenGL ES 2 context (EGL on Wayland; GLX on X11 when the server
+  has GLX_EXT_create_context_es_profile, else EGL; llvmpipe when headless).
   Runs on Wayland or X11; skips cleanly when neither is available.
 
   This software is provided 'as-is', without any express or implied
@@ -66,7 +67,13 @@ int main(void)
     CHECK(SDL_GL_GetProcAddress("glDrawArrays") != NULL, "glDrawArrays proc");
 
     /* swap interval */
-    CHECK(SDL_GL_SetSwapInterval(0), "swap interval 0");
+    /* GLX (X11, also for ES with GLX_EXT_create_context_es_profile) without
+     * a swap control extension reports "not supported", like stock; the
+     * interval then stays at its initial 0 */
+    if (!SDL_GL_SetSwapInterval(0)) {
+        printf("swap interval: %s\n", SDL_GetError());
+        CHECK(strstr(SDL_GetError(), "not supported") != NULL, "swap interval 0: %s", SDL_GetError());
+    }
     int interval = -1;
     CHECK(SDL_GL_GetSwapInterval(&interval) && interval == 0, "get swap interval");
 

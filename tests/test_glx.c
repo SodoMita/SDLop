@@ -12,7 +12,13 @@
     - rendering: clear + glReadPixels on the window, SDL_GL_SwapWindow
     - swap interval round trip
     - shared contexts (SDL_GL_SHARE_WITH_CURRENT_CONTEXT)
-    - OpenGL ES profile and SDL_HINT_VIDEO_FORCE_EGL select EGL instead
+    - OpenGL ES 2.0 / 3.0 contexts go through GLX too when the server has
+      GLX_EXT_create_context_es_profile (else EGL); SDL_HINT_OPENGL_ES_DRIVER
+      and SDL_HINT_VIDEO_FORCE_EGL select EGL; the requested ES version is
+      honoured on GLX and EGL (ES 1.1 is ES-CM 1.1, ES 9.0 / 3.9 fail)
+    - SDL_GL_CONTEXT_NO_ERROR / RESET_NOTIFICATION + ROBUST_ACCESS_FLAG /
+      RELEASE_BEHAVIOR reach the GLX context (read back with glGetIntegerv)
+      when the server has the matching GLX extensions
     - destroying the window while its GLX context is current is safe
     - GLX again after SDL_Quit / SDL_Init
 
@@ -47,6 +53,13 @@ typedef unsigned int GLenum_;
 #define GL_UNSIGNED_BYTE_    0x1401
 #define GL_VERSION_          0x1F02
 #define GL_TEXTURE_2D_       0x0DE1
+#define GL_CONTEXT_FLAGS_    0x821E
+#define GL_CONTEXT_FLAG_ROBUST_ACCESS_BIT_ 0x4
+#define GL_CONTEXT_FLAG_NO_ERROR_BIT_      0x8
+#define GL_RESET_NOTIFICATION_STRATEGY_    0x8256
+#define GL_LOSE_CONTEXT_ON_RESET_          0x8252
+#define GL_CONTEXT_RELEASE_BEHAVIOR_       0x82FB
+typedef void (*PFN_glGetIntegerv)(GLenum_, int *);
 typedef void (*PFN_glClearColor)(float, float, float, float);
 typedef void (*PFN_glClear)(unsigned int);
 typedef void (*PFN_glFinish)(void);
@@ -61,11 +74,14 @@ typedef void *(*PFN_glXGetCurrentContext)(void);
 typedef void *(*PFN_glXGetCurrentDisplay)(void);
 typedef unsigned long (*PFN_glXGetCurrentDrawable)(void);
 typedef int (*PFN_glXQueryVersion)(void *, int *, int *);
+typedef const char *(*PFN_glXQueryExtensionsString)(void *, int);
 
 static PFN_glXGetCurrentContext p_glXGetCurrentContext;
 static PFN_glXGetCurrentDisplay p_glXGetCurrentDisplay;
 static PFN_glXGetCurrentDrawable p_glXGetCurrentDrawable;
 static PFN_glXQueryVersion p_glXQueryVersion;
+static PFN_glXQueryExtensionsString p_glXQueryExtensionsString;
+static char glx_extensions[8192]; /* server+client GLX extensions, read under the first context */
 
 static bool load_glx(void)
 {
@@ -80,7 +96,9 @@ static bool load_glx(void)
     p_glXGetCurrentDisplay = (PFN_glXGetCurrentDisplay)dlsym(lib, "glXGetCurrentDisplay");
     p_glXGetCurrentDrawable = (PFN_glXGetCurrentDrawable)dlsym(lib, "glXGetCurrentDrawable");
     p_glXQueryVersion = (PFN_glXQueryVersion)dlsym(lib, "glXQueryVersion");
-    return p_glXGetCurrentContext && p_glXGetCurrentDisplay && p_glXGetCurrentDrawable && p_glXQueryVersion;
+    p_glXQueryExtensionsString = (PFN_glXQueryExtensionsString)dlsym(lib, "glXQueryExtensionsString");
+    return p_glXGetCurrentContext && p_glXGetCurrentDisplay && p_glXGetCurrentDrawable && p_glXQueryVersion &&
+           p_glXQueryExtensionsString;
 }
 
 static void start_video(void)
@@ -147,6 +165,55 @@ static void reset_attrs(void)
     SDL_GL_ResetAttributes();
 }
 
+static bool glx_has(const char *ext)
+{
+    const size_t len = strlen(ext);
+    for (const char *p = glx_extensions; (p = strstr(p, ext)) != NULL; p += len) {
+        if ((p == glx_extensions || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int gl_int(GLenum_ pname)
+{
+    PFN_glGetIntegerv glGetIntegerv_ = (PFN_glGetIntegerv)SDL_GL_GetProcAddress("glGetIntegerv");
+    int v = -12345;
+    if (glGetIntegerv_) {
+        glGetIntegerv_(pname, &v);
+    }
+    return v;
+}
+
+/* an OpenGL ES context: GLX when the server can, EGL otherwise */
+static void check_es(int major, int minor, bool expect_glx, const char *label)
+{
+    reset_attrs();
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, major);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor);
+    SDL_Window *w = SDL_CreateWindow("test_glx es", 32, 32, SDL_WINDOW_OPENGL);
+    SDL_GLContext es = w ? SDL_GL_CreateContext(w) : NULL;
+    CHECK(es != NULL, "%s: ES %d.%d context", label, major, minor);
+    if (es) {
+        const char *v = gl_version();
+        printf("%s: GL_VERSION='%s' via %s\n", label, v, p_glXGetCurrentContext() ? "GLX" : "EGL");
+        CHECK(strncmp(v, "OpenGL ES ", 10) == 0 && v[10] >= '0' + major, "%s: ES >= %d (got '%s')", label, major, v);
+        if (expect_glx) {
+            check_glx_current(label, w, es);
+        } else {
+            CHECK(p_glXGetCurrentContext() == NULL, "%s: not GLX", label);
+            CHECK(SDL_EGL_GetCurrentDisplay() != NULL, "%s: EGL", label);
+        }
+        check_render(label, w);
+        SDL_GL_DestroyContext(es);
+    }
+    if (w) {
+        SDL_DestroyWindow(w);
+    }
+}
+
 int main(void)
 {
     if (!getenv("DISPLAY")) {
@@ -155,6 +222,12 @@ int main(void)
     }
     if (!load_glx()) {
         printf("test_glx: SKIP (no libGL with GLX)\n");
+        return 0;
+    }
+    /* the backend choice is what is tested: environment overrides would
+     * turn every GLX expectation into a failure */
+    if (SDL_getenv("SDL_VIDEO_FORCE_EGL") || SDL_getenv("SDL_OPENGL_ES_DRIVER")) {
+        printf("test_glx: SKIP (SDL_VIDEO_FORCE_EGL / SDL_OPENGL_ES_DRIVER set in the environment)\n");
         return 0;
     }
     start_video();
@@ -184,6 +257,8 @@ int main(void)
     if (core) {
         CHECK(SDL_GL_MakeCurrent(w, core), "MakeCurrent core");
         check_glx_current("core", w, core);
+        const char *e = p_glXQueryExtensionsString(p_glXGetCurrentDisplay(), 0);
+        snprintf(glx_extensions, sizeof(glx_extensions), "%s", e ? e : "");
         const char *v = gl_version();
         printf("core: GL_VERSION='%s'\n", v);
         CHECK(strstr(v, "OpenGL ES") == NULL && v[0] >= '3', "core: desktop GL >= 3 (got '%s')", v);
@@ -246,23 +321,84 @@ int main(void)
         SDL_GL_DestroyContext(legacy);
     }
 
-    /* 4. OpenGL ES profile -> EGL */
+    /* 4. OpenGL ES: GLX with GLX_EXT_create_context_es_profile, else EGL */
+    const bool glx_es = glx_has("GLX_EXT_create_context_es_profile") && glx_has("GLX_ARB_create_context_profile");
+    const bool glx_es2 = glx_es || (glx_has("GLX_EXT_create_context_es2_profile") && glx_has("GLX_ARB_create_context_profile"));
+    printf("GLX ES profiles: es_profile=%d es2_profile=%d\n", glx_es, glx_es2);
+    check_es(2, 0, glx_es2, "es2");
+    check_es(3, 0, glx_es, "es3");
+    /* stock's switch back to EGL for ES */
+    SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
+    check_es(2, 0, false, "es2 + SDL_OPENGL_ES_DRIVER");
+    SDL_ResetHint(SDL_HINT_OPENGL_ES_DRIVER);
+
+    /* 4b. context attributes through GLX_ARB_create_context_{no_error,robustness}
+     *     and GLX_ARB_context_flush_control */
     reset_attrs();
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    SDL_Window *w_es = SDL_CreateWindow("test_glx es", 32, 32, SDL_WINDOW_OPENGL);
-    SDL_GLContext es = w_es ? SDL_GL_CreateContext(w_es) : NULL;
-    CHECK(es != NULL, "ES context");
-    if (es) {
-        CHECK(p_glXGetCurrentContext() == NULL, "ES context is not GLX");
-        CHECK(SDL_EGL_GetCurrentDisplay() != NULL, "ES context is EGL");
-        CHECK(strstr(gl_version(), "OpenGL ES") != NULL, "ES version '%s'", gl_version());
-        check_render("es", w_es);
-        SDL_GL_DestroyContext(es);
+    int got = -1;
+    CHECK(SDL_GL_GetAttribute(SDL_GL_CONTEXT_RELEASE_BEHAVIOR, &got) && got == SDL_GL_CONTEXT_RELEASE_BEHAVIOR_FLUSH,
+          "default release behavior FLUSH (%d)", got);
+    CHECK(SDL_GL_GetAttribute(SDL_GL_CONTEXT_RESET_NOTIFICATION, &got) && got == SDL_GL_CONTEXT_RESET_NO_NOTIFICATION,
+          "default reset notification (%d)", got);
+    CHECK(SDL_GL_GetAttribute(SDL_GL_CONTEXT_NO_ERROR, &got) && got == 0, "default no_error (%d)", got);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_NO_ERROR, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_RELEASE_BEHAVIOR, SDL_GL_CONTEXT_RELEASE_BEHAVIOR_NONE);
+    CHECK(SDL_GL_GetAttribute(SDL_GL_CONTEXT_NO_ERROR, &got) && got == 1, "no_error round trip (%d)", got);
+    SDL_GLContext noerr = SDL_GL_CreateContext(w);
+    CHECK(noerr != NULL, "no_error + release-none context");
+    if (noerr) {
+        check_glx_current("no_error", w, noerr);
+        if (glx_has("GLX_ARB_create_context_no_error")) {
+            CHECK(gl_int(GL_CONTEXT_FLAGS_) & GL_CONTEXT_FLAG_NO_ERROR_BIT_, "GL_CONTEXT_FLAG_NO_ERROR_BIT (0x%x)",
+                  gl_int(GL_CONTEXT_FLAGS_));
+        }
+        if (glx_has("GLX_ARB_context_flush_control")) {
+            CHECK(gl_int(GL_CONTEXT_RELEASE_BEHAVIOR_) == 0, "GL_CONTEXT_RELEASE_BEHAVIOR NONE (0x%x)",
+                  gl_int(GL_CONTEXT_RELEASE_BEHAVIOR_));
+        }
+        check_render("no_error", w);
+        SDL_GL_DestroyContext(noerr);
     }
-    if (w_es) {
-        SDL_DestroyWindow(w_es);
+    reset_attrs();
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_RESET_NOTIFICATION, SDL_GL_CONTEXT_RESET_LOSE_CONTEXT);
+    SDL_GLContext robust = SDL_GL_CreateContext(w);
+    CHECK(robust != NULL, "robust context");
+    if (robust) {
+        check_glx_current("robust", w, robust);
+        if (glx_has("GLX_ARB_create_context_robustness")) {
+            CHECK(gl_int(GL_CONTEXT_FLAGS_) & GL_CONTEXT_FLAG_ROBUST_ACCESS_BIT_, "GL_CONTEXT_FLAG_ROBUST_ACCESS_BIT (0x%x)",
+                  gl_int(GL_CONTEXT_FLAGS_));
+            CHECK(gl_int(GL_RESET_NOTIFICATION_STRATEGY_) == GL_LOSE_CONTEXT_ON_RESET_,
+                  "GL_RESET_NOTIFICATION_STRATEGY lose-context (0x%x)", gl_int(GL_RESET_NOTIFICATION_STRATEGY_));
+        }
+        check_render("robust", w);
+        SDL_GL_DestroyContext(robust);
+    }
+    if (glx_es) {
+        /* the same attributes on an ES context over GLX */
+        reset_attrs();
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_NO_ERROR, 1);
+        SDL_GLContext es_noerr = SDL_GL_CreateContext(w);
+        CHECK(es_noerr != NULL, "ES 3.0 no_error context");
+        if (es_noerr) {
+            check_glx_current("es no_error", w, es_noerr);
+            if (glx_has("GLX_ARB_create_context_no_error")) {
+                CHECK(gl_int(GL_CONTEXT_FLAGS_) & GL_CONTEXT_FLAG_NO_ERROR_BIT_, "ES: GL_CONTEXT_FLAG_NO_ERROR_BIT (0x%x)",
+                      gl_int(GL_CONTEXT_FLAGS_));
+            }
+            check_render("es no_error", w);
+            SDL_GL_DestroyContext(es_noerr);
+        }
     }
 
     /* 5. SDL_HINT_VIDEO_FORCE_EGL, set from code */
@@ -284,6 +420,43 @@ int main(void)
         SDL_DestroyWindow(w_egl);
     }
     SDL_ResetHint(SDL_HINT_VIDEO_FORCE_EGL);
+
+    /* 5b. the requested ES version is honoured on both paths, like stock:
+     *     ES 1.x is ES-CM 1.x (if the driver has it at all), an impossible
+     *     version fails instead of quietly returning ES 3.2 */
+    for (int forced = 0; forced < 2; forced++) {
+        const char *path = forced ? "EGL" : "default";
+        if (forced) {
+            SDL_SetHint(SDL_HINT_VIDEO_FORCE_EGL, "1");
+        }
+        reset_attrs();
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 1);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+        SDL_GLContext es1 = SDL_GL_CreateContext(w);
+        if (es1) {
+            CHECK(strncmp(gl_version(), "OpenGL ES-CM 1.", 15) == 0, "%s: ES 1.1 request gave '%s'", path, gl_version());
+            SDL_GL_DestroyContext(es1);
+        } else {
+            printf("%s: no ES 1.1 here (%s)\n", path, SDL_GetError());
+        }
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 9);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        SDL_GLContext es9 = SDL_GL_CreateContext(w);
+        CHECK(es9 == NULL, "%s: ES 9.0 must fail (got '%s')", path, es9 ? gl_version() : "");
+        if (es9) {
+            SDL_GL_DestroyContext(es9);
+        }
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 9);
+        SDL_GLContext es39 = SDL_GL_CreateContext(w);
+        CHECK(es39 == NULL, "%s: ES 3.9 must fail (got '%s')", path, es39 ? gl_version() : "");
+        if (es39) {
+            SDL_GL_DestroyContext(es39);
+        }
+    }
+    SDL_ResetHint(SDL_HINT_VIDEO_FORCE_EGL);
+    SDL_ClearError();
 
     /* 6. destroy the window while its GLX context is current */
     reset_attrs();

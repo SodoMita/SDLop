@@ -40,6 +40,9 @@ static void init_glattrs(void)
     sdlop_glattrs.share_with_current_context = 0;
     sdlop_glattrs.framebuffer_srgb_capable = 0;
     sdlop_glattrs.floatbuffers = 0;
+    sdlop_glattrs.release_behavior = SDL_GL_CONTEXT_RELEASE_BEHAVIOR_FLUSH;
+    sdlop_glattrs.reset_notification = SDL_GL_CONTEXT_RESET_NO_NOTIFICATION;
+    sdlop_glattrs.no_error = 0;
     glattrs_initialized = true;
 }
 
@@ -244,11 +247,12 @@ bool SDL_GL_SetAttribute(SDL_GLAttr attr, int value)
     case SDL_GL_SHARE_WITH_CURRENT_CONTEXT: sdlop_glattrs.share_with_current_context = value; break;
     case SDL_GL_FRAMEBUFFER_SRGB_CAPABLE: sdlop_glattrs.framebuffer_srgb_capable = value; break;
     case SDL_GL_FLOATBUFFERS: sdlop_glattrs.floatbuffers = value; break;
+    /* used by GLX (stock passes them only when the GLX extension exists) */
+    case SDL_GL_CONTEXT_RELEASE_BEHAVIOR: sdlop_glattrs.release_behavior = value; break;
+    case SDL_GL_CONTEXT_RESET_NOTIFICATION: sdlop_glattrs.reset_notification = value; break;
+    case SDL_GL_CONTEXT_NO_ERROR: sdlop_glattrs.no_error = value; break;
     case SDL_GL_ACCELERATED_VISUAL:
     case SDL_GL_RETAINED_BACKING:
-    case SDL_GL_CONTEXT_RELEASE_BEHAVIOR:
-    case SDL_GL_CONTEXT_RESET_NOTIFICATION:
-    case SDL_GL_CONTEXT_NO_ERROR:
     case SDL_GL_EGL_PLATFORM:
         break; /* accepted, not acted upon */
     default:
@@ -285,6 +289,9 @@ bool SDL_GL_GetAttribute(SDL_GLAttr attr, int *value)
     case SDL_GL_CONTEXT_PROFILE_MASK: *value = sdlop_glattrs.profile_mask; break;
     case SDL_GL_FRAMEBUFFER_SRGB_CAPABLE: *value = sdlop_glattrs.framebuffer_srgb_capable; break;
     case SDL_GL_FLOATBUFFERS: *value = sdlop_glattrs.floatbuffers; break;
+    case SDL_GL_CONTEXT_RELEASE_BEHAVIOR: *value = sdlop_glattrs.release_behavior; break;
+    case SDL_GL_CONTEXT_RESET_NOTIFICATION: *value = sdlop_glattrs.reset_notification; break;
+    case SDL_GL_CONTEXT_NO_ERROR: *value = sdlop_glattrs.no_error; break;
     case SDL_GL_ACCELERATED_VISUAL: *value = 0; break; /* llvmpipe: software */
     default:
         return SDL_SetError("Unknown OpenGL attribute: %d", (int)attr);
