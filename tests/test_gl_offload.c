@@ -310,6 +310,16 @@ static void test_build_context_attribs(void)
     CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_CLIENT_VERSION, &val) && val == 2, "ES2 version");
     CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, &val) &&
           val == kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR, "ES2 DEBUG emits EGL_CONTEXT_FLAGS_KHR");
+
+    /* requested ES versions pass through like stock: 1.0 stays 1, 3.1 is
+     * major/minor (it used to collapse to "3"), 9.0 is not clamped */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_ES_API, 1, 0, SDL_GL_CONTEXT_PROFILE_ES, 0, attribs, 16);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_CLIENT_VERSION, &val) && val == 1, "ES1 version (%d)", val);
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_ES_API, 3, 1, SDL_GL_CONTEXT_PROFILE_ES, 0, attribs, 16);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_MAJOR_VERSION_KHR, &val) && val == 3, "ES3.1 major (%d)", val);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_MINOR_VERSION_KHR, &val) && val == 1, "ES3.1 minor (%d)", val);
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_ES_API, 9, 0, SDL_GL_CONTEXT_PROFILE_ES, 0, attribs, 16);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_CLIENT_VERSION, &val) && val == 9, "ES9 not clamped (%d)", val);
 }
 
 static void test_context_flags_offload(void)

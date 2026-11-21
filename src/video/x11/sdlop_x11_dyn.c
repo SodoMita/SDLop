@@ -77,7 +77,7 @@ static void unload_module(SDLOP_X11_Module which)
 static bool load_module(SDLOP_X11_Module which)
 {
     const X11ModuleInfo *info = &module_info[which];
-    const char *libname = getenv(info->env);
+    const char *libname = SDL_GetHint(info->env);
     if (libname && !info->required && strcasecmp(libname, "none") == 0) {
         return false; /* explicitly disabled */
     }

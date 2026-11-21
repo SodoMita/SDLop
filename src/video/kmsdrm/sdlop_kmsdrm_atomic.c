@@ -44,8 +44,7 @@
 
 bool KMSDRM_AtomicEnabled(void)
 {
-    const char *v = getenv("SDLOP_KMSDRM_ATOMIC");
-    return !(v && v[0] == '0'); /* default: try atomic first */
+    return SDLOP_HintFlag("SDLOP_KMSDRM_ATOMIC", true); /* default: try atomic first */
 }
 
 /* ------------------------------------------------------------------ */
@@ -447,8 +446,7 @@ int KMSDRM_AtomicFlip(KMSDRM_DeviceData *vid, KMSDRM_DisplayData *dd, uint32_t f
 
 static bool atomic_cursor_env_enabled(void)
 {
-    const char *v = getenv("SDLOP_KMSDRM_ATOMIC_CURSOR");
-    return v && v[0] == '1';
+    return SDLOP_HintFlag("SDLOP_KMSDRM_ATOMIC_CURSOR", false);
 }
 
 /* Discover the CRTC's cursor plane + cache prop ids. Cheap no-op once done. */

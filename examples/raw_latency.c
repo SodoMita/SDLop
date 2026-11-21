@@ -59,7 +59,8 @@ int main(void)
     }
     if (!SDLop_RawInputAvailable()) {
         fprintf(stderr, "raw input unavailable: %s\n", SDL_GetError());
-        fprintf(stderr, "(need access to /dev/input: root or the 'input' group)\n");
+        fprintf(stderr, "(need access to /dev/input: root or the 'input' group;\n"
+                        " on X11/Wayland also SDLOP_RAW_INPUT=1)\n");
         SDL_Quit();
         return 2;
     }

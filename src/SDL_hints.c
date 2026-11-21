@@ -279,6 +279,19 @@ bool SDLOP_GetStringBoolean(const char *value, bool default_value)
     return true;
 }
 
+bool SDLOP_HintFlag(const char *name, bool default_value)
+{
+    const char *value = SDL_GetHint(name);
+    if (!value || !*value) {
+        return default_value;
+    }
+    if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "off") == 0 || strcasecmp(value, "no") == 0) {
+        return false;
+    }
+    return true;
+}
+
 bool SDL_GetHintBoolean(const char *name, bool default_value)
 {
     return SDLOP_GetStringBoolean(SDL_GetHint(name), default_value);

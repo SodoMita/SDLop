@@ -285,7 +285,7 @@ void SDL_ResetLogPriorities(void)
     if (hint) {
         ParseLogPriorities(hint);
     } else {
-        const char *legacy = SDL_getenv("SDLOP_LOG_PRIORITY");
+        const char *legacy = SDL_GetHint("SDLOP_LOG_PRIORITY");
         SDL_LogPriority p;
         if (legacy && *legacy && ParseLogPriority(legacy, SDL_strlen(legacy), &p)) {
             SDL_log_default_priority = p;

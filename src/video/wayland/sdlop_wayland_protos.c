@@ -22,3 +22,4 @@
 #include "idle-inhibit-protocol.c"
 #include "keyboard-shortcuts-inhibit-protocol.c"
 #include "xdg-activation-protocol.c"
+#include "viewporter-protocol.c"

@@ -6,6 +6,9 @@
   keyboard), xdg-shell, zwp_pointer_constraints_v1,
   zwp_relative_pointer_manager_v1.
 
+  With MINI_BUFFER_CHECK=1 it is instead a strict wl_shm compositor for
+  tests/test_wayland_buffers.c (see "buffer check mode" below).
+
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
     - zwp lock_pointer request                -> zwp_locked_pointer.locked
@@ -23,9 +26,11 @@
 #include "pointer-constraints-server-protocol.h"
 #include "relative-pointer-server-protocol.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 struct mini
@@ -54,6 +59,186 @@ struct mini
 
 static struct mini M;
 
+/* ---------------- buffer check mode ----------------
+ *
+ * Holds every committed wl_shm buffer like a real compositor (released at
+ * the next "repaint" after it was replaced, repaints every 4 ms, plus one
+ * 300 ms stall) and fails the run (exit 3) when the client
+ *   - attaches a buffer it holds (no wl_buffer.release yet),
+ *   - changes a held buffer's pixels between commit and release,
+ *   - commits a frame whose pixels differ from the model below (exit 4).
+ *
+ * Frame model shared with test_wayland_buffers.c: pixel (0,0) carries
+ * 0xA50000 | k for frame k. Frame k with k % 40 == 0 fills the whole
+ * buffer with frame_color(k) (size changes happen only there); other
+ * frames fill the band frame_band(k). The marker is drawn last. Buffers
+ * without the marker (the clear colour, e.g. after a resize) are not
+ * checked.
+ */
+#define MINI_TAG 0xA50000u
+
+typedef struct
+{
+    void *map;
+    size_t size;
+    int refs;
+} mini_pool;
+
+typedef struct
+{
+    mini_pool *pool;
+    int32_t offset, w, h, stride;
+    bool held;
+    bool current;
+    uint64_t sum;
+} mini_buffer;
+
+static bool B_mode;
+static struct wl_resource *B_pending;     /* attached, not committed */
+static bool B_pending_set;
+static struct wl_resource *B_held[16];
+static int B_nheld;
+static uint32_t *B_model;
+static int B_w, B_h;
+static int B_last = -1;
+static int B_checked, B_commits, B_releases, B_max_held;
+static bool B_stalled;
+static struct wl_event_source *B_repaint;
+
+static uint32_t frame_color(int k)
+{
+    return ((uint32_t)k * 2654435761u) & 0xffffffu;
+}
+
+static void frame_band(int k, int W, int H, int *x, int *y, int *w, int *h)
+{
+    *w = W / 2;
+    *h = 8;
+    *x = (k * 13) % (W / 2);
+    *y = (k * 37) % (H - 8);
+}
+
+static void mini_pool_unref(mini_pool *p)
+{
+    if (p && --p->refs == 0) {
+        if (p->map) {
+            munmap(p->map, p->size);
+        }
+        free(p);
+    }
+}
+
+static uint32_t *mb_pixels(mini_buffer *b)
+{
+    return (uint32_t *)((uint8_t *)b->pool->map + b->offset);
+}
+
+static uint64_t mb_sum(mini_buffer *b)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (int y = 0; y < b->h; y++) {
+        const uint32_t *row = (const uint32_t *)((uint8_t *)mb_pixels(b) + (size_t)y * b->stride);
+        for (int x = 0; x < b->w; x++) {
+            h = (h ^ (row[x] & 0xffffffu)) * 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+static void B_fail(int code, const char *what)
+{
+    fprintf(stderr, "mini: BUFFER CHECK FAILED: %s\n", what);
+    exit(code);
+}
+
+static void B_model_apply(int k)
+{
+    if (k % 40 == 0) {
+        for (int i = 0; i < B_w * B_h; i++) {
+            B_model[i] = frame_color(k);
+        }
+    } else {
+        int x, y, w, h;
+        frame_band(k, B_w, B_h, &x, &y, &w, &h);
+        for (int j = y; j < y + h; j++) {
+            for (int i = x; i < x + w; i++) {
+                B_model[j * B_w + i] = frame_color(k);
+            }
+        }
+    }
+    B_model[0] = MINI_TAG | (uint32_t)k;
+}
+
+static void B_check_content(mini_buffer *b)
+{
+    const uint32_t *px = mb_pixels(b);
+    const uint32_t marker = px[0] & 0xffffffu;
+    if ((marker & 0xff0000u) != MINI_TAG) {
+        return; /* clear colour (e.g. a resized surface before the app draws) */
+    }
+    const int k = (int)(marker & 0xffffu);
+    if (k <= B_last && B_last >= 0) {
+        B_fail(4, "frame number went backwards");
+    }
+    if (B_last < 0 && k % 40 != 0) {
+        B_fail(4, "first frame is not a full fill (client drew into a committed buffer?)");
+    }
+    if (b->w != B_w || b->h != B_h) {
+        if (k % 40 != 0) {
+            B_fail(4, "size changed on a frame that is not a full fill");
+        }
+        free(B_model);
+        B_w = b->w;
+        B_h = b->h;
+        B_model = calloc((size_t)B_w * B_h, 4);
+    }
+    for (int i = (B_last < 0 ? k : B_last + 1); i <= k; i++) {
+        B_model_apply(i);
+    }
+    B_last = k;
+    for (int y = 0; y < B_h; y++) {
+        const uint32_t *row = (const uint32_t *)((const uint8_t *)px + (size_t)y * b->stride);
+        for (int x = 0; x < B_w; x++) {
+            if ((row[x] & 0xffffffu) != B_model[y * B_w + x]) {
+                fprintf(stderr, "mini: frame %d pixel (%d,%d) = %06x, want %06x\n", k, x, y,
+                        row[x] & 0xffffffu, B_model[y * B_w + x]);
+                B_fail(4, "frame content does not match what the client drew");
+            }
+        }
+    }
+    B_checked++;
+}
+
+/* repaint: release every held buffer that is no longer current */
+static int B_repaint_cb(void *data)
+{
+    (void)data;
+    if (!B_stalled && B_checked >= 20) {
+        /* once: keep everything for 300 ms (client must wait, not reuse) */
+        B_stalled = true;
+        wl_event_source_timer_update(B_repaint, 300);
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < B_nheld; i++) {
+        struct wl_resource *r = B_held[i];
+        mini_buffer *b = wl_resource_get_user_data(r);
+        if (b->current) {
+            B_held[n++] = r;
+            continue;
+        }
+        if (mb_sum(b) != b->sum) {
+            B_fail(3, "client modified a buffer before wl_buffer.release");
+        }
+        b->held = false;
+        wl_buffer_send_release(r);
+        B_releases++;
+    }
+    B_nheld = n;
+    wl_event_source_timer_update(B_repaint, 4);
+    return 0;
+}
+
 /* ---------------- generic no-op helpers ---------------- */
 
 static void noop(void)
@@ -74,6 +259,25 @@ static void buffer_destroy(struct wl_client *client, struct wl_resource *res)
     wl_resource_destroy(res);
 }
 
+static void buffer_res_destroy(struct wl_resource *res)
+{
+    mini_buffer *b = wl_resource_get_user_data(res);
+    if (!b) {
+        return;
+    }
+    for (int i = 0; i < B_nheld; i++) {
+        if (B_held[i] == res) {
+            B_held[i] = B_held[--B_nheld];
+            break;
+        }
+    }
+    if (B_pending == res) {
+        B_pending = NULL;
+    }
+    mini_pool_unref(b->pool);
+    free(b);
+}
+
 
 static const struct wl_buffer_interface buffer_impl = { buffer_destroy };
 
@@ -89,7 +293,18 @@ static void pool_create_buffer(struct wl_client *client, struct wl_resource *res
     (void)stride;
     (void)format;
     struct wl_resource *buf = wl_resource_create(client, &wl_buffer_interface, 1, id);
-    wl_resource_set_implementation(buf, &buffer_impl, NULL, NULL);
+    mini_buffer *b = NULL;
+    mini_pool *p = wl_resource_get_user_data(res);
+    if (B_mode && p) {
+        b = calloc(1, sizeof(*b));
+        b->pool = p;
+        p->refs++;
+        b->offset = offset;
+        b->w = width;
+        b->h = height;
+        b->stride = stride;
+    }
+    wl_resource_set_implementation(buf, &buffer_impl, b, buffer_res_destroy);
 }
 
 static void pool_destroy(struct wl_client *client, struct wl_resource *res)
@@ -108,14 +323,28 @@ static void pool_resize(struct wl_client *client, struct wl_resource *res, int32
 
 static const struct wl_shm_pool_interface pool_impl = { pool_create_buffer, pool_destroy, pool_resize };
 
+static void pool_res_destroy(struct wl_resource *res)
+{
+    mini_pool_unref(wl_resource_get_user_data(res));
+}
+
 static void shm_create_pool(struct wl_client *client, struct wl_resource *res,
                             uint32_t id, int32_t fd, int32_t size)
 {
     (void)res;
-    (void)size;
+    mini_pool *p = NULL;
+    if (B_mode) {
+        p = calloc(1, sizeof(*p));
+        p->refs = 1;
+        p->size = (size_t)size;
+        p->map = mmap(NULL, p->size, PROT_READ, MAP_SHARED, fd, 0);
+        if (p->map == MAP_FAILED) {
+            B_fail(5, "cannot map client shm pool");
+        }
+    }
     close(fd);
     struct wl_resource *pool = wl_resource_create(client, &wl_shm_pool_interface, 1, id);
-    wl_resource_set_implementation(pool, &pool_impl, NULL, NULL);
+    wl_resource_set_implementation(pool, &pool_impl, p, pool_res_destroy);
 }
 
 static const struct wl_shm_interface shm_impl = { shm_create_pool, NULL /* release */ };
@@ -129,10 +358,50 @@ static void surface_attach(struct wl_client *client, struct wl_resource *res,
     (void)res;
     (void)sx;
     (void)sy;
+    if (B_mode && res != M.surface_res) {
+        return; /* cursor etc.: not checked */
+    }
     M.buffer_attached = (buffer != NULL);
+    if (B_mode) {
+        mini_buffer *b = buffer ? wl_resource_get_user_data(buffer) : NULL;
+        if (b && b->held) {
+            B_fail(3, "client attached a buffer the compositor still holds (no release yet)");
+        }
+        B_pending = buffer;
+        B_pending_set = true;
+        return;
+    }
     if (buffer) {
         wl_buffer_send_release(buffer);
     }
+}
+
+static void B_commit(void)
+{
+    if (!B_pending_set) {
+        return;
+    }
+    B_pending_set = false;
+    for (int i = 0; i < B_nheld; i++) {
+        ((mini_buffer *)wl_resource_get_user_data(B_held[i]))->current = false;
+    }
+    if (!B_pending) {
+        return;
+    }
+    mini_buffer *b = wl_resource_get_user_data(B_pending);
+    B_check_content(b);
+    b->sum = mb_sum(b);
+    b->held = true;
+    b->current = true;
+    if (B_nheld >= 16) {
+        B_fail(3, "client has more than 16 buffers in flight");
+    }
+    B_held[B_nheld++] = B_pending;
+    if (B_nheld > B_max_held) {
+        B_max_held = B_nheld;
+    }
+    B_commits++;
+    B_pending = NULL;
 }
 
 static void surface_commit(struct wl_client *client, struct wl_resource *res)
@@ -140,6 +409,12 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
     (void)client;
     (void)res;
 
+    if (B_mode) {
+        if (res != M.surface_res) {
+            return;
+        }
+        B_commit();
+    }
     if (M.xdg_toplevel && !M.configure_sent) {
         M.configure_sent = true;
         struct wl_array empty = { 0, 0, NULL };
@@ -523,6 +798,12 @@ static void client_destroyed(struct wl_listener *listener, void *data)
     (void)listener;
     (void)data;
     printf("mini: client disconnected, exiting\n");
+    if (B_mode) {
+        printf("mini: buffer check: %d commits, %d frames verified, %d releases, max %d held\n",
+               B_commits, B_checked, B_releases, B_max_held);
+        fflush(stdout);
+        exit(B_checked > 0 ? 0 : 4);
+    }
     fflush(stdout);
     exit(0);
 }
@@ -568,6 +849,11 @@ int main(void)
     M.rel_timer = wl_event_loop_add_timer(M.loop, rel_timer_cb, NULL);
     M.abs_timer = wl_event_loop_add_timer(M.loop, abs_timer_cb, NULL);
     M.watchdog = wl_event_loop_add_timer(M.loop, watchdog_cb, NULL);
+    B_mode = getenv("MINI_BUFFER_CHECK") && atoi(getenv("MINI_BUFFER_CHECK"));
+    if (B_mode) {
+        B_repaint = wl_event_loop_add_timer(M.loop, B_repaint_cb, NULL);
+        wl_event_source_timer_update(B_repaint, 4);
+    }
     wl_event_source_timer_update(M.watchdog, 30000);
 
     printf("mini: listening on %s\n", name ? name : "(default)");

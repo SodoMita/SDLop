@@ -113,10 +113,8 @@ static bool pick_config(EGLConfig *out, uint32_t api)
     EGLint renderable;
     if (api == EGL_OPENGL_API) {
         renderable = EGL_OPENGL_BIT;
-    } else if (sdlop_glattrs.major_version >= 3) {
-        renderable = EGL_OPENGL_ES3_BIT;
     } else {
-        renderable = EGL_OPENGL_ES2_BIT;
+        renderable = SDLOP_EGL_ESRenderableType(egl_display);
     }
 
     EGLint attribs[24];
@@ -255,8 +253,10 @@ void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *wind
             ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE; ctx_attribs[n++] = EGL_TRUE;
         }
     } else {
-        ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
-        ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
+        n = SDLOP_EGL_AppendESVersion(egl_display, ctx_attribs, n);
+        if (n < 0) {
+            return NULL;
+        }
     }
     n = SDLOP_EGL_AppendUserAttribs(true, egl_display, config, ctx_attribs, n, (int)SDL_arraysize(ctx_attribs));
     if (n < 0) {
