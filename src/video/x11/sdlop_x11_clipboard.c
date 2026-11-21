@@ -754,7 +754,11 @@ bool SDLOP_X11_SetClipboardData(SDLop_VideoDevice *device)
         /* SDL_ClearClipboardData: give the selection up if it is ours */
         if (selection_owner(cb.atom.CLIPBOARD) == cb.window) {
             X11_xcb_set_selection_owner(conn(), XCB_WINDOW_NONE, cb.atom.CLIPBOARD, cb.clipboard_time);
-            X11_xcb_flush(conn());
+            /* round trip: released once SDL_ClearClipboardData returns (the
+             * server doesn't order requests across connections) */
+            if (selection_owner(cb.atom.CLIPBOARD) == cb.window) {
+                return SDL_SetError("Couldn't release the X11 CLIPBOARD selection");
+            }
         }
         cb.targets_owner = XCB_WINDOW_NONE;
         cb.targets_valid = true;
