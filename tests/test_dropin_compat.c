@@ -95,6 +95,36 @@ static void test_gamepad(void)
     SDL_free(sticks);
     CHECK(!SDL_HasGamepad() && !SDL_HasJoystick(), "no devices");
 
+    /* "no controllers" queries succeed quietly: the neutral value and no
+     * error string (apps check SDL_GetError() after them) */
+    static const SDL_JoystickID ids[] = { 0, 1, 1234 };
+    for (size_t i = 0; i < SDL_arraysize(ids); i++) {
+        const SDL_JoystickID id = ids[i];
+        SDL_ClearError();
+        CHECK(SDL_GetJoystickNameForID(id) == NULL && SDL_GetJoystickPathForID(id) == NULL, "joystick name/path %u", id);
+        CHECK(SDL_GetJoystickPlayerIndexForID(id) == -1, "joystick player index %u", id);
+        SDL_GUID jg = SDL_GetJoystickGUIDForID(id);
+        CHECK(jg.data[0] == 0 && jg.data[15] == 0, "joystick GUID %u", id);
+        CHECK(SDL_GetJoystickVendorForID(id) == 0 && SDL_GetJoystickProductForID(id) == 0 &&
+                  SDL_GetJoystickProductVersionForID(id) == 0, "joystick vendor/product %u", id);
+        CHECK(SDL_GetJoystickTypeForID(id) == SDL_JOYSTICK_TYPE_UNKNOWN, "joystick type %u", id);
+        CHECK(SDL_GetJoystickFromID(id) == NULL && !SDL_IsJoystickVirtual(id), "joystick from id %u", id);
+        CHECK(!SDL_IsGamepad(id), "is gamepad %u", id);
+        CHECK(SDL_GetGamepadNameForID(id) == NULL && SDL_GetGamepadPathForID(id) == NULL, "gamepad name/path %u", id);
+        CHECK(SDL_GetGamepadPlayerIndexForID(id) == -1, "gamepad player index %u", id);
+        SDL_GUID gg = SDL_GetGamepadGUIDForID(id);
+        CHECK(gg.data[0] == 0 && gg.data[15] == 0, "gamepad GUID %u", id);
+        CHECK(SDL_GetGamepadVendorForID(id) == 0 && SDL_GetGamepadProductForID(id) == 0 &&
+                  SDL_GetGamepadProductVersionForID(id) == 0, "gamepad vendor/product %u", id);
+        CHECK(SDL_GetGamepadTypeForID(id) == SDL_GAMEPAD_TYPE_UNKNOWN &&
+                  SDL_GetRealGamepadTypeForID(id) == SDL_GAMEPAD_TYPE_UNKNOWN, "gamepad type %u", id);
+        CHECK(SDL_GetGamepadMappingForID(id) == NULL, "gamepad mapping %u", id);
+        CHECK(SDL_GetGamepadFromID(id) == NULL, "gamepad from id %u", id);
+        CHECK(SDL_GetJoystickFromPlayerIndex((int)i) == NULL && SDL_GetGamepadFromPlayerIndex((int)i) == NULL,
+              "from player index %d", (int)i);
+        CHECK(SDL_GetError()[0] == '\0', "per-ID queries for %u leave no error, got '%s'", id, SDL_GetError());
+    }
+
     SDL_ClearError();
     SDL_Gamepad *pad = SDL_OpenGamepad(1);
     CHECK(pad == NULL && SDL_GetError()[0] != '\0', "SDL_OpenGamepad fails with an error");

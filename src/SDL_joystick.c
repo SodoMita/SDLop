@@ -63,6 +63,11 @@ static SDL_JoystickID *empty_id_list(int *count)
     return ids;
 }
 
+/* With no device there is no valid instance ID. Lookups and per-ID queries
+ * (*ForID, *FromID, *FromPlayerIndex) just return the neutral value and
+ * leave the error state alone, so an app that checks SDL_GetError() after a
+ * "no controllers" query sees nothing. Only real operations (open, set
+ * mapping) fail with an error. */
 static bool no_joystick(SDL_JoystickID instance_id)
 {
     if (instance_id == 0) {
@@ -119,13 +124,13 @@ SDL_JoystickID *SDL_GetJoysticks(int *count)
 
 const char *SDL_GetJoystickNameForID(SDL_JoystickID instance_id)
 {
-    no_joystick(instance_id);
+    (void)instance_id;
     return NULL;
 }
 
 const char *SDL_GetJoystickPathForID(SDL_JoystickID instance_id)
 {
-    no_joystick(instance_id);
+    (void)instance_id;
     return NULL;
 }
 
@@ -173,13 +178,13 @@ SDL_Joystick *SDL_OpenJoystick(SDL_JoystickID instance_id)
 
 SDL_Joystick *SDL_GetJoystickFromID(SDL_JoystickID instance_id)
 {
-    no_joystick(instance_id);
+    (void)instance_id;
     return NULL;
 }
 
 SDL_Joystick *SDL_GetJoystickFromPlayerIndex(int player_index)
 {
-    SDL_SetError("Couldn't find joystick with player index %d", player_index);
+    (void)player_index;
     return NULL;
 }
 
@@ -745,13 +750,13 @@ bool SDL_IsGamepad(SDL_JoystickID instance_id)
 
 const char *SDL_GetGamepadNameForID(SDL_JoystickID instance_id)
 {
-    no_gamepad(instance_id);
+    (void)instance_id;
     return NULL;
 }
 
 const char *SDL_GetGamepadPathForID(SDL_JoystickID instance_id)
 {
-    no_gamepad(instance_id);
+    (void)instance_id;
     return NULL;
 }
 
@@ -799,7 +804,7 @@ SDL_GamepadType SDL_GetRealGamepadTypeForID(SDL_JoystickID instance_id)
 
 char *SDL_GetGamepadMappingForID(SDL_JoystickID instance_id)
 {
-    no_gamepad(instance_id);
+    (void)instance_id;
     return NULL;
 }
 
@@ -811,13 +816,13 @@ SDL_Gamepad *SDL_OpenGamepad(SDL_JoystickID instance_id)
 
 SDL_Gamepad *SDL_GetGamepadFromID(SDL_JoystickID instance_id)
 {
-    no_gamepad(instance_id);
+    (void)instance_id;
     return NULL;
 }
 
 SDL_Gamepad *SDL_GetGamepadFromPlayerIndex(int player_index)
 {
-    SDL_SetError("Couldn't find gamepad with player index %d", player_index);
+    (void)player_index;
     return NULL;
 }
 
