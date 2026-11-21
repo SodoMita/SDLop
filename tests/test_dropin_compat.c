@@ -204,6 +204,10 @@ static void test_filesystem(void)
     const char *home = SDL_GetUserFolder(SDL_FOLDER_HOME);
     snprintf(path2, sizeof(path2), "%s/home/", root);
     CHECK(home && strcmp(home, path2) == 0, "home folder '%s'", home ? home : "(null)");
+    /* user-dirs.dirs: $XDG_CONFIG_HOME, else $HOME/.config (the caller's
+     * XDG_CONFIG_HOME, e.g. on CI runners, must not leak in). Only found
+     * folders are cached, so each case uses another folder. */
+    SDL_unsetenv_unsafe("XDG_CONFIG_HOME");
     snprintf(path, sizeof(path), "%s/home/.config", root);
     mkdir(path, 0700);
     snprintf(path, sizeof(path), "%s/home/.config/user-dirs.dirs", root);
@@ -215,6 +219,24 @@ static void test_filesystem(void)
     const char *docs = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS);
     snprintf(path2, sizeof(path2), "%s/home/Docs/", root);
     CHECK(docs && strcmp(docs, path2) == 0, "documents folder '%s'", docs ? docs : "(null)");
+    snprintf(path, sizeof(path), "%s/cfg", root);
+    mkdir(path, 0700);
+    SDL_setenv_unsafe("XDG_CONFIG_HOME", path, 1);
+    snprintf(path, sizeof(path), "%s/cfg/user-dirs.dirs", root);
+    f = fopen(path, "w");
+    if (f) {
+        fputs("XDG_MUSIC_DIR=\"$HOME/Tunes\"\n", f);
+        fclose(f);
+    }
+    const char *music = SDL_GetUserFolder(SDL_FOLDER_MUSIC);
+    snprintf(path2, sizeof(path2), "%s/home/Tunes/", root);
+    CHECK(music && strcmp(music, path2) == 0, "music folder from XDG_CONFIG_HOME '%s'", music ? music : "(null)");
+    /* not configured: NULL, like stock (only DESKTOP falls back to $HOME/Desktop) */
+    CHECK(SDL_GetUserFolder(SDL_FOLDER_PICTURES) == NULL, "unconfigured pictures folder is NULL");
+    const char *desk = SDL_GetUserFolder(SDL_FOLDER_DESKTOP);
+    snprintf(path2, sizeof(path2), "%s/home/Desktop/", root);
+    CHECK(desk && strcmp(desk, path2) == 0, "desktop fallback '%s'", desk ? desk : "(null)");
+    SDL_unsetenv_unsafe("XDG_CONFIG_HOME");
     CHECK(SDL_GetUserFolder(SDL_FOLDER_SAVEDGAMES) == NULL, "no saved-games folder on XDG");
 
     /* base path: directory of this executable, with trailing slash */
