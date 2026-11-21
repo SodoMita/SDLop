@@ -37,6 +37,10 @@ typedef struct VkWin32SurfaceCreateInfoKHR
 typedef int (*PFN_vkCreateWin32SurfaceKHR)(void *instance, const VkWin32SurfaceCreateInfoKHR *create_info,
                                            const void *allocator, VkSurfaceKHR *surface);
 
+typedef void *VkInstance_;
+typedef void *(*PFN_vkGetInstanceProcAddr_)(VkInstance_, const char *);
+typedef uint32_t (*PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR_)(void *, uint32_t);
+
 /* SDL_vulkan.h already defines VkSurfaceKHR (a pointer on 64-bit builds, a
  * 64-bit integer elsewhere), so the surface type comes from there. */
 
@@ -105,6 +109,27 @@ bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *windo
         *surface = (Uint64)created;
     }
     return true;
+}
+
+/* SDL_Vulkan_GetPresentationSupport(): ask the driver whether a queue family
+ * can present to a Win32 surface. Without this the call reported "no
+ * presentation support" for every queue, so applications gave up on Vulkan
+ * even on hardware that presents to Win32 perfectly well. */
+bool SDLOP_Win32VulkanGetPresentationSupport(SDLop_VideoDevice *device, void *instance,
+                                             void *physical_device, Uint32 queue_family)
+{
+    (void)device;
+    PFN_vkGetInstanceProcAddr_ gipa = (PFN_vkGetInstanceProcAddr_)SDL_Vulkan_GetVkGetInstanceProcAddr();
+    if (!gipa) {
+        return SDL_SetError("Vulkan loader not loaded");
+    }
+    PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR_ query =
+        (PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR_)gipa((VkInstance_)instance,
+                                                                  "vkGetPhysicalDeviceWin32PresentationSupportKHR");
+    if (!query) {
+        return SDL_SetError(VK_KHR_WIN32_SURFACE_EXTENSION_NAME " is not enabled in the Vulkan instance");
+    }
+    return query(physical_device, queue_family) != 0;
 }
 
 #endif /* _WIN32 */

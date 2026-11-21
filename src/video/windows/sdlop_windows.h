@@ -92,6 +92,8 @@ bool SDLOP_Win32GLGetSwapInterval(SDLop_VideoDevice *device, int *interval);
 bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *window,
                                    void *instance, const void *allocator, Uint64 *surface);
 const char *const *SDLOP_Win32VulkanGetInstanceExtensions(SDLop_VideoDevice *device, Uint32 *count);
+bool SDLOP_Win32VulkanGetPresentationSupport(SDLop_VideoDevice *device, void *instance,
+                                             void *physical_device, Uint32 queue_family);
 
 #endif /* _WIN32 */
 

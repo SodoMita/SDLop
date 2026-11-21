@@ -2348,6 +2348,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .GL_GetSwapInterval = SDLOP_Win32GLGetSwapInterval,
     .Vulkan_CreateSurface = SDLOP_Win32VulkanCreateSurface,
     .Vulkan_GetInstanceExtensions = SDLOP_Win32VulkanGetInstanceExtensions,
+    .Vulkan_GetPresentationSupport = SDLOP_Win32VulkanGetPresentationSupport,
 
     .SetWindowMinimumSize = win32_SetWindowMinimumSize,
     .SetWindowMaximumSize = win32_SetWindowMaximumSize,
