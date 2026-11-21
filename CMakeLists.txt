@@ -202,7 +202,8 @@ set(SDLOP_WL_EXTRA_PROTOCOLS
   "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
   "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
   "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml"
-  "viewporter|stable/viewporter/viewporter.xml")
+  "viewporter|stable/viewporter/viewporter.xml"
+  "primary-selection|unstable/primary-selection/primary-selection-unstable-v1.xml")
 set(SDLOP_WL_EXTRA_OUTPUTS)
 foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
   string(REPLACE "|" ";" parts "${entry}")
@@ -253,6 +254,16 @@ add_custom_command(
   DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
 
 add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/primary-selection-server-protocol.h ${WL_GEN_DIR}/primary-selection-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml
+          ${WL_GEN_DIR}/primary-selection-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml
+          ${WL_GEN_DIR}/primary-selection-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml)
+
+add_custom_command(
   OUTPUT ${WL_GEN_DIR}/relative-pointer-server-protocol.h ${WL_GEN_DIR}/relative-pointer-server-protocol.c
   COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
           ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
@@ -301,6 +312,8 @@ add_custom_target(sdlop_wayland_protocols
           ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
           ${WL_GEN_DIR}/relative-pointer-server-protocol.h
           ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+          ${WL_GEN_DIR}/primary-selection-server-protocol.h
+          ${WL_GEN_DIR}/primary-selection-server-protocol.c
           ${SDLOP_WL_EXTRA_OUTPUTS})
 
 # ---------------------------------------------------------------------------
@@ -342,6 +355,7 @@ set(SDLop_SOURCES
   src/video/sdlop_vk_offload.c
   src/video/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland.c
+  src/video/wayland/sdlop_wayland_clipboard.c
   src/video/wayland/sdlop_wayland_dyn.c
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
@@ -648,7 +662,8 @@ if(SDLop_BUILD_TESTS)
       ${WL_GEN_DIR}/xdg-shell-server-protocol.c
       ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
       ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-      ${WL_GEN_DIR}/viewporter-server-protocol.c)
+      ${WL_GEN_DIR}/viewporter-server-protocol.c
+      ${WL_GEN_DIR}/primary-selection-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -675,6 +690,14 @@ if(SDLop_BUILD_TESTS)
     add_dependencies(test_wayland_buffers mini_compositor)
     add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
     add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
+
+    # clipboard + primary selection between two SDL processes
+    add_executable(test_wayland_clipboard tests/test_wayland_clipboard.c)
+    target_link_libraries(test_wayland_clipboard PRIVATE sdlop)
+    target_compile_options(test_wayland_clipboard PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_clipboard mini_compositor)
+    add_test(NAME test_wayland_clipboard COMMAND test_wayland_clipboard $<TARGET_FILE:mini_compositor>)
+    set_tests_properties(test_wayland_clipboard PROPERTIES TIMEOUT 60)
   else()
     message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch, test_wayland_buffers")
   endif()

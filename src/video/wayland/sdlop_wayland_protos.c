@@ -23,3 +23,4 @@
 #include "keyboard-shortcuts-inhibit-protocol.c"
 #include "xdg-activation-protocol.c"
 #include "viewporter-protocol.c"
+#include "primary-selection-protocol.c"

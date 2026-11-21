@@ -10,6 +10,10 @@
   tests/test_wayland_buffers.c (see "buffer check mode" below).
   MINI_VIEWPORTER=1 also offers wp_viewporter (SDLop then shows the clear
   colour as a 1x1 buffer scaled by a viewport).
+  MINI_SELECTION=1 offers wl_data_device_manager and
+  zwp_primary_selection_device_manager_v1 shared by any number of clients
+  (selections go to every client, focus is not modelled) and exits when the
+  last client disconnects - for tests/test_wayland_clipboard.c.
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -28,6 +32,7 @@
 #include "pointer-constraints-server-protocol.h"
 #include "relative-pointer-server-protocol.h"
 #include "viewporter-server-protocol.h"
+#include "primary-selection-server-protocol.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -934,6 +939,331 @@ static void rpm_bind(struct wl_client *client, void *data, uint32_t version, uin
     wl_resource_set_implementation(r, &rpm_impl, NULL, NULL);
 }
 
+/* ---------------- selections (MINI_SELECTION=1) ---------------- */
+/*
+  One model for both wl_data_device (CLIPBOARD) and
+  zwp_primary_selection_device_v1 (PRIMARY): a selection is a source
+  resource; every device gets a fresh offer for it (data_offer, offer*,
+  selection) when it changes and when the device is created. An offer
+  forwards receive() to the source only while that source is still the
+  selection (generation check).
+*/
+
+static bool S_mode;
+static int S_clients;
+
+typedef struct Sel
+{
+    bool primary;
+    struct wl_list devices; /* device resources (wl_resource_get_link) */
+    struct wl_resource *source;
+    uint32_t gen;
+} Sel;
+
+static Sel S_clip = { false, { NULL, NULL }, NULL, 0 };
+static Sel S_prim = { true, { NULL, NULL }, NULL, 0 };
+
+#define S_MAX_MIMES 32
+typedef struct SrcData
+{
+    Sel *sel;
+    char *mimes[S_MAX_MIMES];
+    int n;
+} SrcData;
+
+typedef struct OfferData
+{
+    Sel *sel;
+    uint32_t gen;
+} OfferData;
+
+static void S_res_destroy(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    wl_resource_destroy(res);
+}
+
+static void S_offer_free(struct wl_resource *res)
+{
+    free(wl_resource_get_user_data(res));
+}
+
+static void S_offer_receive(struct wl_client *client, struct wl_resource *res, const char *mime, int32_t fd)
+{
+    (void)client;
+    OfferData *od = wl_resource_get_user_data(res);
+    Sel *sel = od->sel;
+    if (sel->source && od->gen == sel->gen) {
+        if (sel->primary) {
+            zwp_primary_selection_source_v1_send_send(sel->source, mime, fd);
+        } else {
+            wl_data_source_send_send(sel->source, mime, fd);
+        }
+    }
+    close(fd);
+}
+
+static void S_offer_accept(struct wl_client *client, struct wl_resource *res, uint32_t serial, const char *mime)
+{
+    (void)client;
+    (void)res;
+    (void)serial;
+    (void)mime;
+}
+
+static void S_offer_finish(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    (void)res;
+}
+
+static void S_offer_set_actions(struct wl_client *client, struct wl_resource *res, uint32_t actions, uint32_t preferred)
+{
+    (void)client;
+    (void)res;
+    (void)actions;
+    (void)preferred;
+}
+
+static const struct wl_data_offer_interface S_data_offer_impl = {
+    .accept = S_offer_accept,
+    .receive = S_offer_receive,
+    .destroy = S_res_destroy,
+    .finish = S_offer_finish,
+    .set_actions = S_offer_set_actions,
+};
+
+static const struct zwp_primary_selection_offer_v1_interface S_prim_offer_impl = {
+    .receive = S_offer_receive,
+    .destroy = S_res_destroy,
+};
+
+static void S_send_selection(Sel *sel, struct wl_resource *device)
+{
+    struct wl_client *client = wl_resource_get_client(device);
+    if (!sel->source) {
+        if (sel->primary) {
+            zwp_primary_selection_device_v1_send_selection(device, NULL);
+        } else {
+            wl_data_device_send_selection(device, NULL);
+        }
+        return;
+    }
+    SrcData *sd = wl_resource_get_user_data(sel->source);
+    OfferData *od = calloc(1, sizeof(*od));
+    od->sel = sel;
+    od->gen = sel->gen;
+    struct wl_resource *offer;
+    if (sel->primary) {
+        offer = wl_resource_create(client, &zwp_primary_selection_offer_v1_interface, wl_resource_get_version(device), 0);
+        wl_resource_set_implementation(offer, &S_prim_offer_impl, od, S_offer_free);
+        zwp_primary_selection_device_v1_send_data_offer(device, offer);
+        for (int i = 0; i < sd->n; i++) {
+            zwp_primary_selection_offer_v1_send_offer(offer, sd->mimes[i]);
+        }
+        zwp_primary_selection_device_v1_send_selection(device, offer);
+    } else {
+        offer = wl_resource_create(client, &wl_data_offer_interface, wl_resource_get_version(device), 0);
+        wl_resource_set_implementation(offer, &S_data_offer_impl, od, S_offer_free);
+        wl_data_device_send_data_offer(device, offer);
+        for (int i = 0; i < sd->n; i++) {
+            wl_data_offer_send_offer(offer, sd->mimes[i]);
+        }
+        wl_data_device_send_selection(device, offer);
+    }
+}
+
+static void S_broadcast(Sel *sel)
+{
+    struct wl_resource *dev;
+    wl_resource_for_each(dev, &sel->devices)
+    {
+        S_send_selection(sel, dev);
+    }
+}
+
+static void S_set_selection(Sel *sel, struct wl_resource *source)
+{
+    if (sel->source && sel->source != source) {
+        if (sel->primary) {
+            zwp_primary_selection_source_v1_send_cancelled(sel->source);
+        } else {
+            wl_data_source_send_cancelled(sel->source);
+        }
+    }
+    sel->source = source;
+    sel->gen++;
+    S_broadcast(sel);
+}
+
+/* sources */
+static void S_source_free(struct wl_resource *res)
+{
+    SrcData *sd = wl_resource_get_user_data(res);
+    if (sd->sel->source == res) {
+        sd->sel->source = NULL;
+        sd->sel->gen++;
+        S_broadcast(sd->sel);
+    }
+    for (int i = 0; i < sd->n; i++) {
+        free(sd->mimes[i]);
+    }
+    free(sd);
+}
+
+static void S_source_offer(struct wl_client *client, struct wl_resource *res, const char *mime)
+{
+    (void)client;
+    SrcData *sd = wl_resource_get_user_data(res);
+    if (sd->n < S_MAX_MIMES) {
+        sd->mimes[sd->n++] = strdup(mime);
+    }
+}
+
+static void S_source_set_actions(struct wl_client *client, struct wl_resource *res, uint32_t actions)
+{
+    (void)client;
+    (void)res;
+    (void)actions;
+}
+
+static const struct wl_data_source_interface S_data_source_impl = {
+    .offer = S_source_offer,
+    .destroy = S_res_destroy,
+    .set_actions = S_source_set_actions,
+};
+
+static const struct zwp_primary_selection_source_v1_interface S_prim_source_impl = {
+    .offer = S_source_offer,
+    .destroy = S_res_destroy,
+};
+
+/* devices */
+static void S_device_free(struct wl_resource *res)
+{
+    wl_list_remove(wl_resource_get_link(res));
+}
+
+static void S_device_set_selection(struct wl_client *client, struct wl_resource *res, struct wl_resource *source,
+                                   uint32_t serial)
+{
+    (void)client;
+    (void)res;
+    (void)serial;
+    S_set_selection(&S_clip, source);
+}
+
+static void S_prim_device_set_selection(struct wl_client *client, struct wl_resource *res, struct wl_resource *source,
+                                        uint32_t serial)
+{
+    (void)client;
+    (void)res;
+    (void)serial;
+    S_set_selection(&S_prim, source);
+}
+
+static void S_device_start_drag(struct wl_client *client, struct wl_resource *res, struct wl_resource *source,
+                                struct wl_resource *origin, struct wl_resource *icon, uint32_t serial)
+{
+    (void)client;
+    (void)res;
+    (void)source;
+    (void)origin;
+    (void)icon;
+    (void)serial;
+}
+
+static const struct wl_data_device_interface S_data_device_impl = {
+    .start_drag = S_device_start_drag,
+    .set_selection = S_device_set_selection,
+    .release = S_res_destroy,
+};
+
+static const struct zwp_primary_selection_device_v1_interface S_prim_device_impl = {
+    .set_selection = S_prim_device_set_selection,
+    .destroy = S_res_destroy,
+};
+
+/* managers */
+static struct wl_resource *S_new_source(struct wl_client *client, struct wl_resource *mgr, uint32_t id, Sel *sel)
+{
+    SrcData *sd = calloc(1, sizeof(*sd));
+    sd->sel = sel;
+    struct wl_resource *src;
+    if (sel->primary) {
+        src = wl_resource_create(client, &zwp_primary_selection_source_v1_interface, wl_resource_get_version(mgr), id);
+        wl_resource_set_implementation(src, &S_prim_source_impl, sd, S_source_free);
+    } else {
+        src = wl_resource_create(client, &wl_data_source_interface, wl_resource_get_version(mgr), id);
+        wl_resource_set_implementation(src, &S_data_source_impl, sd, S_source_free);
+    }
+    return src;
+}
+
+static void S_new_device(struct wl_client *client, struct wl_resource *mgr, uint32_t id, Sel *sel)
+{
+    struct wl_resource *dev;
+    if (sel->primary) {
+        dev = wl_resource_create(client, &zwp_primary_selection_device_v1_interface, wl_resource_get_version(mgr), id);
+        wl_resource_set_implementation(dev, &S_prim_device_impl, NULL, S_device_free);
+    } else {
+        dev = wl_resource_create(client, &wl_data_device_interface, wl_resource_get_version(mgr), id);
+        wl_resource_set_implementation(dev, &S_data_device_impl, NULL, S_device_free);
+    }
+    wl_list_insert(&sel->devices, wl_resource_get_link(dev));
+    if (sel->source) {
+        S_send_selection(sel, dev); /* what a client sees on keyboard focus */
+    }
+}
+
+static void S_mgr_create_source(struct wl_client *client, struct wl_resource *res, uint32_t id)
+{
+    S_new_source(client, res, id, &S_clip);
+}
+
+static void S_mgr_get_device(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *seat)
+{
+    (void)seat;
+    S_new_device(client, res, id, &S_clip);
+}
+
+static void S_prim_mgr_create_source(struct wl_client *client, struct wl_resource *res, uint32_t id)
+{
+    S_new_source(client, res, id, &S_prim);
+}
+
+static void S_prim_mgr_get_device(struct wl_client *client, struct wl_resource *res, uint32_t id,
+                                  struct wl_resource *seat)
+{
+    (void)seat;
+    S_new_device(client, res, id, &S_prim);
+}
+
+static const struct wl_data_device_manager_interface S_mgr_impl = {
+    .create_data_source = S_mgr_create_source,
+    .get_data_device = S_mgr_get_device,
+};
+
+static const struct zwp_primary_selection_device_manager_v1_interface S_prim_mgr_impl = {
+    .create_source = S_prim_mgr_create_source,
+    .get_device = S_prim_mgr_get_device,
+    .destroy = S_res_destroy,
+};
+
+static void S_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wl_data_device_manager_interface, version, id);
+    wl_resource_set_implementation(r, &S_mgr_impl, NULL, NULL);
+}
+
+static void S_prim_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &zwp_primary_selection_device_manager_v1_interface, version, id);
+    wl_resource_set_implementation(r, &S_prim_mgr_impl, NULL, NULL);
+}
+
 /* ---------------- lifecycle ---------------- */
 
 static int watchdog_cb(void *data)
@@ -947,6 +1277,11 @@ static void client_destroyed(struct wl_listener *listener, void *data)
 {
     (void)listener;
     (void)data;
+    if (S_mode && --S_clients > 0) {
+        printf("mini: client disconnected, %d left\n", S_clients);
+        fflush(stdout);
+        return;
+    }
     printf("mini: client disconnected, exiting\n");
     if (B_mode) {
         printf("mini: buffer check: %d commits, %d frames verified, %d releases, max %d held, "
@@ -971,6 +1306,14 @@ static void client_connected(struct wl_listener *listener, void *data)
     (void)listener;
     struct wl_client *client = data;
     M.client = client;
+    if (S_mode) {
+        /* one listener struct per client (a wl_listener is a list node) */
+        struct wl_listener *l = calloc(1, sizeof(*l));
+        l->notify = client_destroyed;
+        wl_client_add_destroy_listener(client, l);
+        S_clients++;
+        return;
+    }
     wl_client_add_destroy_listener(client, &client_destroy_listener);
 }
 
@@ -1002,6 +1345,14 @@ int main(void)
     B_viewporter = getenv("MINI_VIEWPORTER") && atoi(getenv("MINI_VIEWPORTER"));
     if (B_viewporter) {
         wl_global_create(M.display, &wp_viewporter_interface, 1, NULL, viewporter_bind);
+    }
+
+    S_mode = getenv("MINI_SELECTION") && atoi(getenv("MINI_SELECTION"));
+    if (S_mode) {
+        wl_list_init(&S_clip.devices);
+        wl_list_init(&S_prim.devices);
+        wl_global_create(M.display, &wl_data_device_manager_interface, 3, NULL, S_mgr_bind);
+        wl_global_create(M.display, &zwp_primary_selection_device_manager_v1_interface, 1, NULL, S_prim_mgr_bind);
     }
 
     wl_display_add_client_created_listener(M.display, &client_listener);

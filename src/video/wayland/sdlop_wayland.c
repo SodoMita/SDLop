@@ -153,6 +153,7 @@ typedef struct WaylandDeviceData
     SDL_Window *confine_window;
     uint32_t pointer_serial;      /* last wl_pointer.enter serial (set_cursor) */
     uint32_t input_serial;        /* last button/key serial (xdg_popup grab) */
+    uint32_t keyboard_serial;     /* last wl_keyboard.enter serial */
     struct sdlop_xcursor_theme *cursor_theme;
     bool cursor_theme_tried;
 } WaylandDeviceData;
@@ -665,6 +666,13 @@ static void wayland_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Wind
 /* internals shared with the GL/Vulkan modules                         */
 /* ------------------------------------------------------------------ */
 
+uint32_t SDLOP_Wayland_GetSelectionSerial(void)
+{
+    /* set_selection wants the serial of a recent input event; compositors
+     * accept the keyboard focus serial too */
+    return wl_data.input_serial ? wl_data.input_serial : wl_data.keyboard_serial;
+}
+
 struct wl_display *SDLOP_Wayland_GetDisplay(void)
 {
     return wl_data.display;
@@ -932,7 +940,6 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
     (void)keyboard;
     (void)keys;
     WaylandDeviceData *d = (WaylandDeviceData *)data;
-    (void)d;
     SDL_Window *window = NULL;
     for (SDL_Window *w = sdlop.windows; w; w = w->next) {
         WaylandWindowData *wd = (WaylandWindowData *)w->driverdata;
@@ -941,7 +948,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
             break;
         }
     }
-    (void)serial;
+    d->keyboard_serial = serial;
     if (window) {
         if (sdlop.keyboard_focus && sdlop.keyboard_focus != window) {
             sdlop.keyboard_focus->flags &= ~SDL_WINDOW_INPUT_FOCUS;
@@ -1841,6 +1848,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         d->seat_version = version < 9 ? version : 9;
         d->seat = wl_registry_bind(registry, name, &wl_seat_interface, d->seat_version);
         wl_seat_add_listener(d->seat, &seat_listener, d);
+        SDLOP_Wayland_Clipboard_SeatAdded(d->seat);
     } else if (strcmp(interface, wl_output_interface.name) == 0 && d->num_outputs < SDLOP_MAX_OUTPUTS) {
         struct wl_output *o = wl_registry_bind(registry, name, &wl_output_interface, version < 4 ? version : 4);
         d->outputs[d->num_outputs].output = o;
@@ -1869,6 +1877,8 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, wp_viewporter_interface.name) == 0 && !d->viewporter &&
                !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_VIEWPORTER, false)) {
         d->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+    } else {
+        SDLOP_Wayland_Clipboard_Global(registry, name, interface, version);
     }
 }
 
@@ -1935,11 +1945,13 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     wl_data.registry = wl_display_get_registry(wl_data.display);
     wl_registry_add_listener(wl_data.registry, &registry_listener, &wl_data);
     if (wl_display_roundtrip(wl_data.display) < 0) {
+        SDLOP_Wayland_Clipboard_Quit();
         wl_display_disconnect(wl_data.display);
         wl_data.display = NULL;
         return SDL_SetError("Wayland registry roundtrip failed");
     }
     if (!wl_data.compositor || !wl_data.wm_base || !wl_data.shm) {
+        SDLOP_Wayland_Clipboard_Quit();
         wl_display_disconnect(wl_data.display);
         wl_data.display = NULL;
         return SDL_SetError("Wayland compositor missing required globals (wl_compositor/xdg_wm_base/wl_shm)");
@@ -1951,6 +1963,18 @@ static bool wayland_Init(SDLop_VideoDevice *device)
         wayland_Quit(device);
         return SDL_SetError("wl_display_create_queue failed");
     }
+
+    /* system clipboard when the compositor has wl_data_device_manager;
+     * otherwise the generic in-process clipboard (hooks left NULL) */
+    const bool clip = SDLOP_Wayland_Clipboard_Available();
+    const bool prim = SDLOP_Wayland_PrimarySelection_Available();
+    device->SetClipboardData = clip ? SDLOP_Wayland_SetClipboardData : NULL;
+    device->GetClipboardData = clip ? SDLOP_Wayland_GetClipboardData : NULL;
+    device->HasClipboardData = clip ? SDLOP_Wayland_HasClipboardData : NULL;
+    device->GetTextMimeTypes = clip ? SDLOP_Wayland_GetTextMimeTypes : NULL;
+    device->SetPrimarySelectionText = prim ? SDLOP_Wayland_SetPrimarySelectionText : NULL;
+    device->GetPrimarySelectionText = prim ? SDLOP_Wayland_GetPrimarySelectionText : NULL;
+    device->HasPrimarySelectionText = prim ? SDLOP_Wayland_HasPrimarySelectionText : NULL;
     return true;
 }
 
@@ -1958,6 +1982,7 @@ static void wayland_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
     SDLOP_Wayland_GL_Deinit();
+    SDLOP_Wayland_Clipboard_Quit();
     wayland_release_pointer_lock();
     if (wl_data.confined_pointer) {
         zwp_confined_pointer_v1_destroy(wl_data.confined_pointer);
