@@ -455,6 +455,64 @@ static void win32_constrain_aspect(SDL_Window *window, RECT *rect)
     rect->bottom = rect->top + (want.bottom - want.top);
 }
 
+/* SDL_SetWindowHitTest(): called from WM_NCHITTEST for every point the window
+ * manager asks about. Returns false when the application has no opinion, so
+ * the caller falls through to DefWindowProc (the frame's own hit testing). */
+static bool win32_run_hit_test(SDL_Window *window, LPARAM lparam, LRESULT *result)
+{
+    SDL_Point point;
+    POINT screen_point;
+    SDL_HitTestResult rc;
+
+    if (!window || !window->hit_test) {
+        return false;
+    }
+    screen_point.x = GET_X_LPARAM(lparam);
+    screen_point.y = GET_Y_LPARAM(lparam);
+    if (!ScreenToClient(((SDLop_Win32WindowData *)window->driverdata)->hwnd, &screen_point)) {
+        return false;
+    }
+    point.x = screen_point.x;
+    point.y = screen_point.y;
+    rc = window->hit_test(window, &point, window->hit_test_data);
+    if (rc == SDL_HITTEST_NORMAL) {
+        return false; /* nothing special: let DefWindowProc answer */
+    }
+
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_HIT_TEST, 0, 0);
+
+    switch (rc) {
+    case SDL_HITTEST_DRAGGABLE:
+        /* If a button other than the left one is held, hand the point to the
+         * client area or Windows swallows the press (SDL3 does the same). */
+        {
+            const bool any_pressed = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+                                     (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+                                     (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0 ||
+                                     (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0 ||
+                                     (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
+            const bool left_pressed = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            /* swap left/right when the user asked Windows to */
+            const bool left = GetSystemMetrics(SM_SWAPBUTTON) ? !left_pressed : left_pressed;
+            if (any_pressed && !left) {
+                *result = HTCLIENT;
+                return true;
+            }
+        }
+        *result = HTCAPTION;
+        return true;
+    case SDL_HITTEST_RESIZE_TOPLEFT: *result = HTTOPLEFT; return true;
+    case SDL_HITTEST_RESIZE_TOP: *result = HTTOP; return true;
+    case SDL_HITTEST_RESIZE_TOPRIGHT: *result = HTTOPRIGHT; return true;
+    case SDL_HITTEST_RESIZE_RIGHT: *result = HTRIGHT; return true;
+    case SDL_HITTEST_RESIZE_BOTTOMRIGHT: *result = HTBOTTOMRIGHT; return true;
+    case SDL_HITTEST_RESIZE_BOTTOM: *result = HTBOTTOM; return true;
+    case SDL_HITTEST_RESIZE_BOTTOMLEFT: *result = HTBOTTOMLEFT; return true;
+    case SDL_HITTEST_RESIZE_LEFT: *result = HTLEFT; return true;
+    default: return false;
+    }
+}
+
 /* Keep SDL_GetWindowDisplayScale() honest: the core reads window->display_scale
  * and the other backends set it from their compositor's scale. Win32 gives us
  * the window's own DPI (it follows the monitor the window is on), so the scale
@@ -634,6 +692,19 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         break;
     }
+
+    case WM_NCHITTEST:
+        /* tooltips must stay click-through, before any application hit test */
+        if (window && (window->flags & SDL_WINDOW_TOOLTIP)) {
+            return HTTRANSPARENT;
+        }
+        {
+            LRESULT hit;
+            if (win32_run_hit_test(window, lparam, &hit)) {
+                return hit;
+            }
+        }
+        break;
 
     case WM_SIZING:
         if (window) {
@@ -1517,6 +1588,16 @@ static void win32_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *wi
     }
 }
 
+/* SDL_SetWindowHitTest(): nothing to install up front, the callback is
+ * consulted from WM_NCHITTEST whenever the window manager asks. */
+static bool win32_SetWindowHitTest(SDLop_VideoDevice *device, SDL_Window *window, bool enabled)
+{
+    (void)device;
+    (void)window;
+    (void)enabled;
+    return true;
+}
+
 /* SDL_CaptureMouse(): SDL_WINDOW_MOUSE_CAPTURE. SetCapture makes Win32 keep
  * sending mouse messages to this window after the pointer leaves it, which is
  * what "drag outside the window and keep tracking" needs. */
@@ -2069,6 +2150,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .ShowCursor = win32_ShowCursor,
     .SuspendScreenSaver = win32_SuspendScreenSaver,
     .CaptureMouse = win32_CaptureMouse,
+    .SetWindowHitTest = win32_SetWindowHitTest,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
     .WarpMouse = win32_WarpMouse,
