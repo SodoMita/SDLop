@@ -458,8 +458,8 @@ Highlights:
   swapchain emulation) and reads back into shm/dumb framebuffers.
 - `examples/vulkan_stress.c` — heavier GPU workload: compute-updated instanced
   particles, an offscreen scene pass and a post-process pass, with animated
-  frame checksums. Offload is forced by default (native KMS Vulkan WSI hangs on
-  some NVIDIA 470 setups); use `--native` to opt out. Defaults are a modest
+  frame checksums. It follows SDLop's capability-based offload policy by
+  default; `--offload` and `--native` force either path. Defaults are a modest
   60 frames at 320x180 with 256 particles; the full stress preset is
   `--frames 300 --size 1280x720 --particles 4096`.
 - `tests/mini_compositor.c` — a tiny purpose-built Wayland compositor

@@ -15,8 +15,9 @@
   so SDLop can intercept them when offload is active. That makes the same binary
   work with native WSI, Weston wl_shm, X11 shm, KMS dumb buffers and fbdev.
 
-  Offload is forced by default: native KMS Vulkan WSI hangs on some NVIDIA 470
-  setups, while the headless/shm path is reliable. Pass --native to opt out.
+  Offload follows SDLop's auto policy by default: native WSI is kept where it
+  works, and the headless/shm path is used when present is CPU-only or unsafe
+  (for example NVIDIA 470 KMS). --offload and --native force either choice.
 
   Usage:
     vulkan_stress [--offload|--native] [--frames N] [--duration SECONDS]
@@ -248,8 +249,8 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s [--offload|--native] [--frames N] [--duration SECONDS]\n"
             "          [--size WxH] [--particles N]\n"
-            "  --offload       force SDLop headless/offload path (default)\n"
-            "  --native        use the video driver's native Vulkan WSI instead\n"
+            "  --offload       force SDLop headless/offload path\n"
+            "  --native        force the video driver's native Vulkan WSI instead\n"
             "  --frames N      stop after N frames (default 60)\n"
             "  --duration S    run for S seconds instead of a fixed frame count\n"
             "  --size WxH      window size (default 320x180)\n"
@@ -339,7 +340,7 @@ int main(int argc, char *argv[])
     double duration_sec = 0.0;
     int win_w = 320, win_h = 180;
     uint32_t particle_count = 256;
-    bool use_offload = true;
+    const char *offload_hint = NULL; /* NULL: leave SDLop's auto policy alone */
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -347,9 +348,9 @@ int main(int argc, char *argv[])
             usage(argv[0]);
             return 0;
         } else if (!strcmp(a, "--offload")) {
-            use_offload = true;
+            offload_hint = "force";
         } else if (!strcmp(a, "--native")) {
-            use_offload = false;
+            offload_hint = "0";
         } else if (!strcmp(a, "--frames") && i + 1 < argc) {
             frames_target = atoi(argv[++i]);
         } else if (!strcmp(a, "--duration") && i + 1 < argc) {
@@ -375,9 +376,13 @@ int main(int argc, char *argv[])
         frames_target = INT32_MAX;
     }
 
-    /* CLI wins over the environment here. The default is forced offload so a
-     * bare invocation cannot select native KMS WSI on drivers where it hangs. */
-    SDL_SetHint("SDLOP_VK_OFFLOAD", use_offload ? "force" : "0");
+    /* An explicit CLI choice wins over the environment. With no flag, leave
+     * the hint untouched so SDLop's capability-based auto policy decides. */
+    if (offload_hint &&
+        !SDL_SetHintWithPriority("SDLOP_VK_OFFLOAD", offload_hint, SDL_HINT_OVERRIDE)) {
+        fprintf(stderr, "SDL_SetHintWithPriority failed: %s\n", SDL_GetError());
+        return 1;
+    }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
