@@ -63,6 +63,8 @@
 #define SDLOP_HINT_X11_NO_SHM            "SDLOP_X11_NO_SHM"        /**< bool: do not use MIT-SHM */
 #define SDLOP_HINT_X11_NO_TOUCH          "SDLOP_X11_NO_TOUCH"      /**< bool: no XInput2 touch */
 #define SDLOP_HINT_X11_RELATIVE_WARP     "SDLOP_X11_RELATIVE_WARP" /**< bool: relative mode by warping instead of XInput2 raw motion */
+/* Wayland */
+#define SDLOP_HINT_WAYLAND_NO_VIEWPORTER "SDLOP_WAYLAND_NO_VIEWPORTER" /**< bool: do not use wp_viewporter (the clear colour is then a filled full-size buffer); read at video init */
 /* kmsdrm */
 #define SDLOP_HINT_KMSDRM_DEVICE         "SDLOP_KMSDRM_DEVICE"     /**< DRM device: card number or /dev/dri/cardN path (default: probe) */
 #define SDLOP_HINT_KMSDRM_CONNECTOR      "SDLOP_KMSDRM_CONNECTOR"  /**< use only outputs whose name contains this (e.g. HDMI) */

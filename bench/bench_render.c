@@ -1,6 +1,10 @@
 /*
-  Benchmark: software surface fill vs OpenGL (llvmpipe) clear at 640x480.
-  Both render paths go through the Wayland compositor.
+  Benchmark: software surface fill vs OpenGL clear at 640x480, through
+  whatever video driver SDL picks (SDL_VIDEODRIVER=wayland/x11/kmsdrm to
+  choose). "present" is the time spent in SDL_UpdateWindowSurface: on
+  Wayland it includes waiting for the compositor to release a buffer, so
+  the software rate is bounded by the compositor, as for any conforming
+  client.
 
   Usage: bench_render [frames-per-test]
 */
@@ -19,16 +23,13 @@ static double fps_for(Uint64 dt_ns, int frames)
 int main(int argc, char *argv[])
 {
     const int frames = argc > 1 ? atoi(argv[1]) : 300;
-    if (!getenv("WAYLAND_DISPLAY")) {
-        fprintf(stderr, "needs WAYLAND_DISPLAY (software renderer benchmark)\n");
-        return 2;
-    }
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+    printf("video driver: %s, %d frames per test\n", SDL_GetCurrentVideoDriver(), frames);
 
     /* ---- software surface: full-window fill per frame ---- */
     {
@@ -38,15 +39,19 @@ int main(int argc, char *argv[])
             fprintf(stderr, "no window surface: %s\n", SDL_GetError());
         } else {
             Uint32 color = 0x0030A040;
+            Uint64 present = 0;
             Uint64 t0 = SDL_GetTicksNS();
             for (int i = 0; i < frames; i++) {
                 color ^= 0x000000FF;
                 SDL_FillSurfaceRect(s, NULL, color);
+                Uint64 p0 = SDL_GetTicksNS();
                 SDL_UpdateWindowSurface(w);
+                present += SDL_GetTicksNS() - p0;
+                SDL_PumpEvents();
             }
             Uint64 dt = SDL_GetTicksNS() - t0;
-            printf("software surface fill+present: %6.1f fps  (%.1f us/frame, %.1f MPix/s)\n",
-                   fps_for(dt, frames), (double)dt / frames / 1e3,
+            printf("software surface fill+present: %6.1f fps  (%.1f us/frame, present %.1f us, %.1f MPix/s)\n",
+                   fps_for(dt, frames), (double)dt / frames / 1e3, (double)present / frames / 1e3,
                    (double)frames * s->w * s->h / ((double)dt / 1e9) / 1e6);
         }
         SDL_DestroyWindow(w);
@@ -68,6 +73,7 @@ int main(int argc, char *argv[])
                 glClearColor((float)(i % 255) / 255.0f, 0.2f, 0.6f, 1.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
                 SDL_GL_SwapWindow(w);
+                SDL_PumpEvents();
             }
             Uint64 dt = SDL_GetTicksNS() - t0;
             printf("GL glClear+swap (%s): %6.1f fps  (%.1f us/frame, %.1f MPix/s)\n",

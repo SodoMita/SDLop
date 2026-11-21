@@ -718,6 +718,7 @@ static bool fb_alloc(SDL_Window *window, int w, int h)
         window->surface->h = h;
         window->surface->pitch = w * 4;
         window->surface->pixels = wd->pixels;
+        SDL_SetSurfaceClipRect(window->surface, NULL); /* the old clip may exceed the new size */
     }
     return true;
 }

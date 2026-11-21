@@ -147,6 +147,7 @@ false, anything else true.
 | `SDLOP_X11_NO_SHM`, `_NO_RENDER`, `_NO_TOUCH` | don't use MIT-SHM / XRender / XInput2 touch |
 | `SDLOP_X11_RELATIVE_WARP` | relative mode by warping instead of XInput2 raw motion |
 | `SDLOP_X11_EGL_PLATFORM` | `x11` skips the EGL xcb platform |
+| `SDLOP_WAYLAND_NO_VIEWPORTER` | Wayland: don't use `wp_viewporter` (clear colour as a filled full-size buffer) |
 | `SDL_VIDEO_FORCE_EGL` (`SDL_HINT_VIDEO_FORCE_EGL`) | X11: all contexts (desktop GL and GLES) through EGL instead of GLX (stock SDL3 hint) |
 | `SDL_OPENGL_ES_DRIVER` (`SDL_HINT_OPENGL_ES_DRIVER`) | X11: GLES contexts through EGL instead of GLX (stock SDL3 hint) |
 | `SDL_OPENGL_LIBRARY` (`SDL_HINT_OPENGL_LIBRARY`) | X11: library to load GLX from (default `libGL.so.1`, then `libGLX.so.0`) |
@@ -188,18 +189,41 @@ Raw input path (synthetic uinput device, 2000 events):
 
 (includes the uinput→evdev kernel round-trip; real hardware is similar)
 
-Rendering — 640×480 through Weston (headless), pure software rasterizers:
+Rendering and windows — software rasterizers (llvmpipe), the same programs
+built against SDLop and stock SDL3 3.4.20, 640×480 unless noted:
 
-| path | result |
+| X11 (Xvfb) | SDLop | SDL3 |
+|---|---|---|
+| software surface: full-window fill + present | ≈3 300 fps (≈300 µs; present ≈180 µs: MIT-SHM + sync) | ≈330 fps (≈3 000 µs) |
+| desktop GL (GLX): clear + swap, 320×240 | ≈220 µs | ≈225 µs |
+| desktop GL forced through EGL (`SDL_VIDEO_FORCE_EGL=1`, the pre-GLX path) | ≈310 µs | |
+| GLES 2 (GLX ES profile): clear + swap | ≈2 600 fps | context fails on this server (GLXBadFBConfig) |
+| create + destroy a window | ≈0.4–0.5 ms | ≈2.4–2.8 ms |
+
+| Wayland (Weston 10, headless) | SDLop |
 |---|---|
-| software surface: full-window fill + present | ≈11 000 fps (≈3.5 GPix/s; the pixels **are** the shm buffer, zero copy) |
-| OpenGL ES 3.2 (llvmpipe): glClear + swap | ≈3 400 fps (≈1.0 GPix/s) |
-| Vulkan (lavapipe): swapchain clear + present | verified by read-back, present-paced |
-| software plasma (per-pixel `sin`, 640×480) | ≈35 fps (compute-bound, not presentation-bound) |
+| software surface: full-window fill + present | ≈400 fps, paced by the compositor (see below) |
+| GLES (Mesa EGL): clear + swap | ≈385 fps, same pacing |
+| create + destroy a window | ≈115 µs |
+
+Wayland software presentation follows the `wl_buffer` contract: a buffer is
+written only after the compositor's `wl_buffer.release` (see Notes), so the
+software frame rate is bounded by how fast the compositor gives buffers back.
+Weston releases one per repaint, about every 2.5 ms here, and Mesa's EGL
+waits on the same releases. Compositors that copy `wl_shm` buffers at
+commit and release them right away allow higher rates. **Earlier releases
+published ≈11 000 fps here**, and an external comparison measured ≈17 500
+fps. Those numbers came from re-attaching one buffer every frame without
+waiting for its release, which let the application draw into a buffer the
+compositor was still reading. They measured a protocol violation, not
+presentation, and should not be compared with conforming clients.
+Window creation used to take ≈3.4 ms here (≈0.8 ms in the external run),
+mostly from mapping and filling a full-size buffer during the configure
+handshake. The clear colour is now a 1×1 buffer scaled by `wp_viewporter`.
 
 Reproduce: `cmake --build build && ./build/bench_events && ./build/bench_events_sdl3`
 and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
-`WAYLAND_DISPLAY=wayland-0 ./build/bench_render` for the rendering numbers.
+`SDL_VIDEODRIVER=x11|wayland ./build/bench_render` for the rendering numbers.
 
 ## API surface (SDL3-compatible)
 
@@ -273,8 +297,16 @@ cmake --build build-abi -j
 ctest --test-dir build-abi -R abi_check --output-on-failure
 ```
 
-The manually driven Wayland behavior trace is built with the test targets but
-is not registered with CTest because it waits for an external input script:
+Build switches: `SDLop_BUILD_TESTS`, `SDLop_BUILD_EXAMPLES`,
+`SDLop_BUILD_BENCHMARKS` (all ON by default) and `SDLop_BUILD_TOOLS` (default:
+same as `SDLop_BUILD_TESTS`). The tools are `wl_injector` and the behaviour
+probes. The Wayland input injectors are skipped, with a configure message,
+when wayland-client, libxkbcommon or the vendored virtual-input protocol
+XMLs (`tests/protocols/`) are missing.
+
+The manually driven Wayland behavior trace is built with the tools
+(`SDLop_BUILD_TOOLS`) but is not registered with CTest because it waits for
+an external input script:
 
 ```sh
 cmake --build build --target behaviour_probe_wayland
@@ -491,9 +523,21 @@ Highlights:
   server-side decorations via xdg-decoration (borderless windows request
   client-side mode, and SDLop draws none). Compositors without
   xdg-decoration (e.g. GNOME) show no title bar.
-- Software surfaces are XRGB8888 wl_shm buffers (zero copy); the GL and
-  Vulkan paths were validated against Mesa's software rasterizers
-  (llvmpipe/lavapipe) but work with any EGL/Vulkan driver.
+- Wayland software surfaces: the `SDL_GetWindowSurface` pixels are a
+  client-side XRGB8888 buffer at a fixed address. Each
+  `SDL_UpdateWindowSurface(Rects)` copies the damage into a `wl_shm` buffer
+  the compositor has released, then attaches and commits it. Each buffer
+  tracks what it has missed, so a present copies only the new damage plus
+  the previous frame's. The cycle is two buffers, and a third only while the
+  compositor holds both. A present waits for a release only when all three are
+  held. That wait dispatches only buffer events, never input or window events.
+  Until something is presented, a window shows its clear colour: a 1×1
+  buffer scaled with `wp_viewporter`, or a filled full-size buffer when the
+  compositor lacks it or `SDLOP_WAYLAND_NO_VIEWPORTER=1`. GL offload frames
+  use the same buffer cycle. `test_wayland_buffers` checks all of this
+  against a strict test compositor. The GL and Vulkan paths were validated
+  against Mesa's software rasterizers (llvmpipe/lavapipe) but work with any
+  EGL/Vulkan driver.
 - Hardware GPU offload (OpenGL via EGL surfaceless/pbuffer on a hardware
   DRM render node; Vulkan via `VK_EXT_headless_surface` with hardware GPU
   prioritization) activates automatically when the display backend lacks
@@ -504,7 +548,8 @@ Highlights:
   or `1`/`on`/`true`/`yes`/`force`), overridden per API by
   `SDLOP_GL_OFFLOAD` and `SDLOP_VULKAN_OFFLOAD` (or `SDLOP_VK_OFFLOAD`).
 - `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
-  content yet.
+  content yet. If a window surface exists, it fills the surface and presents
+  it (X11 and Wayland).
 - Web: the static keymap is US-layout only (browser text input events are
   not used yet); `SDL_GL_SHARE_WITH_CURRENT_CONTEXT` is ignored (WebGL has no
   cross-context object sharing);

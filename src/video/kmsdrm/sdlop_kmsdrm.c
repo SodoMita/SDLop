@@ -2001,8 +2001,11 @@ static void kmsdrm_retarget_surface(SDL_Window *window, KMSDRM_WindowData *winda
     KMSDRM_DisplayData *dd = windata->display;
     window->surface->pixels = windata->sw_map[windata->sw_draw];
     window->surface->pitch = (int)windata->sw_pitch;
-    window->surface->w = (int)dd->mode.hdisplay;
-    window->surface->h = (int)dd->mode.vdisplay;
+    if (window->surface->w != (int)dd->mode.hdisplay || window->surface->h != (int)dd->mode.vdisplay) {
+        window->surface->w = (int)dd->mode.hdisplay;
+        window->surface->h = (int)dd->mode.vdisplay;
+        SDL_SetSurfaceClipRect(window->surface, NULL); /* the old clip may exceed the new size */
+    }
 }
 
 /* Program the CRTC with the buffer the app just finished (first present,
