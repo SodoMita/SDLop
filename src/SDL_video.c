@@ -91,8 +91,12 @@ void SDLOP_VideoQuit(void)
     while (sdlop.windows) {
         SDL_DestroyWindow(sdlop.windows);
     }
+    SDLOP_GL_Quit();
+    SDLOP_Vulkan_Quit();
     SDLOP_MouseQuit(); /* cursors hold driver resources */
     sdlop.grabbed_window = NULL;
+    sdlop.keyboard_grabbed_elsewhere = false;
+    sdlop.pointer_grabbed_elsewhere = false;
     sdlop.suspend_screensaver = false;
     if (sdlop.video) {
         sdlop.video->Quit(sdlop.video);
@@ -727,8 +731,14 @@ bool SDLOP_WindowValid(SDL_Window *window)
 SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
 {
     if (!sdlop.init_done || !sdlop.video) {
-        SDL_SetError("Video subsystem not initialized");
-        return NULL;
+        /* stock SDL3 initializes the video subsystem on demand here */
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            return NULL;
+        }
+        if (!sdlop.video) {
+            SDL_SetError("Video subsystem not initialized");
+            return NULL;
+        }
     }
     const char *title = SDL_GetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, NULL);
     int x = (int)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_UNDEFINED);
@@ -769,11 +779,11 @@ SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
         SDL_SetError("Metal support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
         return NULL;
     }
-    if ((flags & SDL_WINDOW_OPENGL) && !sdlop.video->GL_CreateContext) {
+    if ((flags & SDL_WINDOW_OPENGL) && !SDLOP_GL_CanCreateWindow()) {
         SDL_SetError("OpenGL support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
         return NULL;
     }
-    if ((flags & SDL_WINDOW_VULKAN) && !sdlop.video->Vulkan_CreateSurface) {
+    if ((flags & SDL_WINDOW_VULKAN) && !SDLOP_Vulkan_CanCreateWindow()) {
         SDL_SetError("Vulkan support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
         return NULL;
     }
@@ -913,6 +923,13 @@ void SDL_DestroyWindow(SDL_Window *window)
     }
 
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DESTROYED, 0, 0);
+    /* as stock SDL: a GL context current on this window is released (the
+     * context itself stays valid for another window) */
+    if (SDL_GL_GetCurrentWindow() == window) {
+        SDL_GL_MakeCurrent(window, NULL);
+    }
+    SDLOP_GL_NotifyWindowDestroyed(window);
+    SDLOP_Vulkan_NotifyWindowDestroyed(window);
     if (window->surface) {
         /* drivers that own the pixel storage null this out themselves;
          * otherwise (dummy RAM buffers) free it here */
@@ -1012,10 +1029,14 @@ bool SDL_SetWindowSize(SDL_Window *window, int w, int h)
     }
     window->w = w;
     window->h = h;
+    bool ok = true;
     if (sdlop.video && sdlop.video->SetWindowSize) {
-        return sdlop.video->SetWindowSize(sdlop.video, window);
+        ok = sdlop.video->SetWindowSize(sdlop.video, window);
     }
-    return true;
+    if (ok) {
+        SDLOP_GL_NotifyWindowResized(window);
+    }
+    return ok;
 }
 
 bool SDL_GetWindowSize(SDL_Window *window, int *w, int *h)

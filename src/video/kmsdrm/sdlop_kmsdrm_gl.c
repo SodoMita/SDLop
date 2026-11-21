@@ -12,7 +12,8 @@
 
 #include "sdlop_kmsdrm.h"
 
-#include "../../video/wayland/sdlop_egl_dyn.h"
+#include "../sdlop_egl_dyn.h"
+#include "../sdlop_gl_offload.h"
 
 #include <errno.h>
 #include <string.h>
@@ -20,6 +21,16 @@
 #include <stdint.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#ifndef DRM_IOCTL_GEM_CLOSE
+struct sdlop_drm_gem_close {
+    uint32_t handle;
+    uint32_t pad;
+};
+#define SDLOP_DRM_IOCTL_GEM_CLOSE _IOW('d', 0x09, struct sdlop_drm_gem_close)
+#endif
 
 #ifndef EGL_OPENGL_ES3_BIT
 #define EGL_OPENGL_ES3_BIT 0x0040
@@ -50,19 +61,165 @@ typedef struct kmsdrm_gl_context
 {
     EGLContext ctx;
     uint32_t api; /* EGL_OPENGL_API or EGL_OPENGL_ES_API */
+    bool is_offload;
+    SDLOP_GLOffloadContext *offload_ctx;
 } KMSDRMGLContext;
 
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
 static bool egl_initialized;
 static int swap_interval = 1; /* vsync by default (SDL3 behavior) */
+static bool kmsdrm_offload_decided;
+static bool kmsdrm_use_offload;
+static bool kmsdrm_prime_disabled;
+static void kmsdrm_native_gl_deinit(void);
+
+typedef struct KMSDRM_PrimeFBInfo
+{
+    int drm_fd;
+    uint32_t fb_id;
+    uint32_t gem_handle;
+} KMSDRM_PrimeFBInfo;
+
+static void kmsdrm_close_gem_handle(int drm_fd, uint32_t handle)
+{
+    if (drm_fd < 0 || handle == 0) {
+        return;
+    }
+    if (SDLOP_DRM_OPT_drmCloseBufferHandle) {
+        SDLOP_DRM_OPT_drmCloseBufferHandle(drm_fd, handle);
+        return;
+    }
+#ifdef DRM_IOCTL_GEM_CLOSE
+    struct drm_gem_close args = { .handle = handle, .pad = 0 };
+    ioctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &args);
+#else
+    struct sdlop_drm_gem_close args = { .handle = handle, .pad = 0 };
+    ioctl(drm_fd, SDLOP_DRM_IOCTL_GEM_CLOSE, &args);
+#endif
+}
+
+static void kmsdrm_prime_fb_destroy_cb(struct gbm_bo *bo, void *data)
+{
+    (void)bo;
+    KMSDRM_PrimeFBInfo *info = (KMSDRM_PrimeFBInfo *)data;
+    if (!info) {
+        return;
+    }
+    if (info->fb_id && SDLOP_DRM_drmModeRmFB) {
+        SDLOP_DRM_drmModeRmFB(info->drm_fd, info->fb_id);
+    }
+    kmsdrm_close_gem_handle(info->drm_fd, info->gem_handle);
+    free(info);
+}
+
+static KMSDRM_PrimeFBInfo *kmsdrm_prime_fb_from_bo(int drm_fd, struct gbm_bo *bo)
+{
+    if (drm_fd < 0 || !bo || !SDLOP_GBM_Available() ||
+        !SDLOP_GBM_gbm_bo_get_fd || !SDLOP_DRM_OPT_drmPrimeFDToHandle ||
+        !SDLOP_DRM_drmModeAddFB2) {
+        return NULL;
+    }
+
+    KMSDRM_PrimeFBInfo *info = (KMSDRM_PrimeFBInfo *)SDLOP_GBM_gbm_bo_get_user_data(bo);
+    if (info) {
+        return info;
+    }
+
+    int prime_fd = SDLOP_GBM_gbm_bo_get_fd(bo);
+    if (prime_fd < 0) {
+        SDL_SetError("gbm_bo_get_fd failed");
+        return NULL;
+    }
+
+    uint32_t gem_handle = 0;
+    int rc = SDLOP_DRM_OPT_drmPrimeFDToHandle(drm_fd, prime_fd, &gem_handle);
+    close(prime_fd);
+    if (rc != 0 || gem_handle == 0) {
+        SDL_SetError("drmPrimeFDToHandle failed: %s", strerror(errno));
+        return NULL;
+    }
+
+    uint32_t w = SDLOP_GBM_gbm_bo_get_width(bo);
+    uint32_t h = SDLOP_GBM_gbm_bo_get_height(bo);
+    uint32_t format = SDLOP_GBM_gbm_bo_get_format(bo);
+    uint32_t stride = SDLOP_GBM_gbm_bo_get_stride_for_plane
+        ? SDLOP_GBM_gbm_bo_get_stride_for_plane(bo, 0)
+        : SDLOP_GBM_gbm_bo_get_stride(bo);
+    uint32_t offset = SDLOP_GBM_gbm_bo_get_offset
+        ? SDLOP_GBM_gbm_bo_get_offset(bo, 0)
+        : 0;
+
+    uint32_t handles[4] = { gem_handle, 0, 0, 0 };
+    uint32_t pitches[4] = { stride, 0, 0, 0 };
+    uint32_t offsets[4] = { offset, 0, 0, 0 };
+    uint32_t fb_id = 0;
+    rc = SDLOP_DRM_drmModeAddFB2(drm_fd, w, h, format, handles, pitches, offsets, &fb_id, 0);
+    if (rc != 0 || fb_id == 0) {
+        int err = errno;
+        kmsdrm_close_gem_handle(drm_fd, gem_handle);
+        SDL_SetError("drmModeAddFB2(0x%08x) failed: %s", format, strerror(err));
+        return NULL;
+    }
+
+    info = (KMSDRM_PrimeFBInfo *)calloc(1, sizeof(*info));
+    if (!info) {
+        SDLOP_DRM_drmModeRmFB(drm_fd, fb_id);
+        kmsdrm_close_gem_handle(drm_fd, gem_handle);
+        return NULL;
+    }
+    info->drm_fd = drm_fd;
+    info->fb_id = fb_id;
+    info->gem_handle = gem_handle;
+    SDLOP_GBM_gbm_bo_set_user_data(bo, info, kmsdrm_prime_fb_destroy_cb);
+    return info;
+}
+
+static bool kmsdrm_can_try_prime(KMSDRM_DeviceData *dev)
+{
+    if (kmsdrm_prime_disabled || !dev || dev->drm_fd < 0) {
+        return false;
+    }
+    if (!SDLOP_HintFlag(SDLOP_HINT_GL_OFFLOAD_PRIME, true)) {
+        return false;
+    }
+    if (!SDLOP_GLOffload_HasGBM() || !SDLOP_GBM_Available() ||
+        !SDLOP_GBM_gbm_bo_get_fd || !SDLOP_DRM_OPT_drmPrimeFDToHandle ||
+        !SDLOP_DRM_drmModeAddFB2) {
+        return false;
+    }
+    uint64_t prime_cap = 0;
+    if (SDLOP_DRM_drmGetCap(dev->drm_fd, DRM_CAP_PRIME, &prime_cap) != 0) {
+        return false;
+    }
+    return (prime_cap & DRM_PRIME_CAP_IMPORT) != 0;
+}
+
+static void kmsdrm_release_prime_bos(KMSDRM_WindowData *windata)
+{
+    if (!windata) {
+        return;
+    }
+    SDLOP_GLOffloadSurface *osurf = (SDLOP_GLOffloadSurface *)windata->gl_offload_surface;
+    if (windata->prime_bo) {
+        if (osurf) {
+            SDLOP_GLOffload_ReleasePrimeBO(osurf, windata->prime_bo);
+        }
+        windata->prime_bo = NULL;
+    }
+    if (windata->prime_next_bo) {
+        if (osurf) {
+            SDLOP_GLOffload_ReleasePrimeBO(osurf, windata->prime_next_bo);
+        }
+        windata->prime_next_bo = NULL;
+    }
+}
 
 /* SDL_HINT_VIDEO_DOUBLE_BUFFER equivalent: wait for the flip right after
  * queueing it (matches sdl's optional immediate wait; the software path is
  * always synchronous) */
 static bool kmsdrm_double_buffer(void)
 {
-    const char *v = getenv("SDLOP_KMSDRM_DOUBLE_BUFFER");
-    return v && *v && strcmp(v, "0") != 0;
+    return SDLOP_HintFlag("SDLOP_KMSDRM_DOUBLE_BUFFER", false);
 }
 static uint32_t kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888; /* must match the GBM surface format */
 
@@ -304,10 +461,8 @@ static bool pick_config(EGLConfig *out, uint32_t api)
     EGLint renderable;
     if (api == EGL_OPENGL_API) {
         renderable = EGL_OPENGL_BIT;
-    } else if (sdlop_glattrs.major_version >= 3) {
-        renderable = EGL_OPENGL_ES3_BIT;
     } else {
-        renderable = EGL_OPENGL_ES2_BIT;
+        renderable = SDLOP_EGL_ESRenderableType(egl_display);
     }
 
     /* Mesa's GBM platform silently ignores EGL_NATIVE_VISUAL_ID in the
@@ -506,6 +661,15 @@ static bool kmsdrm_gl_create_surfaces(SDLop_VideoDevice *device, SDL_Window *win
 /* Destroy EGL/GBM scanout resources for a window (context survives). */
 void KMSDRM_DestroyGLSurfaces(KMSDRM_WindowData *windata)
 {
+    kmsdrm_release_prime_bos(windata);
+    if (windata->gl_offload_surface) {
+        SDLOP_GLOffload_DestroySurface((SDLOP_GLOffloadSurface *)windata->gl_offload_surface);
+        windata->gl_offload_surface = NULL;
+    }
+    windata->gl_offload_active = false;
+    windata->gl_offload_prime = false;
+    windata->gl_offload_ctx = NULL;
+
     if (egl_initialized) {
         SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
@@ -538,12 +702,124 @@ void KMSDRM_DestroyGLSurfaces(KMSDRM_WindowData *windata)
     windata->crtc_programmed = false;
 }
 
+static void *kmsdrm_create_offload_context(SDLop_VideoDevice *device, SDL_Window *window, uint32_t api)
+{
+    KMSDRM_DeviceData *dev = vid();
+    KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+    KMSDRM_DisplayData *dd = windata ? windata->display : NULL;
+    if (!windata || !dd) {
+        SDL_SetError("Invalid window");
+        return NULL;
+    }
+
+    SDLOP_GLOffloadContext *share_offload = NULL;
+    if (sdlop_glattrs.share_with_current_context) {
+        SDL_GLContext cur = SDLOP_GL_CurrentContext();
+        if (cur && ((KMSDRMGLContext *)cur)->is_offload) {
+            share_offload = ((KMSDRMGLContext *)cur)->offload_ctx;
+        }
+    }
+
+    SDLOP_GLOffloadContext *octx = SDLOP_GLOffload_CreateContext(api, share_offload);
+    if (!octx) {
+        return NULL;
+    }
+
+    KMSDRMGLContext *glctx = (KMSDRMGLContext *)calloc(1, sizeof(*glctx));
+    if (!glctx) {
+        SDLOP_GLOffload_DeleteContext(octx);
+        SDL_OutOfMemory();
+        return NULL;
+    }
+    glctx->api = api;
+    glctx->is_offload = true;
+    glctx->offload_ctx = octx;
+
+    SDLOP_GLOffloadSurface *osurf = NULL;
+    bool using_prime = false;
+    if (kmsdrm_can_try_prime(dev)) {
+        osurf = SDLOP_GLOffload_CreatePrimeSurface(octx,
+                                                   (int)dd->mode.hdisplay,
+                                                   (int)dd->mode.vdisplay);
+        if (osurf) {
+            using_prime = true;
+        }
+    }
+
+    if (using_prime) {
+        if (windata->sw_active) {
+            KMSDRM_DestroySwScanout(window);
+            SDL_DestroyWindowSurface(window);
+        }
+    } else {
+        /* Drop any cached software SDL_Surface wrapper without destroying dumb
+         * buffers; if none exist yet, allocate dumb buffers for scanout. */
+        if (window->surface) {
+            SDL_DestroySurface(window->surface);
+            window->surface = NULL;
+        }
+        if (!KMSDRM_EnsureSwScanout(window)) {
+            SDLOP_GLOffload_DeleteContext(octx);
+            free(glctx);
+            return NULL;
+        }
+        osurf = SDLOP_GLOffload_CreateSurface(octx,
+                                              (int)dd->mode.hdisplay,
+                                              (int)dd->mode.vdisplay);
+        if (!osurf) {
+            SDLOP_GLOffload_DeleteContext(octx);
+            free(glctx);
+            return NULL;
+        }
+    }
+
+    windata->gl_active = true;
+    windata->gl_offload_active = true;
+    windata->gl_offload_prime = using_prime;
+    windata->gl_offload_surface = osurf;
+    windata->gl_offload_ctx = octx;
+    windata->egl_surface_dirty = false;
+
+    if (!KMSDRM_GL_MakeCurrent(device, window, glctx)) {
+        KMSDRM_DestroyGLSurfaces(windata);
+        SDLOP_GLOffload_DeleteContext(octx);
+        free(glctx);
+        return NULL;
+    }
+    KMSDRM_DeferEvent(window, KMSDRM_DEFER_SIZE);
+    SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop KMS/Offload: GL context created (%s on %s, %s)",
+                api == EGL_OPENGL_API ? "desktop GL" : "GLES",
+                SDLOP_GLOffload_GetGPUDescription() ? SDLOP_GLOffload_GetGPUDescription() : "GPU",
+                using_prime ? "PRIME scanout" : "dumb-buffer readback");
+    return glctx;
+}
+
 void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
 {
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
     if (!windata) {
         SDL_SetError("Invalid window");
         return NULL;
+    }
+
+    bool want_desktop_gl =
+        (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) != 0 ||
+        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3);
+    uint32_t api = want_desktop_gl ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
+
+    SDLOP_GLOffload_SetPreferGBM(true);
+    SDLOP_GLOffloadPolicy policy = SDLOP_GLOffload_GetPolicy();
+    if (!kmsdrm_offload_decided && policy == SDLOP_GL_OFFLOAD_FORCE &&
+        SDLOP_GLOffload_HasHardwareGPU()) {
+        kmsdrm_use_offload = true;
+        kmsdrm_offload_decided = true;
+        SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                    "KMSDRM: GL offload forced via SDLOP_GL_OFFLOAD (%s)",
+                    SDLOP_GLOffload_GetGPUDescription());
+    }
+
+    if (kmsdrm_offload_decided && kmsdrm_use_offload) {
+        return kmsdrm_create_offload_context(device, window, api);
     }
 
     /* switch the window from the software dumb-buffer scanout to GL */
@@ -555,13 +831,19 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     windata->gl_active = true;
 
     if (!ensure_egl_display()) {
+        if (!kmsdrm_offload_decided && policy != SDLOP_GL_OFFLOAD_NEVER &&
+            SDLOP_GLOffload_HasHardwareGPU()) {
+            kmsdrm_use_offload = true;
+            kmsdrm_offload_decided = true;
+            windata->gl_active = false;
+            SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: output has no hardware GBM/GL; offloading GL to GPU (%s)",
+                        SDLOP_GLOffload_GetGPUDescription());
+            return kmsdrm_create_offload_context(device, window, api);
+        }
         return NULL;
     }
 
-    bool want_desktop_gl =
-        (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) != 0 ||
-        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3);
-    uint32_t api = want_desktop_gl ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
     if (!SDLOP_EGL_eglBindAPI(api)) {
         SDL_SetError("eglBindAPI failed: 0x%x", SDLOP_EGL_eglGetError());
         return NULL;
@@ -590,8 +872,10 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
             ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE; ctx_attribs[n++] = EGL_TRUE;
         }
     } else {
-        ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
-        ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
+        n = SDLOP_EGL_AppendESVersion(egl_display, ctx_attribs, n);
+        if (n < 0) {
+            return NULL;
+        }
     }
     n = SDLOP_EGL_AppendUserAttribs(true, egl_display, config, ctx_attribs, n, (int)SDL_arraysize(ctx_attribs));
     if (n < 0) {
@@ -601,7 +885,7 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     EGLContext share = EGL_NO_CONTEXT;
     if (sdlop_glattrs.share_with_current_context) {
         SDL_GLContext cur = SDLOP_GL_CurrentContext();
-        if (cur) {
+        if (cur && !((KMSDRMGLContext *)cur)->is_offload) {
             share = ((KMSDRMGLContext *)cur)->ctx;
         }
     }
@@ -623,6 +907,17 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     if (!kmsdrm_gl_create_surfaces(device, window)) {
         SDLOP_EGL_eglDestroyContext(egl_display, ctx);
         free(glctx);
+        if (!kmsdrm_offload_decided && policy != SDLOP_GL_OFFLOAD_NEVER &&
+            SDLOP_GLOffload_HasHardwareGPU()) {
+            kmsdrm_native_gl_deinit();
+            kmsdrm_use_offload = true;
+            kmsdrm_offload_decided = true;
+            windata->gl_active = false;
+            SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: GBM/EGL surface creation failed; offloading GL to GPU (%s)",
+                        SDLOP_GLOffload_GetGPUDescription());
+            return kmsdrm_create_offload_context(device, window, api);
+        }
         return NULL;
     }
 
@@ -634,22 +929,285 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         return NULL;
     }
 
+    if (!kmsdrm_offload_decided) {
+        const char *renderer = SDLOP_GLOffload_QueryCurrentRenderer();
+        bool is_sw = SDLOP_GLOffload_IsSoftwareRenderer(renderer);
+        if (is_sw && policy != SDLOP_GL_OFFLOAD_NEVER && SDLOP_GLOffload_HasHardwareGPU()) {
+            /* Output EGL/GBM is software-rendered (e.g. kms_swrast / llvmpipe)
+             * while a hardware GPU exists: switch session to headless GPU offload. */
+            KMSDRM_DestroyGLSurfaces(windata);
+            SDLOP_EGL_eglDestroyContext(egl_display, ctx);
+            free(glctx);
+            kmsdrm_native_gl_deinit();
+            kmsdrm_use_offload = true;
+            kmsdrm_offload_decided = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: output GL is software (%s); offloading to GPU (%s)",
+                        renderer ? renderer : "unknown",
+                        SDLOP_GLOffload_GetGPUDescription());
+            return kmsdrm_create_offload_context(device, window, api);
+        }
+        kmsdrm_use_offload = false;
+        kmsdrm_offload_decided = true;
+        sdlop_glattrs.accelerated_visual = is_sw ? 0 : 1;
+    }
+
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop KMS/GBM: GL context created (%s)",
                 api == EGL_OPENGL_API ? "desktop GL" : "GLES");
     return glctx;
 }
 
+static bool kmsdrm_present_fb(KMSDRM_DeviceData *dev, KMSDRM_WindowData *windata,
+                              uint32_t fb_id, bool need_modeset)
+{
+    if (!dev->vt_active) {
+        return true; /* another VT owns the screen; drop the frame */
+    }
+    KMSDRM_DisplayData *dd = windata->display;
+    uint32_t flip_flags = DRM_MODE_PAGE_FLIP_EVENT;
+    bool present_ok = true;
+    int ret = 0;
+    const bool use_atomic = dd->atomic.available;
+
+    if (need_modeset) {
+        /* first swap: the CRTC must be told what to scan out */
+        if (use_atomic) {
+            if (!KMSDRM_AtomicModeset(dev, dd, fb_id)) {
+                int merr = errno;
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                            "KMSDRM: atomic modeset failed (%s); using legacy modeset for GL present",
+                            strerror(merr));
+                if (merr == EINVAL || merr == ENOSYS) {
+                    dd->atomic.available = false; /* stop trying atomic every frame */
+                }
+                ret = -1;
+            }
+        } else {
+            ret = -1; /* go straight to the legacy path below */
+        }
+        if (ret == 0) {
+            windata->crtc_programmed = true;
+        } else {
+            ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_id, 0, 0,
+                                           &dd->connector->connector_id, 1, &dd->mode);
+            if (ret) {
+                return SDL_SetError("Could not set videomode on CRTC");
+            }
+            windata->crtc_programmed = true;
+        }
+    } else if (use_atomic) {
+        /* swap_interval 0 async flips are a legacy-path refinement; the
+         * atomic flip below is vsync'd (NONBLOCK without ASYNC), which is
+         * the conservative behavior for the GL path here */
+        (void)flip_flags;
+        ret = KMSDRM_AtomicFlip(dev, dd, fb_id, &windata->waiting_for_flip);
+        if (ret == 0) {
+            windata->waiting_for_flip = true;
+            if (kmsdrm_double_buffer()) {
+                KMSDRM_WaitPageflip(dev, windata, 1500);
+            }
+        } else {
+            int err = errno;
+            if (err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {
+                ret = KMSDRM_AtomicFlip(dev, dd, fb_id, &windata->waiting_for_flip);
+                if (ret == 0) {
+                    windata->waiting_for_flip = true;
+                }
+            }
+            if (ret != 0) {
+                if (is_permission_error(err)) {
+                    windata->lost_master = true;
+                    present_ok = false;
+                    SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: atomic flip lost DRM master");
+                } else {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                                "KMSDRM: atomic flip failed (%s); using modeset for GL present",
+                                strerror(err));
+                    if (err == EINVAL || err == ENOSYS) {
+                        dd->atomic.available = false; /* stop trying atomic every frame */
+                    }
+                    ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_id,
+                                                   0, 0, &dd->connector->connector_id, 1, &dd->mode);
+                    if (ret == 0) {
+                        windata->crtc_programmed = true;
+                    } else {
+                        SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
+                                     "KMSDRM: atomic flip failed and modeset fallback failed: %s",
+                                     strerror(errno));
+                        present_ok = false;
+                    }
+                }
+            }
+        }
+    } else {
+        if (swap_interval == 0 && dev->async_pageflip_support) {
+            flip_flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+        }
+        ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_id,
+                                        flip_flags, &windata->waiting_for_flip);
+        if (ret == 0) {
+            windata->waiting_for_flip = true;
+            /* immediate wait (SDL_HINT_VIDEO_DOUBLE_BUFFER) */
+            if (kmsdrm_double_buffer()) {
+                KMSDRM_WaitPageflip(dev, windata, 1500);
+            }
+        } else {
+            int err = errno;
+            if (err == EINVAL && (flip_flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
+                /* some drivers claim async flips but can't (or fail
+                 * intermittently): retry synchronously without the async
+                 * flag (SDL3 commit 69dd29e) */
+                flip_flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
+                ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_id,
+                                                flip_flags, &windata->waiting_for_flip);
+                err = errno;
+                if (ret == 0) {
+                    windata->waiting_for_flip = true;
+                    if (kmsdrm_double_buffer()) {
+                        KMSDRM_WaitPageflip(dev, windata, 1500);
+                    }
+                }
+            }
+            if (ret != 0 && err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {
+                ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_id,
+                                                flip_flags, &windata->waiting_for_flip);
+                if (ret == 0) {
+                    windata->waiting_for_flip = true;
+                    ret = 0;
+                }
+            }
+            if (ret != 0) {
+                if (is_permission_error(err)) {
+                    windata->lost_master = true;
+                    present_ok = false;
+                    SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: pageflip lost DRM master");
+                } else if (err == EINVAL || err == ENOSYS || err == EBUSY) {
+                    /* this driver cannot page flip right now (e.g. virtio-gpu
+                     * 2D: the flip ioctl always returns EBUSY, even with a
+                     * flip event requested), so present with a modeset like
+                     * the software path does instead of leaving the CRTC on a
+                     * stale framebuffer */
+                    if (err == EINVAL || err == ENOSYS) {
+                        dev->no_flip = true;
+                        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                                    "KMSDRM: pageflip unsupported (%s); using modeset for GL present",
+                                    strerror(err));
+                    }
+                    ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_id,
+                                                   0, 0, &dd->connector->connector_id, 1, &dd->mode);
+                    if (ret == 0) {
+                        windata->crtc_programmed = true;
+                    } else {
+                        SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
+                                     "KMSDRM: pageflip failed and modeset fallback failed: %s",
+                                     strerror(errno));
+                        present_ok = false;
+                    }
+                } else {
+                    SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: pageflip failed: %s", strerror(err));
+                    present_ok = false;
+                }
+            }
+        }
+    }
+
+    if (!present_ok) {
+        return SDL_SetError("KMSDRM: unable to present the frame to the scanout");
+    }
+    return true;
+}
+
+static bool kmsdrm_offload_ensure_surface(KMSDRM_DeviceData *dev, SDL_Window *window,
+                                        KMSDRM_WindowData *windata, KMSDRM_DisplayData *dd,
+                                        SDLOP_GLOffloadContext *octx)
+{
+    int w = (int)dd->mode.hdisplay;
+    int h = (int)dd->mode.vdisplay;
+
+    if (windata->gl_offload_surface && !windata->egl_surface_dirty) {
+        if (!windata->gl_offload_prime && !KMSDRM_EnsureSwScanout(window)) {
+            return false;
+        }
+        return true;
+    }
+
+    if (windata->gl_offload_prime || (!windata->gl_offload_surface && kmsdrm_can_try_prime(dev))) {
+        if (windata->gl_offload_surface) {
+            kmsdrm_release_prime_bos(windata);
+            if (!SDLOP_GLOffload_ResizeSurface(octx,
+                                               (SDLOP_GLOffloadSurface **)&windata->gl_offload_surface,
+                                               w, h)) {
+                SDLOP_GLOffload_DestroySurface((SDLOP_GLOffloadSurface *)windata->gl_offload_surface);
+                windata->gl_offload_surface = NULL;
+            }
+        } else if (kmsdrm_can_try_prime(dev)) {
+            windata->gl_offload_surface = SDLOP_GLOffload_CreatePrimeSurface(octx, w, h);
+        }
+        if (windata->gl_offload_surface &&
+            SDLOP_GLOffload_IsPrimeSurface((SDLOP_GLOffloadSurface *)windata->gl_offload_surface)) {
+            windata->gl_offload_prime = true;
+            windata->egl_surface_dirty = false;
+            return true;
+        }
+        windata->gl_offload_prime = false;
+    }
+
+    if (!KMSDRM_EnsureSwScanout(window)) {
+        return false;
+    }
+    if (!windata->gl_offload_surface) {
+        windata->gl_offload_surface = SDLOP_GLOffload_CreateSurface(octx, w, h);
+        if (!windata->gl_offload_surface) {
+            return false;
+        }
+    } else if (windata->egl_surface_dirty) {
+        if (!SDLOP_GLOffload_ResizeSurface(
+                octx,
+                (SDLOP_GLOffloadSurface **)&windata->gl_offload_surface,
+                w, h)) {
+            return false;
+        }
+    }
+    windata->egl_surface_dirty = false;
+    return true;
+}
+
 bool KMSDRM_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, void *context)
 {
     (void)device;
-    if (!egl_initialized && !ensure_egl_display()) {
-        return false;
-    }
     if (!context) {
-        SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (kmsdrm_use_offload) {
+            SDLOP_GLOffload_MakeCurrent(NULL, NULL);
+        }
+        if (egl_initialized) {
+            SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        }
         return true;
     }
     KMSDRMGLContext *glctx = (KMSDRMGLContext *)context;
+    if (glctx->is_offload) {
+        SDLOP_GLOffloadSurface *osurf = NULL;
+        if (window) {
+            KMSDRM_DeviceData *dev = vid();
+            KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
+            KMSDRM_DisplayData *dd = windata ? windata->display : NULL;
+            if (!windata || !dd) {
+                return SDL_SetError("Invalid window");
+            }
+            windata->gl_active = true;
+            windata->gl_offload_active = true;
+            windata->gl_offload_ctx = glctx->offload_ctx;
+            if (!kmsdrm_offload_ensure_surface(dev, window, windata, dd, glctx->offload_ctx)) {
+                return false;
+            }
+            osurf = (SDLOP_GLOffloadSurface *)windata->gl_offload_surface;
+        }
+        return SDLOP_GLOffload_MakeCurrent(glctx->offload_ctx, osurf);
+    }
+
+    if (!egl_initialized && !ensure_egl_display()) {
+        return false;
+    }
     if (!SDLOP_EGL_eglBindAPI(glctx->api)) {
         return SDL_SetError("eglBindAPI failed: 0x%x", SDLOP_EGL_eglGetError());
     }
@@ -695,6 +1253,126 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_SetError("KMSDRM: display disconnected (window has no live output)");
     }
 
+    if (windata->gl_offload_active) {
+        KMSDRMGLContext *cur = (KMSDRMGLContext *)SDLOP_GL_CurrentContext();
+        SDLOP_GLOffloadContext *octx = (cur && cur->is_offload)
+            ? cur->offload_ctx
+            : (SDLOP_GLOffloadContext *)windata->gl_offload_ctx;
+        if (!octx) {
+            return SDL_SetError("No offload GL context bound for swap");
+        }
+        if (windata->gl_offload_prime) {
+            if (windata->egl_surface_dirty || !windata->gl_offload_surface) {
+                if (!kmsdrm_offload_ensure_surface(dev, window, windata, dd, octx)) {
+                    return false;
+                }
+                if (cur && cur->is_offload &&
+                    !SDLOP_GLOffload_MakeCurrent(octx, (SDLOP_GLOffloadSurface *)windata->gl_offload_surface)) {
+                    return false;
+                }
+            }
+            if (windata->gl_offload_prime) {
+                if (windata->waiting_for_flip && !KMSDRM_WaitPageflip(dev, windata, 1500)) {
+                    return SDL_SetError("Wait for previous pageflip failed");
+                }
+                if (windata->prime_bo) {
+                    SDLOP_GLOffload_ReleasePrimeBO((SDLOP_GLOffloadSurface *)windata->gl_offload_surface,
+                                                   windata->prime_bo);
+                    windata->prime_bo = NULL;
+                }
+                windata->prime_bo = windata->prime_next_bo;
+                windata->prime_next_bo = SDLOP_GLOffload_SwapAndLockPrimeBO(
+                    octx, (SDLOP_GLOffloadSurface *)windata->gl_offload_surface);
+
+                KMSDRM_PrimeFBInfo *pfb = windata->prime_next_bo
+                    ? kmsdrm_prime_fb_from_bo(dev->drm_fd, windata->prime_next_bo)
+                    : NULL;
+                bool prime_ok = pfb != NULL &&
+                    kmsdrm_present_fb(dev, windata, pfb->fb_id,
+                                      !windata->prime_bo || !windata->crtc_programmed);
+                if (prime_ok) {
+                    return true;
+                }
+
+                /* PRIME import or scanout was rejected by the display controller:
+                 * permanently fall back to headless GPU readback -> dumb buffers. */
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                            "KMSDRM: PRIME BO scanout unavailable (%s); falling back to dumb-buffer readback",
+                            SDL_GetError());
+                kmsdrm_prime_disabled = true;
+                windata->gl_offload_prime = false;
+
+                bool salvaged = false;
+                if (KMSDRM_EnsureSwScanout(window) && windata->gl_offload_surface) {
+                    salvaged = SDLOP_GLOffload_ReadToXRGB8888(
+                        octx,
+                        (SDLOP_GLOffloadSurface *)windata->gl_offload_surface,
+                        windata->sw_map[windata->sw_draw],
+                        (int)windata->sw_pitch,
+                        (int)dd->mode.hdisplay,
+                        (int)dd->mode.vdisplay);
+                }
+
+                kmsdrm_release_prime_bos(windata);
+                if (windata->gl_offload_surface) {
+                    SDLOP_GLOffload_DestroySurface((SDLOP_GLOffloadSurface *)windata->gl_offload_surface);
+                    windata->gl_offload_surface = NULL;
+                }
+                if (!KMSDRM_EnsureSwScanout(window)) {
+                    return false;
+                }
+                windata->gl_offload_surface = SDLOP_GLOffload_CreateSurface(
+                    octx, (int)dd->mode.hdisplay, (int)dd->mode.vdisplay);
+                if (!windata->gl_offload_surface) {
+                    return false;
+                }
+                if (cur && cur->is_offload) {
+                    SDLOP_GLOffload_MakeCurrent(octx, (SDLOP_GLOffloadSurface *)windata->gl_offload_surface);
+                }
+                if (!salvaged) {
+                    return false;
+                }
+                return KMSDRM_PresentSw(dev, window);
+            }
+        }
+
+        if (!KMSDRM_EnsureSwScanout(window)) {
+            return false;
+        }
+        if (!windata->gl_offload_surface) {
+            windata->gl_offload_surface = SDLOP_GLOffload_CreateSurface(
+                octx, (int)dd->mode.hdisplay, (int)dd->mode.vdisplay);
+            if (!windata->gl_offload_surface) {
+                return false;
+            }
+            windata->egl_surface_dirty = false;
+        }
+        if (windata->waiting_for_flip && !KMSDRM_WaitPageflip(dev, windata, 1500)) {
+            return SDL_SetError("Wait for previous pageflip failed");
+        }
+        if (!SDLOP_GLOffload_ReadToXRGB8888(octx,
+                                            (SDLOP_GLOffloadSurface *)windata->gl_offload_surface,
+                                            windata->sw_map[windata->sw_draw],
+                                            (int)windata->sw_pitch,
+                                            (int)dd->mode.hdisplay,
+                                            (int)dd->mode.vdisplay)) {
+            return false;
+        }
+        if (!KMSDRM_PresentSw(dev, window)) {
+            return false;
+        }
+        if (windata->egl_surface_dirty) {
+            if (!SDLOP_GLOffload_ResizeSurface(
+                    octx,
+                    (SDLOP_GLOffloadSurface **)&windata->gl_offload_surface,
+                    (int)dd->mode.hdisplay, (int)dd->mode.vdisplay)) {
+                return false;
+            }
+            windata->egl_surface_dirty = false;
+        }
+        return true;
+    }
+
     /* switched away from this VT, or the mode changed: (re)create the
      * GBM/EGL scanout surfaces for the current mode */
     if (windata->egl_surface_dirty || !windata->gs || windata->egl_surface == EGL_NO_SURFACE) {
@@ -709,8 +1387,6 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
             return false;
         }
     }
-
-    uint32_t flip_flags = DRM_MODE_PAGE_FLIP_EVENT;
 
     /* wait for the previously issued flip before touching front buffers */
     if (!KMSDRM_WaitPageflip(dev, windata, 1500)) {
@@ -738,155 +1414,7 @@ bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_SetError("Could not get a framebuffer");
     }
 
-    bool present_ok = true;
-    int ret = 0;
-    const bool use_atomic = dd->atomic.available;
-    if (!windata->bo || !windata->crtc_programmed) {
-        /* first swap: the CRTC must be told what to scan out */
-        if (use_atomic) {
-            if (!KMSDRM_AtomicModeset(dev, dd, fb_info->fb_id)) {
-                int merr = errno;
-                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
-                            "KMSDRM: atomic modeset failed (%s); using legacy modeset for GL present",
-                            strerror(merr));
-                if (merr == EINVAL || merr == ENOSYS) {
-                    dd->atomic.available = false; /* stop trying atomic every frame */
-                }
-                ret = -1;
-            }
-        } else {
-            ret = -1; /* go straight to the legacy path below */
-        }
-        if (ret == 0) {
-            windata->crtc_programmed = true;
-        } else {
-            ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id, 0, 0,
-                                           &dd->connector->connector_id, 1, &dd->mode);
-            if (ret) {
-                return SDL_SetError("Could not set videomode on CRTC");
-            }
-            windata->crtc_programmed = true;
-        }
-    } else if (use_atomic) {
-        /* swap_interval 0 async flips are a legacy-path refinement; the
-         * atomic flip below is vsync'd (NONBLOCK without ASYNC), which is
-         * the conservative behavior for the GL path here */
-        (void)flip_flags;
-        ret = KMSDRM_AtomicFlip(dev, dd, fb_info->fb_id, &windata->waiting_for_flip);
-        if (ret == 0) {
-            windata->waiting_for_flip = true;
-            if (kmsdrm_double_buffer()) {
-                KMSDRM_WaitPageflip(dev, windata, 1500);
-            }
-        } else {
-            int err = errno;
-            if (err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {
-                ret = KMSDRM_AtomicFlip(dev, dd, fb_info->fb_id, &windata->waiting_for_flip);
-                if (ret == 0) {
-                    windata->waiting_for_flip = true;
-                }
-            }
-            if (ret != 0) {
-                if (is_permission_error(err)) {
-                    windata->lost_master = true;
-                    present_ok = false;
-                    SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: atomic flip lost DRM master");
-                } else {
-                    SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
-                                "KMSDRM: atomic flip failed (%s); using modeset for GL present",
-                                strerror(err));
-                    if (err == EINVAL || err == ENOSYS) {
-                        dd->atomic.available = false; /* stop trying atomic every frame */
-                    }
-                    ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
-                                                   0, 0, &dd->connector->connector_id, 1, &dd->mode);
-                    if (ret == 0) {
-                        windata->crtc_programmed = true;
-                    } else {
-                        SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
-                                     "KMSDRM: atomic flip failed and modeset fallback failed: %s",
-                                     strerror(errno));
-                        present_ok = false;
-                    }
-                }
-            }
-        }
-    } else {
-        if (swap_interval == 0 && dev->async_pageflip_support) {
-            flip_flags |= DRM_MODE_PAGE_FLIP_ASYNC;
-        }
-        ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
-                                        flip_flags, &windata->waiting_for_flip);
-        if (ret == 0) {
-            windata->waiting_for_flip = true;
-            /* immediate wait (SDL_HINT_VIDEO_DOUBLE_BUFFER) */
-            if (kmsdrm_double_buffer()) {
-                KMSDRM_WaitPageflip(dev, windata, 1500);
-            }
-        } else {
-            int err = errno;
-            if (err == EINVAL && (flip_flags & DRM_MODE_PAGE_FLIP_ASYNC)) {
-                /* some drivers claim async flips but can't (or fail
-                 * intermittently): retry synchronously without the async
-                 * flag (SDL3 commit 69dd29e) */
-                flip_flags &= ~DRM_MODE_PAGE_FLIP_ASYNC;
-                ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
-                                                flip_flags, &windata->waiting_for_flip);
-                err = errno;
-                if (ret == 0) {
-                    windata->waiting_for_flip = true;
-                    if (kmsdrm_double_buffer()) {
-                        KMSDRM_WaitPageflip(dev, windata, 1500);
-                    }
-                }
-            }
-            if (ret != 0 && err == EBUSY && KMSDRM_WaitPageflip(dev, windata, 1500)) {
-                ret = SDLOP_DRM_drmModePageFlip(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
-                                                flip_flags, &windata->waiting_for_flip);
-                if (ret == 0) {
-                    windata->waiting_for_flip = true;
-                    ret = 0;
-                }
-            }
-            if (ret != 0) {
-                if (is_permission_error(err)) {
-                    windata->lost_master = true;
-                    present_ok = false;
-                    SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: pageflip lost DRM master");
-                } else if (err == EINVAL || err == ENOSYS || err == EBUSY) {
-                    /* this driver cannot page flip right now (e.g. virtio-gpu
-                     * 2D: the flip ioctl always returns EBUSY, even with a
-                     * flip event requested), so present with a modeset like
-                     * the software path does instead of leaving the CRTC on a
-                     * stale framebuffer */
-                    if (err == EINVAL || err == ENOSYS) {
-                        dev->no_flip = true;
-                        SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
-                                    "KMSDRM: pageflip unsupported (%s); using modeset for GL present",
-                                    strerror(err));
-                    }
-                    ret = SDLOP_DRM_drmModeSetCrtc(dev->drm_fd, dd->crtc->crtc_id, fb_info->fb_id,
-                                                   0, 0, &dd->connector->connector_id, 1, &dd->mode);
-                    if (ret == 0) {
-                        windata->crtc_programmed = true;
-                    } else {
-                        SDL_LogError(SDL_LOG_CATEGORY_VIDEO,
-                                     "KMSDRM: pageflip failed and modeset fallback failed: %s",
-                                     strerror(errno));
-                        present_ok = false;
-                    }
-                } else {
-                    SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: pageflip failed: %s", strerror(err));
-                    present_ok = false;
-                }
-            }
-        }
-    }
-
-    if (!present_ok) {
-        return SDL_SetError("KMSDRM: unable to present the frame to the scanout");
-    }
-    return true;
+    return kmsdrm_present_fb(dev, windata, fb_info->fb_id, !windata->bo || !windata->crtc_programmed);
 }
 
 void KMSDRM_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
@@ -894,6 +1422,11 @@ void KMSDRM_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
     (void)device;
     KMSDRMGLContext *glctx = (KMSDRMGLContext *)context;
     if (!glctx) {
+        return;
+    }
+    if (glctx->is_offload) {
+        SDLOP_GLOffload_DeleteContext(glctx->offload_ctx);
+        free(glctx);
         return;
     }
     if (egl_initialized) {
@@ -906,7 +1439,16 @@ void KMSDRM_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
 SDL_FunctionPointer KMSDRM_GL_GetProcAddress(SDLop_VideoDevice *device, const char *proc)
 {
     (void)device;
+    if (kmsdrm_offload_decided && kmsdrm_use_offload) {
+        return SDLOP_GLOffload_GetProcAddress(proc);
+    }
     if (!egl_initialized && !ensure_egl_display()) {
+        if (SDLOP_GLOffload_GetPolicy() != SDLOP_GL_OFFLOAD_NEVER) {
+            SDLOP_GLOffload_SetPreferGBM(true);
+            if (SDLOP_GLOffload_HasHardwareGPU()) {
+                return SDLOP_GLOffload_GetProcAddress(proc);
+            }
+        }
         return NULL;
     }
     SDL_FunctionPointer fn = SDLOP_EGL_eglGetProcAddress(proc);
@@ -936,8 +1478,7 @@ bool KMSDRM_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval)
     return true;
 }
 
-/* used by the driver core when the LAST GL window is destroyed */
-void KMSDRM_GL_Deinit(void)
+static void kmsdrm_native_gl_deinit(void)
 {
     if (egl_initialized) {
         SDLOP_EGL_eglTerminate(egl_display);
@@ -947,11 +1488,38 @@ void KMSDRM_GL_Deinit(void)
     }
     KMSDRM_DeviceData *dev = vid();
     if (dev->gbm_dev) {
+        /* Cursor BOs are created from this device but outlive GL contexts (they
+         * are display state, not window state). Drop them before the device so
+         * driver teardown does not call gbm_bo_destroy() on a dangling BO whose
+         * parent device is already gone. */
+        for (int i = 0; i < dev->num_displays; i++) {
+            KMSDRM_DisplayData *dd = &dev->displays[i];
+            if (!dd->cursor_bo) {
+                continue;
+            }
+            if (dd->atomic_cursor.fb_id && SDLOP_DRM_drmModeRmFB) {
+                SDLOP_DRM_drmModeRmFB(dev->drm_fd, dd->atomic_cursor.fb_id);
+            }
+            dd->atomic_cursor.fb_id = 0;
+            dd->cursor_visible = false;
+            SDLOP_GBM_gbm_bo_destroy(dd->cursor_bo);
+            dd->cursor_bo = NULL;
+        }
         SDLOP_GBM_gbm_device_destroy(dev->gbm_dev);
         dev->gbm_dev = NULL;
         dev->gbm_init = false;
         SDLOP_GBM_UnloadSymbols();
     }
+}
+
+/* used by the driver core when the LAST GL window is destroyed */
+void KMSDRM_GL_Deinit(void)
+{
+    kmsdrm_native_gl_deinit();
+    SDLOP_GLOffload_Shutdown();
+    kmsdrm_offload_decided = false;
+    kmsdrm_use_offload = false;
+    kmsdrm_prime_disabled = false;
     swap_interval = 1;
 }
 

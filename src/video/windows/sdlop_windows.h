@@ -43,6 +43,10 @@ typedef struct SDLop_Win32WindowData
 
     HICON icon;
 
+    /* The clip rect we set, so we only release our own (SDL3 keeps the same
+     * bookkeeping: cursor_clipped_rect). Zero means "not clipping". */
+    RECT cursor_clipped_rect;
+
     /* WGL (sdlop_windows_gl.c) */
     HGLRC gl_context;      /* the implicit context used for wglGetProcAddress */
     bool gl_context_owned; /* created here, must be deleted here */

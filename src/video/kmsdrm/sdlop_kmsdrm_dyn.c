@@ -23,6 +23,9 @@
 #define SDLOP_DRM_ATOMIC_SYM(rc, fn, params) SDLOP_DYNADRM_##fn SDLOP_DRM_ATOMIC_##fn = NULL;
 #include "sdlop_kmsdrm_sym.h"
 #undef SDLOP_DRM_ATOMIC_SYM
+#define SDLOP_DRM_OPT_SYM(rc, fn, params) SDLOP_DYNODRM_##fn SDLOP_DRM_OPT_##fn = NULL;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_OPT_SYM
 static bool atomic_available = false;
 
 static void *drm_lib = NULL;
@@ -35,7 +38,7 @@ bool SDLOP_KMSDRM_LoadSymbols(void)
         return true;
     }
 
-    const char *libname = getenv("SDLOP_LIB_DRM");
+    const char *libname = SDL_GetHint("SDLOP_LIB_DRM");
     if (!libname || !libname[0]) {
         libname = "libdrm.so.2";
     }
@@ -66,6 +69,9 @@ bool SDLOP_KMSDRM_LoadSymbols(void)
 #define SDLOP_DRM_ATOMIC_SYM(rc, fn, params) SDLOP_DRM_ATOMIC_##fn = NULL;
 #include "sdlop_kmsdrm_sym.h"
 #undef SDLOP_DRM_ATOMIC_SYM
+#define SDLOP_DRM_OPT_SYM(rc, fn, params) SDLOP_DRM_OPT_##fn = NULL;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_OPT_SYM
         atomic_available = false;
         dlclose(drm_lib);
         drm_lib = NULL;
@@ -92,6 +98,12 @@ bool SDLOP_KMSDRM_LoadSymbols(void)
         }
     }
 
+    /* optional PRIME symbols: checked individually by callers */
+#define SDLOP_DRM_OPT_SYM(rc, fn, params) \
+    SDLOP_DRM_OPT_##fn = (SDLOP_DYNODRM_##fn)(uintptr_t)dlsym(drm_lib, #fn);
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_OPT_SYM
+
     drm_load_refcount = 1;
     return true;
 }
@@ -109,6 +121,9 @@ void SDLOP_KMSDRM_UnloadSymbols(void)
 #define SDLOP_DRM_ATOMIC_SYM(rc, fn, params) SDLOP_DRM_ATOMIC_##fn = NULL;
 #include "sdlop_kmsdrm_sym.h"
 #undef SDLOP_DRM_ATOMIC_SYM
+#define SDLOP_DRM_OPT_SYM(rc, fn, params) SDLOP_DRM_OPT_##fn = NULL;
+#include "sdlop_kmsdrm_sym.h"
+#undef SDLOP_DRM_OPT_SYM
     atomic_available = false;
     dlclose(drm_lib);
     drm_lib = NULL;
@@ -134,7 +149,7 @@ bool SDLOP_GBM_LoadSymbols(void)
         return gbm_usable;
     }
 
-    const char *libname = getenv("SDLOP_LIB_GBM");
+    const char *libname = SDL_GetHint("SDLOP_LIB_GBM");
     if (!libname || !libname[0]) {
         libname = "libgbm.so.1";
     }

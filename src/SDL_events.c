@@ -530,6 +530,8 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
     if (window && type == SDL_EVENT_WINDOW_MOVED) {
         SDLOP_UpdateWindowDisplay(window);
         SDLOP_OnWindowMoved(window);
+    } else if (window && type == SDL_EVENT_WINDOW_RESIZED) {
+        SDLOP_GL_NotifyWindowResized(window);
     }
     /* SDL_OnWindowFocusGained/Lost: grabs only hold while focused */
     if (window && (type == SDL_EVENT_WINDOW_FOCUS_GAINED || type == SDL_EVENT_WINDOW_FOCUS_LOST) &&

@@ -45,6 +45,14 @@
 #define DRM_CAP_CURSOR_HEIGHT   9
 #endif
 
+#ifndef DRM_CAP_PRIME
+#define DRM_CAP_PRIME           0x0au
+#endif
+
+#ifndef DRM_PRIME_CAP_IMPORT
+#define DRM_PRIME_CAP_IMPORT    0x1u
+#endif
+
 #ifndef DRM_FORMAT_XRGB8888
 #define DRM_FORMAT_XRGB8888 0x34325258u /* 'XR24' */
 #endif
@@ -88,6 +96,8 @@ typedef struct KMSDRM_DisplayData
     uint32_t cursor_dumb;
     uint32_t cursor_dumb_size;
     uint8_t *cursor_map;
+    uint32_t *cursor_shadow;        /* premultiplied ARGB copy for software fallback */
+    size_t cursor_shadow_size;
     uint64_t cursor_w, cursor_h;
     int32_t cursor_hot_x, cursor_hot_y;
     bool cursor_visible;
@@ -122,9 +132,16 @@ typedef struct KMSDRM_WindowData
     void *sw_map[2];                /* mmap'd dumb buffers */
     int sw_draw;                    /* index of the buffer the app draws into */
     int sw_front;                   /* index of the buffer programmed/flipped to the CRTC (-1: none yet) */
+    bool sw_cursor_blended;         /* software cursor already drawn into sw_draw */
 
     /* ---- GL (GBM) scanout ---- */
     bool gl_active;
+    bool gl_offload_active;         /* headless GPU GL offload active */
+    bool gl_offload_prime;          /* offload uses PRIME linear BO scanout */
+    void *gl_offload_surface;       /* SDLOP_GLOffloadSurface* */
+    void *gl_offload_ctx;           /* SDLOP_GLOffloadContext* last bound */
+    struct gbm_bo *prime_bo;        /* locked PRIME BO currently on CRTC */
+    struct gbm_bo *prime_next_bo;   /* locked PRIME BO pending/next */
     struct gbm_surface *gs;
     struct gbm_bo *bo;              /* buffer currently on screen */
     struct gbm_bo *next_bo;         /* buffer pending front-buffer lock */
@@ -162,6 +179,7 @@ typedef struct KMSDRM_DeviceData
     struct gbm_device *gbm_dev;
     bool gbm_init;
     bool video_init;
+    bool vt_active;                 /* false between VT_RELDISP and the acquire signal */
     bool async_pageflip_support;
     bool no_flip;                   /* SDLOP_KMSDRM_NOFLIP=1: always modeset instead of page flip */
 } KMSDRM_DeviceData;
@@ -176,6 +194,8 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window, const
 
 KMSDRM_DeviceData *KMSDRM_GetDevice(void);
 void KMSDRM_DestroySwScanout(SDL_Window *window);
+bool KMSDRM_EnsureSwScanout(SDL_Window *window);
+bool KMSDRM_PresentSw(KMSDRM_DeviceData *vid, SDL_Window *window);
 /* Hotplug: re-scan connected connectors; add/remove core displays.
  * No-op unless hotplug_fd is open and a drm uevent arrived. */
 void KMSDRM_HotplugCheck(KMSDRM_DeviceData *vid);

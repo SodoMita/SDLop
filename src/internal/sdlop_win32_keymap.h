@@ -29,6 +29,12 @@
  * SDL3's "the keycode reports what the key would type" rule. */
 SDL_Keycode SDLOP_Win32KeyFromVK(Uint32 vk, SDL_Keymod modstate);
 
+/* Windows scan code -> SDL_Scancode, for the WM_KEYDOWN path. `scan_code` is
+ * the hardware code from lParam bits 16-23, widened to 0xE0xx for an extended
+ * key (KF_EXTENDED); 0xE046 is Pause. The mapping is stock SDL3's table, and
+ * SDL_Scancode uses USB HID numbering, so it is never the identity. */
+SDL_Scancode SDLOP_Win32ScancodeFromScan(Uint16 scan_code);
+
 /* Character a key produces with the given modifiers, for SDL_GetKeyFromName
  * style helpers; 0 when the key has no character. */
 Uint32 SDLOP_Win32CharFromVK(Uint32 vk, bool shifted);

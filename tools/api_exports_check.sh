@@ -33,7 +33,16 @@ else
     nm -D --defined-only "$SO" | awk '$2=="T" || $2=="i" {sub(/@.*/,"",$3); print $3}' \
         | sort -u > "$tmp/exported"
 fi
+cp "$tmp/exported" "$tmp/all_exported"
 grep -E '^SDL_' "$tmp/exported" > "$tmp/exported.sdl" && mv "$tmp/exported.sdl" "$tmp/exported"
+
+# SDLop's own API (SDLop.h: "extern <type> SDLop_Name(") must be exported too
+tr '\n' ' ' < "$INC/SDL3/SDLop.h" | grep -oE 'extern [^;(]*[ *]SDLop_[A-Za-z0-9_]+ *\(' \
+    | sed -E 's/.*(SDLop_[A-Za-z0-9_]+) *\(/\1/' | sort -u > "$tmp/sdlop_declared" || true
+# the same export list as above, so a PE build checks SDLop_* too
+grep -E '^SDLop_' "$tmp/all_exported" | sort -u > "$tmp/sdlop_exported" || true
+sdlop_missing=$(comm -23 "$tmp/sdlop_declared" "$tmp/sdlop_exported")
+sdlop_extra=$(comm -13 "$tmp/sdlop_declared" "$tmp/sdlop_exported")
 
 missing=$(comm -23 "$tmp/declared" "$tmp/exported")
 extra=$(comm -13 "$tmp/declared" "$tmp/exported")
@@ -43,10 +52,24 @@ if [ -n "$missing" ]; then
     printf '  %s\n' $missing >&2
     status=1
 fi
+if [ -n "$sdlop_missing" ]; then
+    echo "api_exports_check: FAIL - SDLop.h functions not exported:" >&2
+    printf '  %s\n' $sdlop_missing >&2
+    status=1
+fi
+if [ -n "$sdlop_extra" ]; then
+    echo "api_exports_check: FAIL - SDLop_* symbols exported but not declared in SDLop.h:" >&2
+    printf '  %s\n' $sdlop_extra >&2
+    status=1
+fi
+if [ -z "$(cat "$tmp/sdlop_declared")" ]; then
+    echo "api_exports_check: FAIL - no SDLop_* declarations found in SDLop.h (parser broken?)" >&2
+    status=1
+fi
 if [ -n "$extra" ]; then
     echo "api_exports_check: FAIL - exported but not declared in the headers:" >&2
     printf '  %s\n' $extra >&2
     status=1
 fi
-[ $status -eq 0 ] && echo "api_exports_check: PASS ($(wc -l < "$tmp/declared") functions declared and exported)"
+[ $status -eq 0 ] && echo "api_exports_check: PASS ($(wc -l < "$tmp/declared") SDL_* + $(wc -l < "$tmp/sdlop_declared") SDLop_* functions declared and exported)"
 exit $status

@@ -5,6 +5,7 @@
 # 128-byte block at exit, not reproducible with Debian 12's Mesa 22).
 leak:libvulkan_lvp.so
 leak:libvulkan.so
+leak:libVkLayer_khronos_validation.so
 leak:libLLVM
 leak:libgallium
 leak:libEGL_mesa.so

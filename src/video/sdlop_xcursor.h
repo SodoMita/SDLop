@@ -1,5 +1,5 @@
 /*
-  SDLop - XCursor theme loading for the KMSDRM driver.
+  SDLop - shared XCursor theme loading for console video drivers.
 
   Adapted from swa (github.com/nyorain/swa, src/swa/kms/xcursor.c),
   which in turn combines code from:
@@ -21,6 +21,9 @@
 #ifndef sdlop_xcursor_h_
 #define sdlop_xcursor_h_
 
+#include <SDL3/SDL.h>
+
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -64,6 +67,31 @@ struct sdlop_xcursor *sdlop_xcursor_theme_get_cursor(struct sdlop_xcursor_theme 
 int sdlop_xcursor_frame(struct sdlop_xcursor *cursor, uint32_t time);
 int sdlop_xcursor_frame_and_duration(struct sdlop_xcursor *cursor, uint32_t time,
                                      uint32_t *duration);
+
+/* One premultiplied ARGB8888 cursor image, shared by the console drivers so
+ * KMSDRM and fbdev draw exactly the same pointer. Pixels returned by
+ * sdlop_system_cursor_bitmap_fit() are owned by the theme loader and stay
+ * valid until sdlop_cursor_theme_quit(); sdlop_cursor_bitmap_from_surface()
+ * returns a caller-owned copy instead. */
+struct sdlop_cursor_bitmap {
+    int w, h;
+    int hot_x, hot_y;
+    const uint32_t *pixels; /* premultiplied ARGB8888, packed rows */
+};
+
+/* Returns the first frame of the system cursor from the XCursor theme, with
+ * the same built-in arrow fallback for both drivers. max_w/max_h may be 0
+ * when there is no hardware limit; an image that does not fit falls back to
+ * the built-in arrow. */
+const struct sdlop_cursor_bitmap *sdlop_system_cursor_bitmap_fit(SDL_SystemCursor id,
+                                                                 int max_w, int max_h);
+const struct sdlop_cursor_bitmap *sdlop_builtin_cursor_bitmap(void);
+
+/* Premultiplies a color cursor once into `out`. *owned receives the pixel
+ * allocation (free it with SDL_free); out->pixels borrows it. */
+bool sdlop_cursor_bitmap_from_surface(SDL_Surface *surface, int hot_x, int hot_y,
+                                      struct sdlop_cursor_bitmap *out, uint32_t **owned);
+void sdlop_cursor_theme_quit(void);
 
 #ifdef __cplusplus
 }

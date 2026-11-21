@@ -79,6 +79,10 @@ int main(int argc, char **argv)
         return 0;
     }
     SDL_setenv_unsafe("SDL_VIDEODRIVER", driver, 1);
+    /* X11 uses GLX for desktop GL and, with GLX_EXT_create_context_es_profile,
+     * for ES too (like stock): SDL_EGL_* are NULL there. Ask for EGL, as a
+     * stock SDL3 application that uses SDL_EGL_* on X11 has to. */
+    SDL_SetHint(SDL_HINT_VIDEO_FORCE_EGL, "1");
 
     /* before SDL_Init: everything reports an error, nothing crashes */
     CHECK(SDL_EGL_GetCurrentDisplay() == NULL, "no display before init");

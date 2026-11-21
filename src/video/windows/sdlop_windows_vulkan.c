@@ -74,8 +74,11 @@ bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *windo
             return SDL_SetError("Vulkan isn't available (couldn't load vulkan-1.dll)");
         }
     }
-    PFN_vkCreateWin32SurfaceKHR create =
-        (PFN_vkCreateWin32SurfaceKHR)GetProcAddress(vulkan_lib, "vkCreateWin32SurfaceKHR");
+    /* GetProcAddress returns FARPROC; the cast is unavoidable, so make the
+     * intermediate step explicit rather than casting function type to
+     * function type (which is what -Wcast-function-type dislikes). */
+    void *entry = (void *)(uintptr_t)GetProcAddress(vulkan_lib, "vkCreateWin32SurfaceKHR");
+    PFN_vkCreateWin32SurfaceKHR create = (PFN_vkCreateWin32SurfaceKHR)entry;
     if (!create) {
         return SDL_SetError("vkCreateWin32SurfaceKHR is missing from the Vulkan loader");
     }

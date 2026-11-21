@@ -16,6 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(SDLop_BUILD_EXAMPLES "Build SDLop examples" ON)
 option(SDLop_BUILD_TESTS "Build SDLop tests" ON)
 option(SDLop_BUILD_BENCHMARKS "Build SDLop benchmarks (incl. SDL3 comparison)" ON)
+option(SDLop_BUILD_TOOLS "Build developer tools (wl_injector, behaviour probes)" ${SDLop_BUILD_TESTS})
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -30,7 +31,6 @@ add_compile_options(-Wall -Wextra)
 if(EMSCRIPTEN)
   set(SDLop_WEB_SOURCES
     src/SDLop_core.c
-    src/internal/sdlop_platform.c
     src/SDL_stdlib.c
     src/SDL_error.c
     src/SDL_log.c
@@ -43,6 +43,8 @@ if(EMSCRIPTEN)
     src/SDL_clipboard.c
     src/SDL_thread.c
     src/SDL_misc.c
+    src/SDL_joystick.c
+    src/SDL_filesystem.c
     src/SDL_main.c
     src/SDL_rect.c
     src/SDL_pixels.c
@@ -126,6 +128,8 @@ endif()
 # below.
 # ---------------------------------------------------------------------------
 if(NOT WIN32)
+  # Everything below needs pkg-config and POSIX system libraries; the
+  # Windows build links only Win32 system libraries (see further down).
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
   pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
@@ -200,7 +204,8 @@ if(NOT WIN32)
     "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
     "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
     "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
-    "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml")
+    "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml"
+    "viewporter|stable/viewporter/viewporter.xml")
   set(SDLOP_WL_EXTRA_OUTPUTS)
   foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
     string(REPLACE "|" ";" parts "${entry}")
@@ -231,6 +236,16 @@ if(NOT WIN32)
     DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 
   add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/viewporter-server-protocol.h ${WL_GEN_DIR}/viewporter-server-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+            ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+            ${WL_GEN_DIR}/viewporter-server-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+            ${WL_GEN_DIR}/viewporter-server-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml)
+
+  add_custom_command(
     OUTPUT ${WL_GEN_DIR}/pointer-constraints-server-protocol.h ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
     COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
             ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
@@ -250,6 +265,31 @@ if(NOT WIN32)
             ${WL_GEN_DIR}/relative-pointer-server-protocol.c
     DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
 
+  # wlr virtual-pointer / zwp virtual-keyboard (vendored XMLs, not part of
+  # wayland-protocols): used only by test_virtual_input and the developer
+  # tools, generated on demand when one of them is built
+  set(SDLOP_WL_VIRTUAL_POINTER_XML ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml)
+  set(SDLOP_WL_VIRTUAL_KEYBOARD_XML ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
+  if (EXISTS ${SDLOP_WL_VIRTUAL_POINTER_XML} AND EXISTS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
+    set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS ON)
+    add_custom_command(
+      OUTPUT ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_POINTER_XML}
+              ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_POINTER_XML}
+              ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+      DEPENDS ${SDLOP_WL_VIRTUAL_POINTER_XML})
+    add_custom_command(
+      OUTPUT ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
+              ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h
+      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
+              ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+      DEPENDS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
+  else()
+    set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS OFF)
+  endif()
+
   add_custom_target(sdlop_wayland_protocols
     DEPENDS ${WL_GEN_DIR}/wayland-client-protocol.h
             ${WL_GEN_DIR}/xdg-shell-client-protocol.h
@@ -265,192 +305,208 @@ if(NOT WIN32)
             ${WL_GEN_DIR}/relative-pointer-server-protocol.h
             ${WL_GEN_DIR}/relative-pointer-server-protocol.c
             ${SDLOP_WL_EXTRA_OUTPUTS})
+endif()
 
-  # ---------------------------------------------------------------------------
-  # Library
-  # ---------------------------------------------------------------------------
-  set(SDLop_SOURCES
-    src/SDLop_core.c
-    src/internal/sdlop_platform.c
+# ---------------------------------------------------------------------------
+# Library
+# ---------------------------------------------------------------------------
+set(SDLop_SOURCES
+  src/SDLop_core.c
+  src/internal/sdlop_platform.c
+  src/SDL_stdlib.c
+  src/SDL_error.c
+  src/SDL_log.c
+  src/SDL_timer.c
+  src/SDL_events.c
+  src/SDL_properties.c
+  src/SDL_hints.c
+  src/SDL_events_desc.c
+  src/SDL_events_categories.c
+  src/SDL_clipboard.c
+  src/SDL_thread.c
+  src/SDL_misc.c
+  src/SDL_joystick.c
+  src/SDL_filesystem.c
+  src/SDL_main.c
+  src/SDL_rect.c
+  src/SDL_pixels.c
+  src/SDL_blit.c
+  src/SDL_blit_float.c
+  src/SDL_rotate.c
+  src/SDL_keyboard.c
+  src/SDL_keynames.c
+  src/SDL_mouse.c
+  src/SDL_devices.c
+  src/SDL_video.c
+  src/SDL_surface.c
+  src/SDL_gl.c
+  src/SDL_vulkan.c
+  src/internal/sdlop_evdev.c
+  src/sdlop_xkb_dyn.c
+  src/video/sdlop_gl_offload.c
+  src/video/sdlop_vk_offload.c
+  src/video/sdlop_egl_dyn.c
+  src/video/wayland/sdlop_wayland.c
+  src/video/wayland/sdlop_wayland_dyn.c
+  src/video/wayland/sdlop_wayland_gl.c
+  src/video/wayland/sdlop_wayland_vulkan.c
+  src/video/wayland/sdlop_wayland_protos.c
+  src/video/kmsdrm/sdlop_kmsdrm.c
+  src/video/kmsdrm/sdlop_kmsdrm_atomic.c
+  src/video/kmsdrm/sdlop_kmsdrm_dyn.c
+  src/video/kmsdrm/sdlop_kmsdrm_gl.c
+  src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
+  src/video/sdlop_xcursor.c
+  src/video/fbdev/sdlop_fbdev.c
+  src/video/dummy/sdlop_dummy.c
+)
+set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
+
+if(WIN32)
+  # The Win32 driver, the POSIX-name shims it needs, and the VK -> SDL3
+  # keycode table. Everything above is POSIX-only and is filtered out below.
+  list(APPEND SDLop_SOURCES
     src/internal/sdlop_win32_compat.c
-    src/SDL_stdlib.c
-    src/SDL_error.c
-    src/SDL_log.c
-    src/SDL_timer.c
-    src/SDL_events.c
-    src/SDL_properties.c
-    src/SDL_hints.c
-    src/SDL_events_desc.c
-    src/SDL_events_categories.c
-    src/SDL_clipboard.c
-    src/SDL_thread.c
-    src/SDL_misc.c
-    src/SDL_main.c
-    src/SDL_rect.c
-    src/SDL_pixels.c
-    src/SDL_blit.c
-    src/SDL_blit_float.c
-    src/SDL_rotate.c
-    src/SDL_keyboard.c
-    src/SDL_keynames.c
-    src/SDL_mouse.c
-    src/SDL_devices.c
-    src/SDL_video.c
-    src/SDL_surface.c
-    src/SDL_gl.c
-    src/SDL_vulkan.c
-    src/internal/sdlop_evdev.c
-    src/sdlop_xkb_dyn.c
-    src/internal/sdlop_evdev.c
-    src/sdlop_xkb_dyn.c
+    src/internal/sdlop_rawinput_win32.c
+    src/SDL_win32_keymap.c
+    src/video/windows/sdlop_windows.c
+    src/video/windows/sdlop_windows_gl.c
+    src/video/windows/sdlop_windows_vulkan.c
+    src/video/sdlop_gl_offload_win32.c
+    src/video/sdlop_vk_offload_win32.c)
+  list(REMOVE_ITEM SDLop_SOURCES
     src/video/wayland/sdlop_wayland.c
     src/video/wayland/sdlop_wayland_dyn.c
-    src/video/wayland/sdlop_egl_dyn.c
+    src/video/wayland/sdlop_wayland_protos.c
     src/video/wayland/sdlop_wayland_gl.c
     src/video/wayland/sdlop_wayland_vulkan.c
-    src/video/wayland/sdlop_wayland_protos.c
     src/video/kmsdrm/sdlop_kmsdrm.c
     src/video/kmsdrm/sdlop_kmsdrm_atomic.c
     src/video/kmsdrm/sdlop_kmsdrm_dyn.c
     src/video/kmsdrm/sdlop_kmsdrm_gl.c
     src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
-    src/video/kmsdrm/sdlop_xcursor.c
     src/video/fbdev/sdlop_fbdev.c
-    src/video/dummy/sdlop_dummy.c
-  )
-  set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
-  if(SDLOP_VIDEO_X11)
-    list(APPEND SDLop_SOURCES
-      src/video/x11/sdlop_x11.c
-      src/video/x11/sdlop_x11_dyn.c
-      src/video/x11/sdlop_x11_gl.c
-      src/video/x11/sdlop_x11_vulkan.c)
-    list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
-  endif()
-
-  # SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
-  # at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
-  # where those libraries are absent.
-  set(SDLop_LIB_DEPS
-    pthread
-    dl
-    m)
-  # dlopen-ed at run time - the core targets link none of these libraries.
-  # Only their header search paths are needed.
-  set(SDLop_LIB_INCS
-    ${WAYLAND_CLIENT_INCLUDE_DIRS}
-    ${XKBCOMMON_INCLUDE_DIRS}
-    ${EGL_INCLUDE_DIRS}
-    ${GBM_INCLUDE_DIRS}
-    ${LIBDRM_INCLUDE_DIRS}
-    ${X11_XCB_INCLUDE_DIRS})
-
-  add_library(sdlop STATIC ${SDLop_SOURCES})
-  add_library(SDLop::SDLop ALIAS sdlop)
-  add_dependencies(sdlop sdlop_wayland_protocols)
-
-  target_include_directories(sdlop PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-  target_include_directories(sdlop PRIVATE
-    src
-    src/video/wayland
-    src/video/kmsdrm
-    ${WL_GEN_DIR}
-    ${SDLop_LIB_INCS})
-  target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
-  target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
-
-  add_library(sdlop_shared SHARED ${SDLop_SOURCES})
-  add_dependencies(sdlop_shared sdlop_wayland_protocols)
-  set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
-  target_include_directories(sdlop_shared PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-  target_include_directories(sdlop_shared PRIVATE
-    src
-    src/video/wayland
-    src/video/kmsdrm
-    ${WL_GEN_DIR}
-    ${SDLop_LIB_INCS})
-  target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
-  target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
-else()
-  # -------------------------------------------------------------------
-  # Windows (MinGW-w64 / MSVC): core sources plus the Win32 video driver.
-  # There is no dlopen: the driver links user32/gdi32/opengl32/dwmapi
-  # directly, and Vulkan/WGL are loaded at run time by the driver itself.
-  # -------------------------------------------------------------------
-  set(SDLop_SOURCES
-    src/SDLop_core.c
-    src/internal/sdlop_platform.c
-    src/internal/sdlop_win32_compat.c
-    src/SDL_stdlib.c
-    src/SDL_error.c
-    src/SDL_log.c
-    src/SDL_timer.c
-    src/SDL_events.c
-    src/SDL_properties.c
-    src/SDL_hints.c
-    src/SDL_events_desc.c
-    src/SDL_events_categories.c
-    src/SDL_clipboard.c
-    src/SDL_thread.c
-    src/SDL_misc.c
-    src/SDL_main.c
-    src/SDL_rect.c
-    src/SDL_pixels.c
-    src/SDL_blit.c
-    src/SDL_blit_float.c
-    src/SDL_rotate.c
-    src/SDL_keyboard.c
-    src/SDL_keynames.c
-    src/SDL_win32_keymap.c
-    src/SDL_mouse.c
-    src/SDL_devices.c
-    src/SDL_video.c
-    src/SDL_surface.c
-    src/SDL_gl.c
-    src/SDL_vulkan.c
-    src/video/windows/sdlop_windows.c
-    src/video/windows/sdlop_windows_gl.c
-    src/video/windows/sdlop_windows_vulkan.c
-    src/video/dummy/sdlop_dummy.c)
+    src/video/sdlop_evdev.c
+    src/video/sdlop_xcursor.c
+    src/internal/sdlop_evdev.c
+    src/sdlop_xkb_dyn.c
+    src/video/sdlop_egl_dyn.c
+    src/video/sdlop_gl_offload.c
+    src/video/sdlop_vk_offload.c)
   set(SDLop_VIDEO_DEFS SDLop_VIDEO_WINDOWS=1)
+endif()
+if(SDLOP_VIDEO_X11)
+  list(APPEND SDLop_SOURCES
+    src/video/x11/sdlop_x11.c
+    src/video/x11/sdlop_x11_dyn.c
+    src/video/x11/sdlop_x11_gl.c
+    src/video/x11/sdlop_x11_vulkan.c)
+  list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+endif()
+
+# SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
+# at runtime, NOT linked - SDLop loads (and its other drivers work) on systems
+# where those libraries are absent.
+if(WIN32)
+  # dlopen/pthread are emulated on Win32; these are the system libraries the
+  # Win32 driver and the compat layer call into.
   set(SDLop_LIB_DEPS
     user32
     gdi32
+    opengl32
     shell32
     ole32
     uuid
     version
     imm32
     winmm
-    opengl32
     dwmapi
     setupapi)
-  set(SDLop_LIB_INCS)
+else()
+  set(SDLop_LIB_DEPS
+    pthread
+    dl
+    m)
+endif()
+# dlopen-ed at run time - the core targets link none of these libraries.
+# Only their header search paths are needed.
+set(SDLop_LIB_INCS
+  ${WAYLAND_CLIENT_INCLUDE_DIRS}
+  ${XKBCOMMON_INCLUDE_DIRS}
+  ${EGL_INCLUDE_DIRS}
+  ${GBM_INCLUDE_DIRS}
+  ${LIBDRM_INCLUDE_DIRS}
+  ${X11_XCB_INCLUDE_DIRS})
 
-  add_library(sdlop STATIC ${SDLop_SOURCES})
-  add_library(SDLop::SDLop ALIAS sdlop)
-  target_include_directories(sdlop PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-  target_include_directories(sdlop PRIVATE src)
-  target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
-  target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
+add_library(sdlop STATIC ${SDLop_SOURCES})
+add_library(SDLop::SDLop ALIAS sdlop)
+if(NOT WIN32)
+  add_dependencies(sdlop sdlop_wayland_protocols)
+endif()
 
-  add_library(sdlop_shared SHARED ${SDLop_SOURCES})
-  set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
-  target_include_directories(sdlop_shared PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-  target_include_directories(sdlop_shared PRIVATE src)
-  target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
-  target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
+target_include_directories(sdlop PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_include_directories(sdlop PRIVATE
+  src
+  src/video/wayland
+  src/video/kmsdrm
+  ${WL_GEN_DIR}
+  ${SDLop_LIB_INCS})
+target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
+target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
+
+add_library(sdlop_shared SHARED ${SDLop_SOURCES})
+if(NOT WIN32)
+  add_dependencies(sdlop_shared sdlop_wayland_protocols)
+endif()
+set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
+target_include_directories(sdlop_shared PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_include_directories(sdlop_shared PRIVATE
+  src
+  src/video/wayland
+  src/video/kmsdrm
+  ${WL_GEN_DIR}
+  ${SDLop_LIB_INCS})
+target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
+target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
+
+# Drop-in packaging for applications built against stock SDL3.
+#  - SDLOP_SYMBOL_VERSIONING (default ON): export only SDL_*, tagged with
+#    stock SDL3's version node SDL3_0.0.0 (tools/sdlop.sym). With it, a
+#    libSDL3.so.0 -> libSDLop.so symlink loads without the dynamic loader's
+#    "no version information available" warning.
+#  - SDLOP_SDL3_SONAME (default OFF): build the shared library as
+#    libSDL3.so.0.<minor>.<micro> with SONAME libSDL3.so.0, exactly like
+#    stock SDL3, so it can replace it in a library path. Opt-in because it
+#    conflicts with an installed SDL3.
+option(SDLOP_SYMBOL_VERSIONING "Tag exports with SDL3's version node SDL3_0.0.0 and hide internals" ON)
+option(SDLOP_SDL3_SONAME "Name the shared library libSDL3.so.0 (SONAME) like stock SDL3" OFF)
+if (SDLOP_SYMBOL_VERSIONING AND NOT APPLE)
+  target_link_options(sdlop_shared PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tools/sdlop.sym")
+  set_property(TARGET sdlop_shared APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/sdlop.sym)
+endif()
+if (SDLOP_SDL3_SONAME)
+  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/include/SDL3/SDL_version.h _sdl_minor REGEX "^#define SDL_MINOR_VERSION +[0-9]+")
+  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/include/SDL3/SDL_version.h _sdl_micro REGEX "^#define SDL_MICRO_VERSION +[0-9]+")
+  string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _sdl_minor "${_sdl_minor}")
+  string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _sdl_micro "${_sdl_micro}")
+  set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDL3 SOVERSION 0 VERSION 0.${_sdl_minor}.${_sdl_micro})
+  message(STATUS "SDLop shared library: libSDL3.so.0.${_sdl_minor}.${_sdl_micro} (SONAME libSDL3.so.0)")
 endif()
 
 # ---------------------------------------------------------------------------
 # Examples
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_EXAMPLES)
-  foreach(ex window wasd raw_latency surface_plasma)
+  # wasd and raw_latency drive the Linux raw-input (evdev) API and clock_gettime,
+  # so they are built where that backend exists.
+  if(WIN32)
+    set(SDLOP_EXAMPLES window surface_plasma)
+  else()
+    set(SDLOP_EXAMPLES window wasd raw_latency surface_plasma)
+  endif()
+  foreach(ex ${SDLOP_EXAMPLES})
     add_executable(${ex} examples/${ex}.c)
     target_link_libraries(${ex} PRIVATE sdlop m)
   endforeach()
@@ -458,8 +514,11 @@ if(SDLop_BUILD_EXAMPLES)
   if(Vulkan_FOUND)
     add_executable(vulkan_clear examples/vulkan_clear.c)
     target_link_libraries(vulkan_clear PRIVATE sdlop Vulkan::Vulkan m)
+
+    add_executable(vulkan_stress examples/vulkan_stress.c)
+    target_link_libraries(vulkan_stress PRIVATE sdlop Vulkan::Vulkan m)
   else()
-    message(STATUS "Vulkan not found - skipping vulkan_clear example")
+    message(STATUS "Vulkan not found - skipping Vulkan examples")
   endif()
 
   # GL example talks GLES2 directly
@@ -467,8 +526,12 @@ if(SDLop_BUILD_EXAMPLES)
     add_executable(gl_triangle examples/gl_triangle.c)
     target_link_libraries(gl_triangle PRIVATE sdlop ${GLESV2_LIBRARIES})
     target_include_directories(gl_triangle PRIVATE ${GLESV2_INCLUDE_DIRS})
+
+    add_executable(gl_gpu_stress examples/gl_gpu_stress.c)
+    target_link_libraries(gl_gpu_stress PRIVATE sdlop ${GLESV2_LIBRARIES})
+    target_include_directories(gl_gpu_stress PRIVATE ${GLESV2_INCLUDE_DIRS})
   else()
-    message(STATUS "GLESv2 not found - skipping gl_triangle example")
+    message(STATUS "GLESv2 not found - skipping GL examples")
   endif()
 endif()
 
@@ -477,21 +540,17 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  # Portable tests: these build and pass on every platform SDLop targets.
+  # Portable tests build and pass on every platform SDLop targets. The rest
+  # drive Linux-specific backends (evdev, fbdev, KMS, X11, Wayland, sysfs) or
+  # need pkg-config'd headers, and are registered in the !WIN32 branch below.
   if(WIN32)
-    # The evdev/fbdev/KMS/X11/Wayland tests below are Linux-only, and so are
-    # the POSIX-only ones among these (test_scancode, test_vt_mask,
-    # test_fbdev_device); the rest run under Wine (see cmake/mingw-w64.cmake).
-    # test_misc drives the Linux sysfs power backend and xdg-open, and
-    # test_surface/test_scancode their Linux drivers, so they stay below.
-    # test_keycodes drives evdev rawcodes through the xkb path, which only
-    # exists on Linux; test_win32_keycodes covers the Windows equivalent.
     set(SDLOP_PORTABLE_TESTS test_ring test_events test_layouts
         test_core test_main_callbacks test_threads)
   else()
     set(SDLOP_PORTABLE_TESTS test_ring test_scancode test_events test_surface
         test_web test_keycodes test_layouts test_core test_main_callbacks
-        test_misc test_threads test_vt_mask test_fbdev_device)
+        test_misc test_threads test_vt_mask test_fbdev_device test_options
+        test_dropin_compat)
   endif()
   foreach(t ${SDLOP_PORTABLE_TESTS})
     add_executable(${t} tests/${t}.c)
@@ -503,20 +562,26 @@ if(SDLop_BUILD_TESTS)
   if(NOT WIN32)
     target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
   endif()
+
   if(WIN32)
-    # Everything below is POSIX/Linux-specific (X11, Wayland, EGL, Vulkan,
-    # fbdev, KMS, evdev); the Windows port runs the portable set above plus
-    # the dummy-driver window API test.
+    # The only Windows-specific test: the Win32 driver, WGL and the
+    # VK -> SDL3 keycode table all run through the portable set above.
     add_executable(test_window_api tests/test_window_api.c)
     target_link_libraries(test_window_api PRIVATE sdlop)
     target_compile_options(test_window_api PRIVATE -UNDEBUG)
     add_test(NAME test_window_api COMMAND test_window_api dummy)
-    # the Win32 keyboard path: VK translation + driver-supplied text
     add_executable(test_win32_keycodes tests/test_win32_keycodes.c)
     target_link_libraries(test_win32_keycodes PRIVATE sdlop)
     target_include_directories(test_win32_keycodes PRIVATE src)
     target_compile_options(test_win32_keycodes PRIVATE -UNDEBUG)
     add_test(NAME test_win32_keycodes COMMAND test_win32_keycodes)
+    # the scan code table must be stock SDL3's, not an identity cast
+    add_executable(test_win32_scancodes tests/test_win32_scancodes.c)
+    target_link_libraries(test_win32_scancodes PRIVATE sdlop)
+    target_include_directories(test_win32_scancodes PRIVATE src)
+    target_compile_options(test_win32_scancodes PRIVATE -UNDEBUG)
+    add_test(NAME test_win32_scancodes COMMAND test_win32_scancodes)
+    set_tests_properties(test_win32_scancodes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
   else()
   # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
   # below, verified from a second xcb connection)
@@ -546,23 +611,6 @@ if(SDLop_BUILD_TESTS)
   # same keycode checks through the built-in US table (no libxkbcommon)
   add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
   set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
-
-  # Manual, externally driven trace tool. It is intentionally not registered
-  # with CTest: it waits for a compositor-side input script after READY-INPUT.
-  add_executable(behaviour_probe_wayland tools/behaviour_probe_wayland.c)
-  target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
-  target_include_directories(behaviour_probe_wayland PRIVATE src)
-
-  # Reference compositor-side driver for the probe: injects the scripted
-  # pointer/key sequence once READY-INPUT appears. Also not a CTest.
-  add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c
-    ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-    ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
-  add_dependencies(behaviour_probe_inject sdlop_wayland_protocols)
-  target_include_directories(behaviour_probe_inject PRIVATE
-    ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
-  target_link_libraries(behaviour_probe_inject PRIVATE
-    ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
 
   # integration tests that need real subsystems (auto-skip when unavailable)
   add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
@@ -601,6 +649,20 @@ if(SDLop_BUILD_TESTS)
       # relative mode and a single root-window display
       add_test(NAME test_x11_minimal COMMAND test_x11)
       set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
+      add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
+      target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
+      target_include_directories(test_x11_raw_source PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_raw_source PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_raw_source COMMAND test_x11_raw_source)
+      set_tests_properties(test_x11_raw_source PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # desktop GL on X11 is GLX (GLEW & co. need glXGetCurrentDisplay);
+      # GLES / SDL_VIDEO_FORCE_EGL use EGL. libGL is dlopen-ed at run time.
+      add_executable(test_glx tests/test_glx.c)
+      target_link_libraries(test_glx PRIVATE sdlop ${CMAKE_DL_LIBS})
+      target_compile_options(test_glx PRIVATE -UNDEBUG)
+      add_test(NAME test_glx COMMAND test_glx)
+      set_tests_properties(test_glx PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
       set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
         "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none")
@@ -646,6 +708,18 @@ if(SDLop_BUILD_TESTS)
   target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
   add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
 
+  add_executable(test_gl_offload tests/test_gl_offload.c)
+  target_link_libraries(test_gl_offload PRIVATE sdlop)
+  target_include_directories(test_gl_offload PRIVATE src)
+  target_compile_options(test_gl_offload PRIVATE -UNDEBUG)
+  add_test(NAME test_gl_offload COMMAND test_gl_offload)
+
+  add_executable(test_vk_offload tests/test_vk_offload.c)
+  target_link_libraries(test_vk_offload PRIVATE sdlop)
+  target_include_directories(test_vk_offload PRIVATE src)
+  target_compile_options(test_vk_offload PRIVATE -UNDEBUG)
+  add_test(NAME test_vk_offload COMMAND test_vk_offload)
+
   # KMS present-path benchmark (not a ctest gate; skips without KMS)
   add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
   target_link_libraries(bench_kmsdrm PRIVATE sdlop)
@@ -667,7 +741,8 @@ if(SDLop_BUILD_TESTS)
     add_executable(mini_compositor tests/mini_compositor.c
       ${WL_GEN_DIR}/xdg-shell-server-protocol.c
       ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-      ${WL_GEN_DIR}/relative-pointer-server-protocol.c)
+      ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+      ${WL_GEN_DIR}/viewporter-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -685,8 +760,17 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_touch PRIVATE -UNDEBUG)
     add_dependencies(test_touch mini_compositor)
     add_test(NAME test_touch COMMAND test_touch $<TARGET_FILE:mini_compositor>)
+
+    # wl_buffer release contract of software presentation
+    add_executable(test_wayland_buffers tests/test_wayland_buffers.c)
+    target_include_directories(test_wayland_buffers PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+    target_link_libraries(test_wayland_buffers PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
+    target_compile_options(test_wayland_buffers PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_buffers mini_compositor)
+    add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
+    add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
   else()
-    message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch")
+    message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch, test_wayland_buffers")
   endif()
 
   add_executable(smoke_relative_mode tests/smoke_relative_mode.c)
@@ -715,32 +799,17 @@ if(SDLop_BUILD_TESTS)
     target_include_directories(test_vulkan_compute PRIVATE src tests)
     target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
     add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
+
+    add_executable(test_vk_offload_live tests/test_vk_offload_live.c)
+    target_link_libraries(test_vk_offload_live PRIVATE sdlop Vulkan::Vulkan)
+    target_include_directories(test_vk_offload_live PRIVATE src)
+    target_compile_options(test_vk_offload_live PRIVATE -UNDEBUG)
+    add_test(NAME test_vk_offload_live COMMAND test_vk_offload_live)
   else()
-    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute")
+    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute, test_vk_offload_live")
   endif()
 
-  # wlr virtual-input protocols (vendored XMLs) for the sway end-to-end test
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h ${WL_GEN_DIR}/virtual-keyboard-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml
-            ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml
-            ${WL_GEN_DIR}/virtual-keyboard-protocol.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
-
-  if(WAYLAND_CLIENT_FOUND)
+  if(WAYLAND_CLIENT_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
     add_executable(test_virtual_input tests/test_virtual_input.c
       ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
       ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
@@ -749,15 +818,18 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
     add_test(NAME test_virtual_input COMMAND test_virtual_input)
   else()
-    message(STATUS "wayland-client not found - skipping test_virtual_input")
+    message(STATUS "wayland-client or the virtual-input protocol XMLs not found - skipping test_virtual_input")
   endif()
+endif()
   endif()  # else() of if(WIN32): Linux-only tests above
-endif()    # SDLop_BUILD_TESTS
+
 
 # ---------------------------------------------------------------------------
 # Benchmarks (SDLop vs SDL3)
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_BENCHMARKS AND NOT WIN32)
+  # The benchmarks compare against a pkg-config'd stock SDL3 and poke the
+  # POSIX drivers, so they are built on the Linux/macOS side only.
   pkg_check_modules(SDL3 sdl3)
   add_executable(bench_events bench/bench_events.c)
   target_link_libraries(bench_events PRIVATE sdlop)
@@ -789,13 +861,41 @@ if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
   add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
 endif()
 
-# Wayland behaviour injector (virtual pointer + keyboard script driver);
-# pairs with the shared behaviour_probe_wayland on the agent branch and
-# tests/run_behaviour_wayland.sh
-if (NOT EMSCRIPTEN AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND)
-  add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
-  target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
-  target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+# Developer tools (not CTests). SDLop_BUILD_TOOLS=OFF skips them; the
+# injectors are also skipped (with a message) when wayland-client,
+# libxkbcommon or the vendored virtual-input protocol XMLs are missing.
+if (SDLop_BUILD_TOOLS AND NOT EMSCRIPTEN)
+  # Manual, externally driven trace tool: waits for a compositor-side input
+  # script after READY-INPUT.
+  add_executable(behaviour_probe_wayland tools/behaviour_probe_wayland.c)
+  target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
+  target_include_directories(behaviour_probe_wayland PRIVATE src)
+
+  if (WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
+    # Reference compositor-side driver for the probe: injects the scripted
+    # pointer/key sequence once READY-INPUT appears.
+    add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c
+      ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+      ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
+    add_dependencies(behaviour_probe_inject sdlop_wayland_protocols)
+    target_include_directories(behaviour_probe_inject PRIVATE
+      ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+    target_link_libraries(behaviour_probe_inject PRIVATE
+      ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+
+    # Wayland behaviour injector (virtual pointer + keyboard script driver);
+    # pairs with tests/run_behaviour_wayland.sh
+    add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
+    target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+    target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+  else()
+    message(STATUS "wayland-client, libxkbcommon or the virtual-input protocol XMLs not found - skipping wl_injector, behaviour_probe_inject")
+  endif()
+endif()
+
+# Options gate: SDLOP_* options are read through hints (settable from code)
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_test(NAME options_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/options_check.sh ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # Export gate: every function declared in include/SDL3 is exported by the
@@ -840,17 +940,19 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
   # only - every other test keeps full leak checking
-  foreach(t test_gl test_gl_matrix test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
+  foreach(t test_gl test_gl_matrix test_glx test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
     if (TEST ${t})
       set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endif()
   endforeach()
-  # test_vulkan keeps leak checking, minus allocations made inside Mesa /
-  # the Vulkan loader (tests/lsan_gpu.supp)
-  if (TARGET test_vulkan)
-    set_tests_properties(test_vulkan PROPERTIES ENVIRONMENT
-      "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
-  endif()
+  # test_vulkan / test_vk_offload_live / test_gl_offload keep leak checking,
+  # minus allocations made inside Mesa / the Vulkan loader (tests/lsan_gpu.supp)
+  foreach(t test_vulkan test_vk_offload_live test_gl_offload)
+    if (TARGET ${t})
+      set_tests_properties(${t} PROPERTIES ENVIRONMENT
+        "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
+    endif()
+  endforeach()
   # test_surface asserts the alloc-failure contract (CreateSurface must
   # return NULL); ASan's allocator aborts on OOM unless allowed to return null
   set_tests_properties(test_surface

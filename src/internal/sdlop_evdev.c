@@ -72,6 +72,7 @@ static struct
     int num_devices;
     bool have_keyboard;
     bool have_pointer;
+    bool winsys; /* started for X11/Wayland: the only SDL input source there */
 
     /* rings: single producer (worker), single consumer (main thread) */
     _Alignas(SDLOP_CACHELINE) SDLop_RawEvent sdl_ring_storage[SDLOP_SDL_RING_SIZE];
@@ -289,18 +290,47 @@ static void *worker_main(void *arg)
 /* Init / Quit                                                         */
 /* ------------------------------------------------------------------ */
 
-bool SDLOP_RawInputInit(void)
+/* The video driver being initialised (sdlop.video is still NULL while a
+   console driver probes the keyboard from its Init) has its own input. */
+static bool video_has_window_system_input(void)
 {
-    if (raw.running) {
-        return true;
-    }
-    /* an empty value must not disable it: `VAR=` is how a caller forwards an
-       unset knob (the QEMU guest does exactly that) */
-    const char *disabled = getenv("SDLOP_DISABLE_RAW_INPUT");
-    if (disabled && *disabled && strcmp(disabled, "0") != 0) {
+    return sdlop.video && sdlop.video->window_system_input;
+}
+
+/* Input source policy, read when the worker starts (SDL_Init):
+     SDLOP_DISABLE_RAW_INPUT=1  never (kept for compatibility)
+     SDLOP_RAW_INPUT=1|0        force on / off
+     unset                      console drivers: on; X11/Wayland: off
+   Empty values count as unset: `VAR=` is how a caller forwards an unset knob
+   (the QEMU guest does exactly that). */
+static bool raw_input_wanted(bool winsys)
+{
+    if (SDLOP_HintFlag("SDLOP_DISABLE_RAW_INPUT", false)) {
         return SDL_SetError("disabled by SDLOP_DISABLE_RAW_INPUT");
     }
+    if (!SDLOP_HintFlag("SDLOP_RAW_INPUT", !winsys)) {
+        return SDL_SetError(winsys ? "window-system input in use (set SDLOP_RAW_INPUT=1 for evdev)"
+                                   : "disabled by SDLOP_RAW_INPUT");
+    }
+    return true;
+}
+
+bool SDLOP_RawInputInit(void)
+{
+    const bool winsys = video_has_window_system_input();
+    if (raw.running) {
+        if (raw.winsys == winsys) {
+            return true;
+        }
+        /* a console driver probed the keyboard, then failed and a window
+           system took over: re-decide under the window-system policy */
+        SDLOP_RawInputQuit();
+    }
+    if (!raw_input_wanted(winsys)) {
+        return false;
+    }
     memset(&raw, 0, sizeof(raw));
+    raw.winsys = winsys;
     pthread_mutex_init(&raw.cb_mutex, NULL);
     atomic_store(&raw.event_count, 0);
 
@@ -345,6 +375,22 @@ bool SDLOP_RawInputInit(void)
         return SDL_SetError("No readable /dev/input devices (need root or the 'input' group); falling back to window-system input");
     }
 
+    if (winsys && !(raw.have_keyboard && raw.have_pointer)) {
+        /* never mix: evdev replaces the window system's keyboard *and* mouse
+           or neither of them */
+        const bool kb = raw.have_keyboard;
+        for (int i = 0; i < raw.num_devices; i++) {
+            close(raw.devices[i].fd);
+        }
+        close(raw.control_fd);
+        close(raw.epoll_fd);
+        raw.control_fd = raw.epoll_fd = -1;
+        raw.num_devices = 0;
+        pthread_mutex_destroy(&raw.cb_mutex);
+        return SDL_SetError("SDLOP_RAW_INPUT needs a readable keyboard and pointer (no %s); using window-system input",
+                            kb ? "pointer" : "keyboard");
+    }
+
     raw.running = true;
     if (pthread_create(&raw.thread, NULL, worker_main, NULL) != 0) {
         raw.running = false;
@@ -360,10 +406,11 @@ bool SDLOP_RawInputInit(void)
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_INPUT,
-                "SDLop raw input: %d device(s)%s%s",
+                "SDLop raw input: %d device(s)%s%s%s",
                 raw.num_devices,
                 raw.have_keyboard ? " [keyboard]" : "",
-                raw.have_pointer ? " [pointer]" : "");
+                raw.have_pointer ? " [pointer]" : "",
+                winsys ? ", replacing window-system keyboard and mouse" : "");
     return true;
 }
 
@@ -392,6 +439,7 @@ void SDLOP_RawInputQuit(void)
         raw.epoll_fd = -1;
     }
     raw.num_devices = 0;
+    raw.winsys = false;
     free((void *)raw.callbacks);
     raw.callbacks = NULL;
     pthread_mutex_destroy(&raw.cb_mutex);
@@ -431,14 +479,10 @@ bool SDLOP_RawInputHasKeyboard(void)
     return raw.have_keyboard;
 }
 
-bool SDLOP_RawInputKeyboardActive(void)
+bool SDLOP_RawInputIsSource(void)
 {
-    return raw.running && raw.have_keyboard && chord.kb_owns_off;
-}
-
-bool SDLOP_RawInputMouseActive(void)
-{
-    return raw.running && raw.have_pointer;
+    /* only ever set with both a keyboard and a pointer (see Init) */
+    return raw.running && raw.winsys;
 }
 
 /* ------------------------------------------------------------------ */
@@ -514,31 +558,76 @@ static bool sdlop_vt_handle_chord(const SDLop_RawEvent *ev)
     return true;
 }
 
+/* Window-system mode: /dev/input sees every keystroke and mouse movement of
+   the seat, whichever client they are meant for. Deliver only what the
+   window system would have delivered to us, using its focus as the truth:
+   keys while one of our windows has keyboard focus, pointer input while the
+   pointer is over one of our windows (or relative mode holds it), neither
+   while another client holds an active grab (screen locker, WM menu or
+   move). Releases
+   of keys/buttons we reported down always pass, so nothing sticks. */
+static bool winsys_relative_active(void)
+{
+    return sdlop.relative_mode_window && sdlop.keyboard_focus == sdlop.relative_mode_window;
+}
+
+static bool winsys_pointer_focus(void)
+{
+    return !sdlop.pointer_grabbed_elsewhere && (sdlop.mouse_focus || winsys_relative_active());
+}
+
+static bool winsys_keyboard_focus(void)
+{
+    return sdlop.keyboard_focus && !sdlop.keyboard_grabbed_elsewhere;
+}
+
 static void pump_event(const SDLop_RawEvent *ev)
 {
     static float hi_res_x_acc, hi_res_y_acc;
+    const bool winsys = raw.winsys;
 
     switch (ev->type) {
     case SDLop_EV_KEY: {
         if (ev->code >= BTN_LEFT && ev->code <= BTN_EXTRA) {
             Uint8 btn = mouse_button_from_btn(ev->code);
-            if (btn) {
-                SDLOP_SendMouseButton(ev->value != 0, btn, SDLOP_NO_POS, SDLOP_NO_POS, ev->timestamp_ns);
+            if (!btn) {
+                return;
             }
+            if (winsys && !winsys_pointer_focus() &&
+                !(ev->value == 0 && (sdlop.mouse_buttons & SDL_BUTTON_MASK(btn)))) {
+                return;
+            }
+            SDLOP_SendMouseButton(ev->value != 0, btn, SDLOP_NO_POS, SDLOP_NO_POS, ev->timestamp_ns);
+            return;
+        }
+        if (ev->code > SDLOP_EVDEV_KEY_MAX) {
+            return;
+        }
+        SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[ev->code];
+        if (winsys) {
+            /* no VT chord here: the window system owns the console. Kernel
+               autorepeat (value 2) is dropped: SDL's own repeat runs with the
+               window system's delay/rate, as for native key events. */
+            if (sc == SDL_SCANCODE_UNKNOWN || ev->value == 2 ||
+                (!winsys_keyboard_focus() && !(ev->value == 0 && sdlop.keystate[sc]))) {
+                return;
+            }
+            SDLOP_SendKeyboardKey(ev->value != 0, false, sc, ev->code, ev->timestamp_ns);
             return;
         }
         if (sdlop_vt_handle_chord(ev)) {
             return;
         }
-        if (ev->code <= SDLOP_EVDEV_KEY_MAX && raw_console_foreground()) {
-            SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[ev->code];
-            if (sc != SDL_SCANCODE_UNKNOWN) {
-                SDLOP_SendKeyboardKey(ev->value != 0, ev->value == 2, sc, ev->code, ev->timestamp_ns);
-            }
+        if (raw_console_foreground() && sc != SDL_SCANCODE_UNKNOWN) {
+            SDLOP_SendKeyboardKey(ev->value != 0, ev->value == 2, sc, ev->code, ev->timestamp_ns);
         }
         break;
     }
     case SDLop_EV_REL: {
+        if (winsys && !winsys_pointer_focus() &&
+            !((ev->code == SDLop_REL_X || ev->code == SDLop_REL_Y) && sdlop.mouse_buttons)) {
+            break; /* not ours (a drag that started in our window keeps its motion) */
+        }
         switch (ev->code) {
         case SDLop_REL_X:
         case SDLop_REL_Y: {

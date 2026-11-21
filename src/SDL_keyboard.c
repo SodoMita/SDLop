@@ -25,6 +25,9 @@
 /* scancode -> evdev reverse table (built once)                        */
 /* ------------------------------------------------------------------ */
 
+#ifndef _WIN32
+/* Windows has no evdev codes: the driver resolves VKs through the Win32
+ * keymap, so the reverse table and the text filter below are POSIX-only. */
 static Uint16 scancode_to_evdev[SDL_SCANCODE_COUNT];
 static bool tables_ready;
 
@@ -49,6 +52,7 @@ static Uint16 evdev_from_scancode(SDL_Scancode sc)
     }
     return 0;
 }
+#endif /* !_WIN32 */
 
 /* ------------------------------------------------------------------ */
 /* xkb state                                                           */
@@ -682,8 +686,10 @@ static SDL_Keycode default_key_from_scancode(SDL_Scancode sc, SDL_Keymod mod)
     return SDL_SCANCODE_TO_KEYCODE(sc);
 }
 
+#ifndef _WIN32
 /* SDL convention: no text for ctrl/alt combos (AltGr = MODE is fine), and
- * no control characters */
+ * no control characters. POSIX-only: on Windows the text arrives finished
+ * from WM_CHAR, where Win32 has already applied these rules. */
 static void filter_text(char *text_utf8)
 {
     SDL_Keymod mod = sdlop.modstate;
@@ -697,6 +703,7 @@ static void filter_text(char *text_utf8)
         text_utf8[0] = '\0';
     }
 }
+#endif /* !_WIN32 */
 
 /* Feed a key press to the compose state. Returns true when composition
  * consumed the key (text_utf8 then holds the composed text, or nothing

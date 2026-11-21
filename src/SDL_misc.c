@@ -575,7 +575,7 @@ static bool read_power_file(const char *base, const char *node, const char *key,
 /* /sys/class/power_supply, exactly like SDL3's Linux backend */
 static bool power_sys_class(SDL_PowerState *state, int *seconds, int *percent)
 {
-    const char *base = getenv("SDLOP_POWER_SUPPLY_PATH"); /* tests */
+    const char *base = SDL_GetHint("SDLOP_POWER_SUPPLY_PATH"); /* tests */
     if (!base) {
         base = "/sys/class/power_supply";
     }

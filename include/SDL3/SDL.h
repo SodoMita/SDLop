@@ -3,7 +3,8 @@
 
   Aggregate header: `#include <SDL3/SDL.h>` like SDL3. Generated from
   SDL 3.4.20 by tools/gen_headers.py; the subsystems SDLop does not
-  implement (audio, joystick, threads, ...) are present as types only.
+  implement (audio, camera, sensors, ...) are present as types only;
+  joystick/gamepad calls behave as on a machine with no controller.
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
@@ -22,8 +23,6 @@
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_timer.h>
-#include <SDL3/SDL_atomic.h>
-#include <SDL3/SDL_thread.h>
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_rect.h>
 #include <SDL3/SDL_pixels.h>
@@ -41,17 +40,18 @@
 #include <SDL3/SDL_messagebox.h>
 #include <SDL3/SDL_vulkan.h>
 #include <SDL3/SDL_atomic.h>
+#include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_joystick.h>
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_camera.h>
-#include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_guid.h>
 #include <SDL3/SDL_iostream.h>
-#include <SDL3/SDL_joystick.h>
 #include <SDL3/SDL_mutex.h>
 #include <SDL3/SDL_pen.h>
 #include <SDL3/SDL_power.h>
 #include <SDL3/SDL_sensor.h>
-#include <SDL3/SDL_thread.h>
 
 /* SDLop's own version (the SDL API level is SDL_VERSION, SDL_version.h) */
 #define SDLOP_MAJOR_VERSION 0

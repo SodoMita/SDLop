@@ -66,6 +66,8 @@ static size_t inject_len = 0;
 static atomic_int inject_pending = 0; /* bytes not yet written */
 static atomic_bool proxy_stop = false;
 static atomic_int connections = 0;
+static atomic_int proxy_accepted = 0;
+static atomic_int proxy_live = 0;
 
 static int connect_real_server(void)
 {
@@ -202,6 +204,7 @@ static void *proxy_thread(void *arg)
     close(pc->server);
     free(sbuf);
     free(pc);
+    atomic_fetch_sub(&proxy_live, 1);
     return NULL;
 }
 
@@ -227,7 +230,17 @@ static void *accept_thread(void *arg)
         pc->server = s;
         pc->inject = atomic_fetch_add(&connections, 1) == 0;
         pthread_t t;
-        pthread_create(&t, NULL, proxy_thread, pc);
+        /* Account for the thread before publishing the accept, so callers
+         * waiting for "accepted and closed" cannot observe a false zero. */
+        atomic_fetch_add(&proxy_live, 1);
+        if (pthread_create(&t, NULL, proxy_thread, pc) != 0) {
+            atomic_fetch_sub(&proxy_live, 1);
+            close(c);
+            close(s);
+            free(pc);
+            continue;
+        }
+        atomic_fetch_add(&proxy_accepted, 1);
         pthread_detach(t);
     }
     return NULL;
@@ -388,11 +401,14 @@ static void pump(event_log *log, int ms)
 /* inject what is queued and collect the results */
 static void flush_and_collect(event_log *log)
 {
-    Uint64 end = SDL_GetTicks() + 1000;
-    while (atomic_load(&inject_pending) > 0 && SDL_GetTicks() < end) {
-        pump(NULL, 2);
-    }
     memset(log, 0, sizeof(*log));
+    Uint64 end = SDL_GetTicks() + 1000;
+    /* The proxy clears inject_pending once it has written to our socket, not
+     * once SDLop has consumed those events. Collect while waiting so events
+     * delivered during this window are not drained and discarded. */
+    while (atomic_load(&inject_pending) > 0 && SDL_GetTicks() < end) {
+        pump(log, 2);
+    }
     pump(log, 80);
 }
 
@@ -444,12 +460,20 @@ int main(void)
     xcb_connection_t *probe = xcb_connect(proxy_disp, NULL);
     bool probe_ok = !xcb_connection_has_error(probe);
     xcb_disconnect(probe);
-    atomic_store(&connections, 0);
     if (!probe_ok) {
         stop_proxy();
         printf("test_x11_touch: SKIP (server refuses the unauthenticated proxy connection)\n");
         return getenv("SDLOP_TEST_STRICT") ? 1 : 0;
     }
+    /* The proxy's accept thread may not have seen the probe connection when
+     * xcb_disconnect() returns. If we reset the counter too early, the probe
+     * can still be accepted as connection 0 and steal the injection flag from
+     * SDLop's real connection. Wait until it has been accepted and closed. */
+    for (int i = 0; i < 500 &&
+         (atomic_load(&proxy_accepted) < 1 || atomic_load(&proxy_live) != 0); i++) {
+        usleep(1000);
+    }
+    atomic_store(&connections, 0);
     printf("test_x11_touch: proxy %s -> %s, XI opcode %u\n", proxy_disp, disp, xi_opcode);
 
     setenv("DISPLAY", proxy_disp, 1);

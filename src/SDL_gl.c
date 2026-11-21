@@ -1,12 +1,16 @@
 /*
-  SDLop - OpenGL context API (dispatches to the video driver; EGL on
-  Wayland with Mesa llvmpipe as the software rasterizer).
+  SDLop - OpenGL context API (dispatches to the video driver, with a
+  platform-agnostic headless GPU offload fallback in SDL_gl.c).
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
 */
 
 #include "internal/sdlop_internal.h"
+
+#ifndef __EMSCRIPTEN__
+#include "video/sdlop_gl_offload.h"
+#endif
 
 SDLOP_GLAttributes sdlop_glattrs;
 static bool glattrs_initialized;
@@ -21,8 +25,7 @@ static void init_glattrs(void)
         return;
     }
     /* SDL3 defaults */
-    sdlop_glattrs.red_size = 8;   /* SDL3: SDL_GL_RED_SIZE default 3? SDL uses 8/8/8/0 defaults
-                                     on most platforms; EGL config matching below is forgiving */
+    sdlop_glattrs.red_size = 8;
     sdlop_glattrs.green_size = 8;
     sdlop_glattrs.blue_size = 8;
     sdlop_glattrs.alpha_size = 0;
@@ -40,6 +43,10 @@ static void init_glattrs(void)
     sdlop_glattrs.share_with_current_context = 0;
     sdlop_glattrs.framebuffer_srgb_capable = 0;
     sdlop_glattrs.floatbuffers = 0;
+    sdlop_glattrs.release_behavior = SDL_GL_CONTEXT_RELEASE_BEHAVIOR_FLUSH;
+    sdlop_glattrs.reset_notification = SDL_GL_CONTEXT_RESET_NO_NOTIFICATION;
+    sdlop_glattrs.no_error = 0;
+    sdlop_glattrs.accelerated_visual = -1;
     glattrs_initialized = true;
 }
 
@@ -244,11 +251,12 @@ bool SDL_GL_SetAttribute(SDL_GLAttr attr, int value)
     case SDL_GL_SHARE_WITH_CURRENT_CONTEXT: sdlop_glattrs.share_with_current_context = value; break;
     case SDL_GL_FRAMEBUFFER_SRGB_CAPABLE: sdlop_glattrs.framebuffer_srgb_capable = value; break;
     case SDL_GL_FLOATBUFFERS: sdlop_glattrs.floatbuffers = value; break;
-    case SDL_GL_ACCELERATED_VISUAL:
+    /* used by GLX (stock passes them only when the GLX extension exists) */
+    case SDL_GL_CONTEXT_RELEASE_BEHAVIOR: sdlop_glattrs.release_behavior = value; break;
+    case SDL_GL_CONTEXT_RESET_NOTIFICATION: sdlop_glattrs.reset_notification = value; break;
+    case SDL_GL_CONTEXT_NO_ERROR: sdlop_glattrs.no_error = value; break;
+    case SDL_GL_ACCELERATED_VISUAL: sdlop_glattrs.accelerated_visual = value; break;
     case SDL_GL_RETAINED_BACKING:
-    case SDL_GL_CONTEXT_RELEASE_BEHAVIOR:
-    case SDL_GL_CONTEXT_RESET_NOTIFICATION:
-    case SDL_GL_CONTEXT_NO_ERROR:
     case SDL_GL_EGL_PLATFORM:
         break; /* accepted, not acted upon */
     default:
@@ -285,7 +293,10 @@ bool SDL_GL_GetAttribute(SDL_GLAttr attr, int *value)
     case SDL_GL_CONTEXT_PROFILE_MASK: *value = sdlop_glattrs.profile_mask; break;
     case SDL_GL_FRAMEBUFFER_SRGB_CAPABLE: *value = sdlop_glattrs.framebuffer_srgb_capable; break;
     case SDL_GL_FLOATBUFFERS: *value = sdlop_glattrs.floatbuffers; break;
-    case SDL_GL_ACCELERATED_VISUAL: *value = 0; break; /* llvmpipe: software */
+    case SDL_GL_CONTEXT_RELEASE_BEHAVIOR: *value = sdlop_glattrs.release_behavior; break;
+    case SDL_GL_CONTEXT_RESET_NOTIFICATION: *value = sdlop_glattrs.reset_notification; break;
+    case SDL_GL_CONTEXT_NO_ERROR: *value = sdlop_glattrs.no_error; break;
+    case SDL_GL_ACCELERATED_VISUAL: *value = sdlop_glattrs.accelerated_visual >= 0 ? sdlop_glattrs.accelerated_visual : 0; break;
     default:
         return SDL_SetError("Unknown OpenGL attribute: %d", (int)attr);
     }
@@ -295,7 +306,7 @@ bool SDL_GL_GetAttribute(SDL_GLAttr attr, int *value)
 bool SDL_GL_LoadLibrary(const char *path)
 {
     (void)path;
-    /* EGL/GLES are loaded by the active video driver on first use. */
+    /* EGL/GLES are loaded by the active video driver or offload layer on first use. */
     return true;
 }
 
@@ -303,22 +314,274 @@ void SDL_GL_UnloadLibrary(void)
 {
 }
 
+/* current context tracking */
+static SDL_GLContext current_context;
+static SDL_Window *current_window;
+
+#ifndef __EMSCRIPTEN__
+/* ------------------------------------------------------------------ */
+/* Platform-agnostic headless GPU GL offload (any framebuffer driver) */
+/* ------------------------------------------------------------------ */
+
+typedef struct SDLOP_GenericGLCtx
+{
+    SDLOP_GLOffloadContext *offload_ctx;
+    int swap_interval;
+    struct SDLOP_GenericGLCtx *next;
+} SDLOP_GenericGLCtx;
+
+typedef struct SDLOP_GenericGLWin
+{
+    SDL_Window *window;
+    SDLOP_GLOffloadSurface *surf;
+    SDLOP_GenericGLCtx *last_ctx;
+    struct SDLOP_GenericGLWin *next;
+} SDLOP_GenericGLWin;
+
+static SDLOP_GenericGLCtx *generic_ctxs;
+static SDLOP_GenericGLWin *generic_wins;
+static bool generic_offload_used;
+
+static SDLOP_GenericGLCtx *find_generic_ctx(SDL_GLContext ctx)
+{
+    for (SDLOP_GenericGLCtx *c = generic_ctxs; c; c = c->next) {
+        if ((SDL_GLContext)c == ctx) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static SDLOP_GenericGLWin *find_generic_win(SDL_Window *window)
+{
+    for (SDLOP_GenericGLWin *w = generic_wins; w; w = w->next) {
+        if (w->window == window) {
+            return w;
+        }
+    }
+    return NULL;
+}
+
+static SDLOP_GenericGLWin *ensure_generic_win(SDLOP_GenericGLCtx *gctx, SDL_Window *window)
+{
+    SDLOP_GenericGLWin *gw = find_generic_win(window);
+    if (!gw) {
+        gw = (SDLOP_GenericGLWin *)calloc(1, sizeof(*gw));
+        if (!gw) {
+            SDL_OutOfMemory();
+            return NULL;
+        }
+        gw->window = window;
+        gw->next = generic_wins;
+        generic_wins = gw;
+    }
+    int w = window->w > 0 ? window->w : 1;
+    int h = window->h > 0 ? window->h : 1;
+    if (!gw->surf) {
+        gw->surf = SDLOP_GLOffload_CreateSurface(gctx->offload_ctx, w, h);
+        if (!gw->surf) {
+            return NULL;
+        }
+    } else {
+        if (!SDLOP_GLOffload_ResizeSurface(gctx->offload_ctx, &gw->surf, w, h)) {
+            return NULL;
+        }
+    }
+    gw->last_ctx = gctx;
+    return gw;
+}
+
+static bool can_use_generic_gl_offload(void)
+{
+    if (!sdlop.video ||
+        !sdlop.video->CreateWindowFramebuffer ||
+        !sdlop.video->UpdateWindowFramebuffer) {
+        return false;
+    }
+    SDLOP_GLOffloadPolicy policy = SDLOP_GLOffload_GetPolicy();
+    if (policy == SDLOP_GL_OFFLOAD_NEVER) {
+        return false;
+    }
+    /* A forced offload applies to every platform, including drivers that have
+     * their own native GL path (e.g. X11). Otherwise only use the generic path
+     * when the driver has no GL support or selected a software visual. */
+    if (sdlop.video->GL_CreateContext && policy != SDLOP_GL_OFFLOAD_FORCE &&
+        sdlop_glattrs.accelerated_visual != 0) {
+        return false;
+    }
+    if (sdlop_glattrs.accelerated_visual == 0 && policy != SDLOP_GL_OFFLOAD_FORCE) {
+        return false;
+    }
+    return SDLOP_GLOffload_HasHardwareGPU();
+}
+
+static SDL_GLContext create_generic_offload_context(SDL_Window *window)
+{
+    SDLOP_GLOffloadContext *share = NULL;
+    if (sdlop_glattrs.share_with_current_context && current_context) {
+        SDLOP_GenericGLCtx *cur = find_generic_ctx(current_context);
+        if (cur) {
+            share = cur->offload_ctx;
+        }
+    }
+    SDLOP_GLOffloadContext *oc = SDLOP_GLOffload_CreateContextAuto(share);
+    if (!oc) {
+        return NULL;
+    }
+    SDLOP_GenericGLCtx *gctx = (SDLOP_GenericGLCtx *)calloc(1, sizeof(*gctx));
+    if (!gctx) {
+        SDLOP_GLOffload_DeleteContext(oc);
+        SDL_OutOfMemory();
+        return NULL;
+    }
+    gctx->offload_ctx = oc;
+    gctx->swap_interval = 0;
+    gctx->next = generic_ctxs;
+    generic_ctxs = gctx;
+    generic_offload_used = true;
+
+    if (!SDL_GL_MakeCurrent(window, (SDL_GLContext)gctx)) {
+        SDL_GL_DestroyContext((SDL_GLContext)gctx);
+        return NULL;
+    }
+    const char *desc = SDLOP_GLOffload_GetGPUDescription();
+    SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
+                "SDLop: OpenGL offload active on %s (%s)",
+                sdlop.video ? sdlop.video->name : "?",
+                desc ? desc : "hardware GPU");
+    return (SDL_GLContext)gctx;
+}
+#endif /* !__EMSCRIPTEN__ */
+
 SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc)
 {
     if (!proc) {
         SDL_SetError("NULL proc name");
         return NULL;
     }
+#ifndef __EMSCRIPTEN__
+    if (current_context && find_generic_ctx(current_context)) {
+        return SDLOP_GLOffload_GetProcAddress(proc);
+    }
+    if (generic_ctxs && (!sdlop.video || !sdlop.video->GL_GetProcAddress)) {
+        return SDLOP_GLOffload_GetProcAddress(proc);
+    }
+#endif
     if (sdlop.video && sdlop.video->GL_GetProcAddress) {
         return sdlop.video->GL_GetProcAddress(sdlop.video, proc);
     }
     return NULL;
 }
 
-
 SDL_GLContext SDLOP_GL_CurrentContext(void)
 {
     return current_context;
+}
+
+void SDLOP_GL_NotifyWindowResized(SDL_Window *window)
+{
+#ifndef __EMSCRIPTEN__
+    if (!window) {
+        return;
+    }
+    SDLOP_GenericGLWin *gw = find_generic_win(window);
+    if (!gw || !gw->surf) {
+        return;
+    }
+    SDLOP_GenericGLCtx *gctx = current_context ? find_generic_ctx(current_context) : NULL;
+    if (!gctx) {
+        gctx = gw->last_ctx;
+    }
+    if (!gctx || !gctx->offload_ctx) {
+        return;
+    }
+    int w = window->w > 0 ? window->w : 1;
+    int h = window->h > 0 ? window->h : 1;
+    int sw = 0, sh = 0;
+    SDLOP_GLOffload_GetSurfaceSize(gw->surf, &sw, &sh);
+    if (sw != w || sh != h) {
+        if (!SDLOP_GLOffload_ResizeSurface(gctx->offload_ctx, &gw->surf, w, h)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "SDLop: failed to resize GL offload surface to %dx%d: %s",
+                        w, h, SDL_GetError());
+        }
+    }
+#else
+    (void)window;
+#endif
+}
+
+void SDLOP_GL_NotifyWindowDestroyed(SDL_Window *window)
+{
+#ifndef __EMSCRIPTEN__
+    if (!window) {
+        return;
+    }
+    SDLOP_GenericGLWin **pp = &generic_wins;
+    while (*pp) {
+        SDLOP_GenericGLWin *gw = *pp;
+        if (gw->window == window) {
+            *pp = gw->next;
+            if (current_window == window) {
+                current_window = NULL;
+            }
+            if (gw->surf) {
+                SDLOP_GLOffload_DestroySurface(gw->surf);
+            }
+            free(gw);
+            break;
+        }
+        pp = &gw->next;
+    }
+#else
+    (void)window;
+#endif
+}
+
+void SDLOP_GL_Quit(void)
+{
+#ifndef __EMSCRIPTEN__
+    while (generic_wins) {
+        SDLOP_GenericGLWin *gw = generic_wins;
+        generic_wins = gw->next;
+        if (gw->surf) {
+            SDLOP_GLOffload_DestroySurface(gw->surf);
+        }
+        free(gw);
+    }
+    while (generic_ctxs) {
+        SDLOP_GenericGLCtx *gc = generic_ctxs;
+        generic_ctxs = gc->next;
+        if (gc->offload_ctx) {
+            SDLOP_GLOffload_DeleteContext(gc->offload_ctx);
+        }
+        free(gc);
+    }
+    current_context = NULL;
+    current_window = NULL;
+    if (generic_offload_used || (sdlop.video && !sdlop.video->GL_CreateContext)) {
+        generic_offload_used = false;
+        SDLOP_GLOffload_Shutdown();
+    }
+#endif
+}
+
+bool SDLOP_GL_CanCreateWindow(void)
+{
+    if (!sdlop.video) {
+        return false;
+    }
+    if (sdlop.video->GL_CreateContext) {
+        return true;
+    }
+#ifndef __EMSCRIPTEN__
+    if (sdlop.video->CreateWindowFramebuffer &&
+        SDLOP_GLOffload_GetPolicy() != SDLOP_GL_OFFLOAD_NEVER &&
+        SDLOP_GLOffload_HasHardwareGPU()) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)
@@ -327,26 +590,70 @@ SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)
         SDL_SetError("Invalid window");
         return NULL;
     }
-    if (!sdlop.video || !sdlop.video->GL_CreateContext) {
-        SDL_SetError("Video driver does not support OpenGL");
+    if (!sdlop.video) {
+        SDL_SetError("Video subsystem not initialized");
         return NULL;
     }
     init_glattrs();
-    void *ctx = sdlop.video->GL_CreateContext(sdlop.video, window);
-    if (!ctx) {
-        return NULL; /* driver sets error */
+
+    if (sdlop.video->GL_CreateContext) {
+        void *ctx = sdlop.video->GL_CreateContext(sdlop.video, window);
+        if (ctx) {
+            if (!SDL_GL_MakeCurrent(window, (SDL_GLContext)ctx)) {
+                sdlop.video->GL_DeleteContext(sdlop.video, ctx);
+                return NULL;
+            }
+            return (SDL_GLContext)ctx;
+        }
     }
-    if (!SDL_GL_MakeCurrent(window, (SDL_GLContext)ctx)) {
-        sdlop.video->GL_DeleteContext(sdlop.video, ctx);
-        return NULL;
+
+#ifndef __EMSCRIPTEN__
+    if (can_use_generic_gl_offload()) {
+        return create_generic_offload_context(window);
     }
-    return (SDL_GLContext)ctx;
+#endif
+
+    if (!sdlop.video->GL_CreateContext) {
+        SDL_SetError("Video driver '%s' does not support OpenGL", sdlop.video->name);
+    }
+    return NULL;
 }
 
 bool SDL_GL_MakeCurrent(SDL_Window *window, SDL_GLContext context)
 {
-    if (!sdlop.video || !sdlop.video->GL_MakeCurrent) {
-        return SDL_SetError("Video driver does not support OpenGL");
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem not initialized");
+    }
+#ifndef __EMSCRIPTEN__
+    if (!context) {
+        if (current_context && find_generic_ctx(current_context)) {
+            SDLOP_GLOffload_MakeCurrent(NULL, NULL);
+            current_context = NULL;
+            current_window = NULL;
+            return true;
+        }
+    } else {
+        SDLOP_GenericGLCtx *gctx = find_generic_ctx(context);
+        if (gctx) {
+            if (!window) {
+                return SDL_SetError("Invalid window");
+            }
+            SDLOP_GenericGLWin *gw = ensure_generic_win(gctx, window);
+            if (!gw) {
+                return false;
+            }
+            if (!SDLOP_GLOffload_MakeCurrent(gctx->offload_ctx, gw->surf)) {
+                return false;
+            }
+            current_context = context;
+            current_window = window;
+            return true;
+        }
+    }
+#endif
+
+    if (!sdlop.video->GL_MakeCurrent) {
+        return SDL_SetError("Video driver '%s' does not support OpenGL", sdlop.video->name);
     }
     if (!sdlop.video->GL_MakeCurrent(sdlop.video, window, context)) {
         return false;
@@ -368,8 +675,22 @@ SDL_GLContext SDL_GL_GetCurrentContext(void)
 
 bool SDL_GL_SetSwapInterval(int interval)
 {
-    if (!sdlop.video || !sdlop.video->GL_SetSwapInterval) {
-        return SDL_SetError("Video driver does not support OpenGL");
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem not initialized");
+    }
+#ifndef __EMSCRIPTEN__
+    SDLOP_GenericGLCtx *gctx = current_context ? find_generic_ctx(current_context) : NULL;
+    if (gctx) {
+        gctx->swap_interval = interval;
+        return true;
+    }
+    if (!sdlop.video->GL_SetSwapInterval && generic_ctxs) {
+        generic_ctxs->swap_interval = interval;
+        return true;
+    }
+#endif
+    if (!sdlop.video->GL_SetSwapInterval) {
+        return SDL_SetError("Video driver '%s' does not support OpenGL", sdlop.video->name);
     }
     return sdlop.video->GL_SetSwapInterval(sdlop.video, interval);
 }
@@ -379,8 +700,22 @@ bool SDL_GL_GetSwapInterval(int *interval)
     if (!interval) {
         return SDL_SetError("NULL interval pointer");
     }
-    if (!sdlop.video || !sdlop.video->GL_GetSwapInterval) {
-        return SDL_SetError("Video driver does not support OpenGL");
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem not initialized");
+    }
+#ifndef __EMSCRIPTEN__
+    SDLOP_GenericGLCtx *gctx = current_context ? find_generic_ctx(current_context) : NULL;
+    if (gctx) {
+        *interval = gctx->swap_interval;
+        return true;
+    }
+    if (!sdlop.video->GL_GetSwapInterval && generic_ctxs) {
+        *interval = generic_ctxs->swap_interval;
+        return true;
+    }
+#endif
+    if (!sdlop.video->GL_GetSwapInterval) {
+        return SDL_SetError("Video driver '%s' does not support OpenGL", sdlop.video->name);
     }
     return sdlop.video->GL_GetSwapInterval(sdlop.video, interval);
 }
@@ -390,8 +725,58 @@ bool SDL_GL_SwapWindow(SDL_Window *window)
     if (!window) {
         return SDL_SetError("Invalid window");
     }
-    if (!sdlop.video || !sdlop.video->GL_SwapBuffers) {
-        return SDL_SetError("Video driver does not support OpenGL");
+    if (!sdlop.video) {
+        return SDL_SetError("Video subsystem not initialized");
+    }
+#ifndef __EMSCRIPTEN__
+    SDLOP_GenericGLWin *gw = find_generic_win(window);
+    SDLOP_GenericGLCtx *gctx = current_context ? find_generic_ctx(current_context) : NULL;
+    if (!gctx && gw) {
+        gctx = gw->last_ctx;
+    }
+    if (gctx && gw && gw->surf) {
+        int ww = window->w > 0 ? window->w : 1;
+        int wh = window->h > 0 ? window->h : 1;
+        if (window->surface && (window->surface->w != ww || window->surface->h != wh)) {
+            if (sdlop.video->DestroyWindowFramebuffer) {
+                sdlop.video->DestroyWindowFramebuffer(sdlop.video, window);
+            } else {
+                SDL_DestroySurface(window->surface);
+                window->surface = NULL;
+            }
+        }
+        if (!window->surface) {
+            if (!sdlop.video->CreateWindowFramebuffer ||
+                !sdlop.video->CreateWindowFramebuffer(sdlop.video, window, &window->surface)) {
+                return false;
+            }
+        }
+        if (!SDLOP_GLOffload_ReadToXRGB8888(gctx->offload_ctx, gw->surf,
+                                            window->surface->pixels,
+                                            window->surface->pitch,
+                                            window->surface->w,
+                                            window->surface->h)) {
+            return false;
+        }
+        SDL_Rect rect = { 0, 0, window->surface->w, window->surface->h };
+        if (!sdlop.video->UpdateWindowFramebuffer ||
+            !sdlop.video->UpdateWindowFramebuffer(sdlop.video, window, &rect, 1)) {
+            return false;
+        }
+        int sw = 0, sh = 0;
+        SDLOP_GLOffload_GetSurfaceSize(gw->surf, &sw, &sh);
+        if (sw != ww || sh != wh) {
+            if (!SDLOP_GLOffload_ResizeSurface(gctx->offload_ctx, &gw->surf, ww, wh)) {
+                return false;
+            }
+        }
+        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+        return true;
+    }
+#endif
+
+    if (!sdlop.video->GL_SwapBuffers) {
+        return SDL_SetError("Video driver '%s' does not support OpenGL", sdlop.video->name);
     }
     if (!sdlop.video->GL_SwapBuffers(sdlop.video, window)) {
         return false;
@@ -409,6 +794,35 @@ bool SDL_GL_DestroyContext(SDL_GLContext context)
     if (!context) {
         return SDL_InvalidParamError("context");
     }
+#ifndef __EMSCRIPTEN__
+    SDLOP_GenericGLCtx *gctx = find_generic_ctx(context);
+    if (gctx) {
+        if (current_context == context) {
+            SDLOP_GLOffload_MakeCurrent(NULL, NULL);
+            current_context = NULL;
+            current_window = NULL;
+        }
+        for (SDLOP_GenericGLWin *gw = generic_wins; gw; gw = gw->next) {
+            if (gw->last_ctx == gctx) {
+                gw->last_ctx = NULL;
+            }
+        }
+        SDLOP_GenericGLCtx **pp = &generic_ctxs;
+        while (*pp) {
+            if (*pp == gctx) {
+                *pp = gctx->next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+        if (gctx->offload_ctx) {
+            SDLOP_GLOffload_DeleteContext(gctx->offload_ctx);
+        }
+        free(gctx);
+        return true;
+    }
+#endif
+
     if (current_context == context) {
         current_context = NULL;
         current_window = NULL;

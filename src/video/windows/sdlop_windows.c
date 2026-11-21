@@ -98,143 +98,40 @@ static Uint64 timestamp_from_msg(void)
  * SDL exposes as SDL_Scancode values for the main keyboard block, which is
  * why SDL3 can use them almost directly: the differences are the extended
  * keys and the multimedia/pause family. */
-static SDL_Scancode scancode_from_msg(const MSG *msg)
+/* Resolve a WM_KEY* message to an SDL_Scancode plus the scan code to pack
+ * into the rawcode. The translation itself lives in SDL_win32_keymap.c so the
+ * scancode table sits with the rest of the Windows key mapping and can be
+ * tested headless. */
+static SDL_Scancode scancode_from_msg(const MSG *msg, Uint16 *rawcode)
 {
-    UINT scancode = (UINT)((msg->lParam >> 16) & 0xFF);
-    const bool extended = (msg->lParam & (1 << 24)) != 0;
+    const Uint16 keyflags = HIWORD(msg->lParam);
+    Uint16 scan_code = LOBYTE(keyflags);
 
-    if (msg->message == WM_SYSKEYDOWN || msg->message == WM_SYSKEYUP) {
-        /* Alt is a system key; Alt+PrtSc etc. still map normally */
-    }
-    if (msg->message == WM_KEYDOWN || msg->message == WM_KEYUP ||
-        msg->message == WM_SYSKEYDOWN || msg->message == WM_SYSKEYUP) {
-        /* Pause reports scancode 0x45 with an extended flag pattern */
-        if (msg->wParam == VK_PAUSE) {
-            return SDL_SCANCODE_PAUSE;
-        }
-        if (msg->wParam == VK_SNAPSHOT) {
-            return SDL_SCANCODE_PRINTSCREEN;
-        }
-        if (scancode == 0x45) {
-            return SDL_SCANCODE_NUMLOCKCLEAR;
-        }
-    }
+    /* The On-Screen Keyboard can send the break code, with bit 7 set. */
+    scan_code &= (Uint16)~0x80;
 
-    /* The 0x00-0x7F block maps 1:1 onto SDL_Scancode for the standard
-     * keyboard (SDL's scancode list is the USB HID usage table, and Windows
-     * scancodes agree on these). Correct the ones that do not. */
-    switch (scancode) {
-    case 0x2A:
-        return extended ? SDL_SCANCODE_UNKNOWN : SDL_SCANCODE_LSHIFT; /* PrtSc sends this extended */
-    case 0x36:
-        return extended ? SDL_SCANCODE_UNKNOWN : SDL_SCANCODE_RSHIFT;
-    case 0x1D:
-        return extended ? SDL_SCANCODE_RCTRL : SDL_SCANCODE_LCTRL;
-    case 0x38:
-        return extended ? SDL_SCANCODE_RALT : SDL_SCANCODE_LALT;
-    case 0x5B:
-        return SDL_SCANCODE_LGUI;
-    case 0x5C:
-        return SDL_SCANCODE_RGUI;
-    case 0x5D:
-        return SDL_SCANCODE_APPLICATION;
-    case 0x37:
-        return SDL_SCANCODE_PRINTSCREEN; /* PrtSc (non-extended) */
-    case 0x45:
-        return SDL_SCANCODE_NUMLOCKCLEAR;
-    case 0x46:
-        return SDL_SCANCODE_SCROLLLOCK;
-    case 0x1C:
-        return extended ? SDL_SCANCODE_KP_ENTER : SDL_SCANCODE_RETURN;
-    case 0x35:
-        return extended ? SDL_SCANCODE_KP_DIVIDE : SDL_SCANCODE_SLASH;
-    case 0x48:
-        return extended ? SDL_SCANCODE_UP : SDL_SCANCODE_KP_8;
-    case 0x50:
-        return extended ? SDL_SCANCODE_DOWN : SDL_SCANCODE_KP_2;
-    case 0x4B:
-        return extended ? SDL_SCANCODE_LEFT : SDL_SCANCODE_KP_4;
-    case 0x4D:
-        return extended ? SDL_SCANCODE_RIGHT : SDL_SCANCODE_KP_6;
-    case 0x47:
-        return extended ? SDL_SCANCODE_HOME : SDL_SCANCODE_KP_7;
-    case 0x4F:
-        return extended ? SDL_SCANCODE_END : SDL_SCANCODE_KP_1;
-    case 0x49:
-        return extended ? SDL_SCANCODE_PAGEUP : SDL_SCANCODE_KP_9;
-    case 0x51:
-        return extended ? SDL_SCANCODE_PAGEDOWN : SDL_SCANCODE_KP_3;
-    case 0x52:
-        return extended ? SDL_SCANCODE_INSERT : SDL_SCANCODE_KP_0;
-    case 0x53:
-        return extended ? SDL_SCANCODE_DELETE : SDL_SCANCODE_KP_PERIOD;
-    default:
-        break;
+    if (scan_code != 0) {
+        if ((keyflags & KF_EXTENDED) == KF_EXTENDED) {
+            scan_code = MAKEWORD(scan_code, 0xe0);
+        } else if (scan_code == 0x45) {
+            /* Pause reports 0x45; its real code is E0 46 */
+            scan_code = 0xe046;
+        }
+    } else {
+        /* Some keys (multimedia, etc.) arrive without a scan code. */
+        scan_code = LOWORD(MapVirtualKeyW((UINT)LOWORD(msg->wParam), MAPVK_VK_TO_VSC_EX));
+        if (scan_code == 0xe11d) {
+            /* Pause reports E1 1D; use the Win32 Pause code */
+            scan_code = 0xe046;
+        }
     }
 
-    if (scancode <= SDL_SCANCODE_HELP /* 0x75 */) {
-        return (SDL_Scancode)scancode;
+    if (rawcode) {
+        *rawcode = scan_code;
     }
-    if (scancode >= 0x76 && scancode <= 0x7E) {
-        /* Japanese keyboard block: SDL has no equivalent, skip */
-        return SDL_SCANCODE_UNKNOWN;
-    }
-    /* 0x59-0x63: keypad =, comma, minus... Windows sends VK codes for these
-     * on non-104-key layouts; fall through to the VK table below. */
-    switch (msg->wParam) {
-    case VK_OEM_1:
-        return SDL_SCANCODE_SEMICOLON;
-    case VK_OEM_PLUS:
-        return SDL_SCANCODE_EQUALS;
-    case VK_OEM_COMMA:
-        return SDL_SCANCODE_COMMA;
-    case VK_OEM_MINUS:
-        return SDL_SCANCODE_MINUS;
-    case VK_OEM_PERIOD:
-        return SDL_SCANCODE_PERIOD;
-    case VK_OEM_2:
-        return SDL_SCANCODE_SLASH;
-    case VK_OEM_3:
-        return SDL_SCANCODE_GRAVE;
-    case VK_OEM_4:
-        return SDL_SCANCODE_LEFTBRACKET;
-    case VK_OEM_5:
-        return SDL_SCANCODE_BACKSLASH;
-    case VK_OEM_6:
-        return SDL_SCANCODE_RIGHTBRACKET;
-    case VK_OEM_7:
-        return SDL_SCANCODE_APOSTROPHE;
-    case VK_OEM_102:
-        return SDL_SCANCODE_NONUSBACKSLASH;
-    case VK_APPS:
-        return SDL_SCANCODE_APPLICATION;
-    default:
-        break;
-    }
-    {
-        /* Multimedia keys live in 0xE0xx scancodes on real hardware; with
-         * SendInput-less injection only the VK codes arrive. */
-        switch (msg->wParam) {
-        case VK_VOLUME_MUTE: return SDL_SCANCODE_MUTE;
-        case VK_VOLUME_DOWN: return SDL_SCANCODE_VOLUMEDOWN;
-        case VK_VOLUME_UP: return SDL_SCANCODE_VOLUMEUP;
-        case VK_MEDIA_NEXT_TRACK: return SDL_SCANCODE_MEDIA_NEXT_TRACK;
-        case VK_MEDIA_PREV_TRACK: return SDL_SCANCODE_MEDIA_PREVIOUS_TRACK;
-        case VK_MEDIA_STOP: return SDL_SCANCODE_MEDIA_STOP;
-        case VK_MEDIA_PLAY_PAUSE: return SDL_SCANCODE_MEDIA_PLAY_PAUSE;
-        case VK_BROWSER_BACK: return SDL_SCANCODE_AC_BACK;
-        case VK_BROWSER_FORWARD: return SDL_SCANCODE_AC_FORWARD;
-        case VK_BROWSER_REFRESH: return SDL_SCANCODE_AC_REFRESH;
-        case VK_BROWSER_STOP: return SDL_SCANCODE_AC_STOP;
-        case VK_BROWSER_SEARCH: return SDL_SCANCODE_AC_SEARCH;
-        case VK_BROWSER_FAVORITES: return SDL_SCANCODE_AC_BOOKMARKS;
-        case VK_BROWSER_HOME: return SDL_SCANCODE_AC_HOME;
-        default:
-            break;
-        }
-    }
-    return SDL_SCANCODE_UNKNOWN;
+    return SDLOP_Win32ScancodeFromScan(scan_code);
 }
+
 
 /* Translate the character a WM_CHAR/WM_UNICHAR produced. WM_CHAR gives UTF-16
  * code units; WM_UNICHAR gives a code point. */
@@ -288,7 +185,6 @@ static void send_text_from_msg(const MSG *msg)
             return; /* lone surrogate: drop */
         }
         GetMessageW(&peek, msg->hwnd, WM_CHAR, WM_CHAR); /* consume it */
-        const Uint32 cp = 0x10000 + ((ch - 0xD800) << 10) + ((Uint32)peek.wParam - 0xDC00);
         utf16[0] = (wchar_t)ch;
         utf16[1] = (wchar_t)peek.wParam;
         const int n = WideCharToMultiByte(CP_UTF8, 0, utf16, 2, utf8, (int)sizeof(utf8) - 1, NULL, NULL);
@@ -337,18 +233,67 @@ static void update_metrics(SDL_Window *window)
     }
 }
 
+/* Drop the cursor clip, but only if we are the ones who set it: another
+ * window (or another application) may own it right now. */
+static void release_cursor_clip(SDLop_Win32WindowData *data)
+{
+    RECT current;
+    if (GetClipCursor(&current) && EqualRect(&current, &data->cursor_clipped_rect)) {
+        ClipCursor(NULL);
+        SDL_zero(data->cursor_clipped_rect);
+    }
+}
+
+/* Put the clip back after focus returns, for whichever mode wants one. */
+static void restore_cursor_clip(SDL_Window *window)
+{
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data || !data->hwnd) {
+        return;
+    }
+    if (window->flags & SDL_WINDOW_MOUSE_RELATIVE_MODE) {
+        RECT rc;
+        GetClientRect(data->hwnd, &rc);
+        MapWindowPoints(data->hwnd, NULL, (POINT *)&rc, 2);
+        ClipCursor(&rc);
+        SetCapture(data->hwnd);
+    } else if (window->flags & SDL_WINDOW_MOUSE_GRABBED) {
+        RECT rc;
+        GetWindowRect(data->hwnd, &rc);
+        ClipCursor(&rc);
+        SetCapture(data->hwnd);
+    } else if (window->mouse_rect.w > 0 && window->mouse_rect.h > 0) {
+        RECT clip;
+        clip.left = window->mouse_rect.x;
+        clip.top = window->mouse_rect.y;
+        clip.right = clip.left + window->mouse_rect.w;
+        clip.bottom = clip.top + window->mouse_rect.h;
+        MapWindowPoints(data->hwnd, NULL, (POINT *)&clip, 2);
+        ClipCursor(&clip);
+    }
+}
+
 static void set_focus(SDL_Window *window, bool focused)
 {
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
     if (focused) {
         if (sdlop.keyboard_focus != window) {
             sdlop.keyboard_focus = window;
             window->flags |= SDL_WINDOW_INPUT_FOCUS;
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
+            /* SDL3 re-confines on activation: Alt-Tab back into a grabbed or
+             * relative-mode game and the cursor is captured again. */
+            restore_cursor_clip(window);
         }
     } else if (sdlop.keyboard_focus == window) {
         sdlop.keyboard_focus = NULL;
         window->flags &= ~SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_LOST, 0, 0);
+        /* Never leave the pointer trapped in an inactive window (SDL3 does
+         * the same in WIN_UpdateFocus). */
+        if (data) {
+            release_cursor_clip(data);
+        }
     }
 }
 
@@ -498,13 +443,15 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_SYSKEYDOWN:
     case WM_SYSKEYUP:
         if (window) {
-            const SDL_Scancode sc = scancode_from_msg(&m);
+            Uint16 scan_code = 0;
+            const SDL_Scancode sc = scancode_from_msg(&m, &scan_code);
             const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
             if (sc != SDL_SCANCODE_UNKNOWN) {
                 /* the rawcode packs the virtual-key code (high byte) with the
                  * hardware scancode (low byte); the core needs the VK to
-                 * translate the key */
-                const Uint16 raw = SDLOP_WIN32_RAWCODE(wparam, (lparam >> 16) & 0xFF);
+                 * translate the key. The scan code comes from the same helper
+                 * so an injected key without one still resolves. */
+                const Uint16 raw = SDLOP_WIN32_RAWCODE(wparam, scan_code & 0xFF);
                 const Uint64 ts = SDLOP_Win32Timestamp();
                 const bool repeat = (lparam & (1 << 30)) != 0;
                 SDLOP_SendKeyboardKey(down, repeat, sc, raw, ts);
@@ -1131,10 +1078,18 @@ static bool win32_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Wind
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
     if (enabled) {
         if (data && data->hwnd) {
+            RECT rc;
+            GetClientRect(data->hwnd, &rc);
+            MapWindowPoints(data->hwnd, NULL, (POINT *)&rc, 2);
+            ClipCursor(&rc);
+            data->cursor_clipped_rect = rc;
             SetCapture(data->hwnd);
         }
         sdlop_relative_hide_cursor(true);
     } else {
+        if (data) {
+            release_cursor_clip(data);
+        }
         ReleaseCapture();
         sdlop_relative_hide_cursor(false);
     }
@@ -1407,7 +1362,16 @@ static void win32_SetWindowBordered(SDLop_VideoDevice *device, SDL_Window *windo
     if (!data || !data->hwnd) {
         return;
     }
+    /* ``bordered`` is expressed through window->flags by the core, so the
+     * style is recomputed from the flags -- same approach as SDL3, which
+     * re-derives GetWindowStyle() rather than patching single bits. */
+    if (bordered) {
+        window->flags &= ~SDL_WINDOW_BORDERLESS;
+    } else {
+        window->flags |= SDL_WINDOW_BORDERLESS;
+    }
     const DWORD style = window_style_for(window);
+    SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, (LONG_PTR)window_exstyle_for(window));
     SetWindowLongPtrW(data->hwnd, GWL_STYLE, (LONG_PTR)style);
     SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 }
@@ -1448,6 +1412,7 @@ static bool win32_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *wind
         GetWindowRect(data->hwnd, &clip);
     }
     ClipCursor(&clip);
+    data->cursor_clipped_rect = clip;
     return true;
 }
 
@@ -1462,9 +1427,10 @@ static bool win32_SetWindowMouseGrab(SDLop_VideoDevice *device, SDL_Window *wind
         RECT rc;
         GetWindowRect(data->hwnd, &rc);
         ClipCursor(&rc);
+        data->cursor_clipped_rect = rc;
         SetCapture(data->hwnd);
     } else {
-        ClipCursor(NULL);
+        release_cursor_clip(data);
         ReleaseCapture();
     }
     return true;
