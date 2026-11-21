@@ -16,6 +16,15 @@ xcb_connection_t *SDLOP_X11_GetConnection(void);
 int SDLOP_X11_GetScreenNumber(void);
 xcb_visualid_t SDLOP_X11_GetVisual(void);
 xcb_window_t SDLOP_X11_GetWindowXID(SDL_Window *window);
+/* X visual of the window: SDLOP_X11_GetVisual() unless it is an OpenGL window
+ * created with the visual of its GLX framebuffer config */
+xcb_visualid_t SDLOP_X11_GetWindowVisual(SDL_Window *window);
+/* whether windows can use this visual in place of the root visual: TrueColor
+ * at the root depth (the window surface and its blits assume that depth) */
+bool SDLOP_X11_IsCompatibleVisual(xcb_visualid_t visual);
+/* visual an SDL_WINDOW_OPENGL window should be created with for the current
+ * SDL_GL_* attributes, as stock SDL3's X11_GL_GetVisual; 0 = default visual */
+xcb_visualid_t SDLOP_X11_GL_ChooseWindowVisual(void);
 void SDLOP_X11_SetGLActive(SDL_Window *window, bool active);
 void **SDLOP_X11_GetGLSurfaceSlot(SDL_Window *window);
 

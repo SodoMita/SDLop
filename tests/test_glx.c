@@ -21,6 +21,12 @@
       when the server has the matching GLX extensions
     - destroying the window while its GLX context is current is safe
     - GLX again after SDL_Quit / SDL_Init
+    - framebuffer attributes are honoured like stock SDL3 / GLFW: the GLX
+      config behind the context (glXQueryContext GLX_FBCONFIG_ID) has the
+      requested alpha / depth / stencil sizes when the server offers such a
+      config (RGB888 + depth 0 and RGBA8888 + depth 24 / stencil 8), also
+      when the attributes change after the window was created, and
+      SDL_GL_GetAttribute reports the realised sizes (glGetIntegerv)
 
   Skips when DISPLAY is unset or the X server / libGL has no GLX.
 
@@ -75,12 +81,34 @@ typedef void *(*PFN_glXGetCurrentDisplay)(void);
 typedef unsigned long (*PFN_glXGetCurrentDrawable)(void);
 typedef int (*PFN_glXQueryVersion)(void *, int *, int *);
 typedef const char *(*PFN_glXQueryExtensionsString)(void *, int);
+typedef int (*PFN_glXQueryContext)(void *, void *, int, int *);
+typedef void **(*PFN_glXGetFBConfigs)(void *, int, int *);
+typedef int (*PFN_glXGetFBConfigAttrib)(void *, void *, int, int *);
+typedef int (*PFN_XFree)(void *);
+#define GLX_ALPHA_SIZE_     11
+#define GLX_DEPTH_SIZE_     12
+#define GLX_STENCIL_SIZE_   13
+#define GLX_RED_SIZE_       8
+#define GLX_DOUBLEBUFFER_   5
+#define GLX_VISUAL_ID_      0x800B
+#define GLX_DRAWABLE_TYPE_  0x8010
+#define GLX_RENDER_TYPE_    0x8011
+#define GLX_FBCONFIG_ID_    0x8013
+#define GLX_WINDOW_BIT_     0x1
+#define GLX_RGBA_BIT_       0x1
+#define GL_ALPHA_BITS_      0x0D55
+#define GL_DEPTH_BITS_      0x0D56
+#define GL_STENCIL_BITS_    0x0D57
 
 static PFN_glXGetCurrentContext p_glXGetCurrentContext;
 static PFN_glXGetCurrentDisplay p_glXGetCurrentDisplay;
 static PFN_glXGetCurrentDrawable p_glXGetCurrentDrawable;
 static PFN_glXQueryVersion p_glXQueryVersion;
 static PFN_glXQueryExtensionsString p_glXQueryExtensionsString;
+static PFN_glXQueryContext p_glXQueryContext;
+static PFN_glXGetFBConfigs p_glXGetFBConfigs;
+static PFN_glXGetFBConfigAttrib p_glXGetFBConfigAttrib;
+static PFN_XFree p_XFree;
 static char glx_extensions[8192]; /* server+client GLX extensions, read under the first context */
 
 static bool load_glx(void)
@@ -97,6 +125,14 @@ static bool load_glx(void)
     p_glXGetCurrentDrawable = (PFN_glXGetCurrentDrawable)dlsym(lib, "glXGetCurrentDrawable");
     p_glXQueryVersion = (PFN_glXQueryVersion)dlsym(lib, "glXQueryVersion");
     p_glXQueryExtensionsString = (PFN_glXQueryExtensionsString)dlsym(lib, "glXQueryExtensionsString");
+    p_glXQueryContext = (PFN_glXQueryContext)dlsym(lib, "glXQueryContext");
+    p_glXGetFBConfigs = (PFN_glXGetFBConfigs)dlsym(lib, "glXGetFBConfigs");
+    p_glXGetFBConfigAttrib = (PFN_glXGetFBConfigAttrib)dlsym(lib, "glXGetFBConfigAttrib");
+    p_XFree = (PFN_XFree)dlsym(RTLD_DEFAULT, "XFree");
+    if (!p_XFree) {
+        void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+        p_XFree = x11 ? (PFN_XFree)dlsym(x11, "XFree") : NULL;
+    }
     return p_glXGetCurrentContext && p_glXGetCurrentDisplay && p_glXGetCurrentDrawable && p_glXQueryVersion &&
            p_glXQueryExtensionsString;
 }
@@ -212,6 +248,198 @@ static void check_es(int major, int minor, bool expect_glx, const char *label)
     if (w) {
         SDL_DestroyWindow(w);
     }
+}
+
+/* alpha / depth / stencil / visual of the GLX config behind the current
+ * context, read from GLX itself */
+typedef struct FBSizes
+{
+    int alpha, depth, stencil, visual;
+} FBSizes;
+
+static bool fb_api(void)
+{
+    return p_glXQueryContext && p_glXGetFBConfigs && p_glXGetFBConfigAttrib && p_XFree;
+}
+
+static bool current_fb_sizes(FBSizes *out)
+{
+    void *dpy = p_glXGetCurrentDisplay();
+    void *ctx = p_glXGetCurrentContext();
+    int id = 0, n = 0;
+    if (!dpy || !ctx || p_glXQueryContext(dpy, ctx, GLX_FBCONFIG_ID_, &id) != 0) {
+        return false;
+    }
+    void **configs = p_glXGetFBConfigs(dpy, 0, &n);
+    bool found = false;
+    for (int i = 0; i < n && !found; i++) {
+        int cid = -1;
+        if (p_glXGetFBConfigAttrib(dpy, configs[i], GLX_FBCONFIG_ID_, &cid) == 0 && cid == id) {
+            p_glXGetFBConfigAttrib(dpy, configs[i], GLX_ALPHA_SIZE_, &out->alpha);
+            p_glXGetFBConfigAttrib(dpy, configs[i], GLX_DEPTH_SIZE_, &out->depth);
+            p_glXGetFBConfigAttrib(dpy, configs[i], GLX_STENCIL_SIZE_, &out->stencil);
+            p_glXGetFBConfigAttrib(dpy, configs[i], GLX_VISUAL_ID_, &out->visual);
+            found = true;
+        }
+    }
+    if (configs) {
+        p_XFree(configs);
+    }
+    return found;
+}
+
+/* whether the server has a double-buffered RGB(A)8 window config with
+ * exactly these sizes (otherwise the driver's nearest one is fine) */
+static bool server_has_config(int alpha, int depth, int stencil)
+{
+    void *dpy = p_glXGetCurrentDisplay();
+    int n = 0;
+    void **configs = dpy ? p_glXGetFBConfigs(dpy, 0, &n) : NULL;
+    bool found = false;
+    for (int i = 0; i < n && !found; i++) {
+        int r = 0, a = -1, d = -1, st = -1, db = 0, dt = 0, rt = 0, vid = 0;
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_RED_SIZE_, &r);
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_ALPHA_SIZE_, &a);
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_DEPTH_SIZE_, &d);
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_STENCIL_SIZE_, &st);
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_DOUBLEBUFFER_, &db);
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_DRAWABLE_TYPE_, &dt);
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_RENDER_TYPE_, &rt);
+        p_glXGetFBConfigAttrib(dpy, configs[i], GLX_VISUAL_ID_, &vid);
+        found = r == 8 && a == alpha && d == depth && st == stencil && db && (dt & GLX_WINDOW_BIT_) &&
+                (rt & GLX_RGBA_BIT_) && vid != 0;
+    }
+    if (configs) {
+        p_XFree(configs);
+    }
+    return found;
+}
+
+static void request_fb(int alpha, int depth, int stencil)
+{
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, alpha);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, depth);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, stencil);
+}
+
+/* a context with the current attributes on w: the GLX config honours
+ * alpha / depth / stencil (exactly, when the server has such a config), and
+ * SDL_GL_GetAttribute reports what the config has */
+static void check_fb(const char *label, SDL_Window *w, int alpha, int depth, int stencil, bool core)
+{
+    if (core) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    } else {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 0);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    }
+    SDL_GLContext ctx = SDL_GL_CreateContext(w);
+    CHECK(ctx != NULL, "%s: context", label);
+    if (!ctx) {
+        return;
+    }
+    FBSizes fb = { -1, -1, -1, 0 };
+    CHECK(p_glXGetCurrentContext() != NULL && current_fb_sizes(&fb), "%s: GLX config of the context", label);
+    printf("%s: requested a%d d%d s%d -> GLX config a%d d%d s%d (visual 0x%x)\n", label, alpha, depth, stencil,
+           fb.alpha, fb.depth, fb.stencil, (unsigned)fb.visual);
+    if (server_has_config(alpha, depth, stencil)) {
+        CHECK(fb.alpha == alpha && fb.depth == depth && fb.stencil == stencil,
+              "%s: request a%d d%d s%d realised as a%d d%d s%d", label, alpha, depth, stencil, fb.alpha, fb.depth,
+              fb.stencil);
+    } else {
+        /* Mesa (CI: Xvfb + llvmpipe) has every combination used here */
+        const char *strict = getenv("SDLOP_TEST_STRICT");
+        CHECK(!(strict && *strict == '1') || (alpha == 0 && depth == 16),
+              "%s: server has no exact a%d d%d s%d config (SDLOP_TEST_STRICT)", label, alpha, depth, stencil);
+        printf("%s: server has no exact a%d d%d s%d config\n", label, alpha, depth, stencil);
+        CHECK(fb.alpha >= alpha && fb.depth >= depth && fb.stencil >= stencil, "%s: minimums", label);
+    }
+    int a = -1, d = -1, st = -1, r = -1, bs = -1;
+    CHECK(SDL_GL_GetAttribute(SDL_GL_ALPHA_SIZE, &a) && a == fb.alpha, "%s: SDL_GL_ALPHA_SIZE %d != %d", label, a,
+          fb.alpha);
+    CHECK(SDL_GL_GetAttribute(SDL_GL_DEPTH_SIZE, &d) && d == fb.depth, "%s: SDL_GL_DEPTH_SIZE %d != %d", label, d,
+          fb.depth);
+    CHECK(SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &st) && st == fb.stencil, "%s: SDL_GL_STENCIL_SIZE %d != %d",
+          label, st, fb.stencil);
+    CHECK(SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &r) && r == 8, "%s: SDL_GL_RED_SIZE %d", label, r);
+    CHECK(SDL_GL_GetAttribute(SDL_GL_BUFFER_SIZE, &bs) && bs == 24 + fb.alpha, "%s: SDL_GL_BUFFER_SIZE %d", label,
+          bs);
+    if (!core) {
+        /* independent of SDL: the legacy *_BITS state of the context */
+        CHECK(gl_int(GL_ALPHA_BITS_) == fb.alpha && gl_int(GL_DEPTH_BITS_) == fb.depth &&
+                  gl_int(GL_STENCIL_BITS_) == fb.stencil,
+              "%s: GL_*_BITS a%d d%d s%d", label, gl_int(GL_ALPHA_BITS_), gl_int(GL_DEPTH_BITS_),
+              gl_int(GL_STENCIL_BITS_));
+    }
+    check_render(label, w);
+    SDL_GL_DestroyContext(ctx);
+}
+
+static void check_fb_attributes(void)
+{
+    if (!fb_api()) {
+        printf("fb: SKIP (no glXQueryContext / glXGetFBConfigs / XFree)\n");
+        return;
+    }
+    /* RGB888, no depth / stencil (the GLFW-style 8880 + depth 0 request) */
+    reset_attrs();
+    request_fb(0, 0, 0);
+    SDL_Window *w = SDL_CreateWindow("test_glx fb", 32, 32, SDL_WINDOW_OPENGL);
+    CHECK(w != NULL, "fb: window");
+    if (!w) {
+        return;
+    }
+    check_fb("fb 8880/0/0 legacy", w, 0, 0, 0, false);
+    request_fb(0, 0, 0);
+    check_fb("fb 8880/0/0 core", w, 0, 0, 0, true);
+    /* attributes changed after the window was created */
+    request_fb(8, 24, 8);
+    check_fb("fb 8888/24/8 on the 8880 window", w, 8, 24, 8, false);
+    SDL_DestroyWindow(w);
+
+    reset_attrs();
+    request_fb(8, 24, 8);
+    w = SDL_CreateWindow("test_glx fb", 32, 32, SDL_WINDOW_OPENGL);
+    CHECK(w != NULL, "fb: window 2");
+    if (w) {
+        check_fb("fb 8888/24/8 legacy", w, 8, 24, 8, false);
+        request_fb(8, 24, 8);
+        check_fb("fb 8888/24/8 core", w, 8, 24, 8, true);
+        request_fb(0, 16, 0);
+        check_fb("fb 8880/16/0 on the 8888 window", w, 0, 16, 0, true);
+        SDL_DestroyWindow(w);
+    }
+
+    /* defaults (depth 16 minimum): whatever the driver prefers, reported */
+    reset_attrs();
+    w = SDL_CreateWindow("test_glx fb", 32, 32, SDL_WINDOW_OPENGL);
+    if (w) {
+        SDL_GLContext ctx = SDL_GL_CreateContext(w);
+        CHECK(ctx != NULL, "fb defaults: context");
+        FBSizes fb = { -1, -1, -1, 0 };
+        if (ctx && current_fb_sizes(&fb)) {
+            int d = -1;
+            printf("fb defaults: GLX config a%d d%d s%d\n", fb.alpha, fb.depth, fb.stencil);
+            CHECK(fb.depth >= 16, "fb defaults: depth %d < 16", fb.depth);
+            CHECK(SDL_GL_GetAttribute(SDL_GL_DEPTH_SIZE, &d) && d == fb.depth, "fb defaults: reported depth %d", d);
+        }
+        if (ctx) {
+            SDL_GL_DestroyContext(ctx);
+        }
+        SDL_DestroyWindow(w);
+    }
+    /* no context current: the request is reported */
+    reset_attrs();
+    request_fb(0, 0, 0);
+    int d = -1;
+    CHECK(SDL_GL_GetAttribute(SDL_GL_DEPTH_SIZE, &d) && d == 0, "fb: request without a context (%d)", d);
+    reset_attrs();
 }
 
 int main(void)
@@ -483,6 +711,9 @@ int main(void)
     if (w) {
         SDL_DestroyWindow(w);
     }
+
+    /* 8. framebuffer attributes */
+    check_fb_attributes();
     SDL_Quit();
 
     if (failures) {

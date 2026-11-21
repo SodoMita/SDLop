@@ -492,7 +492,13 @@ Highlights:
   `SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG` / `SDL_GL_CONTEXT_RESET_NOTIFICATION`
   (`GLX_ARB_create_context_robustness`) and
   `SDL_GL_CONTEXT_RELEASE_BEHAVIOR` (`GLX_ARB_context_flush_control`), each
-  only when the server has the extension (otherwise ignored). Swap control:
+  only when the server has the extension (otherwise ignored). Framebuffer
+  attributes (`SDL_GL_ALPHA_SIZE`, `SDL_GL_DEPTH_SIZE`, `SDL_GL_STENCIL_SIZE`,
+  ...) pick the driver's best `glXChooseFBConfig` match and OpenGL windows
+  are created with that config's X visual, as in stock SDL3 / GLFW (RGB888 +
+  depth 0 gets exactly that; set them before `SDL_CreateWindow`).
+  `SDL_GL_GetAttribute` reports the realised sizes of the current context
+  (all backends), like stock. Swap control:
   `GLX_EXT_swap_control` (+ `_tear` for adaptive vsync, interval -1), else
   MESA, else SGI; as in stock SDL3, `SDL_GL_SetSwapInterval` fails with "not
   supported" when there is none (e.g. Xvfb).

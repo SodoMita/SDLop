@@ -139,6 +139,8 @@ typedef struct X11WindowData
     /* GL */
     bool gl_active;
     void *egl_surface;
+    xcb_visualid_t visual;        /* x11.visual, or the GLX config's visual */
+    xcb_colormap_t colormap;      /* own colormap for a non-default visual */
 
     /* state the app has been told about (window->flags may be preset by
      * the core before the request is confirmed, e.g. FULLSCREEN) */
@@ -849,6 +851,35 @@ xcb_window_t SDLOP_X11_GetWindowXID(SDL_Window *window)
 {
     X11WindowData *wd = wdata(window);
     return wd ? wd->xid : XCB_WINDOW_NONE;
+}
+
+xcb_visualid_t SDLOP_X11_GetWindowVisual(SDL_Window *window)
+{
+    X11WindowData *wd = wdata(window);
+    return (wd && wd->visual) ? wd->visual : x11.visual;
+}
+
+bool SDLOP_X11_IsCompatibleVisual(xcb_visualid_t visual)
+{
+    if (visual == x11.visual) {
+        return true;
+    }
+    if (!x11.screen || visual == 0) {
+        return false;
+    }
+    xcb_depth_iterator_t di = X11_xcb_screen_allowed_depths_iterator(x11.screen);
+    for (; di.rem; X11_xcb_depth_next(&di)) {
+        if (di.data->depth != x11.depth) {
+            continue;
+        }
+        xcb_visualtype_iterator_t vi = X11_xcb_depth_visuals_iterator(di.data);
+        for (; vi.rem; X11_xcb_visualtype_next(&vi)) {
+            if (vi.data->visual_id == visual) {
+                return vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR;
+            }
+        }
+    }
+    return false;
 }
 
 void SDLOP_X11_SetGLActive(SDL_Window *window, bool active)
@@ -1938,10 +1969,26 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     wd->parent = x11.root;
     uint32_t clear = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
     bool gpu = (window->flags & (SDL_WINDOW_OPENGL | SDL_WINDOW_VULKAN)) != 0;
+    /* OpenGL windows take the X visual of the GLX framebuffer config that
+     * matches the SDL_GL_* attributes, as in stock SDL3 (X11_GL_GetVisual):
+     * the root visual is bound to one fixed config (typically RGBA8888 with
+     * depth 24 / stencil 8), so keeping it would override the request. */
+    wd->visual = x11.visual;
+    if (window->flags & SDL_WINDOW_OPENGL) {
+        xcb_visualid_t gl_visual = SDLOP_X11_GL_ChooseWindowVisual();
+        if (gl_visual && SDLOP_X11_IsCompatibleVisual(gl_visual)) {
+            wd->visual = gl_visual;
+        }
+    }
+    /* a visual other than the parent's needs its own colormap (BadMatch) */
+    if (wd->visual != x11.visual) {
+        wd->colormap = X11_xcb_generate_id(x11.conn);
+        X11_xcb_create_colormap(x11.conn, XCB_COLORMAP_ALLOC_NONE, wd->colormap, x11.root, wd->visual);
+    }
     /* GPU windows get no background so resizes don't flash */
     uint32_t mask = (gpu ? XCB_CW_BACK_PIXMAP : XCB_CW_BACK_PIXEL) | XCB_CW_BORDER_PIXEL |
-                    XCB_CW_BIT_GRAVITY | XCB_CW_EVENT_MASK;
-    uint32_t values[4] = {
+                    XCB_CW_BIT_GRAVITY | XCB_CW_EVENT_MASK | (wd->colormap ? XCB_CW_COLORMAP : 0);
+    uint32_t values[5] = {
         gpu ? XCB_BACK_PIXMAP_NONE : clear,
         0,
         XCB_GRAVITY_NORTH_WEST,
@@ -1949,15 +1996,19 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
             XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
             XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_POINTER_MOTION |
             XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE,
+        wd->colormap, /* value order follows the mask bits: COLORMAP is last */
     };
     xcb_generic_error_t *err = X11_xcb_request_check(
         x11.conn, X11_xcb_create_window_checked(x11.conn, XCB_COPY_FROM_PARENT, wd->xid, x11.root,
                                                 (int16_t)window->x, (int16_t)window->y, (uint16_t)window->w,
                                                 (uint16_t)window->h, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
-                                                x11.visual, mask, values));
+                                                wd->visual, mask, values));
     if (err) {
         int code = err->error_code;
         free(err);
+        if (wd->colormap) {
+            X11_xcb_free_colormap(x11.conn, wd->colormap);
+        }
         free(wd);
         window->driverdata = NULL;
         return SDL_SetError("xcb_create_window failed (X error %d)", code);
@@ -2177,6 +2228,9 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     fb_free(wd);
     X11_xcb_free_gc(x11.conn, wd->gc);
     X11_xcb_destroy_window(x11.conn, wd->xid);
+    if (wd->colormap) {
+        X11_xcb_free_colormap(x11.conn, wd->colormap);
+    }
     x11_flush();
     free(wd);
     window->driverdata = NULL;

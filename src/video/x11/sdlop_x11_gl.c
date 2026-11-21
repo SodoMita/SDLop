@@ -19,6 +19,11 @@
       GLX is unusable (no libGL, no GLX extension, no framebuffer config
       for SDLop's window visual).
 
+  Framebuffer config: the driver's best glXChooseFBConfig match for the
+  SDL_GL_* sizes, and SDL_WINDOW_OPENGL windows are created with its X
+  visual (stock SDL3's X11_GL_GetVisual), so e.g. RGB888 + depth 0 is
+  honoured; see glx_pick_config.
+
   GLX context attributes, each sent only when the extension is present:
   GLX_ARB_create_context_robustness (SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG,
   SDL_GL_CONTEXT_RESET_NOTIFICATION), GLX_ARB_create_context_no_error
@@ -192,7 +197,7 @@ static bool ensure_egl_display(void)
     return true;
 }
 
-static bool pick_config(EGLConfig *out, EGLenum api)
+static bool pick_config(EGLConfig *out, EGLenum api, xcb_visualid_t visual)
 {
     EGLint renderable;
     if (api == EGL_OPENGL_API) {
@@ -221,9 +226,9 @@ static bool pick_config(EGLConfig *out, EGLenum api)
     if (!SDLOP_EGL_eglChooseConfig(egl_display, attribs, configs, 64, &num) || num == 0) {
         return SDL_SetError("eglChooseConfig found no matching config");
     }
-    /* windows use the root visual: a config with a different native
-     * visual would fail eglCreateWindowSurface with EGL_BAD_MATCH */
-    xcb_visualid_t visual = SDLOP_X11_GetVisual();
+    /* the first config (EGL's preference order) on the window's visual: a
+     * config with a different native visual can fail eglCreateWindowSurface
+     * with EGL_BAD_MATCH */
     for (EGLint i = 0; i < num; i++) {
         EGLint vid = 0;
         if (SDLOP_EGL_eglGetConfigAttrib(egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &vid) &&
@@ -236,7 +241,7 @@ static bool pick_config(EGLConfig *out, EGLenum api)
     return true;
 }
 
-static void *egl_CreateContext(void)
+static void *egl_CreateContext(xcb_visualid_t visual)
 {
     if (!ensure_egl_display()) {
         return NULL;
@@ -250,7 +255,7 @@ static void *egl_CreateContext(void)
         return NULL;
     }
     EGLConfig config;
-    if (!pick_config(&config, api)) {
+    if (!pick_config(&config, api, visual)) {
         return NULL;
     }
     EGLint ctx_attribs[64];
@@ -303,7 +308,7 @@ static void *egl_CreateContext(void)
     return glctx;
 }
 
-static bool config_for_context(X11GLContext *glctx, EGLConfig *out)
+static bool config_for_context(X11GLContext *glctx, EGLConfig *out, xcb_visualid_t visual)
 {
     EGLint id = 0;
     if (SDLOP_EGL_eglQueryContext(egl_display, glctx->ctx, EGL_CONFIG_ID, &id)) {
@@ -313,7 +318,7 @@ static bool config_for_context(X11GLContext *glctx, EGLConfig *out)
             return true;
         }
     }
-    return pick_config(out, glctx->api);
+    return pick_config(out, glctx->api, visual);
 }
 
 static bool egl_MakeCurrent(SDL_Window *window, X11GLContext *context)
@@ -341,7 +346,7 @@ static bool egl_MakeCurrent(SDL_Window *window, X11GLContext *context)
         }
         if (!*slot) {
             EGLConfig config;
-            if (!config_for_context(glctx, &config)) {
+            if (!config_for_context(glctx, &config, SDLOP_X11_GetWindowVisual(window))) {
                 return false;
             }
             /* legacy entry point takes the XID by value on both platforms */
@@ -383,7 +388,8 @@ void *SDLOP_X11_EGL_GetConfig(SDLop_VideoDevice *device)
     (void)device;
     X11GLContext *cur = (X11GLContext *)SDLOP_GL_CurrentContext();
     EGLConfig config;
-    if (!egl_initialized || !cur || cur->backend != X11GL_BACKEND_EGL || !config_for_context(cur, &config)) {
+    if (!egl_initialized || !cur || cur->backend != X11GL_BACKEND_EGL ||
+        !config_for_context(cur, &config, SDLOP_X11_GetWindowVisual(SDL_GL_GetCurrentWindow()))) {
         return NULL;
     }
     return (void *)config;
@@ -731,9 +737,27 @@ static bool glx_init(void)
     return true;
 }
 
-/* GLXFBConfig for the current attributes whose X visual is the one SDLop
- * creates its windows with (glXMakeCurrent fails with BadMatch otherwise). */
-static bool glx_pick_config(GLXFBConfig_ *out)
+/* GLXFBConfig for the current SDL_GL_* attributes.
+ *
+ * glXChooseFBConfig treats the sizes as minimums and returns the matches in
+ * the driver's preference order; stock SDL3 (X11_GL_GetVisual) and GLFW take
+ * the driver's best match, and Mesa puts configs without alpha / depth /
+ * stencil first when none is asked for, so a request for RGB888 with depth 0
+ * gets exactly that. The first config whose visual is usable as a window
+ * visual is picked here.
+ *
+ * `visual` != 0 restricts the choice to configs of that X visual: a GL
+ * context must match its window's visual (glXMakeCurrent fails with
+ * BadMatch otherwise), and the window was created with the visual of the
+ * config chosen for the same attributes (SDLOP_X11_GL_ChooseWindowVisual),
+ * so this normally lands on the same config. Windows created without
+ * SDL_WINDOW_OPENGL keep the root visual and get the best config on it.
+ * When the attributes changed after the window was created and no config of
+ * its visual satisfies them, the best config on any compatible visual is
+ * used, which is what stock does (it takes the first config regardless of
+ * the window's visual); Mesa accepts a context config of the window's depth
+ * on that drawable. */
+static bool glx_pick_config(xcb_visualid_t visual, GLXFBConfig_ *out, xcb_visualid_t *out_visual)
 {
     int attribs[64];
     int n = 0;
@@ -787,28 +811,47 @@ static bool glx_pick_config(GLXFBConfig_ *out)
         }
         return SDL_SetError("glXChooseFBConfig found no matching config");
     }
-    const xcb_visualid_t visual = SDLOP_X11_GetVisual();
-    bool found = false;
-    for (int i = 0; i < num && !found; i++) {
+    int exact = -1, compatible = -1;
+    xcb_visualid_t compatible_vid = 0;
+    for (int i = 0; i < num && exact < 0; i++) {
         int vid = 0;
-        if (glx.GetFBConfigAttrib(glx.dpy, configs[i], GLX_VISUAL_ID_, &vid) == 0 &&
-            (xcb_visualid_t)vid == visual) {
-            *out = configs[i];
-            found = true;
+        if (glx.GetFBConfigAttrib(glx.dpy, configs[i], GLX_VISUAL_ID_, &vid) != 0 || vid == 0) {
+            continue;
+        }
+        if (visual && (xcb_visualid_t)vid == visual) {
+            exact = i;
+        } else if (compatible < 0 && SDLOP_X11_IsCompatibleVisual((xcb_visualid_t)vid)) {
+            compatible = i;
+            compatible_vid = (xcb_visualid_t)vid;
+            if (!visual) {
+                break;
+            }
+        }
+    }
+    const int pick = exact >= 0 ? exact : compatible;
+    if (pick >= 0) {
+        *out = configs[pick];
+        if (out_visual) {
+            *out_visual = exact >= 0 ? visual : compatible_vid;
+        }
+        if (visual && exact < 0) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "SDLop: no GLX config of window visual 0x%x fits the GL attributes, using visual 0x%x's",
+                         (unsigned)visual, (unsigned)compatible_vid);
         }
     }
     glx.XFree(configs);
-    if (!found) {
-        return SDL_SetError("No GLX config matches the window visual 0x%x", (unsigned)visual);
+    if (pick < 0) {
+        return SDL_SetError("No GLX config has a usable window visual");
     }
     return true;
 }
 
-static void *glx_CreateContext(void)
+static void *glx_CreateContext(xcb_visualid_t visual)
 {
     const bool es = sdlop_glattrs.profile_mask == SDL_GL_CONTEXT_PROFILE_ES;
     GLXFBConfig_ config = NULL;
-    if (!glx_pick_config(&config)) {
+    if (!glx_pick_config(visual, &config, NULL)) {
         return NULL;
     }
     GLXContext_ share = NULL;
@@ -1002,10 +1045,40 @@ static bool current_is_glx(void)
     return cur && cur->backend == X11GL_BACKEND_GLX;
 }
 
+xcb_visualid_t SDLOP_X11_GL_ChooseWindowVisual(void)
+{
+    /* the generic offload path never renders into the X drawable */
+    if (SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE && SDLOP_GLOffload_HasHardwareGPU()) {
+        return 0;
+    }
+    /* Probing GLX must not leave an error behind for a window that is
+     * created fine (no libGL / no GLX: the default visual is used and
+     * SDL_GL_CreateContext reports the problem later). */
+    char saved[256];
+    SDL_strlcpy(saved, SDL_GetError(), sizeof(saved));
+    xcb_visualid_t visual = 0;
+    GLXFBConfig_ config = NULL;
+    /* EGL contexts keep the default visual: EGL's configs carry the visual
+     * of the window they are created for, so pick_config honours the
+     * request on it already */
+    if (want_glx() && glx_pick_config(0, &config, &visual)) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "SDLop: GL window visual 0x%x (default 0x%x)", (unsigned)visual,
+                     (unsigned)SDLOP_X11_GetVisual());
+    } else {
+        visual = 0;
+    }
+    if (saved[0]) {
+        SDL_SetError("%s", saved);
+    } else {
+        SDL_ClearError();
+    }
+    return visual;
+}
+
 void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    (void)window;
+    const xcb_visualid_t visual = window ? SDLOP_X11_GetWindowVisual(window) : SDLOP_X11_GetVisual();
     /* A forced GL offload must use the generic headless-GPU path in
      * SDL_gl.c rather than GLX/EGL rendering into the X11 drawable. */
     if (SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE &&
@@ -1016,8 +1089,8 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     const bool es = sdlop_glattrs.profile_mask == SDL_GL_CONTEXT_PROFILE_ES;
     if (want_glx()) {
         GLXFBConfig_ probe = NULL;
-        if (glx_pick_config(&probe)) {
-            void *ctx = glx_CreateContext();
+        if (glx_pick_config(visual, &probe, NULL)) {
+            void *ctx = glx_CreateContext(visual);
             if (ctx || !es) {
                 /* desktop GL: a refused version is the answer, as in stock */
                 return ctx;
@@ -1025,7 +1098,7 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
             /* the driver advertises ES over GLX but not this version */
             SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop: %s, trying EGL", SDL_GetError());
             SDL_ClearError();
-            return egl_CreateContext();
+            return egl_CreateContext(visual);
         }
     }
     if (!force_egl() && (!es || !SDL_GetHintBoolean(SDL_HINT_OPENGL_ES_DRIVER, false))) {
@@ -1033,7 +1106,7 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop: GLX not used (%s), using EGL", SDL_GetError());
         SDL_ClearError();
     }
-    return egl_CreateContext();
+    return egl_CreateContext(visual);
 }
 
 bool SDLOP_X11_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, void *context)
