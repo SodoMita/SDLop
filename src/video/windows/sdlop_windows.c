@@ -1588,6 +1588,65 @@ static void win32_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *wi
     }
 }
 
+/* SDL_SetTextInputArea(): tell the IME where the text cursor is, so the
+ * composition window and the candidate list open next to it instead of in a
+ * corner. Both are client coordinates. */
+static bool win32_UpdateTextInputArea(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    HIMC himc;
+    const SDL_Rect *rect;
+
+    if (!data || !data->hwnd) {
+        return true;
+    }
+    rect = &window->text_input_rect;
+    if (rect->w <= 0 || rect->h <= 0) {
+        return true; /* nothing to position against */
+    }
+
+    himc = ImmGetContext(data->hwnd);
+    if (!himc) {
+        return true; /* no IME on this window: not an error */
+    }
+
+    {
+        COMPOSITIONFORM cof;
+        CANDIDATEFORM caf;
+        int font_height = rect->h;
+        LOGFONTW font;
+
+        if (ImmGetCompositionFontW(himc, &font) && font.lfHeight) {
+            font_height = font.lfHeight;
+        }
+
+        SDL_zero(cof);
+        cof.dwStyle = CFS_RECT;
+        cof.ptCurrentPos.x = rect->x + window->text_input_cursor;
+        cof.ptCurrentPos.y = rect->y + (rect->h - font_height) / 2;
+        cof.rcArea.left = rect->x;
+        cof.rcArea.right = rect->x + rect->w;
+        cof.rcArea.top = rect->y;
+        cof.rcArea.bottom = rect->y + rect->h;
+        ImmSetCompositionWindow(himc, &cof);
+
+        SDL_zero(caf);
+        caf.dwIndex = 0;
+        caf.dwStyle = CFS_EXCLUDE;
+        caf.ptCurrentPos.x = rect->x + window->text_input_cursor;
+        caf.ptCurrentPos.y = rect->y;
+        caf.rcArea.left = rect->x;
+        caf.rcArea.right = rect->x + rect->w;
+        caf.rcArea.top = rect->y;
+        caf.rcArea.bottom = rect->y + rect->h;
+        ImmSetCandidateWindow(himc, &caf);
+    }
+
+    ImmReleaseContext(data->hwnd, himc);
+    return true;
+}
+
 /* SDL_SetWindowShape(): SDL_WINDOW_TRANSPARENT windows. Win32 expresses a
  * non-rectangular window as a window region, so the alpha channel is turned
  * into one span per run of opaque pixels (the approach SDL3 takes in
@@ -2239,6 +2298,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .CaptureMouse = win32_CaptureMouse,
     .SetWindowHitTest = win32_SetWindowHitTest,
     .UpdateWindowShape = win32_UpdateWindowShape,
+    .UpdateTextInputArea = win32_UpdateTextInputArea,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
     .WarpMouse = win32_WarpMouse,
