@@ -16,6 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(SDLop_BUILD_EXAMPLES "Build SDLop examples" ON)
 option(SDLop_BUILD_TESTS "Build SDLop tests" ON)
 option(SDLop_BUILD_BENCHMARKS "Build SDLop benchmarks (incl. SDL3 comparison)" ON)
+option(SDLop_BUILD_TOOLS "Build developer tools (wl_injector, behaviour probes)" ${SDLop_BUILD_TESTS})
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -42,6 +43,8 @@ if(EMSCRIPTEN)
     src/SDL_clipboard.c
     src/SDL_thread.c
     src/SDL_misc.c
+    src/SDL_joystick.c
+    src/SDL_filesystem.c
     src/SDL_main.c
     src/SDL_rect.c
     src/SDL_pixels.c
@@ -198,7 +201,8 @@ set(SDLOP_WL_EXTRA_PROTOCOLS
   "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
   "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
   "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
-  "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml")
+  "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml"
+  "viewporter|stable/viewporter/viewporter.xml")
 set(SDLOP_WL_EXTRA_OUTPUTS)
 foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
   string(REPLACE "|" ";" parts "${entry}")
@@ -229,6 +233,16 @@ add_custom_command(
   DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 
 add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/viewporter-server-protocol.h ${WL_GEN_DIR}/viewporter-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+          ${WL_GEN_DIR}/viewporter-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+          ${WL_GEN_DIR}/viewporter-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml)
+
+add_custom_command(
   OUTPUT ${WL_GEN_DIR}/pointer-constraints-server-protocol.h ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
   COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
           ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
@@ -247,6 +261,31 @@ add_custom_command(
           ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
           ${WL_GEN_DIR}/relative-pointer-server-protocol.c
   DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
+
+# wlr virtual-pointer / zwp virtual-keyboard (vendored XMLs, not part of
+# wayland-protocols): used only by test_virtual_input and the developer
+# tools, generated on demand when one of them is built
+set(SDLOP_WL_VIRTUAL_POINTER_XML ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml)
+set(SDLOP_WL_VIRTUAL_KEYBOARD_XML ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
+if (EXISTS ${SDLOP_WL_VIRTUAL_POINTER_XML} AND EXISTS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
+  set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS ON)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_POINTER_XML}
+            ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_POINTER_XML}
+            ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    DEPENDS ${SDLOP_WL_VIRTUAL_POINTER_XML})
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
+            ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
+            ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+    DEPENDS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
+else()
+  set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS OFF)
+endif()
 
 add_custom_target(sdlop_wayland_protocols
   DEPENDS ${WL_GEN_DIR}/wayland-client-protocol.h
@@ -281,6 +320,8 @@ set(SDLop_SOURCES
   src/SDL_clipboard.c
   src/SDL_thread.c
   src/SDL_misc.c
+  src/SDL_joystick.c
+  src/SDL_filesystem.c
   src/SDL_main.c
   src/SDL_rect.c
   src/SDL_pixels.c
@@ -370,6 +411,30 @@ target_include_directories(sdlop_shared PRIVATE
 target_link_libraries(sdlop_shared PUBLIC ${SDLop_LIB_DEPS})
 target_compile_definitions(sdlop_shared PUBLIC ${SDLop_VIDEO_DEFS})
 
+# Drop-in packaging for applications built against stock SDL3.
+#  - SDLOP_SYMBOL_VERSIONING (default ON): export only SDL_*, tagged with
+#    stock SDL3's version node SDL3_0.0.0 (tools/sdlop.sym). With it, a
+#    libSDL3.so.0 -> libSDLop.so symlink loads without the dynamic loader's
+#    "no version information available" warning.
+#  - SDLOP_SDL3_SONAME (default OFF): build the shared library as
+#    libSDL3.so.0.<minor>.<micro> with SONAME libSDL3.so.0, exactly like
+#    stock SDL3, so it can replace it in a library path. Opt-in because it
+#    conflicts with an installed SDL3.
+option(SDLOP_SYMBOL_VERSIONING "Tag exports with SDL3's version node SDL3_0.0.0 and hide internals" ON)
+option(SDLOP_SDL3_SONAME "Name the shared library libSDL3.so.0 (SONAME) like stock SDL3" OFF)
+if (SDLOP_SYMBOL_VERSIONING AND NOT APPLE)
+  target_link_options(sdlop_shared PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tools/sdlop.sym")
+  set_property(TARGET sdlop_shared APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/sdlop.sym)
+endif()
+if (SDLOP_SDL3_SONAME)
+  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/include/SDL3/SDL_version.h _sdl_minor REGEX "^#define SDL_MINOR_VERSION +[0-9]+")
+  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/include/SDL3/SDL_version.h _sdl_micro REGEX "^#define SDL_MICRO_VERSION +[0-9]+")
+  string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _sdl_minor "${_sdl_minor}")
+  string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _sdl_micro "${_sdl_micro}")
+  set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDL3 SOVERSION 0 VERSION 0.${_sdl_minor}.${_sdl_micro})
+  message(STATUS "SDLop shared library: libSDL3.so.0.${_sdl_minor}.${_sdl_micro} (SONAME libSDL3.so.0)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Examples
 # ---------------------------------------------------------------------------
@@ -401,7 +466,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device test_options test_dropin_compat)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
@@ -437,23 +502,6 @@ if(SDLop_BUILD_TESTS)
   # same keycode checks through the built-in US table (no libxkbcommon)
   add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
   set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
-
-  # Manual, externally driven trace tool. It is intentionally not registered
-  # with CTest: it waits for a compositor-side input script after READY-INPUT.
-  add_executable(behaviour_probe_wayland tools/behaviour_probe_wayland.c)
-  target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
-  target_include_directories(behaviour_probe_wayland PRIVATE src)
-
-  # Reference compositor-side driver for the probe: injects the scripted
-  # pointer/key sequence once READY-INPUT appears. Also not a CTest.
-  add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c
-    ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-    ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
-  add_dependencies(behaviour_probe_inject sdlop_wayland_protocols)
-  target_include_directories(behaviour_probe_inject PRIVATE
-    ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
-  target_link_libraries(behaviour_probe_inject PRIVATE
-    ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
 
   # integration tests that need real subsystems (auto-skip when unavailable)
   add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
@@ -492,6 +540,20 @@ if(SDLop_BUILD_TESTS)
       # relative mode and a single root-window display
       add_test(NAME test_x11_minimal COMMAND test_x11)
       set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
+      add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
+      target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
+      target_include_directories(test_x11_raw_source PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_raw_source PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_raw_source COMMAND test_x11_raw_source)
+      set_tests_properties(test_x11_raw_source PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # desktop GL on X11 is GLX (GLEW & co. need glXGetCurrentDisplay);
+      # GLES / SDL_VIDEO_FORCE_EGL use EGL. libGL is dlopen-ed at run time.
+      add_executable(test_glx tests/test_glx.c)
+      target_link_libraries(test_glx PRIVATE sdlop ${CMAKE_DL_LIBS})
+      target_compile_options(test_glx PRIVATE -UNDEBUG)
+      add_test(NAME test_glx COMMAND test_glx)
+      set_tests_properties(test_glx PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
       set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
         "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none")
@@ -570,7 +632,8 @@ if(SDLop_BUILD_TESTS)
     add_executable(mini_compositor tests/mini_compositor.c
       ${WL_GEN_DIR}/xdg-shell-server-protocol.c
       ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-      ${WL_GEN_DIR}/relative-pointer-server-protocol.c)
+      ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+      ${WL_GEN_DIR}/viewporter-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -588,8 +651,17 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_touch PRIVATE -UNDEBUG)
     add_dependencies(test_touch mini_compositor)
     add_test(NAME test_touch COMMAND test_touch $<TARGET_FILE:mini_compositor>)
+
+    # wl_buffer release contract of software presentation
+    add_executable(test_wayland_buffers tests/test_wayland_buffers.c)
+    target_include_directories(test_wayland_buffers PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+    target_link_libraries(test_wayland_buffers PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
+    target_compile_options(test_wayland_buffers PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_buffers mini_compositor)
+    add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
+    add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
   else()
-    message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch")
+    message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch, test_wayland_buffers")
   endif()
 
   add_executable(smoke_relative_mode tests/smoke_relative_mode.c)
@@ -628,28 +700,7 @@ if(SDLop_BUILD_TESTS)
     message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute, test_vk_offload_live")
   endif()
 
-  # wlr virtual-input protocols (vendored XMLs) for the sway end-to-end test
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h ${WL_GEN_DIR}/virtual-keyboard-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml
-            ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml
-            ${WL_GEN_DIR}/virtual-keyboard-protocol.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
-
-  if(WAYLAND_CLIENT_FOUND)
+  if(WAYLAND_CLIENT_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
     add_executable(test_virtual_input tests/test_virtual_input.c
       ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
       ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
@@ -658,7 +709,7 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
     add_test(NAME test_virtual_input COMMAND test_virtual_input)
   else()
-    message(STATUS "wayland-client not found - skipping test_virtual_input")
+    message(STATUS "wayland-client or the virtual-input protocol XMLs not found - skipping test_virtual_input")
   endif()
 endif()
 
@@ -697,13 +748,41 @@ if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
   add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
 endif()
 
-# Wayland behaviour injector (virtual pointer + keyboard script driver);
-# pairs with the shared behaviour_probe_wayland on the agent branch and
-# tests/run_behaviour_wayland.sh
-if (NOT EMSCRIPTEN AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND)
-  add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
-  target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
-  target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+# Developer tools (not CTests). SDLop_BUILD_TOOLS=OFF skips them; the
+# injectors are also skipped (with a message) when wayland-client,
+# libxkbcommon or the vendored virtual-input protocol XMLs are missing.
+if (SDLop_BUILD_TOOLS AND NOT EMSCRIPTEN)
+  # Manual, externally driven trace tool: waits for a compositor-side input
+  # script after READY-INPUT.
+  add_executable(behaviour_probe_wayland tools/behaviour_probe_wayland.c)
+  target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
+  target_include_directories(behaviour_probe_wayland PRIVATE src)
+
+  if (WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
+    # Reference compositor-side driver for the probe: injects the scripted
+    # pointer/key sequence once READY-INPUT appears.
+    add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c
+      ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+      ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
+    add_dependencies(behaviour_probe_inject sdlop_wayland_protocols)
+    target_include_directories(behaviour_probe_inject PRIVATE
+      ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+    target_link_libraries(behaviour_probe_inject PRIVATE
+      ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+
+    # Wayland behaviour injector (virtual pointer + keyboard script driver);
+    # pairs with tests/run_behaviour_wayland.sh
+    add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
+    target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+    target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+  else()
+    message(STATUS "wayland-client, libxkbcommon or the virtual-input protocol XMLs not found - skipping wl_injector, behaviour_probe_inject")
+  endif()
+endif()
+
+# Options gate: SDLOP_* options are read through hints (settable from code)
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_test(NAME options_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/options_check.sh ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # Export gate: every function declared in include/SDL3 is exported by the
@@ -748,7 +827,7 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
   # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
   # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
   # only - every other test keeps full leak checking
-  foreach(t test_gl test_gl_matrix test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
+  foreach(t test_gl test_gl_matrix test_glx test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
     if (TEST ${t})
       set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endif()

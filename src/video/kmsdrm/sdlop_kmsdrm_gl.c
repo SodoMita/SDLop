@@ -179,8 +179,7 @@ static bool kmsdrm_can_try_prime(KMSDRM_DeviceData *dev)
     if (kmsdrm_prime_disabled || !dev || dev->drm_fd < 0) {
         return false;
     }
-    const char *env = getenv("SDLOP_GL_OFFLOAD_PRIME");
-    if (env && strcmp(env, "0") == 0) {
+    if (!SDLOP_HintFlag(SDLOP_HINT_GL_OFFLOAD_PRIME, true)) {
         return false;
     }
     if (!SDLOP_GLOffload_HasGBM() || !SDLOP_GBM_Available() ||
@@ -220,8 +219,7 @@ static void kmsdrm_release_prime_bos(KMSDRM_WindowData *windata)
  * always synchronous) */
 static bool kmsdrm_double_buffer(void)
 {
-    const char *v = getenv("SDLOP_KMSDRM_DOUBLE_BUFFER");
-    return v && *v && strcmp(v, "0") != 0;
+    return SDLOP_HintFlag("SDLOP_KMSDRM_DOUBLE_BUFFER", false);
 }
 static uint32_t kmsdrm_gl_visual_id = GBM_FORMAT_ARGB8888; /* must match the GBM surface format */
 
@@ -463,10 +461,8 @@ static bool pick_config(EGLConfig *out, uint32_t api)
     EGLint renderable;
     if (api == EGL_OPENGL_API) {
         renderable = EGL_OPENGL_BIT;
-    } else if (sdlop_glattrs.major_version >= 3) {
-        renderable = EGL_OPENGL_ES3_BIT;
     } else {
-        renderable = EGL_OPENGL_ES2_BIT;
+        renderable = SDLOP_EGL_ESRenderableType(egl_display);
     }
 
     /* Mesa's GBM platform silently ignores EGL_NATIVE_VISUAL_ID in the
@@ -876,8 +872,10 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
             ctx_attribs[n++] = EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE; ctx_attribs[n++] = EGL_TRUE;
         }
     } else {
-        ctx_attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
-        ctx_attribs[n++] = sdlop_glattrs.major_version >= 3 ? 3 : 2;
+        n = SDLOP_EGL_AppendESVersion(egl_display, ctx_attribs, n);
+        if (n < 0) {
+            return NULL;
+        }
     }
     n = SDLOP_EGL_AppendUserAttribs(true, egl_display, config, ctx_attribs, n, (int)SDL_arraysize(ctx_attribs));
     if (n < 0) {

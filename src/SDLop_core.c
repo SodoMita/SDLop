@@ -219,7 +219,11 @@ bool SDL_Init(SDL_InitFlags flags)
 #endif
         sdlop.init_done = true;
     }
-    if (flags & SDL_INIT_VIDEO) {
+    /* subsystem dependencies, as in stock SDL_InitSubSystem */
+    if (flags & SDL_INIT_GAMEPAD) {
+        flags |= SDL_INIT_JOYSTICK;
+    }
+    if (flags & (SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK | SDL_INIT_SENSOR | SDL_INIT_CAMERA)) {
         flags |= SDL_INIT_EVENTS;
     }
     SDL_InitFlags new_flags = flags & ~sdlop.init_flags;
@@ -267,6 +271,7 @@ void SDL_Quit(void)
     SDLOP_QuitTimers();
     SDLOP_QuitEvents();
     SDLOP_QuitClipboard();
+    SDLOP_QuitFilesystem();
     if (sdlop.wake_fd >= 0) {
         close(sdlop.wake_fd);
         sdlop.wake_fd = -1;

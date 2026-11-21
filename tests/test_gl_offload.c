@@ -27,40 +27,52 @@ static int failures = 0;
 
 static void test_policy(void)
 {
-    unsetenv("SDLOP_GL_OFFLOAD");
-    unsetenv("SDLOP_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_GL_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_OFFLOAD");
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_AUTO, "unset -> AUTO");
 
-    setenv("SDLOP_OFFLOAD", "0", 1);
+    SDL_setenv_unsafe("SDLOP_OFFLOAD", "0", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "SDLOP_OFFLOAD=0 -> NEVER");
-    setenv("SDLOP_OFFLOAD", "1", 1);
+    SDL_setenv_unsafe("SDLOP_OFFLOAD", "1", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "SDLOP_OFFLOAD=1 -> FORCE");
-    setenv("SDLOP_GL_OFFLOAD", "0", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "0", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "SDLOP_GL_OFFLOAD overrides SDLOP_OFFLOAD");
-    unsetenv("SDLOP_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_OFFLOAD");
 
-    setenv("SDLOP_GL_OFFLOAD", "auto", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "auto", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_AUTO, "auto -> AUTO");
 
-    setenv("SDLOP_GL_OFFLOAD", "0", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "0", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "0 -> NEVER");
-    setenv("SDLOP_GL_OFFLOAD", "off", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "off", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "off -> NEVER");
-    setenv("SDLOP_GL_OFFLOAD", "FALSE", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "FALSE", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "FALSE -> NEVER");
-    setenv("SDLOP_GL_OFFLOAD", "no", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "no", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "no -> NEVER");
 
-    setenv("SDLOP_GL_OFFLOAD", "1", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "1", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "1 -> FORCE");
-    setenv("SDLOP_GL_OFFLOAD", "on", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "on", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "on -> FORCE");
-    setenv("SDLOP_GL_OFFLOAD", "TRUE", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "TRUE", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "TRUE -> FORCE");
-    setenv("SDLOP_GL_OFFLOAD", "force", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "force", 1);
     CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "force -> FORCE");
 
-    unsetenv("SDLOP_GL_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_GL_OFFLOAD");
+
+    /* the same options from code (SDL_SetHint) */
+    CHECK(SDL_SetHint(SDLOP_HINT_GL_OFFLOAD, "1"), "set hint: %s", SDL_GetError());
+    CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "hint SDLOP_GL_OFFLOAD=1 -> FORCE");
+    SDL_ResetHint(SDLOP_HINT_GL_OFFLOAD);
+    SDL_SetHint(SDLOP_HINT_OFFLOAD, "no");
+    CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_NEVER, "hint SDLOP_OFFLOAD=no -> NEVER");
+    SDL_SetHint(SDLOP_HINT_GL_OFFLOAD, "force");
+    CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE, "hint SDLOP_GL_OFFLOAD wins over hint SDLOP_OFFLOAD");
+    SDL_ResetHint(SDLOP_HINT_GL_OFFLOAD);
+    SDL_ResetHint(SDLOP_HINT_OFFLOAD);
+    CHECK(SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_AUTO, "reset hints -> AUTO");
 }
 
 static void test_software_renderer_detection(void)
@@ -161,10 +173,10 @@ static void test_live_backend(void)
     typedef void (*PFN_glClear)(unsigned int);
     typedef void (*PFN_glReadPixels)(int, int, int, int, unsigned int, unsigned int, void *);
 
-    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    SDL_setenv_unsafe("SDLOP_DISABLE_RAW_INPUT", "1", 1);
     static const char *const modes[] = { "0", "1" };
     for (size_t i = 0; i < 2; i++) {
-        setenv("SDLOP_GL_OFFLOAD", modes[i], 1);
+        SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", modes[i], 1);
         if (!SDL_Init(SDL_INIT_VIDEO)) {
             fprintf(stderr, "live mode %s: SDL_Init failed: %s\n", modes[i], SDL_GetError());
             failures++;
@@ -198,7 +210,7 @@ static void test_live_backend(void)
         }
         SDL_Quit();
     }
-    unsetenv("SDLOP_GL_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_GL_OFFLOAD");
 }
 
 static int find_attrib_val(const int *attribs, int n, int key, int *val_out)
@@ -310,6 +322,16 @@ static void test_build_context_attribs(void)
     CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_CLIENT_VERSION, &val) && val == 2, "ES2 version");
     CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_FLAGS_KHR, &val) &&
           val == kEGL_CONTEXT_OPENGL_DEBUG_BIT_KHR, "ES2 DEBUG emits EGL_CONTEXT_FLAGS_KHR");
+
+    /* requested ES versions pass through like stock: 1.0 stays 1, 3.1 is
+     * major/minor (it used to collapse to "3"), 9.0 is not clamped */
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_ES_API, 1, 0, SDL_GL_CONTEXT_PROFILE_ES, 0, attribs, 16);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_CLIENT_VERSION, &val) && val == 1, "ES1 version (%d)", val);
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_ES_API, 3, 1, SDL_GL_CONTEXT_PROFILE_ES, 0, attribs, 16);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_MAJOR_VERSION_KHR, &val) && val == 3, "ES3.1 major (%d)", val);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_MINOR_VERSION_KHR, &val) && val == 1, "ES3.1 minor (%d)", val);
+    n = SDLOP_GLOffload_BuildContextAttribs(kEGL_OPENGL_ES_API, 9, 0, SDL_GL_CONTEXT_PROFILE_ES, 0, attribs, 16);
+    CHECK(find_attrib_val(attribs, n, kEGL_CONTEXT_CLIENT_VERSION, &val) && val == 9, "ES9 not clamped (%d)", val);
 }
 
 static void test_context_flags_offload(void)
@@ -318,9 +340,9 @@ static void test_context_flags_offload(void)
     typedef void (*PFN_glClear)(unsigned int);
     typedef void (*PFN_glGetIntegerv)(unsigned int, int *);
 
-    setenv("SDL_VIDEODRIVER", "dummy", 1);
-    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
-    setenv("SDLOP_GL_OFFLOAD", "1", 1);
+    SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_setenv_unsafe("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "1", 1);
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         printf("test_gl_offload: context flags check skipped (SDL_Init: %s)\n", SDL_GetError());
@@ -416,15 +438,15 @@ static void test_context_flags_offload(void)
 
     SDL_Quit();
 done:
-    unsetenv("SDLOP_GL_OFFLOAD");
-    unsetenv("SDL_VIDEODRIVER");
+    SDL_unsetenv_unsafe("SDLOP_GL_OFFLOAD");
+    SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
 }
 
 static void test_dummy_opt_out(void)
 {
-    setenv("SDL_VIDEODRIVER", "dummy", 1);
-    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
-    setenv("SDLOP_GL_OFFLOAD", "0", 1);
+    SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_setenv_unsafe("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    SDL_setenv_unsafe("SDLOP_GL_OFFLOAD", "0", 1);
     if (SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Window *w = SDL_CreateWindow("dummy no offload", 64, 64, SDL_WINDOW_OPENGL);
         if (w) {
@@ -433,8 +455,8 @@ static void test_dummy_opt_out(void)
         }
         SDL_Quit();
     }
-    unsetenv("SDLOP_GL_OFFLOAD");
-    unsetenv("SDL_VIDEODRIVER");
+    SDL_unsetenv_unsafe("SDLOP_GL_OFFLOAD");
+    SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
 }
 
 int main(void)

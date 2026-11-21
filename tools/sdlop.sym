@@ -1,0 +1,25 @@
+/* SDLop shared library version script (GNU ld / lld / gold).
+ *
+ * Stock SDL3 tags every export with the version node SDL3_0.0.0
+ * (src/dynapi/SDL_dynapi.sym), so binaries built against it record
+ * "SDL_Init@SDL3_0.0.0". Using the same node makes libSDLop a clean
+ * libSDL3.so.0 drop-in (no "no version information available" warning),
+ * and exporting only SDL_* (plus SDLop's own SDLop_* API) keeps SDLop's
+ * internals (SDLOP_*) out of the dynamic symbol table. tools/api_exports_check.sh verifies that the exported SDL_*
+ * set is exactly the set declared in include/SDL3.
+ */
+SDL3_0.0.0 {
+  global:
+    SDL_*;
+    /* SDLop's own API (include/SDL3/SDLop.h), listed one by one:
+     * internal SDLop_* data (driver tables) stays local.
+     * api_exports_check.sh keeps this list and SDLop.h in sync. */
+    SDLop_RegisterRawEventCallback;
+    SDLop_UnregisterRawEventCallback;
+    SDLop_PollRawEvents;
+    SDLop_RawInputAvailable;
+    SDLop_GetRawEventCount;
+    SDLop_SetWindowClearColor;
+  local:
+    *;
+};

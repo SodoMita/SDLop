@@ -38,7 +38,7 @@ bool SDLOP_KMSDRM_LoadSymbols(void)
         return true;
     }
 
-    const char *libname = getenv("SDLOP_LIB_DRM");
+    const char *libname = SDL_GetHint("SDLOP_LIB_DRM");
     if (!libname || !libname[0]) {
         libname = "libdrm.so.2";
     }
@@ -149,7 +149,7 @@ bool SDLOP_GBM_LoadSymbols(void)
         return gbm_usable;
     }
 
-    const char *libname = getenv("SDLOP_LIB_GBM");
+    const char *libname = SDL_GetHint("SDLOP_LIB_GBM");
     if (!libname || !libname[0]) {
         libname = "libgbm.so.1";
     }

@@ -158,7 +158,7 @@ static void fbdev_log(const char *fmt, ...)
 
 static bool fbdev_replace8(const char *name, bool fallback)
 {
-    const char *value = SDL_getenv(name);
+    const char *value = SDL_GetHint(name);
 
     if (!value || !*value) {
         return fallback;
@@ -1041,7 +1041,7 @@ static int fbdev_open_vt(const char *path, int *vt_num)
    already is, which is the whole point of not being kmsdrm's VT_ACTIVATE. */
 static bool fbdev_vt_open_target(void)
 {
-    const char *ttyno = SDL_getenv("TTYNO");
+    const char *ttyno = SDL_GetHint("TTYNO");
     char path[32];
 
     if (ttyno && *ttyno) {
@@ -1232,7 +1232,7 @@ static void fbdev_vt_setup(void)
 
     /* opt-in: switch to the VT we were asked to run on */
     const bool want_switch = fbdev_replace8("SDLOP_FBDEV_VT_SWITCH", false) ||
-                             (SDL_getenv("TTYNO") && *SDL_getenv("TTYNO"));
+                             (SDL_GetHint("TTYNO") && *SDL_GetHint("TTYNO"));
     if (want_switch && fbdev.vt.num > 0 && !fbdev.vt.active) {
         if (ioctl(fbdev.vt.fd, VT_ACTIVATE, fbdev.vt.num) == 0) {
             /* asynchronous on purpose: VT_WAITACTIVE would block until this
@@ -1327,11 +1327,11 @@ static bool fbdev_Init(SDLop_VideoDevice *device)
 
     /* dump mode: SDLOP_FBDEV_DUMP=<file> keeps everything in RAM so CI (and
        any machine without a console framebuffer) can verify the scanout */
-    const char *dump = SDL_getenv("SDLOP_FBDEV_DUMP");
+    const char *dump = SDL_GetHint("SDLOP_FBDEV_DUMP");
     if (dump && *dump) {
         int w = FBDEV_DEFAULT_W;
         int h = FBDEV_DEFAULT_H;
-        const char *size = SDL_getenv("SDLOP_FBDEV_SIZE");
+        const char *size = SDL_GetHint("SDLOP_FBDEV_SIZE");
         if (size && *size) {
             int pw = 0, ph = 0;
             if (SDL_sscanf(size, "%dx%d", &pw, &ph) == 2 && pw > 0 && ph > 0 &&
@@ -1346,7 +1346,7 @@ static bool fbdev_Init(SDLop_VideoDevice *device)
             return false;
         }
     } else {
-        const char *path = SDL_getenv("SDLOP_FBDEV_PATH");
+        const char *path = SDL_GetHint("SDLOP_FBDEV_PATH");
         if (!path || !*path) {
             path = "/dev/fb0";
         }

@@ -28,30 +28,48 @@ static int failures = 0;
 
 static void test_policy(void)
 {
-    unsetenv("SDLOP_VULKAN_OFFLOAD");
-    unsetenv("SDLOP_VK_OFFLOAD");
-    unsetenv("SDLOP_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_VK_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_OFFLOAD");
     CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_AUTO, "unset -> AUTO");
 
-    setenv("SDLOP_OFFLOAD", "0", 1);
+    SDL_setenv_unsafe("SDLOP_OFFLOAD", "0", 1);
     CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_NEVER, "SDLOP_OFFLOAD=0 -> NEVER");
-    setenv("SDLOP_OFFLOAD", "force", 1);
+    SDL_setenv_unsafe("SDLOP_OFFLOAD", "force", 1);
     CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_FORCE, "SDLOP_OFFLOAD=force -> FORCE");
 
-    setenv("SDLOP_VK_OFFLOAD", "off", 1);
+    SDL_setenv_unsafe("SDLOP_VK_OFFLOAD", "off", 1);
     CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_NEVER, "SDLOP_VK_OFFLOAD overrides SDLOP_OFFLOAD");
 
-    setenv("SDLOP_VULKAN_OFFLOAD", "1", 1);
+    SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", "1", 1);
     CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_FORCE, "SDLOP_VULKAN_OFFLOAD overrides SDLOP_VK_OFFLOAD");
 
-    setenv("SDLOP_VULKAN_OFFLOAD", "no", 1);
+    SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", "no", 1);
     CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_NEVER, "no -> NEVER");
-    setenv("SDLOP_VULKAN_OFFLOAD", "auto", 1);
+    SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", "auto", 1);
     CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_AUTO, "auto -> AUTO");
 
-    unsetenv("SDLOP_VULKAN_OFFLOAD");
-    unsetenv("SDLOP_VK_OFFLOAD");
-    unsetenv("SDLOP_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_VK_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_OFFLOAD");
+
+    /* the same options from code (SDL_SetHint) */
+    CHECK(SDL_SetHint(SDLOP_HINT_VULKAN_OFFLOAD, "1"), "set hint: %s", SDL_GetError());
+    CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_FORCE, "hint SDLOP_VULKAN_OFFLOAD=1 -> FORCE");
+    SDL_ResetHint(SDLOP_HINT_VULKAN_OFFLOAD);
+    SDL_SetHint(SDLOP_HINT_OFFLOAD, "off");
+    CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_NEVER, "hint SDLOP_OFFLOAD=off -> NEVER");
+    SDL_SetHint(SDLOP_HINT_VK_OFFLOAD, "force");
+    CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_FORCE, "hint SDLOP_VK_OFFLOAD wins over hint SDLOP_OFFLOAD");
+    /* SDL precedence: environment over a normal hint, override hint over both */
+    SDL_setenv_unsafe("SDLOP_VK_OFFLOAD", "0", 1);
+    CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_NEVER, "environment wins over a normal hint");
+    SDL_SetHintWithPriority(SDLOP_HINT_VK_OFFLOAD, "1", SDL_HINT_OVERRIDE);
+    CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_FORCE, "override hint wins over the environment");
+    SDL_unsetenv_unsafe("SDLOP_VK_OFFLOAD");
+    SDL_ResetHint(SDLOP_HINT_VK_OFFLOAD);
+    SDL_ResetHint(SDLOP_HINT_OFFLOAD);
+    CHECK(SDLOP_VulkanOffload_GetPolicy() == SDLOP_VK_OFFLOAD_AUTO, "reset hints -> AUTO");
 }
 
 static void test_extensions_layout(void)
@@ -66,9 +84,9 @@ static void test_extensions_layout(void)
 
 static void test_dummy_opt_out(void)
 {
-    setenv("SDL_VIDEODRIVER", "dummy", 1);
-    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
-    setenv("SDLOP_VULKAN_OFFLOAD", "0", 1);
+    SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_setenv_unsafe("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", "0", 1);
 
     if (SDL_Init(SDL_INIT_VIDEO)) {
         Uint32 ext_count = 99;
@@ -88,8 +106,31 @@ static void test_dummy_opt_out(void)
         SDL_Quit();
     }
 
-    unsetenv("SDLOP_VULKAN_OFFLOAD");
-    unsetenv("SDL_VIDEODRIVER");
+    SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+
+    /* the policy chosen with SDL_SetHint alone must act exactly like the
+     * environment variable (offload extensions where the loader has
+     * VK_EXT_headless_surface, nothing otherwise) */
+    if (SDL_Init(SDL_INIT_VIDEO)) {
+        Uint32 n_env = 99, n = 99;
+        SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", "1", 1);
+        char const *const *exts = SDL_Vulkan_GetInstanceExtensions(&n_env);
+        SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+        SDL_SetHint(SDLOP_HINT_VULKAN_OFFLOAD, "1");
+        exts = SDL_Vulkan_GetInstanceExtensions(&n);
+        CHECK(n == n_env && (n == 0 || n == 2), "SDL_SetHint(SDLOP_VULKAN_OFFLOAD, 1): %u extensions, environment: %u", n, n_env);
+        if (n_env == 0) {
+            printf("test_vk_offload: hint end-to-end compared with the environment only (no VK_EXT_headless_surface)\n");
+        }
+        SDL_SetHint(SDLOP_HINT_VULKAN_OFFLOAD, "0");
+        n = 99;
+        exts = SDL_Vulkan_GetInstanceExtensions(&n);
+        CHECK(exts == NULL && n == 0, "SDL_SetHint(SDLOP_VULKAN_OFFLOAD, 0): no extensions (got %u)", n);
+        SDL_ResetHint(SDLOP_HINT_VULKAN_OFFLOAD);
+        SDL_Vulkan_UnloadLibrary();
+        SDL_Quit();
+    }
+    SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
 }
 
 /* ------------------------------------------------------------------ */
@@ -569,9 +610,9 @@ static void run_mock_vk_case(const char *label, const char *policy,
     mvk.supported_usage = supported_usage;
     mvk.next_h = 1;
 
-    setenv("SDL_VIDEODRIVER", "dummy", 1);
-    setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
-    setenv("SDLOP_VULKAN_OFFLOAD", policy, 1);
+    SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_setenv_unsafe("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+    SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", policy, 1);
     CHECK(SDL_Init(SDL_INIT_VIDEO), "%s: SDL_Init", label);
 
     MockPFN_gipa gipa = (MockPFN_gipa)SDLOP_VulkanOffload_WrapGetInstanceProcAddr(
@@ -712,8 +753,8 @@ cleanup:
     SDLOP_VulkanOffload_Shutdown();
     SDL_DestroyWindow(w);
     SDL_Quit();
-    unsetenv("SDLOP_VULKAN_OFFLOAD");
-    unsetenv("SDL_VIDEODRIVER");
+    SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+    SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
 }
 
 static void run_mock_vk_edge_cases(void)
@@ -737,9 +778,9 @@ static void run_mock_vk_edge_cases(void)
         mvk.expose_invalidate = has_inv;
         mvk.next_h = 1;
 
-        setenv("SDL_VIDEODRIVER", "dummy", 1);
-        setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
-        setenv("SDLOP_VULKAN_OFFLOAD", "force", 1);
+        SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 1);
+        SDL_setenv_unsafe("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+        SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", "force", 1);
         CHECK(SDL_Init(SDL_INIT_VIDEO), "noncoherent(%d): SDL_Init", has_inv);
 
         MockPFN_gipa gipa = (MockPFN_gipa)SDLOP_VulkanOffload_WrapGetInstanceProcAddr(
@@ -811,8 +852,8 @@ static void run_mock_vk_edge_cases(void)
         SDLOP_VulkanOffload_Shutdown();
         SDL_DestroyWindow(w);
         SDL_Quit();
-        unsetenv("SDLOP_VULKAN_OFFLOAD");
-        unsetenv("SDL_VIDEODRIVER");
+        SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+        SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
     }
 
     /* Case C & D: Untracked present queue refused + multi-swapchain present chaining & pResults */
@@ -824,9 +865,9 @@ static void run_mock_vk_edge_cases(void)
         mvk.multi_sc_suboptimal_second = 1;
         mvk.next_h = 1;
 
-        setenv("SDL_VIDEODRIVER", "dummy", 1);
-        setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
-        setenv("SDLOP_VULKAN_OFFLOAD", "force", 1);
+        SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 1);
+        SDL_setenv_unsafe("SDLOP_DISABLE_RAW_INPUT", "1", 1);
+        SDL_setenv_unsafe("SDLOP_VULKAN_OFFLOAD", "force", 1);
         CHECK(SDL_Init(SDL_INIT_VIDEO), "multi/untracked: SDL_Init");
 
         MockPFN_gipa gipa = (MockPFN_gipa)SDLOP_VulkanOffload_WrapGetInstanceProcAddr(
@@ -910,13 +951,45 @@ static void run_mock_vk_edge_cases(void)
         SDL_DestroyWindow(w1);
         SDL_DestroyWindow(w2);
         SDL_Quit();
-        unsetenv("SDLOP_VULKAN_OFFLOAD");
-        unsetenv("SDL_VIDEODRIVER");
+        SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+        SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
     }
+}
+
+/* with a loader that has VK_EXT_headless_surface (the mock), SDL_SetHint
+ * alone switches the offload decision */
+static void run_mock_vk_hint_case(void)
+{
+    memset(&mvk, 0, sizeof(mvk));
+    mvk.present_qf_has_transfer = 1;
+    mvk.supported_usage = 0x11u;
+    mvk.next_h = 1;
+    SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_unsetenv_unsafe("SDLOP_VULKAN_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_VK_OFFLOAD");
+    SDL_unsetenv_unsafe("SDLOP_OFFLOAD");
+    CHECK(SDL_Init(SDL_INIT_VIDEO), "hint case: SDL_Init");
+    SDL_SetHint(SDLOP_HINT_VULKAN_OFFLOAD, "1");
+    CHECK(SDLOP_VulkanOffload_ShouldUseOffload((SDL_FunctionPointer)mvk_gipa),
+          "hint SDLOP_VULKAN_OFFLOAD=1 enables offload");
+    Uint32 n = 0;
+    CHECK(SDLOP_VulkanOffload_GetInstanceExtensions(&n) && n == 2, "hint case: offload extensions (%u)", n);
+    SDL_SetHint(SDLOP_HINT_VULKAN_OFFLOAD, "0");
+    CHECK(!SDLOP_VulkanOffload_ShouldUseOffload((SDL_FunctionPointer)mvk_gipa),
+          "hint SDLOP_VULKAN_OFFLOAD=0 disables offload");
+    SDL_SetHint(SDLOP_HINT_OFFLOAD, "force");
+    SDL_ResetHint(SDLOP_HINT_VULKAN_OFFLOAD);
+    CHECK(SDLOP_VulkanOffload_ShouldUseOffload((SDL_FunctionPointer)mvk_gipa),
+          "hint SDLOP_OFFLOAD=force enables offload");
+    SDL_ResetHint(SDLOP_HINT_OFFLOAD);
+    SDLOP_VulkanOffload_Shutdown();
+    SDL_Quit();
+    SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
 }
 
 static void test_mock_vulkan_offload(void)
 {
+    run_mock_vk_hint_case();
     run_mock_vk_case("auto_probe_single_qf", "auto", 1, 0x11u, 0, 0u, 0);
     run_mock_vk_case("qfot_get_queue2_qf1_qf2", "force", 0, 0x11u, 1, 0u, 0);
     run_mock_vk_case("concurrent_skip_qfot", "force", 0, 0x11u, 1, 1u, 0);

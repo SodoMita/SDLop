@@ -26,6 +26,7 @@
 #include "idle-inhibit-client-protocol.h"
 #include "keyboard-shortcuts-inhibit-client-protocol.h"
 #include "xdg-activation-client-protocol.h"
+#include "viewporter-client-protocol.h"
 #include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
@@ -42,6 +43,17 @@
 #define XDG_TOPLEVEL_STATE_SUSPENDED 9
 #endif
 
+/* one wl_shm buffer of a window's software-presentation cycle */
+#define SDLOP_WL_SHM_MAX_BUFFERS 3
+typedef struct WaylandShmBuffer
+{
+    struct wl_buffer *buffer;
+    void *map;
+    size_t size;
+    bool busy;      /* committed, wl_buffer.release not yet received */
+    SDL_Rect stale; /* shadow region not yet copied into this buffer (w == 0: none) */
+} WaylandShmBuffer;
+
 typedef struct WaylandWindowData
 {
     struct wl_surface *surface;
@@ -49,12 +61,18 @@ typedef struct WaylandWindowData
     struct xdg_toplevel *toplevel;
     struct xdg_popup *popup;      /* SDL_WINDOW_TOOLTIP / SDL_WINDOW_POPUP_MENU */
 
-    struct wl_shm_pool *pool;
-    struct wl_buffer *buffer;
-    int shm_fd;
-    size_t shm_size;
-    void *shm_map;
-    int buffer_w, buffer_h;
+    /* software presentation (see "shm buffers" below) */
+    WaylandShmBuffer shm[SDLOP_WL_SHM_MAX_BUFFERS];
+    int num_shm;
+    int buffer_w, buffer_h;         /* size of the shm[] buffers */
+    WaylandShmBuffer *front;        /* last committed shm[] buffer; NULL: clear colour or nothing */
+    WaylandShmBuffer *offload_buf;  /* acquired by the GL offload, committed by PresentOffloadShm */
+    void *shadow;                   /* window surface pixels (stable between presents) */
+    int shadow_w, shadow_h;
+    struct wl_buffer *clear_buffer; /* 1x1 clear colour, scaled by the viewport */
+    uint32_t clear_buffer_color;
+    struct wp_viewport *viewport;
+    bool viewport_scaled;           /* destination set for clear_buffer */
 
     bool configured;
     bool mapped;
@@ -129,6 +147,8 @@ typedef struct WaylandDeviceData
     struct zwp_idle_inhibit_manager_v1 *idle_inhibit_manager;
     struct zwp_keyboard_shortcuts_inhibit_manager_v1 *shortcuts_inhibit_manager;
     struct xdg_activation_v1 *activation;
+    struct wp_viewporter *viewporter;
+    struct wl_event_queue *shm_queue; /* wl_buffer.release of window buffers only */
     struct zwp_confined_pointer_v1 *confined_pointer;
     SDL_Window *confine_window;
     uint32_t pointer_serial;      /* last wl_pointer.enter serial (set_cursor) */
@@ -146,98 +166,410 @@ static void wayland_release_pointer_lock(void);
 /* ------------------------------------------------------------------ */
 /* shm buffers                                                         */
 /* ------------------------------------------------------------------ */
+/*
+  Software presentation follows the wl_buffer contract: a committed buffer
+  belongs to the compositor until wl_buffer.release and is never written
+  while it is busy.
 
-static void window_destroy_buffer(WaylandWindowData *wd)
+  - The window surface's pixels are a client-side shadow at a fixed address
+    between presents (like stock SDL3's framebuffer), so applications may
+    keep the pointer.
+  - SDL_UpdateWindowSurface(Rects) copies into a free buffer of a small
+    per-window cycle (normally 2, a 3rd only while the compositor holds the
+    others) and commits it. Each buffer remembers the shadow region it has
+    not seen yet, so a present copies the new damage plus what that buffer
+    missed - in steady state the damage of the last two presents, not the
+    whole window.
+  - Release events go to a private event queue: looking for a free buffer
+    never dispatches input or window events behind the application's back.
+    Only when every buffer is held does a present wait for a release.
+  - Until something is presented a window shows its clear colour: a 1x1
+    buffer scaled to the window by wp_viewporter (no per-pixel fill when a
+    window is created), or a filled full-size buffer without viewporter.
+*/
+
+static void shm_buffer_release(void *data, struct wl_buffer *buffer)
 {
-    if (wd->buffer) {
-        wl_buffer_destroy(wd->buffer);
-        wd->buffer = NULL;
-    }
-    if (wd->pool) {
-        wl_shm_pool_destroy(wd->pool);
-        wd->pool = NULL;
-    }
-    if (wd->shm_map && wd->shm_map != MAP_FAILED) {
-        munmap(wd->shm_map, wd->shm_size);
-        wd->shm_map = NULL;
-    }
-    if (wd->shm_fd >= 0) {
-        close(wd->shm_fd);
-        wd->shm_fd = -1;
-    }
-    wd->shm_size = 0;
+    (void)buffer;
+    ((WaylandShmBuffer *)data)->busy = false;
 }
 
-static bool window_create_buffer(SDL_Window *window, int w, int h)
+static const struct wl_buffer_listener shm_buffer_listener = {
+    shm_buffer_release,
+};
+
+static void rect_add(SDL_Rect *acc, const SDL_Rect *r)
+{
+    if (r->w <= 0 || r->h <= 0) {
+        return;
+    }
+    if (acc->w <= 0 || acc->h <= 0) {
+        *acc = *r;
+        return;
+    }
+    const int x0 = SDL_min(acc->x, r->x), y0 = SDL_min(acc->y, r->y);
+    const int x1 = SDL_max(acc->x + acc->w, r->x + r->w), y1 = SDL_max(acc->y + acc->h, r->y + r->h);
+    acc->x = x0;
+    acc->y = y0;
+    acc->w = x1 - x0;
+    acc->h = y1 - y0;
+}
+
+static uint32_t window_clear_xrgb(SDL_Window *window)
+{
+    return ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
+}
+
+static void fill_xrgb(void *pixels, size_t npix, uint32_t color)
+{
+    uint32_t *p = (uint32_t *)pixels;
+    if (color == 0) {
+        memset(p, 0, npix * 4);
+        return;
+    }
+    for (size_t i = 0; i < npix; i++) {
+        p[i] = color;
+    }
+}
+
+/* memfd-backed XRGB8888 wl_buffer; the pool and fd are not kept (the
+ * buffer keeps the memory alive, the compositor has its own mapping) */
+static struct wl_buffer *shm_create_wl_buffer(int w, int h, bool populate, void **map_out, size_t *size_out)
+{
+    const size_t stride = (size_t)w * 4;
+    const size_t size = stride * (size_t)h;
+    int fd = memfd_create("sdlop-shm", MFD_CLOEXEC);
+    if (fd < 0) {
+        SDL_SetError("memfd_create failed: %s", strerror(errno));
+        return NULL;
+    }
+    if (ftruncate(fd, (off_t)size) < 0) {
+        close(fd);
+        SDL_SetError("ftruncate failed: %s", strerror(errno));
+        return NULL;
+    }
+    /* buffers of the cycle are written completely at least once: fault
+     * the pages in with one call instead of one fault per page */
+    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | (populate ? MAP_POPULATE : 0), fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        SDL_SetError("mmap failed: %s", strerror(errno));
+        return NULL;
+    }
+    struct wl_shm_pool *pool = wl_shm_create_pool(wl_data.shm, fd, (int32_t)size);
+    struct wl_buffer *buffer = pool ? wl_shm_pool_create_buffer(pool, 0, w, h, (int32_t)stride, WL_SHM_FORMAT_XRGB8888)
+                                    : NULL;
+    if (pool) {
+        wl_shm_pool_destroy(pool);
+    }
+    close(fd);
+    if (!buffer) {
+        munmap(map, size);
+        SDL_SetError("wl_shm buffer creation failed");
+        return NULL;
+    }
+    *map_out = map;
+    *size_out = size;
+    return buffer;
+}
+
+static void shm_destroy_all(WaylandWindowData *wd)
+{
+    for (int i = 0; i < wd->num_shm; i++) {
+        /* destroying a buffer the compositor still shows is allowed for
+         * wl_shm (it keeps its own mapping); a late release is dropped */
+        wl_buffer_destroy(wd->shm[i].buffer);
+        munmap(wd->shm[i].map, wd->shm[i].size);
+    }
+    memset(wd->shm, 0, sizeof(wd->shm));
+    wd->num_shm = 0;
+    wd->front = NULL;
+    wd->offload_buf = NULL;
+}
+
+/* the cycle's buffers follow the window size; other sizes are dropped */
+static void shm_set_size(WaylandWindowData *wd, int w, int h)
+{
+    if (wd->buffer_w != w || wd->buffer_h != h) {
+        shm_destroy_all(wd);
+        wd->buffer_w = w;
+        wd->buffer_h = h;
+    }
+}
+
+static WaylandShmBuffer *shm_add_buffer(WaylandWindowData *wd)
+{
+    WaylandShmBuffer *b = &wd->shm[wd->num_shm];
+    b->buffer = shm_create_wl_buffer(wd->buffer_w, wd->buffer_h, true, &b->map, &b->size);
+    if (!b->buffer) {
+        return NULL;
+    }
+    wl_proxy_set_queue((struct wl_proxy *)b->buffer, wl_data.shm_queue);
+    wl_buffer_add_listener(b->buffer, &shm_buffer_listener, b);
+    b->busy = false;
+    b->stale.x = 0;
+    b->stale.y = 0;
+    b->stale.w = wd->buffer_w;
+    b->stale.h = wd->buffer_h;
+    wd->num_shm++;
+    return b;
+}
+
+/* read what the compositor has sent (waiting up to timeout_ms for more) and
+ * dispatch the buffer-release queue only; other events stay queued for
+ * the next SDL_PumpEvents */
+static void shm_dispatch_releases(int timeout_ms)
+{
+    struct wl_display *display = wl_data.display;
+    struct wl_event_queue *queue = wl_data.shm_queue;
+    while (wl_display_prepare_read_queue(display, queue) != 0) {
+        wl_display_dispatch_queue_pending(display, queue);
+    }
+    wl_display_flush(display);
+    struct pollfd pfd = { wl_display_get_fd(display), POLLIN, 0 };
+    if (poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN)) {
+        wl_display_read_events(display);
+    } else {
+        wl_display_cancel_read(display);
+    }
+    wl_display_dispatch_queue_pending(display, queue);
+}
+
+static WaylandShmBuffer *shm_pick_free(WaylandWindowData *wd)
+{
+    /* the free buffer that missed the least: smallest copy */
+    WaylandShmBuffer *best = NULL;
+    Sint64 best_area = 0;
+    for (int i = 0; i < wd->num_shm; i++) {
+        WaylandShmBuffer *b = &wd->shm[i];
+        const Sint64 area = (Sint64)b->stale.w * b->stale.h;
+        if (!b->busy && (!best || area < best_area)) {
+            best = b;
+            best_area = area;
+        }
+    }
+    return best;
+}
+
+/* a buffer the compositor does not hold */
+static WaylandShmBuffer *shm_acquire(WaylandWindowData *wd)
+{
+    WaylandShmBuffer *b = shm_pick_free(wd);
+    if (b) {
+        return b;
+    }
+    shm_dispatch_releases(0);
+    if ((b = shm_pick_free(wd)) != NULL) {
+        return b;
+    }
+    if (wd->num_shm < SDLOP_WL_SHM_MAX_BUFFERS) {
+        return shm_add_buffer(wd);
+    }
+    /* all held (compositor still reading them): wait for a release, but
+     * do not hang forever on a compositor that keeps them */
+    for (int waited_ms = 0; waited_ms < 2000; waited_ms += 50) {
+        shm_dispatch_releases(50);
+        if ((b = shm_pick_free(wd)) != NULL) {
+            return b;
+        }
+        if (wl_display_get_error(wl_data.display)) {
+            SDL_SetError("Wayland connection error while waiting for a window buffer");
+            return NULL;
+        }
+    }
+    SDL_SetError("Compositor did not release any of the %d window buffers", wd->num_shm);
+    return NULL;
+}
+
+/* bring b up to date with the shadow */
+static void shm_copy_from_shadow(WaylandWindowData *wd, WaylandShmBuffer *b)
+{
+    const SDL_Rect r = b->stale;
+    b->stale.w = b->stale.h = 0;
+    if (r.w <= 0 || r.h <= 0 || !wd->shadow) {
+        return;
+    }
+    const size_t pitch = (size_t)wd->buffer_w * 4;
+    const Uint8 *src = (const Uint8 *)wd->shadow + (size_t)r.y * pitch + (size_t)r.x * 4;
+    Uint8 *dst = (Uint8 *)b->map + (size_t)r.y * pitch + (size_t)r.x * 4;
+    if (r.x == 0 && r.w == wd->buffer_w) {
+        memcpy(dst, src, pitch * (size_t)r.h);
+        return;
+    }
+    for (int y = 0; y < r.h; y++) {
+        memcpy(dst, src, (size_t)r.w * 4);
+        src += pitch;
+        dst += pitch;
+    }
+}
+
+/* SDLop's own buffers (the shm cycle, the 1x1 clear colour) are always 1:1
+ * surface pixels. The app can reach the wl_surface
+ * (SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER) and may have left a buffer
+ * scale or transform pending or committed (e.g. for its own rendering), so
+ * reset both with every attach of ours: a 1x1 buffer at scale 2 is even a
+ * protocol error (size not a multiple of the scale). */
+static void surface_reset_buffer_geometry(WaylandWindowData *wd)
+{
+    if (wl_data.compositor_version >= 3) {
+        wl_surface_set_buffer_scale(wd->surface, 1);
+    }
+    if (wl_data.compositor_version >= 2) {
+        wl_surface_set_buffer_transform(wd->surface, WL_OUTPUT_TRANSFORM_NORMAL);
+    }
+}
+
+/* attach + damage + commit one buffer of the cycle */
+static void shm_commit(WaylandWindowData *wd, WaylandShmBuffer *b, const SDL_Rect *rects, int numrects)
+{
+    /* damage is relative to the previous buffer; after the clear colour (or
+     * nothing) everything changed */
+    const bool full = !wd->front || wd->viewport_scaled || !rects || numrects <= 0;
+    if (wd->viewport_scaled) {
+        wp_viewport_set_destination(wd->viewport, -1, -1);
+        wd->viewport_scaled = false;
+    }
+    surface_reset_buffer_geometry(wd);
+    wl_surface_attach(wd->surface, b->buffer, 0, 0);
+    if (full) {
+        wl_surface_damage_buffer(wd->surface, 0, 0, INT32_MAX, INT32_MAX);
+    } else {
+        for (int i = 0; i < numrects; i++) {
+            wl_surface_damage_buffer(wd->surface, rects[i].x, rects[i].y, rects[i].w, rects[i].h);
+        }
+    }
+    wl_surface_commit(wd->surface);
+    b->busy = true;
+    wd->front = b;
+    wd->mapped = true;
+    wl_display_flush(wl_data.display);
+}
+
+/* show the clear colour (no content presented at this size yet) */
+static bool window_attach_clear(SDL_Window *window, WaylandWindowData *wd)
+{
+    const uint32_t color = window_clear_xrgb(window);
+    const int w = window->w > 0 ? window->w : 1;
+    const int h = window->h > 0 ? window->h : 1;
+    surface_reset_buffer_geometry(wd);
+    if (wd->viewport) {
+        if (!wd->clear_buffer || wd->clear_buffer_color != color) {
+            /* immutable once created: a new colour gets a new buffer */
+            if (wd->clear_buffer) {
+                wl_buffer_destroy(wd->clear_buffer);
+                wd->clear_buffer = NULL;
+            }
+            void *map = NULL;
+            size_t size = 0;
+            wd->clear_buffer = shm_create_wl_buffer(1, 1, false, &map, &size);
+            if (!wd->clear_buffer) {
+                return false;
+            }
+            *(uint32_t *)map = color;
+            munmap(map, size);
+            wd->clear_buffer_color = color;
+        }
+        wl_surface_attach(wd->surface, wd->clear_buffer, 0, 0);
+        wp_viewport_set_destination(wd->viewport, w, h);
+        wd->viewport_scaled = true;
+    } else {
+        shm_set_size(wd, w, h);
+        WaylandShmBuffer *b = shm_acquire(wd);
+        if (!b) {
+            return false;
+        }
+        fill_xrgb(b->map, (size_t)w * (size_t)h, color);
+        b->stale.x = b->stale.y = 0;
+        b->stale.w = w;
+        b->stale.h = h;
+        wl_surface_attach(wd->surface, b->buffer, 0, 0);
+        b->busy = true;
+    }
+    wl_surface_damage_buffer(wd->surface, 0, 0, INT32_MAX, INT32_MAX);
+    wd->front = NULL;
+    return true;
+}
+
+/* window size changed: drop buffers of the old size, resize the shadow of
+ * an existing window surface (SDL3: the surface survives resizes; its
+ * contents restart at the clear colour) */
+static bool window_resize_buffers(SDL_Window *window, int w, int h)
 {
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     if (!wd) {
         return false;
     }
-    window_destroy_buffer(wd);
-
-    size_t stride = (size_t)w * 4;
-    size_t size = stride * (size_t)h;
-
-    int fd = memfd_create("sdlop-shm", MFD_CLOEXEC);
-    if (fd < 0) {
-        return SDL_SetError("memfd_create failed: %s", strerror(errno));
-    }
-    if (ftruncate(fd, (off_t)size) < 0) {
-        close(fd);
-        return SDL_SetError("ftruncate failed: %s", strerror(errno));
-    }
-    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        close(fd);
-        return SDL_SetError("mmap failed: %s", strerror(errno));
-    }
-
-    /* clear color (XRGB8888) */
-    uint32_t color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
-    uint32_t *pix = (uint32_t *)map;
-    size_t npix = (size_t)w * (size_t)h;
-    for (size_t i = 0; i < npix; i++) {
-        pix[i] = color;
-    }
-
-    wd->pool = wl_shm_create_pool(wl_data.shm, fd, (int32_t)size);
-    wd->buffer = wl_shm_pool_create_buffer(wd->pool, 0, w, h, (int32_t)stride, WL_SHM_FORMAT_XRGB8888);
-    wd->shm_fd = fd;
-    wd->shm_map = map;
-    wd->shm_size = size;
-    wd->buffer_w = w;
-    wd->buffer_h = h;
-
-    /* keep an existing window surface in sync with the new buffer
-     * (SDL3 semantics: the surface survives resizes) */
-    SDLOP_Wayland_GL_WindowResized(window);
-    if (window->surface) {
+    shm_set_size(wd, w, h);
+    if (window->surface && wd->shadow && (wd->shadow_w != w || wd->shadow_h != h)) {
+        void *shadow = malloc((size_t)w * (size_t)h * 4);
+        if (!shadow) {
+            return SDL_OutOfMemory();
+        }
+        fill_xrgb(shadow, (size_t)w * (size_t)h, window_clear_xrgb(window));
+        free(wd->shadow);
+        wd->shadow = shadow;
+        wd->shadow_w = w;
+        wd->shadow_h = h;
         window->surface->w = w;
         window->surface->h = h;
-        window->surface->pitch = (int)stride;
-        window->surface->pixels = map;
+        window->surface->pitch = w * 4;
+        window->surface->pixels = shadow;
+        SDL_SetSurfaceClipRect(window->surface, NULL); /* the old clip may exceed the new size */
     }
+    SDLOP_Wayland_GL_WindowResized(window);
     return true;
 }
 
+static void window_destroy_buffers(WaylandWindowData *wd)
+{
+    shm_destroy_all(wd);
+    if (wd->clear_buffer) {
+        wl_buffer_destroy(wd->clear_buffer);
+        wd->clear_buffer = NULL;
+    }
+    free(wd->shadow);
+    wd->shadow = NULL;
+    wd->shadow_w = wd->shadow_h = 0;
+    wd->buffer_w = wd->buffer_h = 0;
+}
+
+/* (re)show the window's content: the last presented buffer, else the
+ * software surface, else the clear colour */
 static void window_commit(SDL_Window *window)
 {
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
-    if (!wd || !wd->configured || !wd->buffer) {
+    if (!wd || !wd->configured) {
         return;
     }
     if (wd->gl_active && !wd->gl_offload_active) {
         return; /* native Wayland EGL owns buffer management for this window */
     }
-    wl_surface_attach(wd->surface, wd->buffer, 0, 0);
-    wl_surface_damage_buffer(wd->surface, 0, 0, INT32_MAX, INT32_MAX);
-    wl_surface_commit(wd->surface);
-    wd->mapped = true;
+    const int w = window->w > 0 ? window->w : 1;
+    const int h = window->h > 0 ? window->h : 1;
+    if (wd->front && wd->buffer_w == w && wd->buffer_h == h) {
+        /* contents are not modified while attached: re-attaching is fine */
+        WaylandShmBuffer *b = wd->front;
+        wd->front = NULL; /* full damage */
+        shm_commit(wd, b, NULL, 0);
+        return;
+    }
+    if (wd->shadow && wd->shadow_w == w && wd->shadow_h == h) {
+        shm_set_size(wd, w, h);
+        WaylandShmBuffer *b = shm_acquire(wd);
+        if (b) {
+            shm_copy_from_shadow(wd, b);
+            shm_commit(wd, b, NULL, 0);
+            return;
+        }
+    }
+    if (window_attach_clear(window, wd)) {
+        wl_surface_commit(wd->surface);
+        wd->mapped = true;
+    }
 }
 
 /* ------------------------------------------------------------------ */
-/* software window surface (zero copy: pixels ARE the shm buffer)      */
+/* software window surface                                             */
 /* ------------------------------------------------------------------ */
 
 static bool wayland_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface)
@@ -247,12 +579,27 @@ static bool wayland_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     if (!wd) {
         return SDL_SetError("Invalid window");
     }
-    if (!wd->buffer) {
-        if (!window_create_buffer(window, window->w, window->h)) {
-            return false;
+    const int w = window->w > 0 ? window->w : 1;
+    const int h = window->h > 0 ? window->h : 1;
+    shm_set_size(wd, w, h);
+    if (!wd->shadow || wd->shadow_w != w || wd->shadow_h != h) {
+        void *shadow = malloc((size_t)w * (size_t)h * 4);
+        if (!shadow) {
+            return SDL_OutOfMemory();
         }
+        fill_xrgb(shadow, (size_t)w * (size_t)h, window_clear_xrgb(window));
+        free(wd->shadow);
+        wd->shadow = shadow;
+        wd->shadow_w = w;
+        wd->shadow_h = h;
     }
-    SDL_Surface *s = SDL_CreateSurfaceFrom(window->w, window->h, SDL_PIXELFORMAT_XRGB8888, wd->shm_map, window->w * 4);
+    /* buffers may hold GL offload frames or an older surface: resync */
+    for (int i = 0; i < wd->num_shm; i++) {
+        wd->shm[i].stale.x = wd->shm[i].stale.y = 0;
+        wd->shm[i].stale.w = w;
+        wd->shm[i].stale.h = h;
+    }
+    SDL_Surface *s = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_XRGB8888, wd->shadow, w * 4);
     if (!s) {
         return false;
     }
@@ -267,27 +614,50 @@ static bool wayland_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     if (!wd || !wd->configured || wd->gl_active) {
         return SDL_SetError("Window surface is not presentable");
     }
-    wl_surface_attach(wd->surface, wd->buffer, 0, 0);
+    if (!wd->shadow || wd->shadow_w != wd->buffer_w || wd->shadow_h != wd->buffer_h) {
+        return SDL_SetError("Window surface is not valid (window resized?)");
+    }
+    const SDL_Rect all = { 0, 0, wd->buffer_w, wd->buffer_h };
+    SDL_Rect damage = { 0, 0, 0, 0 };
     if (rects && numrects > 0) {
         for (int i = 0; i < numrects; i++) {
-            wl_surface_damage_buffer(wd->surface, rects[i].x, rects[i].y, rects[i].w, rects[i].h);
+            SDL_Rect clipped;
+            if (SDL_GetRectIntersection(&rects[i], &all, &clipped)) {
+                rect_add(&damage, &clipped);
+            }
+        }
+        if (damage.w <= 0) {
+            return true; /* nothing on screen changes */
         }
     } else {
-        wl_surface_damage_buffer(wd->surface, 0, 0, wd->buffer_w, wd->buffer_h);
+        damage = all;
     }
-    wl_surface_commit(wd->surface);
-    wl_display_flush(wl_data.display);
-    wd->mapped = true;
+    for (int i = 0; i < wd->num_shm; i++) {
+        rect_add(&wd->shm[i].stale, &damage);
+    }
+    WaylandShmBuffer *b = shm_acquire(wd);
+    if (!b) {
+        return false;
+    }
+    shm_copy_from_shadow(wd, b);
+    shm_commit(wd, b, rects, numrects);
     return true;
 }
 
 static void wayland_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    /* the surface wraps the shm buffer; free the SDL_Surface struct only */
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    /* the SDL_Surface wraps the shadow: free both; the last presented
+     * buffer stays on screen */
     if (window->surface) {
         SDL_DestroySurface(window->surface);
         window->surface = NULL;
+    }
+    if (wd) {
+        free(wd->shadow);
+        wd->shadow = NULL;
+        wd->shadow_w = wd->shadow_h = 0;
     }
 }
 
@@ -311,6 +681,12 @@ void SDLOP_Wayland_SetGLActive(SDL_Window *window, bool active)
     WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
     if (wd) {
         wd->gl_active = active;
+        if (active && wd->viewport_scaled) {
+            /* native EGL buffers must not be scaled to the old size: drop
+             * the clear colour's viewport with EGL's next commit */
+            wp_viewport_set_destination(wd->viewport, -1, -1);
+            wd->viewport_scaled = false;
+        }
     }
 }
 
@@ -357,6 +733,10 @@ bool SDLOP_Wayland_CompositorHasHardwareBuffers(void)
     return wl_data.has_dmabuf || wl_data.has_wl_drm;
 }
 
+/* GL offload without dmabuf: frames are read back into a buffer of the same
+ * cycle as software presentation (so the offload also never writes a
+ * buffer the compositor holds). Without pixels_out this only sizes the
+ * cycle; with it, a free buffer is reserved for PresentOffloadShm. */
 bool SDLOP_Wayland_AcquireOffloadShm(SDL_Window *window, void **pixels_out, int *pitch_out, int *w_out, int *h_out)
 {
     WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
@@ -365,13 +745,21 @@ bool SDLOP_Wayland_AcquireOffloadShm(SDL_Window *window, void **pixels_out, int 
     }
     int w = window->w > 0 ? window->w : 1;
     int h = window->h > 0 ? window->h : 1;
-    if (!wd->buffer || wd->buffer_w != w || wd->buffer_h != h) {
-        if (!window_create_buffer(window, w, h)) {
-            return false;
-        }
-    }
+    shm_set_size(wd, w, h);
     if (pixels_out) {
-        *pixels_out = wd->shm_map;
+        WaylandShmBuffer *b = wd->offload_buf;
+        if (!b) {
+            b = shm_acquire(wd);
+            if (!b) {
+                return false;
+            }
+        }
+        /* overwritten by the GL frame: out of sync with any shadow */
+        b->stale.x = b->stale.y = 0;
+        b->stale.w = w;
+        b->stale.h = h;
+        wd->offload_buf = b;
+        *pixels_out = b->map;
     }
     if (pitch_out) {
         *pitch_out = wd->buffer_w * 4;
@@ -388,18 +776,17 @@ bool SDLOP_Wayland_AcquireOffloadShm(SDL_Window *window, void **pixels_out, int 
 bool SDLOP_Wayland_PresentOffloadShm(SDL_Window *window)
 {
     WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
-    if (!wd || !wd->buffer) {
-        return SDL_SetError("Window has no shm buffer");
+    if (!wd || !wd->offload_buf) {
+        return SDL_SetError("Window has no acquired shm buffer");
     }
+    WaylandShmBuffer *b = wd->offload_buf;
+    wd->offload_buf = NULL;
     if (!wd->configured) {
-        /* xsurface_configure will commit once the configure handshake arrives */
+        /* xsurface_configure commits wd->front once the handshake arrives */
+        wd->front = b;
         return true;
     }
-    wl_surface_attach(wd->surface, wd->buffer, 0, 0);
-    wl_surface_damage_buffer(wd->surface, 0, 0, wd->buffer_w, wd->buffer_h);
-    wl_surface_commit(wd->surface);
-    wl_display_flush(wl_data.display);
-    wd->mapped = true;
+    shm_commit(wd, b, NULL, 0);
     return true;
 }
 
@@ -428,7 +815,7 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
         (wd->pending_w != window->w || wd->pending_h != window->h)) {
         window->w = wd->pending_w;
         window->h = wd->pending_h;
-        window_create_buffer(window, window->w, window->h);
+        window_resize_buffers(window, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
         /* Stock 3.2.10 sends SAFE_AREA_CHANGED with every size change on
@@ -442,9 +829,6 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
             wd->moved_reported = true;
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, 0, 0);
         }
-    }
-    if (!wd->buffer) {
-        window_create_buffer(window, window->w, window->h);
     }
     if (!(window->flags & SDL_WINDOW_HIDDEN)) {
         window_commit(window);
@@ -590,9 +974,9 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
     (void)time;
     wl_data.input_serial = serial;
 
-    /* Desktop keyboards use the focus-aware seat stream even with a readable
-     * evdev device. Only console keyboard ownership enables raw SDL keys. */
-    if (SDLOP_RawInputKeyboardActive()) {
+    /* SDLOP_RAW_INPUT: evdev delivers every key; never mix the two. The
+     * modifiers/keymap/repeat events below still keep the layout state. */
+    if (SDLOP_RawInputIsSource()) {
         return;
     }
 
@@ -874,12 +1258,19 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     window->flags |= SDL_WINDOW_MOUSE_FOCUS;
     sdlop.mouse_has_position = false; /* stock: the enter's own motion carries no delta */
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
-    /* stock delivers the enter position through the motion path (a movement
-       event with zero delta); a confine warp may arrive with no following
-       motion, so the enter coordinates are the position. */
-    SDLOP_SendMouseMotion((float)wl_fixed_to_double(surface_x),
-                          (float)wl_fixed_to_double(surface_y), 0.0f, 0.0f,
-                          SDLOP_MonotonicNS());
+    if (SDLOP_RawInputIsSource()) {
+        /* evdev sends motion; the enter position only anchors it */
+        sdlop.mouse_x = (float)wl_fixed_to_double(surface_x);
+        sdlop.mouse_y = (float)wl_fixed_to_double(surface_y);
+        sdlop.mouse_has_position = true;
+    } else {
+        /* stock delivers the enter position through the motion path (a
+           movement event with zero delta); a confine warp may arrive with no
+           following motion, so the enter coordinates are the position. */
+        SDLOP_SendMouseMotion((float)wl_fixed_to_double(surface_x),
+                              (float)wl_fixed_to_double(surface_y), 0.0f, 0.0f,
+                              SDLOP_MonotonicNS());
+    }
 
     if (sdlop.relative_mode_window == window) {
         if (!wl_data.locked_pointer) {
@@ -922,7 +1313,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     float x = (float)wl_fixed_to_double(surface_x);
     float y = (float)wl_fixed_to_double(surface_y);
 
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         if (sdlop.relative_mode_window == window) {
             return; /* relative mode: evdev owns motion entirely */
         }
@@ -930,6 +1321,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
          * evdev already emitted the low-latency motion event) */
         sdlop.mouse_x = x;
         sdlop.mouse_y = y;
+        sdlop.mouse_has_position = true;
         return;
     }
     SDLOP_SendMouseMotion(x, y, 0.0f, 0.0f, SDLOP_MonotonicNS()); /* core derives deltas from clamped positions (stock) */
@@ -955,7 +1347,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     (void)pointer;
     (void)time;
     wl_data.input_serial = serial;
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         return; /* evdev owns buttons */
     }
     Uint8 btn = wl_button_to_sdl(button);
@@ -969,7 +1361,7 @@ static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, 
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
     (void)time;
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         return;
     }
     float v = (float)wl_fixed_to_double(value) / 10.0f; /* weston: 10 units per detent */
@@ -984,14 +1376,14 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
-    if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) {
+    if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) { /* accumulators stay empty under raw input */
         SDLOP_SendMouseWheel(d->axis_x_acc, d->axis_y_acc, SDLOP_MonotonicNS());
         d->axis_x_acc = d->axis_y_acc = 0.0f;
     }
     /* relative mouse mode: flush accumulated relative-pointer motion
      * (skipped when the raw evdev worker owns the mouse) */
     if (d->relative_pointer && (d->rel_x_acc != 0.0f || d->rel_y_acc != 0.0f)) {
-        if (!SDLOP_RawInputMouseActive()) {
+        if (!SDLOP_RawInputIsSource()) {
             SDLOP_SendMouseMotion(SDLOP_NO_POS, SDLOP_NO_POS, d->rel_x_acc, d->rel_y_acc, SDLOP_MonotonicNS());
         }
         d->rel_x_acc = d->rel_y_acc = 0.0f;
@@ -1025,7 +1417,7 @@ static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
-    if (SDLOP_RawInputMouseActive()) {
+    if (SDLOP_RawInputIsSource()) {
         return;
     }
     float v = (float)value120 / 120.0f;
@@ -1474,6 +1866,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
             wl_registry_bind(registry, name, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface, 1);
     } else if (strcmp(interface, xdg_activation_v1_interface.name) == 0 && !d->activation) {
         d->activation = wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1);
+    } else if (strcmp(interface, wp_viewporter_interface.name) == 0 && !d->viewporter &&
+               !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_VIEWPORTER, false)) {
+        d->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
     }
 }
 
@@ -1515,6 +1910,8 @@ static const struct wl_registry_listener registry_listener = {
 /* driver interface                                                    */
 /* ------------------------------------------------------------------ */
 
+static void wayland_Quit(SDLop_VideoDevice *device);
+
 static bool wayland_Init(SDLop_VideoDevice *device)
 {
     (void)device;
@@ -1549,6 +1946,11 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     }
     /* second roundtrip so seat capabilities (keyboard/pointer) arrive */
     wl_display_roundtrip(wl_data.display);
+    wl_data.shm_queue = wl_display_create_queue(wl_data.display);
+    if (!wl_data.shm_queue) {
+        wayland_Quit(device);
+        return SDL_SetError("wl_display_create_queue failed");
+    }
     return true;
 }
 
@@ -1605,6 +2007,12 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     if (wl_data.wm_base) {
         xdg_wm_base_destroy(wl_data.wm_base);
     }
+    if (wl_data.viewporter) {
+        wp_viewporter_destroy(wl_data.viewporter);
+    }
+    if (wl_data.shm_queue) {
+        wl_event_queue_destroy(wl_data.shm_queue);
+    }
     if (wl_data.shm) {
         wl_shm_destroy(wl_data.shm);
     }
@@ -1643,6 +2051,32 @@ static void apply_size_limits(SDL_Window *window)
     }
     xdg_toplevel_set_min_size(wd->toplevel, min_w, min_h);
     xdg_toplevel_set_max_size(wd->toplevel, max_w, max_h);
+}
+
+/* SDL3 window properties: the native Wayland objects, as stock SDL
+ * publishes them (apps with their own renderer: wgpu, bgfx, ...). The xdg
+ * role objects follow hide/show and popup re-creation. */
+static void wayland_update_window_props(SDL_Window *window)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    /* window->props directly: SDL_GetWindowProperties() rejects a window
+     * that is still being created */
+    if (!window->props) {
+        if (!wd) {
+            return;
+        }
+        window->props = SDL_CreateProperties();
+    }
+    const SDL_PropertiesID props = window->props;
+    if (!props) {
+        return;
+    }
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, wd ? wl_data.display : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, wd ? wd->surface : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_VIEWPORT_POINTER, wd ? wd->viewport : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_XDG_SURFACE_POINTER, wd ? wd->xsurface : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_POINTER, wd ? wd->toplevel : NULL);
+    SDL_SetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_XDG_POPUP_POINTER, wd ? wd->popup : NULL);
 }
 
 static void destroy_role_objects(WaylandWindowData *wd)
@@ -1747,7 +2181,7 @@ static bool create_popup_role(SDL_Window *window)
     return true;
 }
 
-static bool wayland_create_role_objects(SDL_Window *window)
+static bool wayland_create_role_objects_raw(SDL_Window *window)
 {
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     wd->xsurface = xdg_wm_base_get_xdg_surface(wl_data.wm_base, wd->surface);
@@ -1790,6 +2224,13 @@ static bool wayland_create_role_objects(SDL_Window *window)
     return true;
 }
 
+static bool wayland_create_role_objects(SDL_Window *window)
+{
+    const bool ok = wayland_create_role_objects_raw(window);
+    wayland_update_window_props(window);
+    return ok;
+}
+
 static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -1797,17 +2238,21 @@ static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!wd) {
         return SDL_OutOfMemory();
     }
-    wd->shm_fd = -1;
-
     wd->surface = wl_compositor_create_surface(wl_data.compositor);
     if (!wd->surface) {
         free(wd);
         return SDL_SetError("wl_compositor_create_surface failed");
     }
     wl_surface_add_listener(wd->surface, &surface_listener, window);
+    if (wl_data.viewporter) {
+        wd->viewport = wp_viewporter_get_viewport(wl_data.viewporter, wd->surface);
+    }
     window->driverdata = wd;
 
     if (!wayland_create_role_objects(window)) {
+        if (wd->viewport) {
+            wp_viewport_destroy(wd->viewport);
+        }
         wl_surface_destroy(wd->surface);
         window->driverdata = NULL;
         free(wd);
@@ -1816,6 +2261,7 @@ static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (sdlop.suspend_screensaver && wl_data.idle_inhibit_manager) {
         wd->idle_inhibitor = zwp_idle_inhibit_manager_v1_create_inhibitor(wl_data.idle_inhibit_manager, wd->surface);
     }
+    wayland_update_window_props(window);
     wl_display_roundtrip(wl_data.display);
     return true;
 }
@@ -1851,12 +2297,16 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
         window->surface = NULL;
     }
     destroy_role_objects(wd);
+    if (wd->viewport) {
+        wp_viewport_destroy(wd->viewport);
+    }
     if (wd->surface) {
         wl_surface_destroy(wd->surface);
     }
-    window_destroy_buffer(wd);
+    window_destroy_buffers(wd);
     free(wd);
     window->driverdata = NULL;
+    wayland_update_window_props(window);
 }
 
 static void wayland_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
@@ -1890,6 +2340,7 @@ static void wayland_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
      * next buffer attach is a protocol error, and a bare commit alone will
      * not restart the configure handshake. */
     destroy_role_objects(wd);
+    wayland_update_window_props(window);
     wl_surface_attach(wd->surface, NULL, 0, 0);
     wl_surface_commit(wd->surface);
     wd->configured = false;
@@ -1915,7 +2366,7 @@ static bool wayland_SetWindowSize(SDLop_VideoDevice *device, SDL_Window *window)
     (void)device;
     /* clients can only suggest sizes on Wayland; update buffer and let the
      * compositor confirm via configure */
-    window_create_buffer(window, window->w, window->h);
+    window_resize_buffers(window, window->w, window->h);
     apply_size_limits(window);
     window_commit(window);
     wl_display_flush(wl_data.display);
@@ -2041,16 +2492,17 @@ static void wayland_SetWindowClearColor(SDLop_VideoDevice *device, SDL_Window *w
 {
     (void)device;
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
-    if (!wd || !wd->shm_map) {
+    if (!wd || !wd->configured || (wd->gl_active && !wd->gl_offload_active)) {
         return;
     }
-    uint32_t color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
-    uint32_t *pix = (uint32_t *)wd->shm_map;
-    size_t npix = (size_t)wd->buffer_w * (size_t)wd->buffer_h;
-    for (size_t i = 0; i < npix; i++) {
-        pix[i] = color;
+    if (wd->shadow) {
+        /* as on X11: the software surface is cleared and presented */
+        fill_xrgb(wd->shadow, (size_t)wd->shadow_w * (size_t)wd->shadow_h, window_clear_xrgb(window));
+        wayland_UpdateWindowFramebuffer(device, window, NULL, 0);
+    } else if (!wd->front && !(window->flags & SDL_WINDOW_HIDDEN)) {
+        /* still showing the clear colour: show the new one */
+        window_commit(window);
     }
-    window_commit(window);
     wl_display_flush(wl_data.display);
 }
 
@@ -2405,6 +2857,7 @@ SDLop_VideoDevice SDLop_wayland_device = {
     /* optional hooks */
     .Vulkan_GetPresentationSupport = SDLOP_Wayland_Vulkan_GetPresentationSupport,
     .supports_popups = true,
+    .window_system_input = true,
     .EGL_GetDisplay = SDLOP_Wayland_EGL_GetDisplay,
     .EGL_GetConfig = SDLOP_Wayland_EGL_GetConfig,
     .EGL_GetWindowSurface = SDLOP_Wayland_EGL_GetWindowSurface,

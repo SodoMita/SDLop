@@ -167,10 +167,9 @@ static struct
 
 SDLOP_GLOffloadPolicy SDLOP_GLOffload_GetPolicy(void)
 {
-    const char *v = getenv("SDLOP_GL_OFFLOAD");
-    if (!v || !*v) {
-        v = getenv("SDLOP_OFFLOAD");
-    }
+    /* SDL_SetHint or the environment; the GL option before the global one */
+    static const char *const names[] = { SDLOP_HINT_GL_OFFLOAD, SDLOP_HINT_OFFLOAD, NULL };
+    const char *v = SDLOP_HintFirst(names);
     if (!v || !*v || strcasecmp(v, "auto") == 0) {
         return SDLOP_GL_OFFLOAD_AUTO;
     }
@@ -301,10 +300,8 @@ static bool pick_offload_config(EGLDisplay dpy,
     EGLint renderable;
     if (api == EGL_OPENGL_API) {
         renderable = EGL_OPENGL_BIT;
-    } else if (sdlop_glattrs.major_version >= 3) {
-        renderable = EGL_OPENGL_ES3_BIT;
     } else {
-        renderable = EGL_OPENGL_ES2_BIT;
+        renderable = SDLOP_EGL_ESRenderableType(dpy);
     }
 
     EGLint attribs[28];
@@ -834,8 +831,17 @@ int SDLOP_GLOffload_BuildContextAttribs(uint32_t egl_api,
             attribs[n++] = ctx_flags;
         }
     } else {
-        attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
-        attribs[n++] = major_version >= 3 ? 3 : 2;
+        /* as stock SDL_egl.c: X.0 through the EGL 1.3 client version, X.Y
+         * through EGL_KHR_create_context (which the debug flag below needs
+         * anyway); the old "3 or 2" mapping turned ES 1.1 into ES 3.x and
+         * let impossible versions succeed */
+        if (minor_version == 0) {
+            attribs[n++] = EGL_CONTEXT_CLIENT_VERSION;
+            attribs[n++] = major_version > 1 ? major_version : 1;
+        } else {
+            attribs[n++] = EGL_CONTEXT_MAJOR_VERSION_KHR; attribs[n++] = major_version;
+            attribs[n++] = EGL_CONTEXT_MINOR_VERSION_KHR; attribs[n++] = minor_version;
+        }
         if (flags & SDL_GL_CONTEXT_DEBUG_FLAG) {
             attribs[n++] = EGL_CONTEXT_FLAGS_KHR;
             attribs[n++] = EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;

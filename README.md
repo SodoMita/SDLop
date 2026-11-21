@@ -24,15 +24,17 @@ int main(void) {
   - empty `SDL_PumpEvents`: **~9× faster** (4.5 ns vs 41 ns)
   - raw input: **~5–9 µs** kernel-timestamp → your code, via a dedicated
     worker thread (asyncinput-style)
-- **Lean**: windowing + input only. No audio, renderer, GPU, joystick, HID,
-  camera, filesystem, iostream, … (~39k lines of C including the X11,
+- **Lean**: windowing + input only. No audio, renderer, GPU, HID, camera,
+  iostream, … (the joystick/gamepad API is exported but reports no devices,
+  so unmodified SDL3 apps still link and run; ~39k lines of C including the X11,
   Wayland, KMSDRM and web drivers; the SDL surface/blit code is ported).
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
   rings and fires your callback *on the worker thread*. Native evdev codes,
-  zero translation cost, kernel timestamps. Direct keyboard access is through
-  the raw API or an owned foreground console; desktop SDL key events always
-  use the focus-aware Wayland seat / X11 stream (see input routing below).
+  zero translation cost, kernel timestamps. On the console drivers it is the
+  input source; on X11/Wayland it is opt-in (`SDLOP_RAW_INPUT=1`) and then
+  replaces the window system's keyboard and mouse entirely — sources are never
+  mixed (see input routing below).
 
 ## Status
 
@@ -42,7 +44,8 @@ int main(void) {
 | Linux / X11 (pure XCB; MIT-SHM, XKB, XInput2 raw motion, RandR 1.5 — all `dlopen`-ed) | ✅ done, tested on Xvfb with and without a WM (openbox) |
 | Linux / evdev raw input worker (asyncinput-style) | ✅ done, tested via synthetic uinput devices |
 | Software rendering (`SDL_GetWindowSurface`, zero-copy wl_shm) | ✅ done, tested |
-| OpenGL / OpenGL ES via EGL (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
+| OpenGL / OpenGL ES: GLX on X11 for desktop GL and for GLES when the server has `GLX_EXT_create_context_es_profile` (as stock SDL3), EGL otherwise and on Wayland / KMSDRM (llvmpipe on GPU-less systems) | ✅ done, verified by pixel read-back |
+| Drop-in for binaries built against stock SDL3 (`libSDL3.so.0`, symbol version `SDL3_0.0.0`) | ✅ done, tested with Dear ImGui and Nuklear SDL3+OpenGL3 examples |
 | Vulkan WSI (`SDL_Vulkan_*`, lavapipe) | ✅ done, verified by swapchain read-back |
 | Pointer lock (`zwp_pointer_constraints` + `zwp_relative_pointer`) | ✅ done, tested against a mini compositor |
 | Linux / KMSDRM (dumb buffers, GBM/EGL, VK_KHR_display, hardware cursor) | ✅ done (no DRM device in CI; build-tested) |
@@ -75,37 +78,84 @@ int main(void) {
   draining into SDL events.
 ### Input routing and focus
 
-- **X11 / Wayland SDL keyboard events always come from the window system**,
-  even when the evdev worker can read a keyboard. This is intentional: a
-  background or unfocused window must not receive global evdev keystrokes.
-  The compositor/server determines keyboard focus, layout and native delivery;
-  having a readable `/dev/input` device does not suppress that stream.
-- **fbdev / kmsdrm SDL keyboard events use evdev only while SDLop owns `K_OFF`
-  on the foreground VT.** A working raw keyboard is required before disabling
-  the kernel keyboard handler. Ctrl+Alt+Fn is forwarded through `VT_ACTIVATE`.
+SDLop never mixes input sources: SDL keyboard **and** mouse events come
+either all from evdev (`/dev/input`) or all from the window system.
+
+- **X11 / Wayland default to window-system input.** The evdev worker is not
+  started; keys, buttons, motion, wheel and relative motion all come from the
+  server/compositor, which owns focus, layout and delivery.
+- **`SDLOP_RAW_INPUT=1` makes evdev the only source on X11 / Wayland.** The
+  driver then drops its own key, button, motion, wheel and relative-motion
+  events; it still tracks focus, enter/leave, keymap/layout/lock state and
+  repeat settings, and the pointer position it reports only re-anchors the
+  position evdev's deltas are added to. Because `/dev/input` sees the whole
+  seat, raw events are filtered with the window system's focus: keys need one
+  of our windows to have keyboard focus, pointer input needs the pointer over
+  one of our windows (or relative mode on the focused window); releases of
+  keys/buttons SDL reported down always pass, and a drag that started in our
+  window keeps its motion. All or nothing: if the worker cannot read both a
+  keyboard and a pointer, SDLop logs why and uses window-system input for
+  both. Touch stays with the window system.
+- **fbdev / kmsdrm use evdev by default** (`SDLOP_RAW_INPUT=0` turns that
+  off). SDL keyboard events use evdev only while SDLop owns `K_OFF` on the
+  foreground VT. A working raw keyboard is required before disabling the
+  kernel keyboard handler. Ctrl+Alt+Fn is forwarded through `VT_ACTIVATE`.
   Switch-away detaches keyboard delivery and releases SDL's held key state.
   With raw input disabled/unavailable the console retains its kernel handler;
   that preserves VT switching but does not create an SDL keyboard event source.
-- **Raw mouse routing is unchanged:** when a readable evdev pointer is present,
-  its events feed SDL mouse events and the corresponding window-system mouse
-  stream is suppressed. Thus desktop keys and pointer events can have different
-  sources. This revision does not make raw mouse delivery focus-aware.
-- **The low-latency raw API remains available on every Linux video driver.**
-  `SDLop_RegisterRawEventCallback` runs on the worker thread and
-  `SDLop_PollRawEvents` drains a separate ring. These expose global device
-  events, including keys, regardless of window/VT focus. Applications using
-  this API must implement their own focus/security policy; do not treat it as
-  a focus-filtered SDL event queue. `SDLop_RawInputAvailable` reports the worker,
-  not whether raw keys are currently being forwarded to SDL.
-- **Timestamp provenance differs.** Raw events carry normalized kernel times;
-  raw-derived SDL events convert these to SDL's tick epoch. Desktop SDL key
-  events use the native handler's receipt time in the SDL tick epoch, not the
-  keyboard's evdev timestamp. Nanosecond units do not imply identical latency
-  or ordering across desktop keyboard and raw mouse sources. The raw-input
-  benchmark below measures the evdev path, not desktop SDL keyboard latency.
+- **The low-latency raw API needs the worker.** `SDLop_RegisterRawEventCallback`
+  runs on the worker thread and `SDLop_PollRawEvents` drains a separate ring;
+  on X11/Wayland they only receive events with `SDLOP_RAW_INPUT=1`. These
+  expose global device events, including keys, regardless of window/VT focus.
+  Applications using this API must implement their own focus/security policy;
+  do not treat it as a focus-filtered SDL event queue. `SDLop_RawInputAvailable`
+  reports the worker; on X11/Wayland true also means evdev is the SDL source.
+- **Timestamp provenance follows the source.** Raw-derived SDL events convert
+  kernel times to SDL's tick epoch; window-system events use the native
+  handler's receipt time. The raw-input benchmark below measures the evdev path.
 
-Set `SDLOP_DISABLE_RAW_INPUT=1` to disable the worker and use only native
-window-system input on X11/Wayland. `0` or an empty value leaves it enabled.
+`SDLOP_DISABLE_RAW_INPUT=1` (legacy) never starts the worker, whatever
+`SDLOP_RAW_INPUT` says. `0` or an empty value leaves the default.
+
+### Options: environment or code
+
+Every `SDLOP_*` environment variable is also an SDL hint of the same name
+(`SDLOP_HINT_*` macros in `<SDL3/SDLop.h>`), so code can choose it too:
+
+```c
+SDL_SetHint(SDLOP_HINT_RAW_INPUT, "1");      /* app default; the environment may override */
+SDL_SetHintWithPriority(SDLOP_HINT_X11_NO_SHM, "1",
+                        SDL_HINT_OVERRIDE);  /* wins over the environment */
+SDL_Init(SDL_INIT_VIDEO);
+```
+
+Precedence: `SDL_HINT_OVERRIDE` hint > environment > lower-priority hint >
+built-in default. Options are read when the subsystem or driver using them
+initialises (mostly `SDL_Init`), so set them first; `SDL_ResetHint` returns to
+environment/default, and `SDL_Quit` drops all hints (as in SDL3). The
+environment is read through `SDL_GetEnvironment()`, a snapshot taken on first
+use, so change it with `SDL_setenv_unsafe` after that. Booleans: unset/empty = default, `0`/`false`/`off`/`no` =
+false, anything else true.
+
+| Option | Meaning |
+|---|---|
+| `SDLOP_RAW_INPUT` | evdev input (default: on for kmsdrm/fbdev, off for X11/Wayland; see above) |
+| `SDLOP_DISABLE_RAW_INPUT` | legacy: never start evdev input |
+| `SDLOP_LOG_PRIORITY` | default log priority when `SDL_LOGGING` is unset |
+| `SDLOP_POWER_SUPPLY_PATH` | sysfs power-supply directory (tests) |
+| `TTYNO` | console drivers: VT to run on (implies switching to it) |
+| `SDLOP_X11_NO_SHM`, `_NO_RENDER`, `_NO_TOUCH` | don't use MIT-SHM / XRender / XInput2 touch |
+| `SDLOP_X11_RELATIVE_WARP` | relative mode by warping instead of XInput2 raw motion |
+| `SDLOP_X11_EGL_PLATFORM` | `x11` skips the EGL xcb platform |
+| `SDLOP_OFFLOAD`, `SDLOP_GL_OFFLOAD`, `SDLOP_VULKAN_OFFLOAD` (`SDLOP_VK_OFFLOAD`) | GPU offload policy: `auto` (default), `0`/`off`, `1`/`force`; the per-API option wins (see Notes) |
+| `SDLOP_GL_OFFLOAD_PRIME` | kmsdrm: `0` copies offloaded GL frames instead of PRIME scan-out |
+| `SDLOP_WAYLAND_NO_VIEWPORTER` | Wayland: don't use `wp_viewporter` (clear colour as a filled full-size buffer) |
+| `SDL_VIDEO_FORCE_EGL` (`SDL_HINT_VIDEO_FORCE_EGL`) | X11: all contexts (desktop GL and GLES) through EGL instead of GLX (stock SDL3 hint) |
+| `SDL_OPENGL_ES_DRIVER` (`SDL_HINT_OPENGL_ES_DRIVER`) | X11: GLES contexts through EGL instead of GLX (stock SDL3 hint) |
+| `SDL_OPENGL_LIBRARY` (`SDL_HINT_OPENGL_LIBRARY`) | X11: library to load GLX from (default `libGL.so.1`, then `libGLX.so.0`) |
+| `SDLOP_KMSDRM_*` | `DEVICE`, `CONNECTOR`, `ATOMIC`, `ATOMIC_CURSOR`, `DOUBLE_BUFFER`, `FLIP_TIMEOUT_MS`, `HOTPLUG`, `KEEP_MASTER`, `NOFLIP`, `REQUIRE_MASTER`, `VT_SWITCH` (see `sdlop_kmsdrm.c`) |
+| `SDLOP_FBDEV_*` | `PATH`, `SIZE`, `DUMP`, `CURSOR`, `TAKEOVER`, `VT_SWITCH` (see `sdlop_fbdev.c`) |
+| `SDLOP_LIB_*` | dlopen name for `X11`, `XCB`, `XCB_RANDR`, `XCB_RENDER`, `XCB_SHM`, `XCB_XINPUT`, `XCB_XKB`, `XKB`, `XKBCOMMON_X11`, `WAYLAND`, `EGL`, `DRM`, `GBM` (`none` disables an optional X11 extension library) |
 
 ### fbdev arbitration
 
@@ -141,22 +191,45 @@ Raw input path (synthetic uinput device, 2000 events):
 
 (includes the uinput→evdev kernel round-trip; real hardware is similar)
 
-Rendering — 640×480 through Weston (headless), pure software rasterizers:
+Rendering and windows — software rasterizers (llvmpipe), the same programs
+built against SDLop and stock SDL3 3.4.20, 640×480 unless noted:
 
-| path | result |
+| X11 (Xvfb) | SDLop | SDL3 |
+|---|---|---|
+| software surface: full-window fill + present | ≈3 300 fps (≈300 µs; present ≈180 µs: MIT-SHM + sync) | ≈330 fps (≈3 000 µs) |
+| desktop GL (GLX): clear + swap, 320×240 | ≈220 µs | ≈225 µs |
+| desktop GL forced through EGL (`SDL_VIDEO_FORCE_EGL=1`, the pre-GLX path) | ≈310 µs | |
+| GLES 2 (GLX ES profile): clear + swap | ≈2 600 fps | context fails on this server (GLXBadFBConfig) |
+| create + destroy a window | ≈0.4–0.5 ms | ≈2.4–2.8 ms |
+
+| Wayland (Weston 10, headless) | SDLop |
 |---|---|
-| software surface: full-window fill + present | ≈11 000 fps (≈3.5 GPix/s; the pixels **are** the shm buffer, zero copy) |
-| OpenGL ES 3.2 (llvmpipe): glClear + swap | ≈3 400 fps (≈1.0 GPix/s) |
-| Vulkan (lavapipe): swapchain clear + present | verified by read-back, present-paced |
-| software plasma (per-pixel `sin`, 640×480) | ≈35 fps (compute-bound, not presentation-bound) |
+| software surface: full-window fill + present | ≈400 fps, paced by the compositor (see below) |
+| GLES (Mesa EGL): clear + swap | ≈385 fps, same pacing |
+| create + destroy a window | ≈115 µs |
+
+Wayland software presentation follows the `wl_buffer` contract: a buffer is
+written only after the compositor's `wl_buffer.release` (see Notes), so the
+software frame rate is bounded by how fast the compositor gives buffers back.
+Weston releases one per repaint, about every 2.5 ms here, and Mesa's EGL
+waits on the same releases. Compositors that copy `wl_shm` buffers at
+commit and release them right away allow higher rates. **Earlier releases
+published ≈11 000 fps here**, and an external comparison measured ≈17 500
+fps. Those numbers came from re-attaching one buffer every frame without
+waiting for its release, which let the application draw into a buffer the
+compositor was still reading. They measured a protocol violation, not
+presentation, and should not be compared with conforming clients.
+Window creation used to take ≈3.4 ms here (≈0.8 ms in the external run),
+mostly from mapping and filling a full-size buffer during the configure
+handshake. The clear colour is now a 1×1 buffer scaled by `wp_viewporter`.
 
 Reproduce: `cmake --build build && ./build/bench_events && ./build/bench_events_sdl3`
 and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
-`WAYLAND_DISPLAY=wayland-0 ./build/bench_render` for the rendering numbers.
+`SDL_VIDEODRIVER=x11|wayland ./build/bench_render` for the rendering numbers.
 
 ## API surface (SDL3-compatible)
 
-596 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+737 SDL3 functions; every one is declared in `include/SDL3/` (generated from
 the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
 with the same signature as SDL3, and checked by the `api_exports` test.
 
@@ -168,13 +241,15 @@ with the same signature as SDL3, and checked by the `api_exports` test.
 | Events | queue, `SDL_PeepEvents`, filters + watches, `SDL_WaitEvent*`, user events, `SDL_GetEventDescription` |
 | Keyboard / text | keymaps with xkb layouts, key names, text input start/stop, compose |
 | Surfaces | create/convert/duplicate/scale/flip/rotate, palettes, colorspaces, blend modes, color keys, `SDL_BlitSurface*` incl. scaled/tiled/9-grid, float/HDR (PQ, 10-bit) conversions, premultiplied alpha, rects |
-| OpenGL / Vulkan | EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks), Vulkan WSI (`SDL_Vulkan_*`) |
+| OpenGL / Vulkan | GLX (X11 desktop GL) and EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks; NULL for GLX contexts, as stock), Vulkan WSI (`SDL_Vulkan_*`) |
+| Filesystem | `SDL_GetBasePath`, `SDL_GetPrefPath`, `SDL_GetUserFolder` (XDG), `SDL_CreateDirectory`, `SDL_EnumerateDirectory`, `SDL_GetPathInfo`, `SDL_CopyFile`, `SDL_RenamePath`, `SDL_RemovePath`, `SDL_GetCurrentDirectory` (no `SDL_GlobDirectory`) |
+| Joystick / gamepad | the whole `SDL_joystick.h` / `SDL_gamepad.h` API, behaving like stock SDL3 with no controller attached: empty device lists, opens fail with an error, NULL handles are harmless, string/label helpers work |
 | Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings |
 
 Unsupported with an SDL error (like a stock SDL3 build without that feature):
 FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).
-Out of scope by design: audio, renderer, GPU, joystick/gamepad, haptics,
-sensors, camera, filesystem, iostream.
+Out of scope by design: audio, renderer, GPU, haptics, sensors, camera,
+iostream, and real game controller support.
 
 `struct`/enum/constant ABI is byte-identical to SDL3 3.4.20 (verified by an
 offset/value harness compiled against both header sets), and SDLop's exported
@@ -224,8 +299,16 @@ cmake --build build-abi -j
 ctest --test-dir build-abi -R abi_check --output-on-failure
 ```
 
-The manually driven Wayland behavior trace is built with the test targets but
-is not registered with CTest because it waits for an external input script:
+Build switches: `SDLop_BUILD_TESTS`, `SDLop_BUILD_EXAMPLES`,
+`SDLop_BUILD_BENCHMARKS` (all ON by default) and `SDLop_BUILD_TOOLS` (default:
+same as `SDLop_BUILD_TESTS`). The tools are `wl_injector` and the behaviour
+probes. The Wayland input injectors are skipped, with a configure message,
+when wayland-client, libxkbcommon or the vendored virtual-input protocol
+XMLs (`tests/protocols/`) are missing.
+
+The manually driven Wayland behavior trace is built with the tools
+(`SDLop_BUILD_TOOLS`) but is not registered with CTest because it waits for
+an external input script:
 
 ```sh
 cmake --build build --target behaviour_probe_wayland
@@ -252,8 +335,8 @@ Runtime loading is SDL3-style dynamic: `libwayland-client.so.0`,
 `libxkbcommon.so.0`, `libEGL.so.1`, `libwayland-egl.so.1`, `libvulkan.so.1`
 and the X11 libraries (`libxcb.so.1`, `libxcb-shm.so.0`, `libxcb-xkb.so.1`,
 `libxkbcommon-x11.so.0`, `libxcb-xinput.so.0`, `libxcb-randr.so.0`, and
-`libX11.so.6` only for EGL stacks without
-`EGL_EXT_platform_xcb`) are all `dlopen`-ed on demand — nothing optional is linked
+`libX11.so.6` + `libGL.so.1` for GLX, `libX11.so.6` also for EGL stacks
+without `EGL_EXT_platform_xcb`) are all `dlopen`-ed on demand — nothing optional is linked
 (`objdump -p libSDLop.so` shows NEEDED: libc and libm only). Apps link just
 `-lsdlop` (plus `-lpthread -ldl -lm` where the toolchain doesn't fold them
 into libc). Missing libs degrade gracefully: no wayland-client -> dummy
@@ -278,6 +361,32 @@ WAYLAND_DISPLAY=wayland-0 ctest --test-dir build   # wayland integration test
 xvfb-run -s "-screen 0 1280x1024x24" ctest --test-dir build  # X11 suite
 sudo ./build/test_evdev_uinput                     # raw evdev end-to-end
 ```
+
+### Drop-in use with binaries built against stock SDL3
+
+`libSDLop.so` exports only `SDL_*`, every symbol tagged with stock SDL3's
+version node `SDL3_0.0.0` (`tools/sdlop.sym`, CMake option
+`SDLOP_SYMBOL_VERSIONING`, default ON). That makes two setups work:
+
+```sh
+# 1. alias: no rebuild of SDLop needed
+mkdir -p dropin && ln -sf "$PWD/build/libSDLop.so" dropin/libSDL3.so.0
+LD_LIBRARY_PATH=$PWD/dropin ./app-built-against-SDL3
+
+# 2. real SDL3 file names: libSDL3.so.0.4.20, SONAME libSDL3.so.0 (opt-in,
+#    because it collides with an installed SDL3)
+cmake -S . -B build-sdl3 -DSDLOP_SDL3_SONAME=ON && cmake --build build-sdl3
+LD_LIBRARY_PATH=$PWD/build-sdl3 ./app-built-against-SDL3
+```
+
+Both load without the "no version information available" warning. Things
+stock SDL3 apps rely on that SDLop now matches: `SDL_CreateWindow` without
+`SDL_Init` initializes video + events (`SDL_WasInit` = `0x4020`), init flag
+dependencies (`GAMEPAD` → `JOYSTICK` → `EVENTS`), GLX contexts on X11, the
+gamepad/joystick API (no devices) and the `SDL_filesystem.h` helpers
+(`tests/test_dropin_compat.c`, `tests/test_glx.c`). An app that calls an
+SDL3 function outside SDLop's subset still fails to load with "undefined
+symbol": run it with `LD_BIND_NOW=1` to see all of them at once.
 
 ### Web (Emscripten)
 
@@ -327,7 +436,8 @@ Highlights:
 - `examples/window.c` — classic SDL3 loop; **compiles unmodified against real
   SDL3 too** (verified).
 - `examples/wasd.c` — asyncinput-style: raw callback drives movement, with
-  automatic SDL-queue fallback when raw input is unavailable.
+  automatic SDL-queue fallback when raw input is unavailable (on X11/Wayland
+  run it with `SDLOP_RAW_INPUT=1` for the raw path).
 - `examples/raw_latency.c` — measures kernel→callback latency percentiles
   (asyncinput `read_keys` equivalent).
 - `examples/surface_plasma.c` — software rendering: plasma drawn straight
@@ -344,8 +454,9 @@ Highlights:
 ## Notes & limitations
 
 - Raw evdev input needs read access to `/dev/input` (root or `input` group);
-  otherwise SDLop silently uses Wayland seat input. Like asyncinput, the raw
-  path bypasses compositor keyboard focus/layout.
+  otherwise SDLop silently uses window-system input. On X11/Wayland it is off
+  unless `SDLOP_RAW_INPUT=1`; then SDL events follow the window system's
+  focus, while the raw callback/poll API, like asyncinput, sees the whole seat.
 - Wayland cannot position toplevel windows: `SDL_SetWindowPosition` returns
   false for them. Popup and tooltip windows are `xdg_popup`s placed relative
   to their parent (menus grab input and close on outside clicks). Requests
@@ -362,8 +473,29 @@ Highlights:
   client-side like on Wayland. Relative mouse mode = XInput2 raw motion +
   confined pointer grab + blank cursor; warp-to-center without XInput2.
   Content scale follows `SDL_VIDEO_X11_SCALING_FACTOR`, `Xft.dpi`, then
-  `GDK_SCALE`. GL goes through EGL (`EGL_PLATFORM_XCB_EXT`, else
-  `EGL_PLATFORM_X11_EXT` on a private Xlib connection; GLX is not used).
+  `GDK_SCALE`. Desktop OpenGL uses GLX like stock SDL3 (loaders such as
+  GLEW need `glXGetCurrentDisplay()`), on a private Xlib connection.
+  OpenGL ES uses GLX as well when the server has
+  `GLX_EXT_create_context_es_profile` (any ES version; the older
+  `GLX_EXT_create_context_es2_profile` alone: ES 2.0) on top of
+  `GLX_ARB_create_context_profile`, which avoids an EGL detour on drivers
+  whose GLX path is the fast one. Unlike stock, the ES version is not capped
+  by `GL_ARB_ES3_compatibility`: the driver is asked, and a version it
+  refuses falls back to EGL (on every EGL path, X11/Wayland/KMSDRM, the ES
+  version is passed like stock: X.0 as `EGL_CONTEXT_CLIENT_VERSION`, X.Y
+  through `EGL_KHR_create_context`, so an unavailable version fails instead
+  of returning a different one). `SDL_VIDEO_FORCE_EGL=1` (everything),
+  `SDL_OPENGL_ES_DRIVER=1` (GLES only) and systems without usable GLX use
+  EGL (`EGL_PLATFORM_XCB_EXT`, else `EGL_PLATFORM_X11_EXT`); `SDL_EGL_*`
+  return NULL for GLX contexts, as in stock. GLX contexts honour
+  `SDL_GL_CONTEXT_NO_ERROR` (`GLX_ARB_create_context_no_error`),
+  `SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG` / `SDL_GL_CONTEXT_RESET_NOTIFICATION`
+  (`GLX_ARB_create_context_robustness`) and
+  `SDL_GL_CONTEXT_RELEASE_BEHAVIOR` (`GLX_ARB_context_flush_control`), each
+  only when the server has the extension (otherwise ignored). Swap control:
+  `GLX_EXT_swap_control` (+ `_tear` for adaptive vsync, interval -1), else
+  MESA, else SGI; as in stock SDL3, `SDL_GL_SetSwapInterval` fails with "not
+  supported" when there is none (e.g. Xvfb).
   `SDLOP_X11_NO_SHM=1` disables MIT-SHM. Layout switches (`setxkbmap`, XKB
   group changes) are followed live and reported as
   `SDL_EVENT_KEYMAP_CHANGED`; without libxcb-xkb only full keymap changes
@@ -387,15 +519,27 @@ Highlights:
   selection (and thus the server's own pointer emulation) to X11.
 - Relative mouse mode uses real pointer lock (`zwp_pointer_constraints` +
   `zwp_relative_pointer`) on Wayland when the compositor has a seat/pointer,
-  and raw evdev deltas when the worker thread is active; the window-system
-  fallback streams deltas from the relative-pointer protocol.
+  and raw evdev deltas when `SDLOP_RAW_INPUT=1` made evdev the input source;
+  otherwise deltas come from the relative-pointer protocol.
 - Window decorations: X11 uses `_MOTIF_WM_HINTS`; Wayland asks for
   server-side decorations via xdg-decoration (borderless windows request
   client-side mode, and SDLop draws none). Compositors without
   xdg-decoration (e.g. GNOME) show no title bar.
-- Software surfaces are XRGB8888 wl_shm buffers (zero copy); the GL and
-  Vulkan paths were validated against Mesa's software rasterizers
-  (llvmpipe/lavapipe) but work with any EGL/Vulkan driver.
+- Wayland software surfaces: the `SDL_GetWindowSurface` pixels are a
+  client-side XRGB8888 buffer at a fixed address. Each
+  `SDL_UpdateWindowSurface(Rects)` copies the damage into a `wl_shm` buffer
+  the compositor has released, then attaches and commits it. Each buffer
+  tracks what it has missed, so a present copies only the new damage plus
+  the previous frame's. The cycle is two buffers, and a third only while the
+  compositor holds both. A present waits for a release only when all three are
+  held. That wait dispatches only buffer events, never input or window events.
+  Until something is presented, a window shows its clear colour: a 1×1
+  buffer scaled with `wp_viewporter`, or a filled full-size buffer when the
+  compositor lacks it or `SDLOP_WAYLAND_NO_VIEWPORTER=1`. GL offload frames
+  use the same buffer cycle. `test_wayland_buffers` checks all of this
+  against a strict test compositor. The GL and Vulkan paths were validated
+  against Mesa's software rasterizers (llvmpipe/lavapipe) but work with any
+  EGL/Vulkan driver.
 - Hardware GPU offload (OpenGL via EGL surfaceless/pbuffer on a hardware
   DRM render node; Vulkan via `VK_EXT_headless_surface` with hardware GPU
   prioritization) activates automatically when the display backend lacks
@@ -405,8 +549,11 @@ Highlights:
   Configure via `SDLOP_OFFLOAD` (global default: `auto`, `0`/`off`/`false`/`no`,
   or `1`/`on`/`true`/`yes`/`force`), overridden per API by
   `SDLOP_GL_OFFLOAD` and `SDLOP_VULKAN_OFFLOAD` (or `SDLOP_VK_OFFLOAD`).
+  Like every SDLop option these are also hints: `SDL_SetHint(SDLOP_HINT_GL_OFFLOAD, "0")`
+  etc. (environment over a normal hint, `SDL_HINT_OVERRIDE` over both).
 - `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
-  content yet.
+  content yet. If a window surface exists, it fills the surface and presents
+  it (X11 and Wayland).
 - Web: the static keymap is US-layout only (browser text input events are
   not used yet); `SDL_GL_SHARE_WITH_CURRENT_CONTEXT` is ignored (WebGL has no
   cross-context object sharing);

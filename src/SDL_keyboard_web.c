@@ -358,7 +358,7 @@ void SDLOP_KeyboardQuit(void)
 /* raw-input stubs (no evdev on the web)                               */
 /* ------------------------------------------------------------------ */
 
-bool SDLOP_RawInputKeyboardActive(void)
+bool SDLOP_RawInputIsSource(void)
 {
     return false;
 }

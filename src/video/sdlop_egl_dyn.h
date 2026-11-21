@@ -41,6 +41,14 @@ extern EGLDisplay SDLOP_EGL_PlatformDisplay(EGLenum platform, void *native, cons
 extern int SDLOP_EGL_AppendUserAttribs(bool context, EGLDisplay display, EGLConfig config, EGLint *attribs, int n,
                                        int max);
 
+/* OpenGL ES version handling of stock SDL_EGL_ChooseConfig/CreateContext,
+ * from sdlop_glattrs: the EGL_RENDERABLE_TYPE bit for the requested ES
+ * major version, and the context version attributes (X.0 ->
+ * EGL_CONTEXT_CLIENT_VERSION X; X.Y -> EGL_KHR_create_context major/minor,
+ * error without it). AppendESVersion returns the new n, -1 on error (set). */
+extern EGLint SDLOP_EGL_ESRenderableType(EGLDisplay display);
+extern int SDLOP_EGL_AppendESVersion(EGLDisplay display, EGLint *attribs, int n);
+
 #ifdef __cplusplus
 }
 #endif
