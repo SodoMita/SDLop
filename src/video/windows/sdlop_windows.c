@@ -1494,6 +1494,47 @@ static void win32_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *wind
     SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 }
 
+/* Undocumented but the only way to show the system menu at a point; SDL3
+ * defines it the same way. */
+#ifndef WM_POPUPSYSTEMMENU
+#define WM_POPUPSYSTEMMENU 0x313
+#endif
+
+/* SDL_ShowWindowSystemMenu(): the window menu at a client point. Win32 answers
+ * WM_POPUPSYSTEMMENU by showing the system menu there (SDL3 does the same). */
+static void win32_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *window, int x, int y)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    POINT pt;
+    if (!data || !data->hwnd) {
+        return;
+    }
+    pt.x = x;
+    pt.y = y;
+    if (ClientToScreen(data->hwnd, &pt)) {
+        SendMessageW(data->hwnd, WM_POPUPSYSTEMMENU, 0, MAKELPARAM(pt.x, pt.y));
+    }
+}
+
+/* SDL_CaptureMouse(): SDL_WINDOW_MOUSE_CAPTURE. SetCapture makes Win32 keep
+ * sending mouse messages to this window after the pointer leaves it, which is
+ * what "drag outside the window and keep tracking" needs. */
+static bool win32_CaptureMouse(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    if (window) {
+        SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+        if (!data || !data->hwnd) {
+            return false;
+        }
+        SetCapture(data->hwnd);
+    } else if (GetCapture() != NULL) {
+        ReleaseCapture();
+    }
+    return true;
+}
+
 /* Keep the display on while a window has focus, the way SDL3 does: Windows
  * has no screensaver API, SetThreadExecutionState is the documented way to
  * say "the user is here". Called again periodically, so re-assert it. */
@@ -2027,6 +2068,8 @@ SDLop_VideoDevice SDLop_windows_device = {
     .FreeCursor = win32_FreeCursor,
     .ShowCursor = win32_ShowCursor,
     .SuspendScreenSaver = win32_SuspendScreenSaver,
+    .CaptureMouse = win32_CaptureMouse,
+    .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
     .WarpMouse = win32_WarpMouse,
     .WarpMouseGlobal = win32_WarpMouseGlobal,

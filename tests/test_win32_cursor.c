@@ -151,6 +151,18 @@ int main(void)
     CHECK(SDL_GetGlobalMouseState(&gx, &gy) == 0,
           "expected no buttons held, got mask 0x%x", (unsigned)SDL_GetGlobalMouseState(NULL, NULL));
 
+    /* SDL_CaptureMouse(): while captured, Win32 keeps sending mouse messages
+     * to the window even when the pointer leaves it -- which is what dragging
+     * outside the window needs. */
+    CHECK(SDL_CaptureMouse(true), "SDL_CaptureMouse(true): %s", SDL_GetError());
+    CHECK((window->flags & SDL_WINDOW_MOUSE_CAPTURE) != 0,
+          "SDL_WINDOW_MOUSE_CAPTURE not set after SDL_CaptureMouse(true)");
+    CHECK(GetCapture() != NULL, "Win32 capture was not set");
+    CHECK(SDL_CaptureMouse(false), "SDL_CaptureMouse(false): %s", SDL_GetError());
+    CHECK(GetCapture() == NULL, "Win32 capture was not released");
+    CHECK((window->flags & SDL_WINDOW_MOUSE_CAPTURE) == 0,
+          "SDL_WINDOW_MOUSE_CAPTURE still set after SDL_CaptureMouse(false)");
+
     /* SDL_SetWindowAspectRatio() has no Win32 call behind it: the driver
      * applies it in WM_SIZING. Post the same message the window manager sends
      * while the user drags an edge, and check the rect comes back 16:9. */
