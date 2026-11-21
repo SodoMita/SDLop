@@ -11,7 +11,8 @@
 
   Library names can be overridden per module (SDLOP_LIB_XCB,
   SDLOP_LIB_XCB_SHM, SDLOP_LIB_XCB_XKB, SDLOP_LIB_XKBCOMMON_X11,
-  SDLOP_LIB_XCB_XINPUT, SDLOP_LIB_XCB_RANDR). Setting an optional module's
+  SDLOP_LIB_XCB_XINPUT, SDLOP_LIB_XCB_RANDR,
+  SDLOP_LIB_XCB_RENDER, SDLOP_LIB_XCB_XFIXES). Setting an optional module's
   variable to "none" disables it, which is how the fallback paths are
   tested.
 
@@ -32,6 +33,44 @@
 #include <xcb/xinput.h>
 #include <xcb/randr.h>
 #include <xcb/render.h>
+#if defined(__has_include)
+#if __has_include(<xcb/xfixes.h>)
+#include <xcb/xfixes.h>
+#define SDLOP_HAVE_XCB_XFIXES_H 1
+#endif
+#endif
+#ifndef SDLOP_HAVE_XCB_XFIXES_H
+/* libxcb-xfixes is dlopen-ed (optional); without its headers at build time
+ * the few pieces used for clipboard owner-change events are declared here
+ * exactly as xcb/xfixes.h has them */
+typedef struct xcb_xfixes_query_version_cookie_t { unsigned int sequence; } xcb_xfixes_query_version_cookie_t;
+typedef struct xcb_xfixes_query_version_reply_t {
+    uint8_t response_type, pad0;
+    uint16_t sequence;
+    uint32_t length, major_version, minor_version;
+    uint8_t pad1[16];
+} xcb_xfixes_query_version_reply_t;
+typedef struct xcb_xfixes_selection_notify_event_t {
+    uint8_t response_type, subtype;
+    uint16_t sequence;
+    xcb_window_t window, owner;
+    xcb_atom_t selection;
+    xcb_timestamp_t timestamp, selection_timestamp;
+    uint8_t pad0[8];
+} xcb_xfixes_selection_notify_event_t;
+#define XCB_XFIXES_SELECTION_NOTIFY 0
+#define XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER 1
+#define XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY 2
+#define XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE 4
+extern xcb_extension_t xcb_xfixes_id;
+xcb_xfixes_query_version_cookie_t xcb_xfixes_query_version(xcb_connection_t *c, uint32_t client_major_version,
+                                                           uint32_t client_minor_version);
+xcb_xfixes_query_version_reply_t *xcb_xfixes_query_version_reply(xcb_connection_t *c,
+                                                                 xcb_xfixes_query_version_cookie_t cookie,
+                                                                 xcb_generic_error_t **e);
+xcb_void_cookie_t xcb_xfixes_select_selection_input(xcb_connection_t *c, xcb_window_t window, xcb_atom_t selection,
+                                                    uint32_t event_mask);
+#endif
 #include <xkbcommon/xkbcommon-x11.h>
 
 #ifdef __cplusplus

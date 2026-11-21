@@ -235,6 +235,8 @@ bool SDLOP_HasInternalClipboardData(const char *mime_type);
 const char *const *SDLOP_GetClipboardOfferMimeTypes(size_t *count);
 /* a foreign owner took the selection (owner=false) or our own offer changed */
 void SDLOP_SendClipboardUpdate(bool owner, char **mime_types, size_t num_mime_types);
+/* the system took the clipboard from us: drop the app's offer (cleanup runs) */
+void SDLOP_CancelClipboardData(void);
 const void *SDLCALL SDLOP_ClipboardTextCallback(void *userdata, const char *mime_type, size_t *size);
 
 /* Provided by backends */

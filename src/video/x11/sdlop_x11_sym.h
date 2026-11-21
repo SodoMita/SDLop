@@ -17,6 +17,7 @@
     XINPUT  libxcb-xinput.so.0      optional - XI2 raw motion (relative mouse)
     RANDR   libxcb-randr.so.0       optional - monitors, modes, refresh rates
     RENDER  libxcb-render.so.0      optional - ARGB cursors
+    XFIXES  libxcb-xfixes.so.0      optional - clipboard owner-change events
 
   (libX11 is only needed as a fallback for EGL implementations without
   EGL_EXT_platform_xcb; sdlop_x11_gl.c dlopens it on demand.)
@@ -55,6 +56,10 @@ SDLOP_X11_SYM(XCB, xcb_get_atom_name_name)
 SDLOP_X11_SYM(XCB, xcb_get_atom_name_name_length)
 SDLOP_X11_SYM(XCB, xcb_create_window_checked)
 SDLOP_X11_SYM(XCB, xcb_destroy_window)
+SDLOP_X11_SYM(XCB, xcb_set_selection_owner)
+SDLOP_X11_SYM(XCB, xcb_get_selection_owner)
+SDLOP_X11_SYM(XCB, xcb_get_selection_owner_reply)
+SDLOP_X11_SYM(XCB, xcb_convert_selection)
 SDLOP_X11_SYM(XCB, xcb_map_window)
 SDLOP_X11_SYM(XCB, xcb_unmap_window)
 SDLOP_X11_SYM(XCB, xcb_configure_window)
@@ -171,3 +176,10 @@ SDLOP_X11_SYM(RENDER, xcb_render_pictforminfo_next)
 SDLOP_X11_SYM(RENDER, xcb_render_create_picture)
 SDLOP_X11_SYM(RENDER, xcb_render_free_picture)
 SDLOP_X11_SYM(RENDER, xcb_render_create_cursor)
+
+/* ------------------------------------------------------------- XFIXES */
+SDLOP_X11_MODULE(XFIXES)
+SDLOP_X11_DATA(XFIXES, xcb_xfixes_id)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_query_version)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_query_version_reply)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_select_selection_input)

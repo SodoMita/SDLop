@@ -13,6 +13,9 @@
 
 /* accessors implemented in sdlop_x11.c */
 xcb_connection_t *SDLOP_X11_GetConnection(void);
+xcb_window_t SDLOP_X11_GetRoot(void);
+/* dispatch events until pred(userdata) holds or timeout_ms passes */
+void SDLOP_X11_PumpUntil(bool (*pred)(void *), void *userdata, int timeout_ms);
 int SDLOP_X11_GetScreenNumber(void);
 xcb_visualid_t SDLOP_X11_GetVisual(void);
 xcb_window_t SDLOP_X11_GetWindowXID(SDL_Window *window);
@@ -48,5 +51,17 @@ bool SDLOP_X11_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *windo
 const char *const *SDLOP_X11_Vulkan_GetInstanceExtensions(SDLop_VideoDevice *device, Uint32 *count);
 bool SDLOP_X11_Vulkan_GetPresentationSupport(SDLop_VideoDevice *device, void *instance,
                                              void *physical_device, Uint32 queue_family);
+
+/* sdlop_x11_clipboard.c */
+void SDLOP_X11_Clipboard_Init(void);
+void SDLOP_X11_Clipboard_Quit(void);
+bool SDLOP_X11_Clipboard_HandleEvent(xcb_generic_event_t *ev); /* true = consumed */
+bool SDLOP_X11_SetClipboardData(SDLop_VideoDevice *device);
+void *SDLOP_X11_GetClipboardData(SDLop_VideoDevice *device, const char *mime_type, size_t *size);
+bool SDLOP_X11_HasClipboardData(SDLop_VideoDevice *device, const char *mime_type);
+const char *const *SDLOP_X11_GetTextMimeTypes(SDLop_VideoDevice *device, size_t *num_mime_types);
+bool SDLOP_X11_SetPrimarySelectionText(SDLop_VideoDevice *device, const char *text);
+char *SDLOP_X11_GetPrimarySelectionText(SDLop_VideoDevice *device);
+bool SDLOP_X11_HasPrimarySelectionText(SDLop_VideoDevice *device);
 
 #endif /* sdlop_x11_internal_h_ */

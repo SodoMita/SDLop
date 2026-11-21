@@ -837,6 +837,11 @@ xcb_connection_t *SDLOP_X11_GetConnection(void)
     return x11.conn;
 }
 
+xcb_window_t SDLOP_X11_GetRoot(void)
+{
+    return x11.root;
+}
+
 int SDLOP_X11_GetScreenNumber(void)
 {
     return x11.screen_num;
@@ -1918,6 +1923,8 @@ static bool x11_Init(SDLop_VideoDevice *device)
     x11.mouse_id = x11_device_next_id();
     SDLOP_AddMouse(x11.mouse_id, NULL);
 
+    SDLOP_X11_Clipboard_Init();
+
     x11_flush();
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
                 "SDLop x11: %s, %d display(s), shm=%d xkb=%d%s xi2=%d randr=%d%s scale=%g",
@@ -1935,6 +1942,7 @@ static void x11_Quit(SDLop_VideoDevice *device)
         SDLOP_DelDisplay(x11.monitors[i].display_id, false);
     }
     x11.num_monitors = 0;
+    SDLOP_X11_Clipboard_Quit();
     free(x11.peeked);
     x11.peeked = NULL;
     if (x11.conn) {
@@ -2086,11 +2094,11 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 }
 
 /* run the event loop until pred() holds or timeout_ms passes */
-static void pump_until(SDL_Window *window, bool (*pred)(SDL_Window *), int timeout_ms)
+void SDLOP_X11_PumpUntil(bool (*pred)(void *), void *userdata, int timeout_ms)
 {
     Uint64 deadline = SDLOP_MonotonicNS() + (Uint64)timeout_ms * 1000000ull;
     x11_flush();
-    while (!pred(window) && !x11.dead) {
+    while (!pred(userdata) && !x11.dead) {
         Uint64 now = SDLOP_MonotonicNS();
         if (now >= deadline) {
             break;
@@ -2112,6 +2120,24 @@ static void pump_until(SDL_Window *window, bool (*pred)(SDL_Window *), int timeo
         int ms = (int)((deadline - now) / 1000000ull) + 1;
         poll(&pfd, 1, ms);
     }
+}
+
+typedef struct WindowPred
+{
+    SDL_Window *window;
+    bool (*pred)(SDL_Window *);
+} WindowPred;
+
+static bool window_pred(void *userdata)
+{
+    WindowPred *wp = (WindowPred *)userdata;
+    return wp->pred(wp->window);
+}
+
+static void pump_until(SDL_Window *window, bool (*pred)(SDL_Window *), int timeout_ms)
+{
+    WindowPred wp = { window, pred };
+    SDLOP_X11_PumpUntil(window_pred, &wp, timeout_ms);
 }
 
 static bool is_mapped(SDL_Window *window)
@@ -3269,6 +3295,9 @@ static void x11_dispatch(xcb_generic_event_t *ev)
         handle_xkb_event(ev);
         return;
     }
+    if (SDLOP_X11_Clipboard_HandleEvent(ev)) {
+        return;
+    }
     if (x11.has_randr && (type == x11.randr_event_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY ||
                           type == x11.randr_event_base + XCB_RANDR_NOTIFY)) {
         x11.displays_dirty = true;
@@ -3607,4 +3636,11 @@ SDLop_VideoDevice SDLop_x11_device = {
     .WarpMouseGlobal = x11_WarpMouseGlobal,
     .CaptureMouse = x11_CaptureMouse,
     .GetGlobalMouseState = x11_GetGlobalMouseState,
+    .SetClipboardData = SDLOP_X11_SetClipboardData,
+    .GetClipboardData = SDLOP_X11_GetClipboardData,
+    .HasClipboardData = SDLOP_X11_HasClipboardData,
+    .GetTextMimeTypes = SDLOP_X11_GetTextMimeTypes,
+    .SetPrimarySelectionText = SDLOP_X11_SetPrimarySelectionText,
+    .GetPrimarySelectionText = SDLOP_X11_GetPrimarySelectionText,
+    .HasPrimarySelectionText = SDLOP_X11_HasPrimarySelectionText,
 };

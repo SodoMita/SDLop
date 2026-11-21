@@ -361,6 +361,7 @@ if(SDLOP_VIDEO_X11)
     src/video/x11/sdlop_x11.c
     src/video/x11/sdlop_x11_dyn.c
     src/video/x11/sdlop_x11_gl.c
+    src/video/x11/sdlop_x11_clipboard.c
     src/video/x11/sdlop_x11_vulkan.c)
   list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
 endif()
@@ -544,6 +545,16 @@ if(SDLop_BUILD_TESTS)
       # relative mode and a single root-window display
       add_test(NAME test_x11_minimal COMMAND test_x11)
       set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # system clipboard / primary selection against other X clients (raw
+      # xcb requestor + owner thread), with and without XFixes
+      add_executable(test_x11_clipboard tests/test_x11_clipboard.c)
+      target_link_libraries(test_x11_clipboard PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} pthread)
+      target_include_directories(test_x11_clipboard PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_clipboard PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_clipboard COMMAND test_x11_clipboard)
+      add_test(NAME test_x11_clipboard_noxfixes COMMAND test_x11_clipboard)
+      set_tests_properties(test_x11_clipboard test_x11_clipboard_noxfixes PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      set_tests_properties(test_x11_clipboard_noxfixes PROPERTIES ENVIRONMENT "SDLOP_LIB_XCB_XFIXES=none")
       # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
       add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
       target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
@@ -560,7 +571,7 @@ if(SDLop_BUILD_TESTS)
       set_tests_properties(test_glx PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
       set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
-        "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none")
+        "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none;SDLOP_LIB_XCB_XFIXES=none")
     endif()
     # keyboard layouts end-to-end (setxkbmap + XKB group locking; the test
     # restores the server layout). Skips where the keymap cannot be set.
