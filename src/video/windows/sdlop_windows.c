@@ -1588,6 +1588,93 @@ static void win32_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *wi
     }
 }
 
+/* SDL_SetWindowShape(): SDL_WINDOW_TRANSPARENT windows. Win32 expresses a
+ * non-rectangular window as a window region, so the alpha channel is turned
+ * into one span per run of opaque pixels (the approach SDL3 takes in
+ * SDL_windowsshape.c). A NULL shape puts the rectangular region back. */
+static void win32_add_shape_span(HRGN *region, int x1, int y1, int x2, int y2)
+{
+    HRGN span = CreateRectRgn(x1, y1, x2, y2);
+    if (!span) {
+        return;
+    }
+    if (*region) {
+        CombineRgn(*region, *region, span, RGN_OR);
+        DeleteObject(span);
+    } else {
+        *region = span;
+    }
+}
+
+static HRGN win32_region_from_shape(SDL_Surface *shape, int offset_x, int offset_y)
+{
+    HRGN region = NULL;
+    for (int y = 0; y < shape->h; y++) {
+        const Uint8 *row = (const Uint8 *)shape->pixels + (size_t)y * shape->pitch;
+        int span_start = -1;
+        for (int x = 0; x < shape->w; x++) {
+            const Uint8 alpha = row[x * 4 + 3];
+            if (alpha == SDL_ALPHA_TRANSPARENT) {
+                if (span_start >= 0) {
+                    win32_add_shape_span(&region, offset_x + span_start, offset_y + y,
+                                         offset_x + x, offset_y + y + 1);
+                    span_start = -1;
+                }
+            } else if (span_start < 0) {
+                span_start = x;
+            }
+        }
+        if (span_start >= 0) {
+            win32_add_shape_span(&region, offset_x + span_start, offset_y + y,
+                                 offset_x + shape->w, offset_y + y + 1);
+        }
+    }
+    return region;
+}
+
+static bool win32_UpdateWindowShape(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *shape)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    HRGN region = NULL;
+
+    if (!data || !data->hwnd) {
+        return true;
+    }
+
+    if (shape) {
+        /* The frame is drawn outside the client area, so shift the shape by
+         * the frame size and add the frame itself back as four spans, or the
+         * title bar and borders would be cut away with the shape. */
+        RECT frame = { 0, 0, 0, 0 };
+        const bool bordered = (window->flags & SDL_WINDOW_BORDERLESS) == 0;
+        if (bordered) {
+            SDLOP_Win32AdjustWindowRect(window, &frame);
+        }
+        const int ox = -frame.left;
+        const int oy = -frame.top;
+
+        region = win32_region_from_shape(shape, ox, oy);
+        if (bordered) {
+            const int full_w = ox + shape->w + frame.right;
+            const int full_h = oy + shape->h + frame.bottom;
+            win32_add_shape_span(&region, 0, 0, full_w + 1, oy + 1);                      /* top */
+            win32_add_shape_span(&region, 0, oy, ox + 1, oy + shape->h + 1);              /* left */
+            win32_add_shape_span(&region, ox + shape->w, oy, full_w + 1, oy + shape->h + 1); /* right */
+            win32_add_shape_span(&region, 0, oy + shape->h, full_w + 1, full_h + 1);      /* bottom */
+        }
+    }
+
+    /* SetWindowRgn takes ownership of the region on success */
+    if (!SetWindowRgn(data->hwnd, region, TRUE)) {
+        if (region) {
+            DeleteObject(region);
+        }
+        return SDL_SetError("SetWindowRgn() failed");
+    }
+    return true;
+}
+
 /* SDL_SetWindowHitTest(): nothing to install up front, the callback is
  * consulted from WM_NCHITTEST whenever the window manager asks. */
 static bool win32_SetWindowHitTest(SDLop_VideoDevice *device, SDL_Window *window, bool enabled)
@@ -2151,6 +2238,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .SuspendScreenSaver = win32_SuspendScreenSaver,
     .CaptureMouse = win32_CaptureMouse,
     .SetWindowHitTest = win32_SetWindowHitTest,
+    .UpdateWindowShape = win32_UpdateWindowShape,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
     .WarpMouse = win32_WarpMouse,
