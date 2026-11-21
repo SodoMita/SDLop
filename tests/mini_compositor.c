@@ -35,6 +35,9 @@
   <log> as "enabled=E hint=H purpose=P rect=X,Y,W,H". After the first
   enabled commit the "IME" sends preedit "日本語" (cursor bytes 3..6), done,
   then a long commit_string (MINI_TI_COMMIT), done.
+  MINI_CURSOR_LOG=<log> logs every cursor request for
+  tests/test_wayland_cursor.c: "shape=N" (wp_cursor_shape_device_v1, offered
+  unless MINI_CURSOR_SHAPE=0) and "cursor=surface|null" (wl_pointer).
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -56,6 +59,7 @@
 #include "fractional-scale-v1-server-protocol.h"
 #include "primary-selection-server-protocol.h"
 #include "text-input-unstable-v3-server-protocol.h"
+#include "cursor-shape-v1-server-protocol.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -827,10 +831,71 @@ static const struct zwp_relative_pointer_manager_v1_interface rpm_impl = {
 
 /* ---------------- wl_pointer / wl_keyboard / wl_seat ---------------- */
 
+static const char *C_log; /* MINI_CURSOR_LOG */
+
+static void C_logf(const char *fmt, unsigned v, const char *s)
+{
+    FILE *f = C_log ? fopen(C_log, "a") : NULL;
+    if (f) {
+        if (s) {
+            fprintf(f, fmt, s);
+        } else {
+            fprintf(f, fmt, v);
+        }
+        fputc('\n', f);
+        fclose(f);
+    }
+}
+
+static void pointer_set_cursor(struct wl_client *client, struct wl_resource *res, uint32_t serial,
+                               struct wl_resource *surface, int32_t hx, int32_t hy)
+{
+    (void)client;
+    (void)res;
+    (void)serial;
+    (void)hx;
+    (void)hy;
+    C_logf("cursor=%s", 0, surface ? "surface" : "null");
+}
+
 static const struct wl_pointer_interface pointer_impl = {
-    .set_cursor = (void *)noop,
+    .set_cursor = pointer_set_cursor,
     .release = res_destroy,
 };
+
+static void C_set_shape(struct wl_client *client, struct wl_resource *res, uint32_t serial, uint32_t shape)
+{
+    (void)client;
+    (void)res;
+    (void)serial;
+    C_logf("shape=%u", shape, NULL);
+}
+
+static const struct wp_cursor_shape_device_v1_interface C_device_impl = {
+    .destroy = res_destroy,
+    .set_shape = C_set_shape,
+};
+
+static void C_get_device(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *obj)
+{
+    (void)obj;
+    struct wl_resource *d = wl_resource_create(client, &wp_cursor_shape_device_v1_interface,
+                                               wl_resource_get_version(res), id);
+    wl_resource_set_implementation(d, &C_device_impl, NULL, NULL);
+}
+
+static const struct wp_cursor_shape_manager_v1_interface C_mgr_impl = {
+    .destroy = res_destroy,
+    .get_pointer = C_get_device,
+    .get_tablet_tool_v2 = C_get_device,
+};
+
+static void C_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wp_cursor_shape_manager_v1_interface, version, id);
+    wl_resource_set_implementation(r, &C_mgr_impl, NULL, NULL);
+}
 
 static const struct wl_keyboard_interface keyboard_impl = {
     .release = res_destroy,
@@ -1880,6 +1945,10 @@ int main(void)
         wl_global_create(M.display, &zwp_primary_selection_device_manager_v1_interface, 1, NULL, S_prim_mgr_bind);
     }
 
+    C_log = getenv("MINI_CURSOR_LOG");
+    if (C_log && !(getenv("MINI_CURSOR_SHAPE") && atoi(getenv("MINI_CURSOR_SHAPE")) == 0)) {
+        wl_global_create(M.display, &wp_cursor_shape_manager_v1_interface, 1, NULL, C_mgr_bind);
+    }
     T_log = getenv("MINI_TEXT_INPUT");
     if (T_log) {
         wl_global_create(M.display, &zwp_text_input_manager_v3_interface, 1, NULL, T_mgr_bind);

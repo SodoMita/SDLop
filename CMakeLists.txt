@@ -228,7 +228,9 @@ endforeach()
 set(SDLOP_WL_VENDORED_DIR ${CMAKE_SOURCE_DIR}/src/video/wayland/protocols)
 set(SDLOP_WL_VENDORED_PROTOCOLS
   fractional-scale-v1
-  text-input-unstable-v3)
+  text-input-unstable-v3
+  tablet-v2
+  cursor-shape-v1)
 foreach(proto_name ${SDLOP_WL_VENDORED_PROTOCOLS})
   set(proto_xml ${SDLOP_WL_VENDORED_DIR}/${proto_name}.xml)
   add_custom_command(
@@ -713,7 +715,9 @@ if(SDLop_BUILD_TESTS)
       ${WL_GEN_DIR}/viewporter-server-protocol.c
       ${WL_GEN_DIR}/primary-selection-server-protocol.c
       ${WL_GEN_DIR}/fractional-scale-v1-server-protocol.c
-      ${WL_GEN_DIR}/text-input-unstable-v3-server-protocol.c)
+      ${WL_GEN_DIR}/text-input-unstable-v3-server-protocol.c
+      ${WL_GEN_DIR}/tablet-v2-server-protocol.c
+      ${WL_GEN_DIR}/cursor-shape-v1-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -755,6 +759,16 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_wayland_dnd PRIVATE -UNDEBUG)
     add_dependencies(test_wayland_dnd mini_compositor)
     # HiDPI: fractional / preferred buffer / output scales
+    add_executable(test_wayland_cursor tests/test_wayland_cursor.c)
+    target_link_libraries(test_wayland_cursor PRIVATE sdlop)
+    target_compile_options(test_wayland_cursor PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_cursor mini_compositor)
+    foreach(cursor_mode shape noshape theme)
+      add_test(NAME test_wayland_cursor_${cursor_mode}
+               COMMAND test_wayland_cursor $<TARGET_FILE:mini_compositor> ${cursor_mode})
+      set_tests_properties(test_wayland_cursor_${cursor_mode} PROPERTIES TIMEOUT 60)
+    endforeach()
+
     add_executable(test_wayland_textinput tests/test_wayland_textinput.c)
     target_link_libraries(test_wayland_textinput PRIVATE sdlop)
     target_compile_options(test_wayland_textinput PRIVATE -UNDEBUG)

@@ -72,6 +72,7 @@
 #define SDLOP_HINT_GL_OFFLOAD_PRIME      "SDLOP_GL_OFFLOAD_PRIME"  /**< bool: kmsdrm: scan out offloaded GL frames via PRIME import (default on; "0" copies through dumb buffers) */
 /* Wayland */
 #define SDLOP_HINT_WAYLAND_NO_VIEWPORTER "SDLOP_WAYLAND_NO_VIEWPORTER" /**< bool: do not use wp_viewporter (the clear colour is then a filled full-size buffer); read at video init */
+#define SDLOP_HINT_WAYLAND_NO_CURSOR_SHAPE "SDLOP_WAYLAND_NO_CURSOR_SHAPE" /**< bool: draw system cursors from the theme instead of wp_cursor_shape_v1; read at video init */
 #define SDLOP_HINT_WAYLAND_NO_TEXT_INPUT "SDLOP_WAYLAND_NO_TEXT_INPUT" /**< bool: do not use zwp_text_input_v3 (IME); read at video init */
 #define SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE "SDLOP_WAYLAND_NO_FRACTIONAL_SCALE" /**< bool: do not use wp_fractional_scale_v1 (integer preferred buffer / output scales only); read at video init */
 /* kmsdrm */

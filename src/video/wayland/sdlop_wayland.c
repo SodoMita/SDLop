@@ -28,6 +28,7 @@
 #include "xdg-activation-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "cursor-shape-v1-client-protocol.h"
 #include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
@@ -152,6 +153,8 @@ typedef struct WaylandDeviceData
     /* relative mouse mode (pointer lock) */
     struct zwp_pointer_constraints_v1 *pointer_constraints;
     struct zwp_relative_pointer_manager_v1 *relative_manager;
+    struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+    struct wp_cursor_shape_device_v1 *cursor_shape_device; /* of `pointer` */
     struct zwp_locked_pointer_v1 *locked_pointer;
     struct zwp_relative_pointer_v1 *relative_pointer;
     SDL_Window *relative_lock_window;
@@ -1199,7 +1202,57 @@ typedef struct WaylandCursor
 {
     struct wl_buffer *buffer;
     int w, h, hot_x, hot_y;
+    uint32_t shape; /* wp_cursor_shape_device_v1 shape of a system cursor, 0 = none */
 } WaylandCursor;
+
+/* stock Wayland_GetSystemCursorShape */
+static uint32_t system_cursor_shape(SDL_SystemCursor id)
+{
+    switch (id) {
+    case SDL_SYSTEM_CURSOR_DEFAULT:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
+    case SDL_SYSTEM_CURSOR_TEXT:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
+    case SDL_SYSTEM_CURSOR_WAIT:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT;
+    case SDL_SYSTEM_CURSOR_CROSSHAIR:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR;
+    case SDL_SYSTEM_CURSOR_PROGRESS:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_PROGRESS;
+    case SDL_SYSTEM_CURSOR_NWSE_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE;
+    case SDL_SYSTEM_CURSOR_NESW_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE;
+    case SDL_SYSTEM_CURSOR_EW_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE;
+    case SDL_SYSTEM_CURSOR_NS_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE;
+    case SDL_SYSTEM_CURSOR_MOVE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_SCROLL;
+    case SDL_SYSTEM_CURSOR_NOT_ALLOWED:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED;
+    case SDL_SYSTEM_CURSOR_POINTER:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
+    case SDL_SYSTEM_CURSOR_NW_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE;
+    case SDL_SYSTEM_CURSOR_N_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE;
+    case SDL_SYSTEM_CURSOR_NE_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE;
+    case SDL_SYSTEM_CURSOR_E_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE;
+    case SDL_SYSTEM_CURSOR_SE_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE;
+    case SDL_SYSTEM_CURSOR_S_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE;
+    case SDL_SYSTEM_CURSOR_SW_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE;
+    case SDL_SYSTEM_CURSOR_W_RESIZE:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE;
+    default:
+        return WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
+    }
+}
 
 /* premultiplied ARGB8888 wl_shm buffer (the pool is released right away;
  * the buffer keeps the memory alive) */
@@ -1280,6 +1333,9 @@ static bool wayland_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
         wc->h = s->h;
         wc->hot_x = cursor->hot_x;
         wc->hot_y = cursor->hot_y;
+    } else if (wl_data.cursor_shape_manager) {
+        /* stock: the compositor draws system cursors (theme, scale) */
+        wc->shape = system_cursor_shape(cursor->system_id);
     } else {
         /* themed (CSS name, fallback, legacy X name - like SDL3's
          * wayland-cursor path); the built-in arrow when nothing matches */
@@ -1311,7 +1367,7 @@ static bool wayland_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
             wc->hot_x = wc->hot_y = 0;
         }
     }
-    if (!wc->buffer) {
+    if (!wc->buffer && !wc->shape) {
         free(wc);
         return SDL_SetError("Couldn't create Wayland cursor buffer");
     }
@@ -1340,8 +1396,19 @@ static void apply_cursor(uint32_t serial)
     }
     SDL_Cursor *cursor = SDLOP_GetCurrentCursor();
     WaylandCursor *wc = cursor ? (WaylandCursor *)cursor->internal : NULL;
-    if (!wc || !wc->buffer || (wl_data.locked_pointer && wl_data.relative_lock_window == wl_data.pointer_focus)) {
+    if (!wc || (!wc->buffer && !wc->shape) ||
+        (wl_data.locked_pointer && wl_data.relative_lock_window == wl_data.pointer_focus)) {
         wl_pointer_set_cursor(wl_data.pointer, serial, NULL, 0, 0);
+        return;
+    }
+    if (wc->shape) {
+        if (!wl_data.cursor_shape_device && wl_data.cursor_shape_manager) {
+            wl_data.cursor_shape_device =
+                wp_cursor_shape_manager_v1_get_pointer(wl_data.cursor_shape_manager, wl_data.pointer);
+        }
+        if (wl_data.cursor_shape_device) {
+            wp_cursor_shape_device_v1_set_shape(wl_data.cursor_shape_device, serial, wc->shape);
+        }
         return;
     }
     if (!cursor_surface && wl_data.compositor) {
@@ -2004,6 +2071,10 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
         d->pointer_id = sdlop_device_next_id();
         send_mouse_device_event(true, d->pointer_id);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
+        if (d->cursor_shape_device) {
+            wp_cursor_shape_device_v1_destroy(d->cursor_shape_device);
+            d->cursor_shape_device = NULL;
+        }
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
         send_mouse_device_event(false, d->pointer_id);
@@ -2066,6 +2137,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         d->pointer_constraints = wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, 1);
     } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0 && !d->relative_manager) {
         d->relative_manager = wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, 1);
+    } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0 && !d->cursor_shape_manager &&
+               !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_CURSOR_SHAPE, false)) {
+        d->cursor_shape_manager = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
         d->has_dmabuf = true;
     } else if (strcmp(interface, "wl_drm") == 0) {
@@ -2228,6 +2302,12 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     }
     if (wl_data.keyboard) {
         wl_keyboard_destroy(wl_data.keyboard);
+    }
+    if (wl_data.cursor_shape_device) {
+        wp_cursor_shape_device_v1_destroy(wl_data.cursor_shape_device);
+    }
+    if (wl_data.cursor_shape_manager) {
+        wp_cursor_shape_manager_v1_destroy(wl_data.cursor_shape_manager);
     }
     if (wl_data.pointer) {
         wl_pointer_destroy(wl_data.pointer);
