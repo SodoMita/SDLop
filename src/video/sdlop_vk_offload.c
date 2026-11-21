@@ -90,7 +90,12 @@
 #define VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO 42u
 #define VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER 45u
 #define VK_STRUCTURE_TYPE_MEMORY_BARRIER 46u
+#define VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR 1000002001u
 #define VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT 1000256000u
+
+#define VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR 0x00000001u
+#define VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR 0x00000001u
+#define VK_VENDOR_ID_NVIDIA 0x10deu
 
 typedef int32_t VkResult_;
 typedef uint32_t VkFlags_;
@@ -114,6 +119,11 @@ typedef struct VkExtent2D_ {
     uint32_t width;
     uint32_t height;
 } VkExtent2D_;
+
+typedef struct VkOffset2D_ {
+    int32_t x;
+    int32_t y;
+} VkOffset2D_;
 
 typedef struct VkExtent3D_ {
     uint32_t width;
@@ -404,8 +414,11 @@ typedef struct VkDeviceQueueInfo2_ {
     uint32_t queueIndex;
 } VkDeviceQueueInfo2_;
 
+typedef uint64_t VkDisplayKHR_;
+typedef uint64_t VkDisplayModeKHR_;
+
 typedef struct VkDisplayPropertiesKHR_ {
-    void *display;
+    VkDisplayKHR_ display;
     const char *displayName;
     VkExtent2D_ physicalDimensions;
     VkExtent2D_ physicalResolution;
@@ -413,6 +426,46 @@ typedef struct VkDisplayPropertiesKHR_ {
     VkBool32_ planeReorderPossible;
     VkBool32_ persistentContent;
 } VkDisplayPropertiesKHR_;
+
+typedef struct VkDisplayModeParametersKHR_ {
+    VkExtent2D_ visibleRegion;
+    uint32_t refreshRate;
+} VkDisplayModeParametersKHR_;
+
+typedef struct VkDisplayModePropertiesKHR_ {
+    VkDisplayModeKHR_ displayMode;
+    VkDisplayModeParametersKHR_ parameters;
+} VkDisplayModePropertiesKHR_;
+
+typedef struct VkDisplayPlanePropertiesKHR_ {
+    VkDisplayKHR_ currentDisplay;
+    uint32_t currentStackIndex;
+} VkDisplayPlanePropertiesKHR_;
+
+typedef struct VkDisplayPlaneCapabilitiesKHR_ {
+    VkFlags_ supportedAlpha;
+    VkOffset2D_ minSrcPosition;
+    VkOffset2D_ maxSrcPosition;
+    VkExtent2D_ minSrcExtent;
+    VkExtent2D_ maxSrcExtent;
+    VkOffset2D_ minDstPosition;
+    VkOffset2D_ maxDstPosition;
+    VkExtent2D_ minDstExtent;
+    VkExtent2D_ maxDstExtent;
+} VkDisplayPlaneCapabilitiesKHR_;
+
+typedef struct VkDisplaySurfaceCreateInfoKHR_ {
+    uint32_t sType;
+    const void *pNext;
+    VkFlags_ flags;
+    VkDisplayModeKHR_ displayMode;
+    uint32_t planeIndex;
+    uint32_t planeStackIndex;
+    uint32_t transform;
+    float globalAlpha;
+    uint32_t alphaMode;
+    VkExtent2D_ imageExtent;
+} VkDisplaySurfaceCreateInfoKHR_;
 
 typedef void (*PFN_vkVoid_)(void);
 #define VK_CAST(T, fn) ((T)(uintptr_t)(fn))
@@ -427,6 +480,13 @@ typedef void (*PFN_vkGetPhysicalDeviceProperties_)(VkPhysicalDevice_, VkPhysical
 typedef void (*PFN_vkGetPhysicalDeviceQueueFamilyProperties_)(VkPhysicalDevice_, uint32_t *, VkQueueFamilyProperties_ *);
 typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties_)(VkPhysicalDevice_, VkPhysicalDeviceMemoryProperties_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceDisplayPropertiesKHR_)(VkPhysicalDevice_, uint32_t *, VkDisplayPropertiesKHR_ *);
+typedef VkResult_ (*PFN_vkGetDisplayModePropertiesKHR_)(VkPhysicalDevice_, VkDisplayKHR_, uint32_t *, VkDisplayModePropertiesKHR_ *);
+typedef VkResult_ (*PFN_vkGetPhysicalDeviceDisplayPlanePropertiesKHR_)(VkPhysicalDevice_, uint32_t *, VkDisplayPlanePropertiesKHR_ *);
+typedef VkResult_ (*PFN_vkGetDisplayPlaneSupportedDisplaysKHR_)(VkPhysicalDevice_, uint32_t, uint32_t *, VkDisplayKHR_ *);
+typedef VkResult_ (*PFN_vkGetDisplayPlaneCapabilitiesKHR_)(VkPhysicalDevice_, VkDisplayModeKHR_, uint32_t, VkDisplayPlaneCapabilitiesKHR_ *);
+typedef VkResult_ (*PFN_vkCreateDisplayPlaneSurfaceKHR_)(VkInstance_, const VkDisplaySurfaceCreateInfoKHR_ *, const void *, VkSurfaceKHR_ *);
+typedef void (*PFN_vkDestroySurfaceKHR_)(VkInstance_, VkSurfaceKHR_, const void *);
+typedef VkResult_ (*PFN_vkEnumerateDeviceExtensionProperties_)(VkPhysicalDevice_, const char *, uint32_t *, VkExtensionProperties_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceSupportKHR_)(VkPhysicalDevice_, uint32_t, VkSurfaceKHR_, VkBool32_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_)(VkPhysicalDevice_, VkSurfaceKHR_, VkSurfaceCapabilitiesKHR_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_)(VkPhysicalDevice_, VkSurfaceKHR_, uint32_t *, VkSurfaceFormatKHR_ *);
@@ -718,6 +778,268 @@ static bool has_instance_extension(PFN_vkGetInstanceProcAddr_ gipa,
     return found;
 }
 
+static bool has_device_extension(PFN_vkGetInstanceProcAddr_ gipa,
+                                 VkInstance_ instance, VkPhysicalDevice_ gpu,
+                                 const char *name)
+{
+    if (!gipa || !instance || !gpu || !name) {
+        return false;
+    }
+    PFN_vkEnumerateDeviceExtensionProperties_ p_enum =
+        VK_CAST(PFN_vkEnumerateDeviceExtensionProperties_,
+                gipa(instance, "vkEnumerateDeviceExtensionProperties"));
+    if (!p_enum) {
+        return false;
+    }
+    uint32_t count = 0;
+    if (p_enum(gpu, NULL, &count, NULL) != VK_SUCCESS || count == 0) {
+        return false;
+    }
+    VkExtensionProperties_ *props = (VkExtensionProperties_ *)calloc(count, sizeof(*props));
+    if (!props) {
+        return false;
+    }
+    bool found = false;
+    if (p_enum(gpu, NULL, &count, props) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(props[i].extensionName, name) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    free(props);
+    return found;
+}
+
+static uint32_t query_gpu_vendor(PFN_vkGetInstanceProcAddr_ gipa,
+                                 VkInstance_ instance, VkPhysicalDevice_ gpu)
+{
+    PFN_vkGetPhysicalDeviceProperties_ p_props =
+        VK_CAST(PFN_vkGetPhysicalDeviceProperties_, gipa(instance, "vkGetPhysicalDeviceProperties"));
+    if (!p_props) {
+        return 0;
+    }
+    VkPhysicalDevicePropertiesBuf_ buf;
+    memset(&buf, 0, sizeof(buf));
+    p_props(gpu, &buf);
+    uint32_t vendor = 0;
+    memcpy(&vendor, buf.bytes + 8, sizeof(vendor));
+    return vendor;
+}
+
+/* Proper native KMS WSI capability probe. Merely seeing a VkDisplayKHR is not
+ * enough: the ICD must also expose a mode and a plane that can drive it, swapchain
+ * support on the device, and a surface that reports formats and present modes.
+ * This deliberately stops short of creating a swapchain/presenting, because a
+ * broken driver can hang the machine at that point. */
+static bool native_kms_wsi_supported(PFN_vkGetInstanceProcAddr_ gipa,
+                                     VkInstance_ instance, VkPhysicalDevice_ gpu)
+{
+    if (!has_device_extension(gipa, instance, gpu, "VK_KHR_swapchain")) {
+        return false;
+    }
+
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties_ p_queues =
+        VK_CAST(PFN_vkGetPhysicalDeviceQueueFamilyProperties_,
+                gipa(instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    PFN_vkGetPhysicalDeviceDisplayPropertiesKHR_ p_displays =
+        VK_CAST(PFN_vkGetPhysicalDeviceDisplayPropertiesKHR_,
+                gipa(instance, "vkGetPhysicalDeviceDisplayPropertiesKHR"));
+    PFN_vkGetDisplayModePropertiesKHR_ p_modes =
+        VK_CAST(PFN_vkGetDisplayModePropertiesKHR_,
+                gipa(instance, "vkGetDisplayModePropertiesKHR"));
+    PFN_vkGetPhysicalDeviceDisplayPlanePropertiesKHR_ p_planes =
+        VK_CAST(PFN_vkGetPhysicalDeviceDisplayPlanePropertiesKHR_,
+                gipa(instance, "vkGetPhysicalDeviceDisplayPlanePropertiesKHR"));
+    PFN_vkGetDisplayPlaneSupportedDisplaysKHR_ p_plane_displays =
+        VK_CAST(PFN_vkGetDisplayPlaneSupportedDisplaysKHR_,
+                gipa(instance, "vkGetDisplayPlaneSupportedDisplaysKHR"));
+    PFN_vkGetDisplayPlaneCapabilitiesKHR_ p_plane_caps =
+        VK_CAST(PFN_vkGetDisplayPlaneCapabilitiesKHR_,
+                gipa(instance, "vkGetDisplayPlaneCapabilitiesKHR"));
+    PFN_vkCreateDisplayPlaneSurfaceKHR_ p_create_surface =
+        VK_CAST(PFN_vkCreateDisplayPlaneSurfaceKHR_,
+                gipa(instance, "vkCreateDisplayPlaneSurfaceKHR"));
+    PFN_vkDestroySurfaceKHR_ p_destroy_surface =
+        VK_CAST(PFN_vkDestroySurfaceKHR_, gipa(instance, "vkDestroySurfaceKHR"));
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR_ p_surface_support =
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceSupportKHR_,
+                gipa(instance, "vkGetPhysicalDeviceSurfaceSupportKHR"));
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_surface_caps =
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_,
+                gipa(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_ p_surface_formats =
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_,
+                gipa(instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR_ p_surface_modes =
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR_,
+                gipa(instance, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
+
+    if (!p_queues || !p_displays || !p_modes || !p_planes || !p_plane_displays ||
+        !p_plane_caps || !p_create_surface || !p_destroy_surface ||
+        !p_surface_support || !p_surface_caps || !p_surface_formats ||
+        !p_surface_modes) {
+        return false;
+    }
+
+    uint32_t queue_count = 0;
+    p_queues(gpu, &queue_count, NULL);
+    uint32_t graphics_queue = UINT32_MAX;
+    if (queue_count) {
+        VkQueueFamilyProperties_ *queues =
+            (VkQueueFamilyProperties_ *)calloc(queue_count, sizeof(*queues));
+        if (!queues) {
+            return false;
+        }
+        p_queues(gpu, &queue_count, queues);
+        for (uint32_t i = 0; i < queue_count; i++) {
+            if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                graphics_queue = i;
+                break;
+            }
+        }
+        free(queues);
+    }
+    if (graphics_queue == UINT32_MAX) {
+        return false;
+    }
+
+    bool ok = false;
+    uint32_t display_count = 0;
+    VkDisplayPropertiesKHR_ *displays = NULL;
+    VkDisplayModePropertiesKHR_ *modes = NULL;
+    VkDisplayPlanePropertiesKHR_ *planes = NULL;
+    VkDisplayKHR_ *plane_displays = NULL;
+
+    if (p_displays(gpu, &display_count, NULL) != VK_SUCCESS || display_count == 0) {
+        return false;
+    }
+    displays = (VkDisplayPropertiesKHR_ *)calloc(display_count, sizeof(*displays));
+    if (!displays) {
+        goto clean;
+    }
+    if (p_displays(gpu, &display_count, displays) != VK_SUCCESS) {
+        goto clean;
+    }
+
+    for (uint32_t d = 0; d < display_count && !ok; d++) {
+        uint32_t mode_count = 0;
+        if (p_modes(gpu, displays[d].display, &mode_count, NULL) != VK_SUCCESS ||
+            mode_count == 0) {
+            continue;
+        }
+        free(modes);
+        modes = (VkDisplayModePropertiesKHR_ *)calloc(mode_count, sizeof(*modes));
+        if (!modes) {
+            goto clean;
+        }
+        if (p_modes(gpu, displays[d].display, &mode_count, modes) != VK_SUCCESS) {
+            continue;
+        }
+
+        uint32_t plane_count = 0;
+        if (p_planes(gpu, &plane_count, NULL) != VK_SUCCESS || plane_count == 0) {
+            continue;
+        }
+        free(planes);
+        planes = (VkDisplayPlanePropertiesKHR_ *)calloc(plane_count, sizeof(*planes));
+        if (!planes) {
+            goto clean;
+        }
+        if (p_planes(gpu, &plane_count, planes) != VK_SUCCESS) {
+            continue;
+        }
+
+        for (uint32_t m = 0; m < mode_count && !ok; m++) {
+            for (uint32_t p = 0; p < plane_count && !ok; p++) {
+                if (planes[p].currentDisplay != displays[d].display &&
+                    planes[p].currentDisplay != 0) {
+                    continue;
+                }
+
+                uint32_t supported_count = 0;
+                if (p_plane_displays(gpu, p, &supported_count, NULL) != VK_SUCCESS ||
+                    supported_count == 0) {
+                    continue;
+                }
+                free(plane_displays);
+                plane_displays = (VkDisplayKHR_ *)calloc(supported_count, sizeof(*plane_displays));
+                if (!plane_displays) {
+                    goto clean;
+                }
+                if (p_plane_displays(gpu, p, &supported_count, plane_displays) != VK_SUCCESS) {
+                    continue;
+                }
+                bool display_supported = false;
+                for (uint32_t s = 0; s < supported_count; s++) {
+                    if (plane_displays[s] == displays[d].display) {
+                        display_supported = true;
+                        break;
+                    }
+                }
+                if (!display_supported) {
+                    continue;
+                }
+
+                VkDisplayPlaneCapabilitiesKHR_ caps;
+                memset(&caps, 0, sizeof(caps));
+                if (p_plane_caps(gpu, modes[m].displayMode, p, &caps) != VK_SUCCESS ||
+                    !(caps.supportedAlpha & VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR)) {
+                    continue;
+                }
+
+                VkExtent2D_ extent = modes[m].parameters.visibleRegion;
+                if (caps.maxSrcExtent.width && extent.width > caps.maxSrcExtent.width) extent.width = caps.maxSrcExtent.width;
+                if (caps.maxSrcExtent.height && extent.height > caps.maxSrcExtent.height) extent.height = caps.maxSrcExtent.height;
+                if (extent.width == 0 || extent.height == 0 ||
+                    extent.width < caps.minSrcExtent.width ||
+                    extent.height < caps.minSrcExtent.height) {
+                    continue;
+                }
+
+                VkDisplaySurfaceCreateInfoKHR_ sci;
+                memset(&sci, 0, sizeof(sci));
+                sci.sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR;
+                sci.displayMode = modes[m].displayMode;
+                sci.planeIndex = p;
+                sci.planeStackIndex = 0;
+                sci.transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+                sci.globalAlpha = 1.0f;
+                sci.alphaMode = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR;
+                sci.imageExtent = extent;
+
+                VkSurfaceKHR_ surface = 0;
+                if (p_create_surface(instance, &sci, NULL, &surface) != VK_SUCCESS || !surface) {
+                    continue;
+                }
+
+                VkBool32_ supported = VK_FALSE;
+                uint32_t format_count = 0, present_count = 0;
+                VkSurfaceCapabilitiesKHR_ surface_caps;
+                memset(&surface_caps, 0, sizeof(surface_caps));
+                if (p_surface_support(gpu, graphics_queue, surface, &supported) == VK_SUCCESS &&
+                    supported &&
+                    p_surface_caps(gpu, surface, &surface_caps) == VK_SUCCESS &&
+                    p_surface_formats(gpu, surface, &format_count, NULL) == VK_SUCCESS &&
+                    format_count > 0 &&
+                    p_surface_modes(gpu, surface, &present_count, NULL) == VK_SUCCESS &&
+                    present_count > 0) {
+                    ok = true;
+                }
+                p_destroy_surface(instance, surface, NULL);
+            }
+        }
+    }
+
+clean:
+    free(plane_displays);
+    free(planes);
+    free(modes);
+    free(displays);
+    return ok;
+}
+
 static bool is_hardware_device_type(uint32_t device_type)
 {
     return device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
@@ -747,12 +1069,12 @@ static uint32_t query_gpu_device_type(PFN_vkGetInstanceProcAddr_ gipa,
 }
 
 static void probe_vulkan_devices(PFN_vkGetInstanceProcAddr_ gipa,
-                                 bool check_kms_displays,
+                                 bool check_native_wsi,
                                  bool *has_hw_gpu_out,
-                                 bool *has_kms_display_out)
+                                 bool *native_wsi_ok_out)
 {
     *has_hw_gpu_out = false;
-    *has_kms_display_out = false;
+    *native_wsi_ok_out = false;
 
     PFN_vkCreateInstance_ p_create = VK_CAST(PFN_vkCreateInstance_, gipa(NULL, "vkCreateInstance"));
     if (!p_create) {
@@ -761,7 +1083,7 @@ static void probe_vulkan_devices(PFN_vkGetInstanceProcAddr_ gipa,
 
     const char *exts[2] = { "VK_KHR_surface", "VK_KHR_display" };
     uint32_t ext_count = 0;
-    if (check_kms_displays &&
+    if (check_native_wsi &&
         has_instance_extension(gipa, "VK_KHR_surface") &&
         has_instance_extension(gipa, "VK_KHR_display")) {
         ext_count = 2;
@@ -796,8 +1118,6 @@ static void probe_vulkan_devices(PFN_vkGetInstanceProcAddr_ gipa,
 
     PFN_vkEnumeratePhysicalDevices_ p_enum =
         VK_CAST(PFN_vkEnumeratePhysicalDevices_, gipa(inst, "vkEnumeratePhysicalDevices"));
-    PFN_vkGetPhysicalDeviceDisplayPropertiesKHR_ p_disp = ext_count ?
-        VK_CAST(PFN_vkGetPhysicalDeviceDisplayPropertiesKHR_, gipa(inst, "vkGetPhysicalDeviceDisplayPropertiesKHR")) : NULL;
 
     if (p_enum) {
         uint32_t count = 0;
@@ -806,14 +1126,20 @@ static void probe_vulkan_devices(PFN_vkGetInstanceProcAddr_ gipa,
             if (gpus && p_enum(inst, &count, gpus) == VK_SUCCESS) {
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t dtype = query_gpu_device_type(gipa, inst, gpus[i]);
-                    if (is_hardware_device_type(dtype)) {
-                        *has_hw_gpu_out = true;
+                    if (!is_hardware_device_type(dtype)) {
+                        continue;
                     }
-                    if (p_disp) {
-                        uint32_t dcount = 0;
-                        if (p_disp(gpus[i], &dcount, NULL) == VK_SUCCESS && dcount > 0) {
-                            *has_kms_display_out = true;
-                        }
+                    *has_hw_gpu_out = true;
+
+                    /* NVIDIA's proprietary VK_KHR_display implementation
+                     * reports full display/plane support but hangs under real
+                     * swapchain use on the 470 driver. Keep auto policy on the
+                     * safe offload path for it; --native / offload=0 opts in. */
+                    if (query_gpu_vendor(gipa, inst, gpus[i]) == VK_VENDOR_ID_NVIDIA) {
+                        continue;
+                    }
+                    if (native_kms_wsi_supported(gipa, inst, gpus[i])) {
+                        *native_wsi_ok_out = true;
                     }
                 }
             }
@@ -877,8 +1203,8 @@ bool SDLOP_VulkanOffload_ShouldUseOffload(SDL_FunctionPointer real_gipa)
     }
 
     bool has_hw_gpu = false;
-    bool has_kms_display = false;
-    probe_vulkan_devices(gipa, is_kmsdrm, &has_hw_gpu, &has_kms_display);
+    bool native_wsi_ok = false;
+    probe_vulkan_devices(gipa, is_kmsdrm, &has_hw_gpu, &native_wsi_ok);
 
     bool decision = false;
     if (!sdlop.video || !sdlop.video->Vulkan_CreateSurface) {
@@ -891,7 +1217,11 @@ bool SDLOP_VulkanOffload_ShouldUseOffload(SDL_FunctionPointer real_gipa)
         decision = has_hw_gpu;
 #endif
     } else if (is_kmsdrm) {
-        decision = has_hw_gpu && !has_kms_display;
+        /* Prefer native KMS WSI only when the full display/plane/surface probe
+         * succeeded; otherwise use the headless/shm offload path. The probe
+         * result already accounts for usable GPUs, so this also avoids picking
+         * a native path on CPU-only ICDs with no KMS displays. */
+        decision = !native_wsi_ok;
     }
 
     vk_offload.cached_decision = decision;

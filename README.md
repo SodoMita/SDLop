@@ -551,8 +551,12 @@ Highlights:
   DRM render node; Vulkan via `VK_EXT_headless_surface` with hardware GPU
   prioritization) activates automatically when the display backend lacks
   native hardware presentation (e.g. `dummy`, `wl_shm`-only Wayland, or
-  displayless KMSDRM), presenting frames back through the window
-  framebuffer (`wl_shm`, DRM dumb buffers, or `SDL_GetWindowSurface`).
+  KMSDRM where the `VK_KHR_display` display/mode/plane/surface probe fails),
+  presenting frames back through the window framebuffer (`wl_shm`, DRM dumb
+  buffers, or `SDL_GetWindowSurface`). On KMSDRM, auto mode prefers native
+  Vulkan WSI when that full capability probe succeeds; the NVIDIA proprietary
+  driver is kept on the safe offload path unless selected explicitly with
+  `0`/`off`.
   Configure via `SDLOP_OFFLOAD` (global default: `auto`, `0`/`off`/`false`/`no`,
   or `1`/`on`/`true`/`yes`/`force`), overridden per API by
   `SDLOP_GL_OFFLOAD` and `SDLOP_VULKAN_OFFLOAD` (or `SDLOP_VK_OFFLOAD`).

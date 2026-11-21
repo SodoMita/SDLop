@@ -18,7 +18,10 @@
   to SDLOP_OFFLOAD:
     0 / off / false / no    - disable offload
     1 / on / true / force   - force offload when VK_EXT_headless_surface exists
-    unset / auto            - automatic when output lacks hw WSI + hw GPU exists
+    unset / auto            - automatic when the native WSI capability probe fails
+                              (KMSDRM checks displays, modes, planes, surface
+                              formats and present modes; NVIDIA's proprietary
+                              driver is treated as unsafe for auto selection)
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
