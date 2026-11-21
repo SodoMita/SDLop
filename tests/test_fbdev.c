@@ -28,13 +28,19 @@
 #include <unistd.h>
 #include "qemu/vt_mask_check.h"
 
+/* CHECK is used both from main (int failures) and from helpers that take an
+ * int *failures. Increment through a pointer in both cases so the helpers'
+ * failures actually reach the caller's counter. */
+static inline void check_inc_failure(int *counter) { (*counter)++; }
+#define CHECK_COUNTER_PTR(c) _Generic((c), int: &(c), int *: (c))
+
 #define CHECK(cond, ...)                          \
     do {                                          \
         if (!(cond)) {                            \
             fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
             fprintf(stderr, __VA_ARGS__);         \
             fprintf(stderr, "\n");                \
-            failures++;                           \
+            check_inc_failure(CHECK_COUNTER_PTR(failures)); \
         } else {                                  \
             printf("  ok: " __VA_ARGS__);         \
             printf("\n");                         \
@@ -153,23 +159,28 @@ static unsigned screen_pixel(SDL_Surface *surface, int x, int y)
 
     if (fb_fd == -2) {
         fb_fd = -1;
-        const char *path = getenv("SDLOP_FBDEV_PATH");
-        if (!path || !*path) {
-            path = "/dev/fb0";
-        }
-        fb_fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fb_fd >= 0 && (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) != 0 ||
-                           ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) != 0)) {
-            close(fb_fd);
-            fb_fd = -1;
-        }
-        if (fb_fd >= 0) {
-            map = (unsigned char *)mmap(NULL, (size_t)fix.line_length * var.yres_virtual,
-                                        PROT_READ, MAP_SHARED, fb_fd, 0);
-            if (map == MAP_FAILED) {
-                map = NULL;
+        /* In dump mode the driver renders into RAM, not /dev/fb0: sample the
+         * dumped frame even when a real framebuffer device is accessible. */
+        const char *dump_mode = getenv("SDLOP_FBDEV_DUMP");
+        if (!dump_mode || !*dump_mode) {
+            const char *path = getenv("SDLOP_FBDEV_PATH");
+            if (!path || !*path) {
+                path = "/dev/fb0";
+            }
+            fb_fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fb_fd >= 0 && (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) != 0 ||
+                               ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) != 0)) {
                 close(fb_fd);
                 fb_fd = -1;
+            }
+            if (fb_fd >= 0) {
+                map = (unsigned char *)mmap(NULL, (size_t)fix.line_length * var.yres_virtual,
+                                            PROT_READ, MAP_SHARED, fb_fd, 0);
+                if (map == MAP_FAILED) {
+                    map = NULL;
+                    close(fb_fd);
+                    fb_fd = -1;
+                }
             }
         }
     }
@@ -708,13 +719,22 @@ int main(void)
         free(modes);
     }
 
-    /* GL must fail cleanly: fbdev has no present API for it */
-    printf("-- OpenGL rejected --\n");
+    /* fbdev has no native GL present path, but with a hardware GPU SDLop can
+     * render headlessly and blit the frame to the framebuffer (GL offload).
+     * Accept either outcome, as long as it is self-consistent: a GL window is
+     * only offered when a context can actually be created. */
+    printf("-- OpenGL availability --\n");
     {
         SDL_Window *glw = SDL_CreateWindow("SDLop fbdev gl probe", bounds.w, bounds.h, SDL_WINDOW_OPENGL);
-        CHECK(glw == NULL, "GL window creation fails on fbdev (got %p)", (void *)glw);
         if (glw) {
+            SDL_GLContext ctx = SDL_GL_CreateContext(glw);
+            CHECK(ctx != NULL, "GL context created on fbdev via GPU offload (%s)", SDL_GetError());
+            if (ctx) {
+                SDL_GL_DestroyContext(ctx);
+            }
             SDL_DestroyWindow(glw);
+        } else {
+            printf("  ok: GL window rejected without a usable GPU offload target (%s)\n", SDL_GetError());
         }
     }
 
