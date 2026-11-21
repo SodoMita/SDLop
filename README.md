@@ -174,6 +174,13 @@ driver implements it. That avoids the cursor disappearing between the erase
 and redraw steps during motion. `SDLOP_FBDEV_CURSOR=0` disables the cursor;
 `SDLOP_FBDEV_CONSOLE_KEYS=0` keeps the console keyboard handler alive.
 
+KMSDRM prefers the hardware cursor plane (atomic when available, legacy ioctls
+otherwise) and now sets it up before a Vulkan window hands DRM master over.
+Drivers that expose no usable cursor plane (some NVIDIA KMS setups reject both
+cursor ioctls) get a software cursor composited into the dumb scanout, which
+keeps the pointer visible for Vulkan/GL offload presents. Native `VK_KHR_display`
+WSI still depends on the driver's own cursor support.
+
 Console drivers reserve their VT release/acquire signals until shutdown. They
 undo only signal blocks they introduced; unrelated application signal-mask
 changes made after video initialization are preserved. Do not change the two

@@ -311,6 +311,7 @@ static int KMSDRM_ConnectorGetOrientation(int fd, uint32_t connector_id)
 }
 
 static void kmsdrm_hide_cursor(KMSDRM_DisplayData *dd); /* defined below with the cursor code */
+static void kmsdrm_blend_sw_cursor(KMSDRM_WindowData *windata);
 
 /* ------------------------------------------------------------------ */
 /* VT switch handling (VT_PROCESS mode, ported from SDL3)              */
@@ -734,6 +735,7 @@ static void kmsdrm_vt_release(void)
         }
         windata->crtc_programmed = false;
         windata->sw_front = -1;
+        windata->sw_cursor_blended = false;
         /* Do not let a present between RELDISP and the acquire signal call
          * drmSetMaster and program our framebuffer onto the other VT. */
         windata->lost_master = true;
@@ -1901,6 +1903,7 @@ static void kmsdrm_destroy_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *winda
     windata->sw_size = 0;
     windata->sw_draw = 0;
     windata->sw_front = -1;
+    windata->sw_cursor_blended = false;
 }
 
 static bool kmsdrm_create_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windata, uint32_t w, uint32_t h)
@@ -1962,6 +1965,7 @@ static bool kmsdrm_create_dumb(KMSDRM_DeviceData *vid, KMSDRM_WindowData *windat
     windata->sw_size = new_size;
     windata->sw_draw = 0;
     windata->sw_front = -1;
+    windata->sw_cursor_blended = false;
     windata->sw_active = true;
     return true;
 
@@ -2070,6 +2074,11 @@ static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
     int idx = windata->sw_draw;
     uint32_t fb_id = windata->sw_fb_id[idx];
 
+    /* KMS drivers without a cursor plane (some NVIDIA setups) reject the
+     * legacy cursor ioctls. Composite the pointer into the dumb scanout so
+     * offloaded Vulkan/GL still gets a visible cursor. */
+    kmsdrm_blend_sw_cursor(windata);
+
     /* If we lost master earlier, try to get it back before programming */
     if (windata->lost_master) {
         if (SDLOP_DRM_drmSetMaster && SDLOP_DRM_drmSetMaster(vid->drm_fd) == 0) {
@@ -2166,6 +2175,7 @@ static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
     if (ok) {
         windata->sw_front = idx;
         windata->sw_draw = 1 - idx;
+        windata->sw_cursor_blended = false;
         kmsdrm_retarget_surface(window, windata);
     }
     return ok;
@@ -2217,6 +2227,7 @@ static void kmsdrm_destroy_surfaces(KMSDRM_DeviceData *vid, SDL_Window *window)
      * next window/present will reprogram it. */
     windata->crtc_programmed = false;
     windata->sw_front = -1;
+    windata->sw_cursor_blended = false;
 }
 void KMSDRM_DestroySurfaces(KMSDRM_DeviceData *vid, SDL_Window *window)
 {
@@ -2427,6 +2438,9 @@ static void kmsdrm_cursor_state_reset(void)
 static void kmsdrm_cursor_dumb_free(KMSDRM_DisplayData *dd)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
+    free(dd->cursor_shadow);
+    dd->cursor_shadow = NULL;
+    dd->cursor_shadow_size = 0;
     if (dd->cursor_map) {
         munmap(dd->cursor_map, dd->cursor_dumb_size);
         dd->cursor_map = NULL;
@@ -2437,11 +2451,28 @@ static void kmsdrm_cursor_dumb_free(KMSDRM_DisplayData *dd)
     dd->cursor_dumb = 0;
     dd->cursor_dumb_size = 0;
 }
+/* DRM's ARGB8888 cursor format is premultiplied; XCursor images are not. */
+static uint32_t kmsdrm_premul_argb(uint32_t px)
+{
+    uint32_t a = px >> 24;
+    if (a == 0) {
+        return 0;
+    }
+    if (a == 255) {
+        return px;
+    }
+    uint32_t r = ((px >> 16) & 0xffu) * a / 255u;
+    uint32_t g = ((px >> 8) & 0xffu) * a / 255u;
+    uint32_t b = (px & 0xffu) * a / 255u;
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
 /* fill the cursor bo of a display with the current SDL cursor (or the
  * default arrow: XCursor theme when it fits, else the built-in one) */
 static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
 {
     const uint64_t cw = dd->cursor_w, ch = dd->cursor_h;
+    const size_t bytes = (size_t)cw * ch * sizeof(uint32_t);
     uint32_t *buf = calloc((size_t)cw * ch, sizeof(uint32_t));
     if (!buf) {
         return false;
@@ -2473,11 +2504,11 @@ static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
         hot_x = cur->hot_x < w ? cur->hot_x : w - 1;
         hot_y = cur->hot_y < h ? cur->hot_y : h - 1;
     } else if (theme_image) {
-        /* XCursor pixels are ARGB8888 in memory on little-endian hosts,
-         * which is exactly GBM_FORMAT_ARGB8888; rows are packed */
+        const uint32_t *src = (const uint32_t *)theme_image->buffer;
         for (uint32_t y = 0; y < theme_image->height; y++) {
-            memcpy(buf + (size_t)y * cw, theme_image->buffer + (size_t)y * theme_image->width * 4,
-                   (size_t)theme_image->width * 4);
+            for (uint32_t x = 0; x < theme_image->width; x++) {
+                buf[(size_t)y * cw + x] = kmsdrm_premul_argb(src[(size_t)y * theme_image->width + x]);
+            }
         }
         hot_x = (int32_t)theme_image->hotspot_x;
         hot_y = (int32_t)theme_image->hotspot_y;
@@ -2498,15 +2529,12 @@ static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
             }
         }
     }
+
+    bool ok = false;
     if (dd->cursor_bo) {
-        const int ret = SDLOP_GBM_gbm_bo_write(dd->cursor_bo, buf, (size_t)cw * ch * 4);
-        free(buf);
-        if (ret != 0) {
-            return false;
-        }
+        ok = SDLOP_GBM_gbm_bo_write(dd->cursor_bo, buf, bytes) == 0;
     } else if (dd->cursor_map) {
-        memcpy(dd->cursor_map, buf, (size_t)cw * ch * 4);
-        free(buf);
+        memcpy(dd->cursor_map, buf, bytes);
         const uint32_t *px = (const uint32_t *)dd->cursor_map;
         bool any = false;
         for (size_t i = 0; i < (size_t)cw * ch && !any; i++) {
@@ -2515,13 +2543,83 @@ static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
         if (!any) {
             SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: cursor image is fully transparent");
         }
-    } else {
-        free(buf);
+        ok = true;
+    }
+
+    /* Keep a CPU copy for drivers with no cursor plane: the dumb-buffer
+     * present path composites it into the scanout when the plane is absent. */
+    if (ok && dd->cursor_shadow_size != bytes) {
+        free(dd->cursor_shadow);
+        dd->cursor_shadow = malloc(bytes);
+        dd->cursor_shadow_size = dd->cursor_shadow ? bytes : 0;
+    }
+    if (ok && dd->cursor_shadow) {
+        memcpy(dd->cursor_shadow, buf, bytes);
+    }
+    free(buf);
+    if (!ok) {
         return false;
     }
     dd->cursor_hot_x = hot_x;
     dd->cursor_hot_y = hot_y;
     return true;
+}
+
+/* Composite the cursor into the dumb scanout when the driver has no usable
+ * cursor plane. The shadow image is premultiplied ARGB8888, like the cursor
+ * BO, so blending is a single over operation. */
+static void kmsdrm_blend_sw_cursor(KMSDRM_WindowData *windata)
+{
+    if (windata->sw_cursor_blended || !windata->sw_active || !windata->sw_map[windata->sw_draw]) {
+        return;
+    }
+    KMSDRM_DisplayData *dd = windata->display;
+    if (!dd || dd->cursor_visible || !dd->cursor_shadow || kmsdrm_cursor_hidden) {
+        return;
+    }
+    SDL_Window *focus = sdlop.mouse_focus;
+    if (!focus || (KMSDRM_WindowData *)focus->driverdata != windata) {
+        return;
+    }
+
+    const int cw = (int)dd->cursor_w, ch = (int)dd->cursor_h;
+    const int x0 = (int)sdlop.mouse_x - dd->cursor_hot_x;
+    const int y0 = (int)sdlop.mouse_y - dd->cursor_hot_y;
+    const int dst_w = (int)dd->mode.hdisplay, dst_h = (int)dd->mode.vdisplay;
+    const int sx0 = x0 < 0 ? -x0 : 0;
+    const int sy0 = y0 < 0 ? -y0 : 0;
+    const int sx1 = x0 + cw < dst_w ? cw : dst_w - x0;
+    const int sy1 = y0 + ch < dst_h ? ch : dst_h - y0;
+    if (sx0 >= sx1 || sy0 >= sy1) {
+        windata->sw_cursor_blended = true;
+        return;
+    }
+
+    const size_t pitch_px = (size_t)windata->sw_pitch / 4;
+    uint32_t *dst = (uint32_t *)windata->sw_map[windata->sw_draw];
+    for (int y = sy0; y < sy1; y++) {
+        uint32_t *row = dst + (size_t)(y0 + y) * pitch_px + (size_t)x0;
+        const uint32_t *src = dd->cursor_shadow + (size_t)y * (size_t)cw;
+        for (int x = sx0; x < sx1; x++) {
+            uint32_t s = src[x];
+            uint32_t a = s >> 24;
+            if (!a) {
+                continue;
+            }
+            uint32_t d = row[x];
+            if (a == 255) {
+                row[x] = s;
+                continue;
+            }
+            uint32_t inv = 255u - a;
+            uint32_t r = ((d >> 16) & 0xffu) * inv / 255u + ((s >> 16) & 0xffu);
+            uint32_t g = ((d >> 8) & 0xffu) * inv / 255u + ((s >> 8) & 0xffu);
+            uint32_t b = (d & 0xffu) * inv / 255u + (s & 0xffu);
+            row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+    SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "KMSDRM: software cursor composited into dumb scanout");
+    windata->sw_cursor_blended = true;
 }
 
 static bool kmsdrm_ensure_cursor_bo(KMSDRM_DisplayData *dd)
@@ -2819,6 +2917,7 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     windata->display = dd;
     windata->sw_draw = 0;
     windata->sw_front = -1;
+    windata->sw_cursor_blended = false;
     windata->egl_surface = EGL_NO_SURFACE;
     windata->clear_color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
 
@@ -2837,6 +2936,17 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         sdlop.mouse_focus = window;
         window->flags |= SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_MOUSE_FOCUS;
         kmsdrm_log("KMSDRM: Vulkan window (scanout handled by VK_KHR_display)");
+
+        /* The cursor plane is independent of the Vulkan scanout. Set it up
+         * while DRM master is still ours: native VK_KHR_display may use the
+         * primary plane itself, and offloaded Vulkan presents through our dumb
+         * buffers but still needs this plane for the pointer. Showing before
+         * moving also makes the first move actually take effect. */
+        if (kmsdrm_ensure_cursor_bo(dd)) {
+            kmsdrm_show_cursor(dd);
+            kmsdrm_move_cursor(dd, (float)window->w / 2.0f, (float)window->h / 2.0f);
+        }
+
         /* VK_KHR_display takes master itself. Handing it back here - rather
          * than at init - leaves non-Vulkan windows with master they never lost,
          * and keeps the window usable if no Vulkan surface is ever created.
@@ -2887,10 +2997,11 @@ static bool kmsdrm_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     /* paint both buffers with the clear color so the first frame is sane */
     kmsdrm_fill_sw(windata, dd->mode.hdisplay, dd->mode.vdisplay, windata->clear_color);
 
-    /* hardware cursor (best effort; needs GBM) */
+    /* hardware cursor (best effort; needs GBM). Show first: move_cursor is a
+     * no-op until the plane has a framebuffer. */
     if (kmsdrm_ensure_cursor_bo(dd)) {
-        kmsdrm_move_cursor(dd, (float)window->w / 2.0f, (float)window->h / 2.0f);
         kmsdrm_show_cursor(dd);
+        kmsdrm_move_cursor(dd, (float)window->w / 2.0f, (float)window->h / 2.0f);
     }
 
     window->driverdata = windata;
