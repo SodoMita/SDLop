@@ -297,9 +297,11 @@ set(SDLop_SOURCES
   src/SDL_vulkan.c
   src/internal/sdlop_evdev.c
   src/sdlop_xkb_dyn.c
+  src/video/sdlop_gl_offload.c
+  src/video/sdlop_vk_offload.c
+  src/video/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland.c
   src/video/wayland/sdlop_wayland_dyn.c
-  src/video/wayland/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
   src/video/wayland/sdlop_wayland_protos.c
@@ -535,6 +537,18 @@ if(SDLop_BUILD_TESTS)
   target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
   add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
 
+  add_executable(test_gl_offload tests/test_gl_offload.c)
+  target_link_libraries(test_gl_offload PRIVATE sdlop)
+  target_include_directories(test_gl_offload PRIVATE src)
+  target_compile_options(test_gl_offload PRIVATE -UNDEBUG)
+  add_test(NAME test_gl_offload COMMAND test_gl_offload)
+
+  add_executable(test_vk_offload tests/test_vk_offload.c)
+  target_link_libraries(test_vk_offload PRIVATE sdlop)
+  target_include_directories(test_vk_offload PRIVATE src)
+  target_compile_options(test_vk_offload PRIVATE -UNDEBUG)
+  add_test(NAME test_vk_offload COMMAND test_vk_offload)
+
   # KMS present-path benchmark (not a ctest gate; skips without KMS)
   add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
   target_link_libraries(bench_kmsdrm PRIVATE sdlop)
@@ -604,8 +618,14 @@ if(SDLop_BUILD_TESTS)
     target_include_directories(test_vulkan_compute PRIVATE src tests)
     target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
     add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
+
+    add_executable(test_vk_offload_live tests/test_vk_offload_live.c)
+    target_link_libraries(test_vk_offload_live PRIVATE sdlop Vulkan::Vulkan)
+    target_include_directories(test_vk_offload_live PRIVATE src)
+    target_compile_options(test_vk_offload_live PRIVATE -UNDEBUG)
+    add_test(NAME test_vk_offload_live COMMAND test_vk_offload_live)
   else()
-    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute")
+    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute, test_vk_offload_live")
   endif()
 
   # wlr virtual-input protocols (vendored XMLs) for the sway end-to-end test
@@ -733,12 +753,14 @@ if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
       set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endif()
   endforeach()
-  # test_vulkan keeps leak checking, minus allocations made inside Mesa /
-  # the Vulkan loader (tests/lsan_gpu.supp)
-  if (TARGET test_vulkan)
-    set_tests_properties(test_vulkan PROPERTIES ENVIRONMENT
-      "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
-  endif()
+  # test_vulkan / test_vk_offload_live / test_gl_offload keep leak checking,
+  # minus allocations made inside Mesa / the Vulkan loader (tests/lsan_gpu.supp)
+  foreach(t test_vulkan test_vk_offload_live test_gl_offload)
+    if (TARGET ${t})
+      set_tests_properties(${t} PROPERTIES ENVIRONMENT
+        "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
+    endif()
+  endforeach()
   # test_surface asserts the alloc-failure contract (CreateSurface must
   # return NULL); ASan's allocator aborts on OOM unless allowed to return null
   set_tests_properties(test_surface

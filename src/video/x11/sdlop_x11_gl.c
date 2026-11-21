@@ -16,7 +16,7 @@
 */
 
 #include "sdlop_x11_internal.h"
-#include "../wayland/sdlop_egl_dyn.h"
+#include "../sdlop_egl_dyn.h"
 
 #include <dlfcn.h>
 #include <string.h>

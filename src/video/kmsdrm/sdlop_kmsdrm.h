@@ -45,6 +45,14 @@
 #define DRM_CAP_CURSOR_HEIGHT   9
 #endif
 
+#ifndef DRM_CAP_PRIME
+#define DRM_CAP_PRIME           0x0au
+#endif
+
+#ifndef DRM_PRIME_CAP_IMPORT
+#define DRM_PRIME_CAP_IMPORT    0x1u
+#endif
+
 #ifndef DRM_FORMAT_XRGB8888
 #define DRM_FORMAT_XRGB8888 0x34325258u /* 'XR24' */
 #endif
@@ -125,6 +133,12 @@ typedef struct KMSDRM_WindowData
 
     /* ---- GL (GBM) scanout ---- */
     bool gl_active;
+    bool gl_offload_active;         /* headless GPU GL offload active */
+    bool gl_offload_prime;          /* offload uses PRIME linear BO scanout */
+    void *gl_offload_surface;       /* SDLOP_GLOffloadSurface* */
+    void *gl_offload_ctx;           /* SDLOP_GLOffloadContext* last bound */
+    struct gbm_bo *prime_bo;        /* locked PRIME BO currently on CRTC */
+    struct gbm_bo *prime_next_bo;   /* locked PRIME BO pending/next */
     struct gbm_surface *gs;
     struct gbm_bo *bo;              /* buffer currently on screen */
     struct gbm_bo *next_bo;         /* buffer pending front-buffer lock */
@@ -176,6 +190,8 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window, const
 
 KMSDRM_DeviceData *KMSDRM_GetDevice(void);
 void KMSDRM_DestroySwScanout(SDL_Window *window);
+bool KMSDRM_EnsureSwScanout(SDL_Window *window);
+bool KMSDRM_PresentSw(KMSDRM_DeviceData *vid, SDL_Window *window);
 /* Hotplug: re-scan connected connectors; add/remove core displays.
  * No-op unless hotplug_fd is open and a drm uevent arrived. */
 void KMSDRM_HotplugCheck(KMSDRM_DeviceData *vid);

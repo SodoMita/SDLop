@@ -23,8 +23,14 @@ struct wl_surface *SDLOP_Wayland_GetWindowSurfaceHandle(SDL_Window *window);
  * GL module can take over buffer management without EGL types here) */
 void SDLOP_Wayland_SetGLActive(SDL_Window *window, bool active);
 bool SDLOP_Wayland_IsGLActive(SDL_Window *window);
-void *SDLOP_Wayland_GetGLSurfaceSlot(SDL_Window *window); /* -> EGLSurface storage */
+void SDLOP_Wayland_SetGLOffloadActive(SDL_Window *window, bool active);
+bool SDLOP_Wayland_IsGLOffloadActive(SDL_Window *window);
+void *SDLOP_Wayland_GetGLSurfaceSlot(SDL_Window *window); /* -> EGLSurface or SDLOP_GLOffloadSurface* storage */
 void *SDLOP_Wayland_GetGLEGLWindowSlot(SDL_Window *window); /* -> wl_egl_window storage */
+void *SDLOP_Wayland_GetGLOffloadContextSlot(SDL_Window *window); /* -> SDLOP_GLOffloadContext* storage */
+bool SDLOP_Wayland_CompositorHasHardwareBuffers(void);
+bool SDLOP_Wayland_AcquireOffloadShm(SDL_Window *window, void **pixels_out, int *pitch_out, int *w_out, int *h_out);
+bool SDLOP_Wayland_PresentOffloadShm(SDL_Window *window);
 
 /* GL module (sdlop_wayland_gl.c) - vtable entry points */
 void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window);
@@ -39,6 +45,7 @@ void *SDLOP_Wayland_EGL_GetDisplay(SDLop_VideoDevice *device);
 void *SDLOP_Wayland_EGL_GetConfig(SDLop_VideoDevice *device);
 void *SDLOP_Wayland_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window);
 void SDLOP_Wayland_GL_WindowResized(SDL_Window *window);
+void SDLOP_Wayland_GL_Deinit(void);
 
 /* Vulkan module (sdlop_wayland_vulkan.c) - vtable entry point */
 bool SDLOP_Wayland_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface);
