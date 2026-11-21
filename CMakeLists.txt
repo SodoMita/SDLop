@@ -351,7 +351,7 @@ set(SDLop_SOURCES
   src/video/kmsdrm/sdlop_kmsdrm_dyn.c
   src/video/kmsdrm/sdlop_kmsdrm_gl.c
   src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
-  src/video/kmsdrm/sdlop_xcursor.c
+  src/video/sdlop_xcursor.c
   src/video/fbdev/sdlop_fbdev.c
   src/video/dummy/sdlop_dummy.c
 )

@@ -60,7 +60,7 @@
 
 #include "sdlop_kmsdrm.h"
 #include "internal/sdlop_vt.h"
-#include "sdlop_xcursor.h"
+#include "../sdlop_xcursor.h"
 #include "../sdlop_gl_offload.h"
 #include "../sdlop_vk_offload.h"
 
@@ -2322,26 +2322,6 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window,
 /* Hardware cursor (via GBM; unavailable -> cursor hidden, mouse fine) */
 /* ------------------------------------------------------------------ */
 
-/* 16x16 classic arrow; 0 = transparent, 1 = outline (black), 2 = fill (white) */
-static const char cursor_arrow[16][17] = {
-    "2...............",
-    "22..............",
-    "212.............",
-    "2112............",
-    "21112...........",
-    "211112..........",
-    "2111112.........",
-    "21111112........",
-    "211111112.......",
-    "2111111112......",
-    "21111111112.....",
-    "21111122222.....",
-    "2111212.........",
-    "212.1212........",
-    "22..1212........",
-    ".....112........",
-};
-
 static bool kmsdrm_ensure_gbm(void)
 {
     KMSDRM_DeviceData *vid = &kmsdrm;
@@ -2363,57 +2343,9 @@ static bool kmsdrm_ensure_gbm(void)
     return true;
 }
 
-/* XCursor theme cache (loaded at most once per driver lifetime).
- * Returns NULL when no theme is available (e.g. minimal systems); the
- * built-in arrow below is used as the fallback cursor then. */
-static struct sdlop_xcursor_theme *kmsdrm_cursor_theme_cache = NULL;
-static bool kmsdrm_cursor_theme_tried = false;
-
-static struct sdlop_xcursor_theme *kmsdrm_cursor_theme_load_once(void)
-{
-    if (!kmsdrm_cursor_theme_tried) {
-        kmsdrm_cursor_theme_tried = true;
-        const char *theme_name = getenv("XCURSOR_THEME");
-        int size = 32;
-        const char *ss = getenv("XCURSOR_SIZE");
-        if (ss) {
-            long s = strtol(ss, NULL, 10);
-            if (s >= 8 && s <= 256) {
-                size = (int)s;
-            }
-        }
-        kmsdrm_cursor_theme_cache = sdlop_xcursor_theme_load(theme_name, size);
-        if (!kmsdrm_cursor_theme_cache) {
-            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
-                         "KMSDRM: no XCursor theme found; using built-in arrow cursor");
-        }
-    }
-    return kmsdrm_cursor_theme_cache;
-}
-
-static struct sdlop_xcursor *kmsdrm_theme_arrow(void)
-{
-    struct sdlop_xcursor_theme *t = kmsdrm_cursor_theme_load_once();
-    if (!t) {
-        return NULL;
-    }
-    static const char *const names[] = { "left_ptr", "default", "arrow", "top_left_arrow", NULL };
-    for (int i = 0; names[i]; i++) {
-        struct sdlop_xcursor *c = sdlop_xcursor_theme_get_cursor(t, names[i]);
-        if (c) {
-            return c;
-        }
-    }
-    return NULL;
-}
-
 void KMSDRM_XCursorQuit(void)
 {
-    if (kmsdrm_cursor_theme_cache) {
-        sdlop_xcursor_theme_destroy(kmsdrm_cursor_theme_cache);
-        kmsdrm_cursor_theme_cache = NULL;
-    }
-    kmsdrm_cursor_theme_tried = false;
+    sdlop_cursor_theme_quit();
 }
 
 static void kmsdrm_cursor_state_reset(void);
@@ -2451,27 +2383,14 @@ static void kmsdrm_cursor_dumb_free(KMSDRM_DisplayData *dd)
     dd->cursor_dumb = 0;
     dd->cursor_dumb_size = 0;
 }
-/* DRM's ARGB8888 cursor format is premultiplied; XCursor images are not. */
-static uint32_t kmsdrm_premul_argb(uint32_t px)
-{
-    uint32_t a = px >> 24;
-    if (a == 0) {
-        return 0;
-    }
-    if (a == 255) {
-        return px;
-    }
-    uint32_t r = ((px >> 16) & 0xffu) * a / 255u;
-    uint32_t g = ((px >> 8) & 0xffu) * a / 255u;
-    uint32_t b = (px & 0xffu) * a / 255u;
-    return (a << 24) | (r << 16) | (g << 8) | b;
-}
-
-/* fill the cursor bo of a display with the current SDL cursor (or the
- * default arrow: XCursor theme when it fits, else the built-in one) */
+/* fill the cursor bo of a display with the current SDL cursor. The shared
+ * bitmap helper gives KMSDRM and fbdev the same theme image and alpha. */
 static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
 {
     const uint64_t cw = dd->cursor_w, ch = dd->cursor_h;
+    if (cw == 0 || ch == 0 || cw > SIZE_MAX / ch / sizeof(uint32_t)) {
+        return false;
+    }
     const size_t bytes = (size_t)cw * ch * sizeof(uint32_t);
     uint32_t *buf = calloc((size_t)cw * ch, sizeof(uint32_t));
     if (!buf) {
@@ -2479,21 +2398,12 @@ static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
     }
     int32_t hot_x = 0, hot_y = 0;
     const KMSDRM_Cursor *cur = kmsdrm_current_cursor;
-    struct sdlop_xcursor *theme_cursor = cur ? NULL : kmsdrm_theme_arrow();
-    struct sdlop_xcursor_image *theme_image = NULL;
-    if (theme_cursor && theme_cursor->image_count > 0) {
-        theme_image = theme_cursor->images[0];
-        if (theme_image->width == 0 || theme_image->height == 0
-            || theme_image->width > cw || theme_image->height > ch) {
-            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
-                         "KMSDRM: XCursor image %ux%u exceeds hardware cursor %llux%llu; "
-                         "using built-in arrow",
-                         theme_image->width, theme_image->height,
-                         (unsigned long long)cw, (unsigned long long)ch);
-            theme_image = NULL;
-        }
-    }
+    const struct sdlop_cursor_bitmap *bitmap = NULL;
     if (cur) {
+        if (!cur->pixels || cur->w <= 0 || cur->h <= 0) {
+            free(buf);
+            return false;
+        }
         /* larger images are clipped to the hardware cursor size (stock
          * SDL3 rejects them; a clipped cursor beats none) */
         const int w = cur->w < (int)cw ? cur->w : (int)cw;
@@ -2501,32 +2411,24 @@ static bool kmsdrm_fill_cursor_bo(KMSDRM_DisplayData *dd)
         for (int y = 0; y < h; y++) {
             memcpy(buf + (size_t)y * cw, cur->pixels + (size_t)y * cur->w, (size_t)w * 4);
         }
-        hot_x = cur->hot_x < w ? cur->hot_x : w - 1;
-        hot_y = cur->hot_y < h ? cur->hot_y : h - 1;
-    } else if (theme_image) {
-        const uint32_t *src = (const uint32_t *)theme_image->buffer;
-        for (uint32_t y = 0; y < theme_image->height; y++) {
-            for (uint32_t x = 0; x < theme_image->width; x++) {
-                buf[(size_t)y * cw + x] = kmsdrm_premul_argb(src[(size_t)y * theme_image->width + x]);
-            }
-        }
-        hot_x = (int32_t)theme_image->hotspot_x;
-        hot_y = (int32_t)theme_image->hotspot_y;
-        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
-                     "KMSDRM: using XCursor theme cursor '%s' (%ux%u, hot %+d,%+d)",
-                     theme_cursor->name, theme_image->width, theme_image->height, hot_x, hot_y);
+        hot_x = SDL_clamp(cur->hot_x, 0, w - 1);
+        hot_y = SDL_clamp(cur->hot_y, 0, h - 1);
     } else {
-        for (uint64_t y = 0; y < ch; y++) {
-            for (uint64_t x = 0; x < cw; x++) {
-                char c = cursor_arrow[(y * 16) / ch][(x * 16) / cw];
-                uint32_t px = 0;
-                if (c == '1') {
-                    px = 0xFF000000u; /* opaque black */
-                } else if (c == '2') {
-                    px = 0xFFFFFFFFu; /* opaque white */
-                }
-                buf[y * cw + x] = px;
+        bitmap = sdlop_system_cursor_bitmap_fit(SDL_SYSTEM_CURSOR_DEFAULT, (int)cw, (int)ch);
+        if (bitmap && bitmap->w > 0 && bitmap->h > 0) {
+            /* The shared bitmap normally fits the plane, but clip it too so a
+             * tiny cursor cap cannot overflow the buffer. */
+            const int w = bitmap->w < (int)cw ? bitmap->w : (int)cw;
+            const int h = bitmap->h < (int)ch ? bitmap->h : (int)ch;
+            for (int y = 0; y < h; y++) {
+                memcpy(buf + (size_t)y * cw,
+                       bitmap->pixels + (size_t)y * bitmap->w, (size_t)w * 4);
             }
+            hot_x = SDL_clamp(bitmap->hot_x, 0, w - 1);
+            hot_y = SDL_clamp(bitmap->hot_y, 0, h - 1);
+            SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                         "KMSDRM: using shared cursor bitmap (%ux%u, hot %+d,%+d)",
+                         bitmap->w, bitmap->h, hot_x, hot_y);
         }
     }
 
@@ -2787,44 +2689,37 @@ static bool kmsdrm_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
         return SDL_OutOfMemory();
     }
     if (cursor->surface) {
-        SDL_Surface *s = cursor->surface; /* ARGB8888, straight alpha */
-        kc->pixels = (uint32_t *)malloc((size_t)s->w * (size_t)s->h * 4);
-        if (!kc->pixels) {
-            free(kc);
-            return SDL_OutOfMemory();
-        }
-        /* cursor planes blend premultiplied (as stock SDL3 uploads) */
-        if (!SDL_PremultiplyAlpha(s->w, s->h, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch,
-                                  SDL_PIXELFORMAT_ARGB8888, kc->pixels, s->w * 4, false)) {
-            free(kc->pixels);
+        /* cursor planes blend premultiplied, and fbdev uses the same helper
+         * for the same image, so both console drivers render identically */
+        struct sdlop_cursor_bitmap bm;
+        uint32_t *owned = NULL;
+        if (!sdlop_cursor_bitmap_from_surface(cursor->surface, cursor->hot_x, cursor->hot_y,
+                                              &bm, &owned)) {
             free(kc);
             return false;
         }
-        kc->w = s->w;
-        kc->h = s->h;
-        kc->hot_x = cursor->hot_x;
-        kc->hot_y = cursor->hot_y;
+        kc->pixels = owned;
+        kc->w = bm.w;
+        kc->h = bm.h;
+        kc->hot_x = bm.hot_x;
+        kc->hot_y = bm.hot_y;
     } else {
-        /* system cursor: theme image by CSS name / fallback name; the
-         * default arrow (kc->pixels NULL) when the theme lacks it */
-        struct sdlop_xcursor_theme *t = kmsdrm_cursor_theme_load_once();
-        const char *fallback = NULL;
-        const char *names[2] = { SDLOP_GetCSSCursorName(cursor->system_id, &fallback), NULL };
-        names[1] = fallback;
-        for (int i = 0; t && i < 2 && !kc->pixels; ++i) {
-            struct sdlop_xcursor *xc = names[i] ? sdlop_xcursor_theme_get_cursor(t, names[i]) : NULL;
-            if (xc && xc->image_count > 0 && xc->images[0]->width > 0 && xc->images[0]->height > 0) {
-                const struct sdlop_xcursor_image *img = xc->images[0];
-                const size_t n = (size_t)img->width * img->height;
-                kc->pixels = (uint32_t *)malloc(n * 4);
-                if (kc->pixels) {
-                    memcpy(kc->pixels, img->buffer, n * 4); /* already premultiplied */
-                    kc->w = (int)img->width;
-                    kc->h = (int)img->height;
-                    kc->hot_x = (int)img->hotspot_x;
-                    kc->hot_y = (int)img->hotspot_y;
-                }
+        /* system cursor: the shared theme bitmap keeps KMSDRM and fbdev
+         * visually identical, including hotspot and premultiplied alpha */
+        const struct sdlop_cursor_bitmap *bm =
+            sdlop_system_cursor_bitmap_fit(cursor->system_id, 0, 0);
+        if (bm) {
+            const size_t n = (size_t)bm->w * (size_t)bm->h;
+            kc->pixels = (uint32_t *)SDL_malloc(n * 4);
+            if (!kc->pixels) {
+                free(kc);
+                return SDL_OutOfMemory();
             }
+            memcpy(kc->pixels, bm->pixels, n * 4);
+            kc->w = bm->w;
+            kc->h = bm->h;
+            kc->hot_x = bm->hot_x;
+            kc->hot_y = bm->hot_y;
         }
     }
     cursor->internal = kc;
@@ -2862,7 +2757,7 @@ static void kmsdrm_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
             kmsdrm_current_cursor = NULL;
             kmsdrm_refresh_cursors();
         }
-        free(kc->pixels);
+        SDL_free(kc->pixels);
         free(kc);
         cursor->internal = NULL;
     }

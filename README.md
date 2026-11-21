@@ -181,6 +181,10 @@ cursor ioctls) get a software cursor composited into the dumb scanout, which
 keeps the pointer visible for Vulkan/GL offload presents. Native `VK_KHR_display`
 WSI still depends on the driver's own cursor support.
 
+Both console drivers use the same XCursor theme bitmap, hotspot and premultiplied
+alpha handling, so the pointer looks the same on KMSDRM and fbdev. When no theme
+is installed they fall back to the same built-in arrow.
+
 Console drivers reserve their VT release/acquire signals until shutdown. They
 undo only signal blocks they introduced; unrelated application signal-mask
 changes made after video initialization are preserved. Do not change the two

@@ -27,7 +27,7 @@
 #include "keyboard-shortcuts-inhibit-client-protocol.h"
 #include "xdg-activation-client-protocol.h"
 #include "viewporter-client-protocol.h"
-#include "../kmsdrm/sdlop_xcursor.h"
+#include "../sdlop_xcursor.h"
 
 #include <errno.h>
 #include <poll.h>

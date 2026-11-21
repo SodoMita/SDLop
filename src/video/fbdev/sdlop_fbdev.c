@@ -41,6 +41,7 @@
 
 #include "internal/sdlop_internal.h"
 #include "internal/sdlop_vt.h"
+#include "../sdlop_xcursor.h"
 
 #if defined(__linux__)
 
@@ -65,8 +66,6 @@
 #define FBDEV_DEFAULT_W 1024
 #define FBDEV_DEFAULT_H 768
 #define FBDEV_MAX_DIM 16384
-#define FBDEV_ARROW_W 12
-#define FBDEV_ARROW_H 16
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -143,6 +142,10 @@ static struct
     SDL_DisplayID display;
     FBDEV_VT vt;
     SDL_Cursor *cursor;       /* last cursor handed to ShowCursor (not owned) */
+    const uint32_t *cursor_image; /* premultiplied ARGB pixels currently drawn */
+    uint32_t *cursor_image_owned; /* premultiplied copy of a custom cursor */
+    bool cursor_image_ready;
+    int cursor_w, cursor_h, cursor_hot_x, cursor_hot_y;
     SDL_Rect cursor_rect;     /* where it is drawn; empty = not on screen */
     float cursor_drawn_x, cursor_drawn_y; /* logical position of that draw */
     bool cursor_enabled;
@@ -525,54 +528,57 @@ static void fbdev_cursor_erase(void)
     fbdev.cursor_rect = (SDL_Rect){ 0, 0, 0, 0 };
 }
 
-/* The console has no cursor theme to load, and system cursors carry no
-   image, so a plain arrow is drawn instead: an outline (X), a white body (W)
-   and transparency (.). Hot spot is the top-left pixel. */
-static const char *const fbdev_arrow[FBDEV_ARROW_H] = {
-    "X...........",
-    "XX..........",
-    "XWX.........",
-    "XWWX........",
-    "XWWWX.......",
-    "XWWWWX......",
-    "XWWWWWX.....",
-    "XWWWWWWX....",
-    "XWWWWWWWX...",
-    "XWWWWXXXX...",
-    "XWWXWWX.....",
-    "XWX.XWWX....",
-    "XX..XWWX....",
-    "X....XWWX...",
-    ".....XWWX...",
-    "......XX...."
-};
-
-static void fbdev_put_px(int x, int y, Uint32 xrgb)
+static void fbdev_cursor_release_image(void)
 {
-    if (x < 0 || y < 0 || x >= fbdev.scanout.w || y >= fbdev.scanout.h || !fbdev_frame_ready()) {
-        return;
-    }
-    fbdev_store(&fbdev.layout,
-                fbdev.frame + (size_t)(fbdev.pan_y + y) * fbdev.scanout.pitch +
-                    (size_t)(fbdev.pan_x + x) * (size_t)fbdev.layout.bytes,
-                fbdev_pack(&fbdev.layout, xrgb));
+    SDL_free(fbdev.cursor_image_owned);
+    fbdev.cursor_image_owned = NULL;
+    fbdev.cursor_image = NULL;
+    fbdev.cursor_image_ready = false;
+    fbdev.cursor_w = 0;
+    fbdev.cursor_h = 0;
+    fbdev.cursor_hot_x = 0;
+    fbdev.cursor_hot_y = 0;
 }
 
-static void fbdev_cursor_draw_arrow(int x, int y)
+/* Resolve the pointer to the same premultiplied ARGB8888 bitmap KMSDRM uses.
+ * System cursors come from the shared XCursor theme; color cursors go through
+ * the shared premultiply helper. That keeps size, hotspot and alpha identical
+ * between the two console drivers. */
+static void fbdev_cursor_set_image(SDL_Cursor *cursor)
 {
-    for (int row = 0; row < FBDEV_ARROW_H; row++) {
-        const char *line = fbdev_arrow[row];
-        for (int col = 0; line[col] && col < FBDEV_ARROW_W; col++) {
-            if (line[col] == 'X') {
-                fbdev_put_px(x + col, y + row, 0x000000);
-            } else if (line[col] == 'W') {
-                fbdev_put_px(x + col, y + row, 0xFFFFFF);
-            }
-        }
+    fbdev_cursor_release_image();
+    if (!cursor) {
+        return;
     }
-    fbdev.cursor_rect = (SDL_Rect){ x, y, FBDEV_ARROW_W, FBDEV_ARROW_H };
-    fbdev.cursor_drawn_x = sdlop.mouse_x;
-    fbdev.cursor_drawn_y = sdlop.mouse_y;
+
+    if (cursor->surface) {
+        struct sdlop_cursor_bitmap bm;
+        uint32_t *owned = NULL;
+        if (!sdlop_cursor_bitmap_from_surface(cursor->surface, cursor->hot_x, cursor->hot_y,
+                                              &bm, &owned)) {
+            return;
+        }
+        fbdev.cursor_image_owned = owned;
+        fbdev.cursor_image = bm.pixels;
+        fbdev.cursor_w = bm.w;
+        fbdev.cursor_h = bm.h;
+        fbdev.cursor_hot_x = bm.hot_x;
+        fbdev.cursor_hot_y = bm.hot_y;
+        fbdev.cursor_image_ready = true;
+        return;
+    }
+
+    const struct sdlop_cursor_bitmap *bm =
+        sdlop_system_cursor_bitmap_fit(cursor->system_id, fbdev.scanout.w, fbdev.scanout.h);
+    if (!bm) {
+        return;
+    }
+    fbdev.cursor_image = bm->pixels;
+    fbdev.cursor_w = bm->w;
+    fbdev.cursor_h = bm->h;
+    fbdev.cursor_hot_x = bm->hot_x;
+    fbdev.cursor_hot_y = bm->hot_y;
+    fbdev.cursor_image_ready = true;
 }
 
 static void fbdev_cursor_draw(void)
@@ -587,54 +593,61 @@ static void fbdev_cursor_draw(void)
         return; /* SDL_HideCursor() with no cursor object installed */
     }
 
-    SDL_Surface *image = fbdev.cursor ? fbdev.cursor->surface : NULL;
-    if (!image || !image->pixels || image->format != SDL_PIXELFORMAT_ARGB8888) {
-        /* system cursor (no image) or an image the core could not convert:
-           the built-in arrow stands in for the pointer */
-        if (fbdev.scanout.w < FBDEV_ARROW_W || fbdev.scanout.h < FBDEV_ARROW_H) {
+    int w, h, hot_x, hot_y;
+    const uint32_t *pixels;
+    if (fbdev.cursor_image_ready && fbdev.cursor_image) {
+        w = fbdev.cursor_w;
+        h = fbdev.cursor_h;
+        hot_x = fbdev.cursor_hot_x;
+        hot_y = fbdev.cursor_hot_y;
+        pixels = fbdev.cursor_image;
+    } else {
+        /* No cursor object yet, but the core still reports a visible pointer:
+           use the same default bitmap as KMSDRM. */
+        const struct sdlop_cursor_bitmap *bm =
+            sdlop_system_cursor_bitmap_fit(SDL_SYSTEM_CURSOR_DEFAULT,
+                                           fbdev.scanout.w, fbdev.scanout.h);
+        if (!bm) {
             return;
         }
-        const int ax = SDL_clamp((int)sdlop.mouse_x, 0, fbdev.scanout.w - FBDEV_ARROW_W);
-        const int ay = SDL_clamp((int)sdlop.mouse_y, 0, fbdev.scanout.h - FBDEV_ARROW_H);
-        fbdev_cursor_draw_arrow(ax, ay);
-        fbdev_dirty_add(fbdev.cursor_rect);
+        w = bm->w;
+        h = bm->h;
+        hot_x = bm->hot_x;
+        hot_y = bm->hot_y;
+        pixels = bm->pixels;
+    }
+    if (w <= 0 || h <= 0 || w > fbdev.scanout.w || h > fbdev.scanout.h) {
         return;
     }
 
-    int x = (int)sdlop.mouse_x - fbdev.cursor->hot_x;
-    int y = (int)sdlop.mouse_y - fbdev.cursor->hot_y;
-    if (image->w <= 0 || image->h <= 0 || image->w > fbdev.scanout.w || image->h > fbdev.scanout.h) {
-        return;
-    }
-    x = SDL_clamp(x, 0, fbdev.scanout.w - image->w);
-    y = SDL_clamp(y, 0, fbdev.scanout.h - image->h);
-
+    const int x = SDL_clamp((int)sdlop.mouse_x - hot_x, 0, fbdev.scanout.w - w);
+    const int y = SDL_clamp((int)sdlop.mouse_y - hot_y, 0, fbdev.scanout.h - h);
     const FBDEV_PixelLayout *l = &fbdev.layout;
-    for (int row = 0; row < image->h; row++) {
-        const Uint8 *src = (const Uint8 *)image->pixels + (size_t)row * (size_t)image->pitch;
+
+    for (int row = 0; row < h; row++) {
+        const uint32_t *src = pixels + (size_t)row * (size_t)w;
         Uint8 *dst = fbdev.frame + (size_t)(fbdev.pan_y + y + row) * fbdev.scanout.pitch +
                      (size_t)(fbdev.pan_x + x) * (size_t)l->bytes;
-        for (int col = 0; col < image->w; col++) {
-            Uint32 px = 0;
-            memcpy(&px, src + (size_t)col * 4u, sizeof(px));
-            const Uint32 a = (px >> 24) & 0xFF;
+        for (int col = 0; col < w; col++) {
+            const uint32_t s = src[col];
+            const Uint32 a = (s >> 24) & 0xFFu;
             if (a == 0) {
                 continue;
             }
             Uint8 *out = dst + (size_t)col * (size_t)l->bytes;
-            Uint32 value = px & 0x00FFFFFFu;
-            if (a != 0xFF) {
+            Uint32 value = s & 0x00FFFFFFu; /* already premultiplied */
+            if (a != 0xFFu) {
                 const Uint32 under = fbdev_unpack(l, fbdev_load(l, out));
                 const Uint32 inv = 255u - a;
-                const Uint32 r = ((((value >> 16) & 0xFF) * a) + (((under >> 16) & 0xFF) * inv)) / 255u;
-                const Uint32 g = ((((value >> 8) & 0xFF) * a) + (((under >> 8) & 0xFF) * inv)) / 255u;
-                const Uint32 b = ((((value & 0xFF) * a) + ((under & 0xFF) * inv)) / 255u);
+                const Uint32 r = (((under >> 16) & 0xFFu) * inv) / 255u + ((value >> 16) & 0xFFu);
+                const Uint32 g = (((under >> 8) & 0xFFu) * inv) / 255u + ((value >> 8) & 0xFFu);
+                const Uint32 b = ((under & 0xFFu) * inv) / 255u + (value & 0xFFu);
                 value = (r << 16) | (g << 8) | b;
             }
             fbdev_store(l, out, fbdev_pack(l, value));
         }
     }
-    fbdev.cursor_rect = (SDL_Rect){ x, y, image->w, image->h };
+    fbdev.cursor_rect = (SDL_Rect){ x, y, w, h };
     fbdev.cursor_drawn_x = sdlop.mouse_x;
     fbdev.cursor_drawn_y = sdlop.mouse_y;
     fbdev_dirty_add(fbdev.cursor_rect);
@@ -1507,7 +1520,9 @@ static void fbdev_Quit(SDLop_VideoDevice *device)
     fbdev.shadow_live = false;
     memset(fbdev.windows, 0, sizeof(fbdev.windows));
     fbdev.cursor = NULL;
+    fbdev_cursor_release_image();
     fbdev.cursor_rect = (SDL_Rect){ 0, 0, 0, 0 };
+    sdlop_cursor_theme_quit();
     fbdev.dump = false;
 }
 
@@ -1850,6 +1865,7 @@ static void fbdev_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
     if (fbdev.cursor == cursor) {
         fbdev_cursor_erase();
         fbdev.cursor = NULL;
+        fbdev_cursor_release_image();
         fbdev_present_dirty();
     }
 }
@@ -1858,6 +1874,7 @@ static bool fbdev_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
 {
     (void)device;
     fbdev_cursor_erase();
+    fbdev_cursor_set_image(cursor);
     fbdev.cursor = cursor; /* NULL hides */
     if (cursor) {
         fbdev_cursor_draw();
