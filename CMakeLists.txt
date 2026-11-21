@@ -559,6 +559,9 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
+  # test_core exercises the clipboard, which is one global OS resource. Under a
+  # parallel ctest run it races the Windows clipboard test in both directions.
+  set_tests_properties(test_core PROPERTIES RUN_SERIAL TRUE)
   if(NOT WIN32)
     target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
   endif()
@@ -639,6 +642,16 @@ if(SDLop_BUILD_TESTS)
     target_include_directories(test_win32_raw_keyboard_once PRIVATE src)
     target_compile_options(test_win32_raw_keyboard_once PRIVATE -UNDEBUG)
     add_test(NAME test_win32_raw_keyboard_once COMMAND test_win32_raw_keyboard_once)
+
+    add_executable(test_win32_clipboard tests/test_win32_clipboard.c)
+    target_link_libraries(test_win32_clipboard PRIVATE sdlop)
+    target_include_directories(test_win32_clipboard PRIVATE src)
+    target_compile_options(test_win32_clipboard PRIVATE -UNDEBUG)
+    add_test(NAME test_win32_clipboard COMMAND test_win32_clipboard)
+    # The OS clipboard is one global resource: a parallel test that touches it
+    # corrupts this one and vice versa. Measured: test_core failed with
+    # "empty [!SDL_HasClipboardText()]" 4 runs out of 8 under -j3.
+    set_tests_properties(test_win32_clipboard PROPERTIES RUN_SERIAL TRUE)
     set_tests_properties(test_win32_raw_keyboard_once PROPERTIES RUN_SERIAL TRUE)
   else()
   # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11

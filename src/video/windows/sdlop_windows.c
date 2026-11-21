@@ -1252,6 +1252,9 @@ static void win32_add_displays(SDLop_VideoDevice *device)
     sdlop_win32.monitor_count = idx;
 }
 
+/* Clipboard sequence number as of the last pump; see win32_check_clipboard_update. */
+static DWORD win32_clipboard_sequence;
+
 static bool win32_Init(SDLop_VideoDevice *device)
 {
     SDL_zero(sdlop_win32);
@@ -1262,6 +1265,9 @@ static bool win32_Init(SDLop_VideoDevice *device)
     }
     win32_add_displays(device);
     sdlop_win32.window_count = 0;
+    /* Baseline for external clipboard change detection: anything that changes
+     * this number afterwards belongs to another application. */
+    win32_clipboard_sequence = GetClipboardSequenceNumber();
 
     /* Raw keyboard input is opt-in, like SDL3: the hint defaults to off. The
      * callbacks keep it in sync if the application sets the hint later. */
@@ -1645,10 +1651,78 @@ static void sdlop_relative_hide_cursor(bool hide)
 /* Event pump                                                          */
 /* ------------------------------------------------------------------ */
 
+/* Win32 raises no event when another application changes the clipboard, so
+ * SDL3 compares the clipboard sequence number after each pump and reports a
+ * non-owner update when it moves. Without this SDL_GetClipboardText silently
+ * keeps returning the old string after a copy made in another program. */
+static UINT win32_clipboard_format_png(void);   /* defined with the clipboard code */
+static bool win32_open_clipboard(void);         /* ditto */
+
+static void win32_check_clipboard_update(void)
+{
+    const DWORD count = GetClipboardSequenceNumber();
+    char **mime_types = NULL;
+    size_t num = 0;
+    size_t capacity = 0;
+    bool has_png = false;
+    bool has_text = false;
+
+    if (count == win32_clipboard_sequence) {
+        return;
+    }
+    win32_clipboard_sequence = count;
+    if (!count) {
+        return; /* the clipboard was emptied and has no owner */
+    }
+    if (!SDL_EventEnabled(SDL_EVENT_CLIPBOARD_UPDATE)) {
+        return; /* nobody is listening; do not pay for the format scan */
+    }
+
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) || IsClipboardFormatAvailable(CF_TEXT)) {
+        has_text = true;
+    }
+    if (win32_clipboard_format_png() && IsClipboardFormatAvailable(win32_clipboard_format_png())) {
+        has_png = true;
+    }
+    if (!has_text && !has_png) {
+        return;
+    }
+    capacity = (has_text ? 1 : 0) + (has_png ? 1 : 0);
+    mime_types = (char **)SDL_calloc(capacity + 1, sizeof(char *));
+    if (!mime_types) {
+        return;
+    }
+    if (has_text) {
+        mime_types[num] = SDL_strdup("text/plain;charset=utf-8");
+        if (mime_types[num]) {
+            num++;
+        }
+    }
+    if (has_png) {
+        mime_types[num] = SDL_strdup("image/png");
+        if (mime_types[num]) {
+            num++;
+        }
+    }
+    if (num) {
+        /* owner = false: another application owns the clipboard now, so the
+         * app's own offer callback is released and these types are what
+         * reading will produce. */
+        mime_types[num] = NULL;
+        SDLOP_SendClipboardUpdate(false, mime_types, num);
+    } else {
+        SDL_free(mime_types);
+        mime_types = NULL;
+    }
+    /* SDLOP_SendClipboardUpdate keeps the array on the false path; freeing it
+     * here would leave the event pointing at freed memory. */
+}
+
 static void win32_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
 {
     (void)device;
     MSG msg;
+    win32_check_clipboard_update();
     if (timeout_ms < 0) {
         while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -2688,6 +2762,381 @@ static SDL_SystemTheme win32_GetSystemTheme(SDLop_VideoDevice *device)
 /* Device table                                                        */
 /* ------------------------------------------------------------------ */
 
+
+/* ---- Clipboard ----------------------------------------------------------
+ *
+ * Win32 keeps the clipboard itself: an app hands over a block of memory per
+ * format and the system shares it, so there is nothing to render later. Real
+ * SDL3 does the same and notes that delayed rendering buys nothing for text
+ * and images (both are requested immediately). Accessibility formats such as
+ * text/html are converted to CF_HTML, the way CF_HTML-aware apps expect.
+ *
+ * Formats SDLop does not implement here fall back to the in-process clipboard,
+ * which is the generic behaviour when these hooks are NULL.
+ */
+
+/* Formats a caller should see as text when reading the clipboard. */
+static bool win32_is_text_mime_type(const char *mime_type)
+{
+    /* SDL3 uses the same prefix test (SDL_IsTextMimeType). */
+    return SDL_strncmp(mime_type, "text", 4) == 0;
+}
+
+/* Any window of ours will do as the clipboard owner; NULL is also valid (the
+ * clipboard is then owned by the task), so this never fails the operation. */
+static HWND win32_clipboard_window(void)
+{
+    SDL_Window *window = sdlop.keyboard_focus;
+    if (!window) {
+        window = sdlop.windows;
+    }
+    if (window && window->driverdata) {
+        return ((SDLop_Win32WindowData *)window->driverdata)->hwnd;
+    }
+    return NULL;
+}
+
+/* The clipboard is a shared resource: another process may hold it open, so
+ * retry briefly instead of failing outright (as SDL3 does). */
+static bool win32_open_clipboard(void)
+{
+    HWND owner = win32_clipboard_window();
+    int attempt;
+
+    for (attempt = 0; attempt < 3; ++attempt) {
+        if (OpenClipboard(owner)) {
+            return true;
+        }
+        SDL_Delay(10);
+    }
+    return SDL_SetError("Couldn't open clipboard");
+}
+
+static UINT win32_clipboard_format_png(void)
+{
+    static UINT format;
+    if (!format) {
+        format = RegisterClipboardFormatW(L"PNG");
+    }
+    return format;
+}
+
+static bool win32_set_clipboard_text(const char *mime_type)
+{
+    size_t size = 0;
+    void *utf8 = SDLOP_GetInternalClipboardData(mime_type, &size);
+    wchar_t *wide;
+    HGLOBAL memory;
+    int length;
+    bool result = false;
+
+    (void)utf8;
+    SDL_free(utf8);
+    if (!size) {
+        return true; /* the app offered no text under this type */
+    }
+
+    utf8 = SDLOP_GetInternalClipboardData(mime_type, &size);
+    if (!utf8) {
+        return SDL_SetError("Couldn't get clipboard data from the application");
+    }
+
+    length = MultiByteToWideChar(CP_UTF8, 0, (const char *)utf8, (int)size, NULL, 0);
+    if (length > 0) {
+        memory = GlobalAlloc(GMEM_MOVEABLE, ((SIZE_T)length + 1) * sizeof(wchar_t));
+        if (memory) {
+            wide = (wchar_t *)GlobalLock(memory);
+            if (wide) {
+                MultiByteToWideChar(CP_UTF8, 0, (const char *)utf8, (int)size, wide, length);
+                wide[length] = L'\0';
+                GlobalUnlock(memory);
+                if (SetClipboardData(CF_UNICODETEXT, memory)) {
+                    result = true; /* the system owns the block now */
+                } else {
+                    GlobalFree(memory);
+                    SDL_SetError("Couldn't set clipboard data");
+                }
+            } else {
+                GlobalFree(memory);
+                SDL_SetError("Couldn't lock clipboard memory");
+            }
+        } else {
+            SDL_SetError("Couldn't allocate clipboard memory");
+        }
+    }
+    SDL_free(utf8);
+    return result;
+}
+
+/* text/html is exposed to Windows apps as CF_HTML: a header of byte offsets,
+ * then the markup. The offsets are ten-digit fixed width fields, so they can be
+ * patched after the header is laid out. They are located by name rather than by
+ * hardcoded positions -- an earlier version used positions I had counted by
+ * hand, and every one was wrong, which overwrote "StartHTML" with digits. */
+static void win32_patch_offset(char *buffer, const char *field, size_t value)
+{
+    char *at = SDL_strstr(buffer, field);
+    if (at) {
+        char digits[16];
+        SDL_snprintf(digits, sizeof(digits), "%010lu", (unsigned long)value);
+        SDL_memcpy(at + SDL_strlen(field), digits, 10);
+    }
+}
+
+static bool win32_set_clipboard_html(const char *mime_type)
+{
+    static const char header[] =
+        "Version:0.9\r\n"
+        "StartHTML:" "0000000000" "\r\n"
+        "EndHTML:" "0000000000" "\r\n"
+        "StartFragment:" "0000000000" "\r\n"
+        "EndFragment:" "0000000000" "\r\n";
+    static const char open_marker[] = "<!--StartFragment-->";
+    static const char close_marker[] = "<!--EndFragment-->";
+    size_t size = 0;
+    void *html;
+    char *buffer;
+    HGLOBAL memory = NULL;
+    const size_t header_len = sizeof(header) - 1;
+    const size_t open_len = sizeof(open_marker) - 1;
+    const size_t close_len = sizeof(close_marker) - 1;
+    const size_t fragment_start = header_len + open_len;
+    const size_t fragment_end = fragment_start + size; /* set below */
+    size_t total;
+    UINT format;
+    bool result = false;
+
+    html = SDLOP_GetInternalClipboardData(mime_type, &size);
+    if (!html) {
+        return true; /* the app offered no HTML under this type */
+    }
+    if (!size) {
+        SDL_free(html);
+        return true;
+    }
+    total = header_len + open_len + size + close_len;
+
+    buffer = (char *)SDL_malloc(total);
+    if (!buffer) {
+        SDL_free(html);
+        return SDL_SetError("Out of memory");
+    }
+    SDL_memcpy(buffer, header, header_len);
+    SDL_memcpy(buffer + header_len, open_marker, open_len);
+    SDL_memcpy(buffer + fragment_start, html, size);
+    SDL_memcpy(buffer + fragment_start + size, close_marker, close_len);
+    SDL_free(html);
+
+    win32_patch_offset(buffer, "StartHTML:", 0); /* the header starts at 0 */
+    win32_patch_offset(buffer, "EndHTML:", total);
+    win32_patch_offset(buffer, "StartFragment:", fragment_start);
+    win32_patch_offset(buffer, "EndFragment:", fragment_start + size);
+    (void)fragment_end;
+
+    memory = GlobalAlloc(GMEM_MOVEABLE, total);
+    if (memory) {
+        void *locked = GlobalLock(memory);
+        if (locked) {
+            SDL_memcpy(locked, buffer, total);
+            GlobalUnlock(memory);
+            format = RegisterClipboardFormatW(L"HTML Format");
+            if (format && SetClipboardData(format, memory)) {
+                result = true;
+            } else {
+                GlobalFree(memory);
+            }
+        } else {
+            GlobalFree(memory);
+        }
+    } else {
+        SDL_SetError("Out of memory");
+    }
+    SDL_free(buffer);
+    return result;
+}
+
+static bool win32_set_clipboard_image(const char *mime_type)
+{
+    size_t size = 0;
+    void *data;
+    HGLOBAL memory;
+    bool result = false;
+
+    data = SDLOP_GetInternalClipboardData(mime_type, &size);
+    if (!data) {
+        return true;
+    }
+    if (!size) {
+        SDL_free(data);
+        return true;
+    }
+
+    memory = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (memory) {
+        void *locked = GlobalLock(memory);
+        if (locked) {
+            SDL_memcpy(locked, data, size);
+            GlobalUnlock(memory);
+            if (SetClipboardData(win32_clipboard_format_png(), memory)) {
+                result = true;
+            } else {
+                GlobalFree(memory);
+            }
+        } else {
+            GlobalFree(memory);
+        }
+    }
+    SDL_free(data);
+    return result;
+}
+
+static bool win32_SetClipboardData(SDLop_VideoDevice *device)
+{
+    const char *const *mime_types = NULL;
+    size_t count = 0;
+    size_t i;
+    bool result = true;
+
+    (void)device;
+    mime_types = SDLOP_GetClipboardOfferMimeTypes(&count);
+    if (!win32_open_clipboard()) {
+        return false;
+    }
+    EmptyClipboard();
+    for (i = 0; i < count; ++i) {
+        const char *mime_type = mime_types[i];
+        if (win32_is_text_mime_type(mime_type)) {
+            /* Windows has one text flavour; offer the first text type only,
+             * as SDL3 does. */
+            if (!win32_set_clipboard_text(mime_type)) {
+                result = false;
+            }
+            break;
+        }
+    }
+    for (i = 0; i < count; ++i) {
+        const char *mime_type = mime_types[i];
+        if (SDL_strcmp(mime_type, "text/html") == 0) {
+            if (!win32_set_clipboard_html(mime_type)) {
+                result = false;
+            }
+        } else if (SDL_strcmp(mime_type, "image/png") == 0) {
+            if (!win32_set_clipboard_image(mime_type)) {
+                result = false;
+            }
+        }
+    }
+    CloseClipboard();
+    return result;
+}
+
+/* CF_TEXT is the ANSI flavour. Wine and Windows both still expose it, and an
+ * app that only understands CF_TEXT has nothing otherwise. */
+static char *win32_clipboard_text_from_ansi(HANDLE handle)
+{
+    const char *ansi = (const char *)GlobalLock(handle);
+    char *utf8 = NULL;
+
+    if (ansi) {
+        const int needed = MultiByteToWideChar(CP_ACP, 0, ansi, -1, NULL, 0);
+        if (needed > 0) {
+            wchar_t *wide = (wchar_t *)SDL_malloc(((size_t)needed) * sizeof(wchar_t));
+            if (wide &&
+                MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide, needed) > 0) {
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                if (bytes > 0) {
+                    utf8 = (char *)SDL_malloc((size_t)bytes);
+                    if (utf8) {
+                        WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+                    }
+                }
+            }
+            SDL_free(wide);
+        }
+        GlobalUnlock(handle);
+    }
+    return utf8;
+}
+
+static void *win32_GetClipboardData(SDLop_VideoDevice *device, const char *mime_type, size_t *size)
+{
+    void *data = NULL;
+
+    (void)device;
+    *size = 0;
+    if (win32_is_text_mime_type(mime_type)) {
+        if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+            if (win32_open_clipboard()) {
+                HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+                if (handle) {
+                    const wchar_t *wide = (const wchar_t *)GlobalLock(handle);
+                    if (wide) {
+                        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                        if (bytes > 0) {
+                            char *utf8 = (char *)SDL_malloc((size_t)bytes);
+                            if (utf8) {
+                                WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+                                *size = SDL_strlen(utf8);
+                                data = utf8;
+                            }
+                        }
+                        GlobalUnlock(handle);
+                    }
+                }
+                CloseClipboard();
+            }
+        } else if (IsClipboardFormatAvailable(CF_TEXT)) {
+            if (win32_open_clipboard()) {
+                HANDLE handle = GetClipboardData(CF_TEXT);
+                if (handle) {
+                    char *utf8 = win32_clipboard_text_from_ansi(handle);
+                    if (utf8) {
+                        *size = SDL_strlen(utf8);
+                        data = utf8;
+                    }
+                }
+                CloseClipboard();
+            }
+        }
+        return data;
+    }
+    if (SDL_strcmp(mime_type, "image/png") == 0) {
+        const UINT format = win32_clipboard_format_png();
+        if (format && IsClipboardFormatAvailable(format) && win32_open_clipboard()) {
+            HANDLE handle = GetClipboardData(format);
+            if (handle) {
+                const size_t bytes = (size_t)GlobalSize(handle);
+                const void *locked = GlobalLock(handle);
+                if (locked) {
+                    data = SDL_malloc(bytes);
+                    if (data) {
+                        SDL_memcpy(data, locked, bytes);
+                        *size = bytes;
+                    }
+                    GlobalUnlock(handle);
+                }
+            }
+            CloseClipboard();
+        }
+        return data;
+    }
+    return SDLOP_GetInternalClipboardData(mime_type, size);
+}
+
+static bool win32_HasClipboardData(SDLop_VideoDevice *device, const char *mime_type)
+{
+    (void)device;
+    if (win32_is_text_mime_type(mime_type)) {
+        return (IsClipboardFormatAvailable(CF_UNICODETEXT) ||
+                IsClipboardFormatAvailable(CF_TEXT)) ? true : false;
+    }
+    if (SDL_strcmp(mime_type, "image/png") == 0) {
+        const UINT format = win32_clipboard_format_png();
+        return (format && IsClipboardFormatAvailable(format)) ? true : false;
+    }
+    return SDLOP_HasInternalClipboardData(mime_type);
+}
+
 SDLop_VideoDevice SDLop_windows_device = {
     .name = "windows",
     .Init = win32_Init,
@@ -2723,6 +3172,9 @@ SDLop_VideoDevice SDLop_windows_device = {
     .Vulkan_CreateSurface = SDLOP_Win32VulkanCreateSurface,
     .Vulkan_GetInstanceExtensions = SDLOP_Win32VulkanGetInstanceExtensions,
     .Vulkan_GetPresentationSupport = SDLOP_Win32VulkanGetPresentationSupport,
+    .SetClipboardData = win32_SetClipboardData,
+    .GetClipboardData = win32_GetClipboardData,
+    .HasClipboardData = win32_HasClipboardData,
 
     .SetWindowMinimumSize = win32_SetWindowMinimumSize,
     .SetWindowMaximumSize = win32_SetWindowMaximumSize,
