@@ -1588,6 +1588,75 @@ static void win32_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *wi
     }
 }
 
+/* SDL_GetWindowICCProfile(): the monitor's ICC profile, as the raw file
+ * bytes. Windows keeps the profile as a path (GDI "ICM profile" on the
+ * display's device context), so the file is read here and the caller frees
+ * the buffer. Returns NULL with an error when the monitor has no profile,
+ * which is common -- a plain sRGB display often has none installed. */
+static void *win32_GetWindowICCProfile(SDLop_VideoDevice *device, SDL_Window *window, size_t *size)
+{
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    wchar_t path[MAX_PATH];
+    DWORD path_len = (DWORD)SDL_arraysize(path);
+    HMONITOR hmon;
+    MONITORINFOEXW mi;
+    HDC hdc;
+    FILE *file;
+    void *contents = NULL;
+
+    if (size) {
+        *size = 0;
+    }
+    (void)device;
+    if (!data || !data->hwnd) {
+        SDL_SetError("no window");
+        return NULL;
+    }
+    hmon = MonitorFromWindow(data->hwnd, MONITOR_DEFAULTTONEAREST);
+    SDL_zero(mi);
+    mi.cbSize = sizeof(mi);
+    if (!hmon || !GetMonitorInfoW(hmon, (MONITORINFO *)&mi)) {
+        SDL_SetError("could not find the window's monitor");
+        return NULL;
+    }
+
+    hdc = CreateDCW(mi.szDevice, NULL, NULL, NULL);
+    if (!hdc) {
+        SDL_SetError("could not open the display device context");
+        return NULL;
+    }
+    if (!GetICMProfileW(hdc, &path_len, path)) {
+        DeleteDC(hdc);
+        SDL_SetError("the monitor has no ICC profile");
+        return NULL;
+    }
+    DeleteDC(hdc);
+
+    file = _wfopen(path, L"rb");
+    if (!file) {
+        SDL_SetError("could not open the ICC profile file");
+        return NULL;
+    }
+    if (fseek(file, 0, SEEK_END) == 0) {
+        const long length = ftell(file);
+        if (length > 0 && fseek(file, 0, SEEK_SET) == 0) {
+            contents = SDL_malloc((size_t)length);
+            if (contents && fread(contents, 1, (size_t)length, file) != (size_t)length) {
+                SDL_free(contents);
+                contents = NULL;
+            }
+            if (contents && size) {
+                *size = (size_t)length;
+            }
+        }
+    }
+    fclose(file);
+    if (!contents) {
+        SDL_SetError("could not read the ICC profile file");
+    }
+    return contents;
+}
+
 /* SDL_SetTextInputArea(): tell the IME where the text cursor is, so the
  * composition window and the candidate list open next to it instead of in a
  * corner. Both are client coordinates. */
@@ -2299,6 +2368,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .SetWindowHitTest = win32_SetWindowHitTest,
     .UpdateWindowShape = win32_UpdateWindowShape,
     .UpdateTextInputArea = win32_UpdateTextInputArea,
+    .GetWindowICCProfile = win32_GetWindowICCProfile,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
     .WarpMouse = win32_WarpMouse,
