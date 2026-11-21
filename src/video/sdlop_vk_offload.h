@@ -8,9 +8,11 @@
 
   When the application resolves Vulkan entry points through
   SDL_Vulkan_GetVkGetInstanceProcAddr(), hardware GPUs are prioritized over
-  software devices (lavapipe) and vkQueuePresentKHR automatically reads back
-  and blits presented swapchain images into the active driver's window
-  framebuffer (CreateWindowFramebuffer / UpdateWindowFramebuffer).
+  software devices (lavapipe). If an ICD cannot create a real headless
+  swapchain, swapchain images and acquisition are emulated with plain GPU
+  images; vkQueuePresentKHR then reads them back and blits them into the
+  active driver's window framebuffer (CreateWindowFramebuffer /
+  UpdateWindowFramebuffer).
 
   Controlled by SDLOP_VULKAN_OFFLOAD (alias SDLOP_VK_OFFLOAD), falling back
   to SDLOP_OFFLOAD:

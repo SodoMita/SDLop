@@ -45,6 +45,14 @@
 #define VK_COLOR_SPACE_SRGB_NONLINEAR_KHR 0
 
 #define VK_IMAGE_USAGE_TRANSFER_SRC_BIT 0x00000001u
+#define VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT 0x00000010u
+#define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT 0x00000001u
+#define VK_PRESENT_MODE_FIFO_KHR 2u
+#define VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO 14u
+#define VK_IMAGE_TYPE_2D 1u
+#define VK_IMAGE_TILING_OPTIMAL 0u
+#define VK_IMAGE_LAYOUT_UNDEFINED 0u
+#define VK_SAMPLE_COUNT_1_BIT 0x00000001u
 #define VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL 6u
 #define VK_IMAGE_LAYOUT_PRESENT_SRC_KHR 1000001002u
 
@@ -265,6 +273,24 @@ typedef struct VkMemoryAllocateInfo_ {
     uint32_t memoryTypeIndex;
 } VkMemoryAllocateInfo_;
 
+typedef struct VkImageCreateInfo_ {
+    uint32_t sType;
+    const void *pNext;
+    VkFlags_ flags;
+    uint32_t imageType;
+    uint32_t format;
+    VkExtent3D_ extent;
+    uint32_t mipLevels;
+    uint32_t arrayLayers;
+    uint32_t samples;
+    uint32_t tiling;
+    VkFlags_ usage;
+    uint32_t sharingMode;
+    uint32_t queueFamilyIndexCount;
+    const uint32_t *pQueueFamilyIndices;
+    uint32_t initialLayout;
+} VkImageCreateInfo_;
+
 typedef struct VkMappedMemoryRange_ {
     uint32_t sType;
     const void *pNext;
@@ -404,12 +430,17 @@ typedef VkResult_ (*PFN_vkGetPhysicalDeviceDisplayPropertiesKHR_)(VkPhysicalDevi
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceSupportKHR_)(VkPhysicalDevice_, uint32_t, VkSurfaceKHR_, VkBool32_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_)(VkPhysicalDevice_, VkSurfaceKHR_, VkSurfaceCapabilitiesKHR_ *);
 typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_)(VkPhysicalDevice_, VkSurfaceKHR_, uint32_t *, VkSurfaceFormatKHR_ *);
+typedef VkResult_ (*PFN_vkGetPhysicalDeviceSurfacePresentModesKHR_)(VkPhysicalDevice_, VkSurfaceKHR_, uint32_t *, uint32_t *);
 typedef VkResult_ (*PFN_vkCreateHeadlessSurfaceEXT_)(VkInstance_, const VkHeadlessSurfaceCreateInfoEXT_ *, const void *, VkSurfaceKHR_ *);
 typedef VkResult_ (*PFN_vkCreateDevice_)(VkPhysicalDevice_, const VkDeviceCreateInfo_ *, const void *, VkDevice_ *);
 typedef void (*PFN_vkDestroyDevice_)(VkDevice_, const void *);
 typedef void (*PFN_vkGetDeviceQueue_)(VkDevice_, uint32_t, uint32_t, VkQueue_ *);
 typedef void (*PFN_vkGetDeviceQueue2_)(VkDevice_, const VkDeviceQueueInfo2_ *, VkQueue_ *);
 typedef VkResult_ (*PFN_vkCreateSwapchainKHR_)(VkDevice_, const VkSwapchainCreateInfoKHR_ *, const void *, VkSwapchainKHR_ *);
+typedef VkResult_ (*PFN_vkCreateImage_)(VkDevice_, const VkImageCreateInfo_ *, const void *, VkImage_ *);
+typedef void (*PFN_vkDestroyImage_)(VkDevice_, VkImage_, const void *);
+typedef void (*PFN_vkGetImageMemoryRequirements_)(VkDevice_, VkImage_, VkMemoryRequirements_ *);
+typedef VkResult_ (*PFN_vkAcquireNextImageKHR_)(VkDevice_, VkSwapchainKHR_, uint64_t, VkSemaphore_, VkFence_, uint32_t *);
 typedef void (*PFN_vkDestroySwapchainKHR_)(VkDevice_, VkSwapchainKHR_, const void *);
 typedef VkResult_ (*PFN_vkGetSwapchainImagesKHR_)(VkDevice_, VkSwapchainKHR_, uint32_t *, VkImage_ *);
 typedef VkResult_ (*PFN_vkQueuePresentKHR_)(VkQueue_, const VkPresentInfoKHR_ *);
@@ -419,6 +450,7 @@ typedef void (*PFN_vkGetBufferMemoryRequirements_)(VkDevice_, VkBuffer_, VkMemor
 typedef VkResult_ (*PFN_vkAllocateMemory_)(VkDevice_, const VkMemoryAllocateInfo_ *, const void *, VkDeviceMemory_ *);
 typedef void (*PFN_vkFreeMemory_)(VkDevice_, VkDeviceMemory_, const void *);
 typedef VkResult_ (*PFN_vkBindBufferMemory_)(VkDevice_, VkBuffer_, VkDeviceMemory_, VkDeviceSize_);
+typedef VkResult_ (*PFN_vkBindImageMemory_)(VkDevice_, VkImage_, VkDeviceMemory_, VkDeviceSize_);
 typedef VkResult_ (*PFN_vkMapMemory_)(VkDevice_, VkDeviceMemory_, VkDeviceSize_, VkDeviceSize_, VkFlags_, void **);
 typedef void (*PFN_vkUnmapMemory_)(VkDevice_, VkDeviceMemory_);
 typedef VkResult_ (*PFN_vkInvalidateMappedMemoryRanges_)(VkDevice_, uint32_t, const VkMappedMemoryRange_ *);
@@ -484,6 +516,12 @@ typedef struct TrackedDevice
     PFN_vkDestroySwapchainKHR_ real_destroy_swapchain;
     PFN_vkGetSwapchainImagesKHR_ real_get_swapchain_images;
     PFN_vkQueuePresentKHR_ real_queue_present;
+    PFN_vkAcquireNextImageKHR_ real_acquire_next_image;
+
+    PFN_vkCreateImage_ p_create_image;
+    PFN_vkDestroyImage_ p_destroy_image;
+    PFN_vkGetImageMemoryRequirements_ p_get_image_mem_req;
+    PFN_vkBindImageMemory_ p_bind_image_mem;
 
     PFN_vkCreateBuffer_ p_create_buffer;
     PFN_vkDestroyBuffer_ p_destroy_buffer;
@@ -524,7 +562,10 @@ typedef struct TrackedSwapchain
     uint32_t sharing_mode;
     bool concurrent_has_transfer_qf;
     VkImage_ *images;
+    VkDeviceMemory_ *image_mem;
     uint32_t image_count;
+    uint32_t acquire_index;
+    bool emulated; /* true: images are ours, no driver swapchain exists */
 
     /* Lazy readback staging state */
     bool staging_init;
@@ -1054,6 +1095,19 @@ static void free_tracked_swapchain(TrackedSwapchain *ts)
         return;
     }
     destroy_swapchain_staging(ts);
+    if (ts->emulated && ts->dev) {
+        TrackedDevice *dev = ts->dev;
+        for (uint32_t i = 0; i < ts->image_count; i++) {
+            if (ts->images && ts->images[i] && dev->p_destroy_image) {
+                dev->p_destroy_image(dev->device, ts->images[i], NULL);
+            }
+            if (ts->image_mem && ts->image_mem[i] && dev->p_free_mem) {
+                dev->p_free_mem(dev->device, ts->image_mem[i], NULL);
+            }
+        }
+        free(ts->image_mem);
+        ts->image_mem = NULL;
+    }
     free(ts->images);
     free(ts);
 }
@@ -1177,6 +1231,35 @@ static int find_host_mem_type(TrackedDevice *dev, uint32_t type_bits, bool *is_c
                 }
                 return (int)i;
             }
+        }
+    }
+    return -1;
+}
+
+static int find_device_mem_type(TrackedDevice *dev, uint32_t type_bits)
+{
+    VkInstance_ inst = dev->instance ? dev->instance : resolve_instance_for_gpu(dev->gpu);
+    if (!vk_offload.real_gipa || !dev->gpu || !inst) {
+        return -1;
+    }
+    PFN_vkGetPhysicalDeviceMemoryProperties_ p_memprops =
+        VK_CAST(PFN_vkGetPhysicalDeviceMemoryProperties_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceMemoryProperties"));
+    if (!p_memprops) {
+        return -1;
+    }
+    VkPhysicalDeviceMemoryProperties_ mp;
+    memset(&mp, 0, sizeof(mp));
+    p_memprops(dev->gpu, &mp);
+
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
+        if ((type_bits & (1u << i)) &&
+            (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            return (int)i;
+        }
+    }
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
+        if (type_bits & (1u << i)) {
+            return (int)i;
         }
     }
     return -1;
@@ -1387,6 +1470,38 @@ static void copy_vk_pixels_to_xrgb8888(const uint8_t *src,
             }
         }
     }
+}
+
+static VkQueue_ pick_acquire_queue(TrackedDevice *d)
+{
+    if (!d) {
+        return NULL;
+    }
+    if (d->transfer_queue) {
+        return d->transfer_queue;
+    }
+    for (TrackedQueue *q = d->queues; q; q = q->next) {
+        if (q->family < d->qf_count &&
+            is_transfer_capable_flags(d->qf_flags[q->family])) {
+            return q->queue;
+        }
+    }
+    if (d->real_get_device_queue && d->qf_count > 0) {
+        uint32_t qf = d->has_transfer_qf ? d->transfer_qf : 0;
+        for (uint32_t i = 0; i < d->qf_count; i++) {
+            if (is_transfer_capable_flags(d->qf_flags[i])) {
+                qf = i;
+                break;
+            }
+        }
+        VkQueue_ q = NULL;
+        d->real_get_device_queue(d->device, qf, 0, &q);
+        if (q) {
+            track_device_queue(d, q, qf);
+        }
+        return q;
+    }
+    return NULL;
 }
 
 static bool choose_readback_queue(TrackedDevice *d, TrackedSwapchain *sc, VkQueue_ present_queue,
@@ -1774,48 +1889,114 @@ static VkResult_ wrap_vkEnumeratePhysicalDevices(VkInstance_ instance,
     return res;
 }
 
+/* Ask the ICD (not the wrapper) whether the tracked headless surface has real
+ * WSI support. Returns 1 supported, 0 unsupported, -1 if the ICD exposes no
+ * surface-support query (e.g. a mock loader). */
+static int real_surface_supported(VkPhysicalDevice_ gpu, VkSurfaceKHR_ surface)
+{
+    VkInstance_ inst = resolve_instance_for_gpu(gpu);
+    if (!vk_offload.real_gipa || !inst || !gpu) {
+        return -1;
+    }
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR_ p_support =
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfaceSupportKHR_,
+                vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceSupportKHR"));
+    if (!p_support) {
+        return -1;
+    }
+    uint32_t qfc = 0;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties_ p_qf =
+        VK_CAST(PFN_vkGetPhysicalDeviceQueueFamilyProperties_,
+                vk_offload.real_gipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    if (p_qf) {
+        p_qf(gpu, &qfc, NULL);
+    }
+    if (qfc == 0 || qfc > 64) {
+        qfc = qfc > 64 ? 64 : 1;
+    }
+    for (uint32_t i = 0; i < qfc; i++) {
+        VkBool32_ supported = VK_FALSE;
+        if (p_support(gpu, i, surface, &supported) == VK_SUCCESS && supported) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static VkResult_ wrap_vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice_ gpu,
                                                              uint32_t queueFamilyIndex,
                                                              VkSurfaceKHR_ surface,
                                                              VkBool32_ *pSupported)
 {
+    (void)gpu;
+    (void)queueFamilyIndex;
+    /* Our headless surfaces are not real WSI surfaces: presentation is
+     * emulated by the readback wrapper, so every graphics queue can present.
+     * Answer before asking the ICD -- NVIDIA 470 reports VK_FALSE here even
+     * though its queues are perfectly usable for headless rendering. */
+    if (find_surface(surface)) {
+        if (pSupported) {
+            *pSupported = VK_TRUE;
+        }
+        return VK_SUCCESS;
+    }
     VkInstance_ inst = resolve_instance_for_gpu(gpu);
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR_ p_real = (vk_offload.real_gipa && inst) ?
         VK_CAST(PFN_vkGetPhysicalDeviceSurfaceSupportKHR_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceSupportKHR")) : NULL;
-    if (p_real) {
-        VkResult_ res = p_real(gpu, queueFamilyIndex, surface, pSupported);
-        if (res == VK_SUCCESS) {
-            return res;
-        }
-    }
-    if (find_surface(surface) && pSupported) {
-        *pSupported = VK_TRUE;
-        return VK_SUCCESS;
-    }
-    return -1;
+    return p_real ? p_real(gpu, queueFamilyIndex, surface, pSupported) : -1;
 }
 
 static VkResult_ wrap_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice_ gpu,
                                                                   VkSurfaceKHR_ surface,
                                                                   VkSurfaceCapabilitiesKHR_ *pCapabilities)
 {
+    TrackedSurface *ts = find_surface(surface);
+    int supported = ts ? real_surface_supported(gpu, surface) : 1;
     VkInstance_ inst = resolve_instance_for_gpu(gpu);
-    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_real = (vk_offload.real_gipa && inst) ?
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_real = (supported != 0 && vk_offload.real_gipa && inst) ?
         VK_CAST(PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) : NULL;
-    if (!p_real) {
+    if (p_real) {
+        VkResult_ res = p_real(gpu, surface, pCapabilities);
+        if (res == VK_SUCCESS) {
+            if (pCapabilities && ts &&
+                (pCapabilities->currentExtent.width == 0xFFFFFFFFu ||
+                 pCapabilities->currentExtent.height == 0xFFFFFFFFu)) {
+                pCapabilities->currentExtent.width = ts->window && ts->window->w > 0 ? (uint32_t)ts->window->w : 640u;
+                pCapabilities->currentExtent.height = ts->window && ts->window->h > 0 ? (uint32_t)ts->window->h : 480u;
+            }
+            return res;
+        }
+        if (!ts) {
+            return res;
+        }
+    } else if (!ts) {
         return -1;
     }
-    VkResult_ res = p_real(gpu, surface, pCapabilities);
-    if (res == VK_SUCCESS && pCapabilities) {
-        TrackedSurface *ts = find_surface(surface);
-        if (ts && ts->window &&
-            (pCapabilities->currentExtent.width == 0xFFFFFFFFu ||
-             pCapabilities->currentExtent.height == 0xFFFFFFFFu)) {
-            pCapabilities->currentExtent.width = ts->window->w > 0 ? (uint32_t)ts->window->w : 640u;
-            pCapabilities->currentExtent.height = ts->window->h > 0 ? (uint32_t)ts->window->h : 480u;
-        }
+
+    /* ICDs without headless WSI (e.g. NVIDIA 470) return an error here. The
+     * emulated swapchain does not depend on driver surface support, so expose
+     * a minimal, self-consistent capability set instead. */
+    if (!pCapabilities) {
+        return VK_SUCCESS;
     }
-    return res;
+    uint32_t w = (ts->window && ts->window->w > 0) ? (uint32_t)ts->window->w : 640u;
+    uint32_t h = (ts->window && ts->window->h > 0) ? (uint32_t)ts->window->h : 480u;
+    memset(pCapabilities, 0, sizeof(*pCapabilities));
+    pCapabilities->minImageCount = 2;
+    pCapabilities->maxImageCount = 0;
+    pCapabilities->currentExtent.width = w;
+    pCapabilities->currentExtent.height = h;
+    pCapabilities->minImageExtent.width = 1;
+    pCapabilities->minImageExtent.height = 1;
+    pCapabilities->maxImageExtent.width = w;
+    pCapabilities->maxImageExtent.height = h;
+    pCapabilities->maxImageArrayLayers = 1;
+    pCapabilities->supportedTransforms = 0x00000001u; /* IDENTITY */
+    pCapabilities->currentTransform = 0x00000001u;
+    pCapabilities->supportedCompositeAlpha = 0x00000001u; /* OPAQUE */
+    pCapabilities->supportedUsageFlags =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    return VK_SUCCESS;
 }
 
 static VkResult_ wrap_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice_ gpu,
@@ -1823,23 +2004,62 @@ static VkResult_ wrap_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice_ gpu
                                                              uint32_t *pSurfaceFormatCount,
                                                              VkSurfaceFormatKHR_ *pSurfaceFormats)
 {
+    TrackedSurface *ts = find_surface(surface);
+    int supported = ts ? real_surface_supported(gpu, surface) : 1;
     VkInstance_ inst = resolve_instance_for_gpu(gpu);
-    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_ p_real = (vk_offload.real_gipa && inst) ?
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_ p_real = (supported != 0 && vk_offload.real_gipa && inst) ?
         VK_CAST(PFN_vkGetPhysicalDeviceSurfaceFormatsKHR_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceFormatsKHR")) : NULL;
-    if (!p_real) {
+    if (p_real) {
+        VkResult_ res = p_real(gpu, surface, pSurfaceFormatCount, pSurfaceFormats);
+        if (res == VK_SUCCESS && (!ts || !pSurfaceFormatCount || *pSurfaceFormatCount > 0)) {
+            return res;
+        }
+        if (!ts) {
+            return res;
+        }
+    } else if (!ts) {
         return -1;
     }
-    VkResult_ res = p_real(gpu, surface, pSurfaceFormatCount, pSurfaceFormats);
-    if (res == VK_SUCCESS && pSurfaceFormatCount && *pSurfaceFormatCount == 0 && find_surface(surface)) {
-        if (!pSurfaceFormats) {
-            *pSurfaceFormatCount = 1;
-        } else {
-            pSurfaceFormats[0].format = VK_FORMAT_B8G8R8A8_UNORM;
-            pSurfaceFormats[0].colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-            *pSurfaceFormatCount = 1;
-        }
+    if (!pSurfaceFormatCount) {
+        return VK_SUCCESS;
     }
-    return res;
+    if (pSurfaceFormats) {
+        pSurfaceFormats[0].format = VK_FORMAT_B8G8R8A8_UNORM;
+        pSurfaceFormats[0].colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    }
+    *pSurfaceFormatCount = 1;
+    return VK_SUCCESS;
+}
+
+static VkResult_ wrap_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice_ gpu,
+                                                                 VkSurfaceKHR_ surface,
+                                                                 uint32_t *pPresentModeCount,
+                                                                 uint32_t *pPresentModes)
+{
+    TrackedSurface *ts = find_surface(surface);
+    int supported = ts ? real_surface_supported(gpu, surface) : 1;
+    VkInstance_ inst = resolve_instance_for_gpu(gpu);
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR_ p_real = (supported != 0 && vk_offload.real_gipa && inst) ?
+        VK_CAST(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR_, vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfacePresentModesKHR")) : NULL;
+    if (p_real) {
+        VkResult_ res = p_real(gpu, surface, pPresentModeCount, pPresentModes);
+        if (res == VK_SUCCESS && (!ts || !pPresentModeCount || *pPresentModeCount > 0)) {
+            return res;
+        }
+        if (!ts) {
+            return res;
+        }
+    } else if (!ts) {
+        return -1;
+    }
+    if (!pPresentModeCount) {
+        return VK_SUCCESS;
+    }
+    if (pPresentModes) {
+        pPresentModes[0] = VK_PRESENT_MODE_FIFO_KHR;
+    }
+    *pPresentModeCount = 1;
+    return VK_SUCCESS;
 }
 
 static VkResult_ wrap_vkCreateSwapchainKHR(VkDevice_ device,
@@ -1848,64 +2068,198 @@ static VkResult_ wrap_vkCreateSwapchainKHR(VkDevice_ device,
                                             VkSwapchainKHR_ *pSwapchain)
 {
     TrackedDevice *td = find_device(device);
-    if (!td || !td->real_create_swapchain || !pCreateInfo || !pSwapchain) {
+    if (!td || !pCreateInfo || !pSwapchain) {
         return -1;
     }
-
     TrackedSurface *ts = find_surface(pCreateInfo->surface);
-    VkSwapchainCreateInfoKHR_ ci = *pCreateInfo;
-    if (ts) {
-        VkInstance_ inst = td->instance ? td->instance : resolve_instance_for_gpu(td->gpu);
-        PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_caps = (vk_offload.real_gipa && inst && td->gpu) ?
+    VkInstance_ inst = td->instance ? td->instance : resolve_instance_for_gpu(td->gpu);
+    PFN_vkCreateSwapchainKHR_ p_real =
+        (vk_offload.real_gipa && inst)
+            ? VK_CAST(PFN_vkCreateSwapchainKHR_,
+                      vk_offload.real_gipa(inst, "vkCreateSwapchainKHR"))
+            : td->real_create_swapchain;
+
+    /* Prefer the driver's real headless swapchain when it advertises support.
+     * ICDs that reject headless WSI entirely (NVIDIA 470 returns -7 even for
+     * the capability query) fall through to the emulated swapchain below. */
+    bool real_caps_ok = false;
+    if (ts && real_surface_supported(td->gpu, pCreateInfo->surface) != 0 &&
+        vk_offload.real_gipa && inst && td->gpu) {
+        PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ p_caps =
             VK_CAST(PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR_,
-                    vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) : NULL;
+                    vk_offload.real_gipa(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
         if (p_caps) {
             VkSurfaceCapabilitiesKHR_ caps;
             memset(&caps, 0, sizeof(caps));
-            if (p_caps(td->gpu, pCreateInfo->surface, &caps) == VK_SUCCESS &&
-                (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0) {
-                SDL_SetError("Vulkan offload requires VK_IMAGE_USAGE_TRANSFER_SRC_BIT, which the surface does not support");
-                return VK_ERROR_INITIALIZATION_FAILED;
-            }
+            real_caps_ok = p_caps(td->gpu, pCreateInfo->surface, &caps) == VK_SUCCESS &&
+                           (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
         }
-        ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
+    if (!ts || real_caps_ok) {
+        VkSwapchainCreateInfoKHR_ ci = *pCreateInfo;
+        if (ts) {
+            ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        }
+        *pSwapchain = 0;
+        VkResult_ res = p_real ? p_real(device, &ci, pAllocator, pSwapchain) : -1;
+        if (!ts) {
+            return res;
+        }
+        if (res == VK_SUCCESS && *pSwapchain) {
+            TrackedSwapchain *real_sc = (TrackedSwapchain *)calloc(1, sizeof(*real_sc));
+            if (real_sc) {
+                real_sc->swapchain = *pSwapchain;
+                real_sc->dev = td;
+                real_sc->window = ts->window;
+                real_sc->width = pCreateInfo->imageExtent.width;
+                real_sc->height = pCreateInfo->imageExtent.height;
+                real_sc->format = pCreateInfo->imageFormat;
+                real_sc->sharing_mode = pCreateInfo->imageSharingMode;
+                if (pCreateInfo->imageSharingMode == VK_SHARING_MODE_CONCURRENT &&
+                    pCreateInfo->pQueueFamilyIndices && td->has_transfer_qf) {
+                    for (uint32_t i = 0; i < pCreateInfo->queueFamilyIndexCount; i++) {
+                        if (pCreateInfo->pQueueFamilyIndices[i] == td->transfer_qf) {
+                            real_sc->concurrent_has_transfer_qf = true;
+                            break;
+                        }
+                    }
+                }
+                if (td->real_get_swapchain_images) {
+                    uint32_t ic = 0;
+                    if (td->real_get_swapchain_images(device, *pSwapchain, &ic, NULL) == VK_SUCCESS && ic > 0) {
+                        real_sc->images = (VkImage_ *)calloc(ic, sizeof(VkImage_));
+                        if (real_sc->images &&
+                            td->real_get_swapchain_images(device, *pSwapchain, &ic, real_sc->images) == VK_SUCCESS) {
+                            real_sc->image_count = ic;
+                        }
+                    }
+                }
+                real_sc->next = vk_offload.swapchains;
+                vk_offload.swapchains = real_sc;
+            }
+            return res;
+        }
     }
 
-    VkResult_ res = td->real_create_swapchain(device, &ci, pAllocator, pSwapchain);
-    if (res == VK_SUCCESS && ts && *pSwapchain) {
-        TrackedSwapchain *sc = (TrackedSwapchain *)calloc(1, sizeof(*sc));
-        if (sc) {
-            sc->swapchain = *pSwapchain;
-            sc->dev = td;
-            sc->window = ts->window;
-            sc->width = pCreateInfo->imageExtent.width;
-            sc->height = pCreateInfo->imageExtent.height;
-            sc->format = pCreateInfo->imageFormat;
-            sc->sharing_mode = pCreateInfo->imageSharingMode;
-            if (pCreateInfo->imageSharingMode == VK_SHARING_MODE_CONCURRENT &&
-                pCreateInfo->pQueueFamilyIndices && td->has_transfer_qf) {
-                for (uint32_t i = 0; i < pCreateInfo->queueFamilyIndexCount; i++) {
-                    if (pCreateInfo->pQueueFamilyIndices[i] == td->transfer_qf) {
-                        sc->concurrent_has_transfer_qf = true;
-                        break;
-                    }
-                }
-            }
-            if (td->real_get_swapchain_images) {
-                uint32_t ic = 0;
-                if (td->real_get_swapchain_images(device, *pSwapchain, &ic, NULL) == VK_SUCCESS && ic > 0) {
-                    sc->images = (VkImage_ *)calloc(ic, sizeof(VkImage_));
-                    if (sc->images &&
-                        td->real_get_swapchain_images(device, *pSwapchain, &ic, sc->images) == VK_SUCCESS) {
-                        sc->image_count = ic;
-                    }
-                }
-            }
-            sc->next = vk_offload.swapchains;
-            vk_offload.swapchains = sc;
+    /* Emulated swapchain: allocate plain images and let the present wrapper
+     * read them back into the window's shm/dumb framebuffer. */
+    if (!td->p_create_image || !td->p_destroy_image || !td->p_get_image_mem_req ||
+        !td->p_alloc_mem || !td->p_free_mem || !td->p_bind_image_mem) {
+        SDL_SetError("Vulkan offload needs vkCreateImage/vkAllocateMemory for emulated swapchains");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    uint32_t count = pCreateInfo->minImageCount ? pCreateInfo->minImageCount : 2;
+    if (count > 8) {
+        count = 8;
+    }
+    uint32_t w = pCreateInfo->imageExtent.width;
+    uint32_t h = pCreateInfo->imageExtent.height;
+    if (!w || !h) {
+        w = (ts->window && ts->window->w > 0) ? (uint32_t)ts->window->w : 640u;
+        h = (ts->window && ts->window->h > 0) ? (uint32_t)ts->window->h : 480u;
+    }
+
+    TrackedSwapchain *sc = (TrackedSwapchain *)calloc(1, sizeof(*sc));
+    if (!sc) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    sc->images = (VkImage_ *)calloc(count, sizeof(*sc->images));
+    sc->image_mem = (VkDeviceMemory_ *)calloc(count, sizeof(*sc->image_mem));
+    if (!sc->images || !sc->image_mem) {
+        free(sc->images);
+        free(sc->image_mem);
+        free(sc);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    uint32_t created = 0;
+    for (; created < count; created++) {
+        VkImageCreateInfo_ ici;
+        memset(&ici, 0, sizeof(ici));
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = pCreateInfo->imageFormat;
+        ici.extent.width = w;
+        ici.extent.height = h;
+        ici.extent.depth = 1;
+        ici.mipLevels = 1;
+        ici.arrayLayers = pCreateInfo->imageArrayLayers ? pCreateInfo->imageArrayLayers : 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = pCreateInfo->imageUsage |
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.sharingMode = pCreateInfo->imageSharingMode;
+        ici.queueFamilyIndexCount = pCreateInfo->queueFamilyIndexCount;
+        ici.pQueueFamilyIndices = pCreateInfo->pQueueFamilyIndices;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        if (td->p_create_image(td->device, &ici, NULL, &sc->images[created]) != VK_SUCCESS ||
+            !sc->images[created]) {
+            break;
+        }
+
+        VkMemoryRequirements_ req;
+        memset(&req, 0, sizeof(req));
+        td->p_get_image_mem_req(td->device, sc->images[created], &req);
+        int mtype = find_device_mem_type(td, req.memoryTypeBits);
+        if (mtype < 0) {
+            break;
+        }
+
+        VkMemoryAllocateInfo_ mai;
+        memset(&mai, 0, sizeof(mai));
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = (uint32_t)mtype;
+        if (td->p_alloc_mem(td->device, &mai, NULL, &sc->image_mem[created]) != VK_SUCCESS ||
+            !sc->image_mem[created]) {
+            break;
+        }
+        if (td->p_bind_image_mem(td->device, sc->images[created], sc->image_mem[created], 0) != VK_SUCCESS) {
+            break;
         }
     }
-    return res;
+    if (created != count) {
+        for (uint32_t i = 0; i < created; i++) {
+            if (sc->images[i] && td->p_destroy_image) {
+                td->p_destroy_image(td->device, sc->images[i], NULL);
+            }
+            if (sc->image_mem[i] && td->p_free_mem) {
+                td->p_free_mem(td->device, sc->image_mem[i], NULL);
+            }
+        }
+        free(sc->images);
+        free(sc->image_mem);
+        free(sc);
+        SDL_SetError("Failed to allocate emulated Vulkan swapchain images");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    sc->dev = td;
+    sc->window = ts->window;
+    sc->width = w;
+    sc->height = h;
+    sc->format = pCreateInfo->imageFormat;
+    sc->sharing_mode = pCreateInfo->imageSharingMode;
+    sc->image_count = count;
+    sc->emulated = true;
+    if (pCreateInfo->imageSharingMode == VK_SHARING_MODE_CONCURRENT &&
+        pCreateInfo->pQueueFamilyIndices && td->has_transfer_qf) {
+        for (uint32_t i = 0; i < pCreateInfo->queueFamilyIndexCount; i++) {
+            if (pCreateInfo->pQueueFamilyIndices[i] == td->transfer_qf) {
+                sc->concurrent_has_transfer_qf = true;
+                break;
+            }
+        }
+    }
+
+    sc->swapchain = (VkSwapchainKHR_)(uintptr_t)sc;
+    sc->next = vk_offload.swapchains;
+    vk_offload.swapchains = sc;
+    *pSwapchain = sc->swapchain;
+    return VK_SUCCESS;
 }
 
 static VkResult_ wrap_vkGetSwapchainImagesKHR(VkDevice_ device,
@@ -1913,43 +2267,90 @@ static VkResult_ wrap_vkGetSwapchainImagesKHR(VkDevice_ device,
                                                uint32_t *pSwapchainImageCount,
                                                VkImage_ *pSwapchainImages)
 {
-    TrackedDevice *td = find_device(device);
-    if (!td || !td->real_get_swapchain_images) {
-        return -1;
-    }
-    VkResult_ res = td->real_get_swapchain_images(device, swapchain, pSwapchainImageCount, pSwapchainImages);
-    if (res == VK_SUCCESS && pSwapchainImages && pSwapchainImageCount && *pSwapchainImageCount > 0) {
-        TrackedSwapchain *sc = find_swapchain(swapchain);
-        if (sc) {
-            free(sc->images);
-            sc->images = (VkImage_ *)calloc(*pSwapchainImageCount, sizeof(VkImage_));
-            if (sc->images) {
-                memcpy(sc->images, pSwapchainImages, *pSwapchainImageCount * sizeof(VkImage_));
-                sc->image_count = *pSwapchainImageCount;
-            }
+    TrackedSwapchain *sc = find_swapchain(swapchain);
+    if (sc && sc->emulated) {
+        if (!pSwapchainImageCount) {
+            return VK_SUCCESS;
         }
+        if (pSwapchainImages) {
+            uint32_t n = (*pSwapchainImageCount < sc->image_count)
+                ? *pSwapchainImageCount : sc->image_count;
+            memcpy(pSwapchainImages, sc->images, n * sizeof(*pSwapchainImages));
+        }
+        *pSwapchainImageCount = sc->image_count;
+        return VK_SUCCESS;
     }
-    return res;
+    TrackedDevice *td = find_device(device);
+    if (td && td->real_get_swapchain_images) {
+        return td->real_get_swapchain_images(device, swapchain, pSwapchainImageCount, pSwapchainImages);
+    }
+    return -1;
 }
 
 static void wrap_vkDestroySwapchainKHR(VkDevice_ device,
                                        VkSwapchainKHR_ swapchain,
                                        const void *pAllocator)
 {
-    TrackedDevice *td = find_device(device);
+    bool emulated = false;
     TrackedSwapchain **pp = &vk_offload.swapchains;
     while (*pp) {
         TrackedSwapchain *sc = *pp;
         if (sc->swapchain == swapchain) {
+            emulated = sc->emulated;
             *pp = sc->next;
             free_tracked_swapchain(sc);
             break;
         }
         pp = &sc->next;
     }
-    if (td && td->real_destroy_swapchain) {
-        td->real_destroy_swapchain(device, swapchain, pAllocator);
+    if (!emulated) {
+        TrackedDevice *td = find_device(device);
+        if (td && td->real_destroy_swapchain) {
+            td->real_destroy_swapchain(device, swapchain, pAllocator);
+        }
     }
+}
+
+static VkResult_ wrap_vkAcquireNextImageKHR(VkDevice_ device,
+                                            VkSwapchainKHR_ swapchain,
+                                            uint64_t timeout,
+                                            VkSemaphore_ semaphore,
+                                            VkFence_ fence,
+                                            uint32_t *pImageIndex)
+{
+    (void)timeout;
+    TrackedSwapchain *sc = find_swapchain(swapchain);
+    if (!sc || !sc->emulated) {
+        TrackedDevice *td = find_device(device);
+        if (td && td->real_acquire_next_image) {
+            return td->real_acquire_next_image(device, swapchain, timeout, semaphore, fence, pImageIndex);
+        }
+        return -1;
+    }
+    if (!pImageIndex || sc->image_count == 0) {
+        return -1;
+    }
+
+    *pImageIndex = sc->acquire_index % sc->image_count;
+    sc->acquire_index++;
+
+    VkQueue_ queue = pick_acquire_queue(sc->dev);
+    if ((semaphore || fence) && queue && sc->dev && sc->dev->p_queue_submit) {
+        VkSubmitInfo_ si;
+        memset(&si, 0, sizeof(si));
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        if (semaphore) {
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &semaphore;
+        }
+        VkResult_ res = sc->dev->p_queue_submit(queue, 1, &si, fence);
+        if (res != VK_SUCCESS) {
+            return res;
+        }
+    } else if (fence && (!queue || !sc->dev || !sc->dev->p_queue_submit)) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    return VK_SUCCESS;
 }
 
 static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ *pPresentInfo)
@@ -1964,13 +2365,24 @@ static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ 
     if (!p_present && vk_offload.devices) {
         p_present = vk_offload.devices->real_queue_present;
     }
-    if (!p_present) {
+    bool all_emulated = pPresentInfo && pPresentInfo->swapchainCount > 0 &&
+                        pPresentInfo->pSwapchains;
+    if (all_emulated) {
+        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
+            TrackedSwapchain *sc = find_swapchain(pPresentInfo->pSwapchains[i]);
+            if (!sc || !sc->emulated) {
+                all_emulated = false;
+                break;
+            }
+        }
+    }
+    if (!p_present && !all_emulated) {
         return -1;
     }
 
     if (!pPresentInfo || !pPresentInfo->pSwapchains || !pPresentInfo->pImageIndices ||
         pPresentInfo->swapchainCount == 0) {
-        return p_present(queue, pPresentInfo);
+        return p_present ? p_present(queue, pPresentInfo) : VK_SUCCESS;
     }
 
     /* Chain readbacks sequentially so each swapchain's semaphore wait consumes
@@ -1992,6 +2404,15 @@ static VkResult_ wrap_vkQueuePresentKHR(VkQueue_ queue, const VkPresentInfoKHR_ 
                 cur_wait_sems = &chained_sem;
             }
         }
+    }
+
+    if (all_emulated) {
+        if (pPresentInfo->pResults) {
+            for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
+                pPresentInfo->pResults[i] = VK_SUCCESS;
+            }
+        }
+        return VK_SUCCESS;
     }
 
     VkPresentInfoKHR_ pi = *pPresentInfo;
@@ -2099,6 +2520,9 @@ static PFN_vkVoid_ wrap_vkGetDeviceProcAddr(VkDevice_ device, const char *pName)
         if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
             return VK_VOID(wrap_vkGetSwapchainImagesKHR);
         }
+        if (strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+            return VK_VOID(wrap_vkAcquireNextImageKHR);
+        }
         if (strcmp(pName, "vkQueuePresentKHR") == 0) {
             return VK_VOID(wrap_vkQueuePresentKHR);
         }
@@ -2203,6 +2627,15 @@ static VkResult_ wrap_vkCreateDevice(VkPhysicalDevice_ physicalDevice,
         td->real_destroy_swapchain = VK_CAST(PFN_vkDestroySwapchainKHR_, gdpa(*pDevice, "vkDestroySwapchainKHR"));
         td->real_get_swapchain_images = VK_CAST(PFN_vkGetSwapchainImagesKHR_, gdpa(*pDevice, "vkGetSwapchainImagesKHR"));
         td->real_queue_present = VK_CAST(PFN_vkQueuePresentKHR_, gdpa(*pDevice, "vkQueuePresentKHR"));
+        td->real_acquire_next_image =
+            VK_CAST(PFN_vkAcquireNextImageKHR_, gdpa(*pDevice, "vkAcquireNextImageKHR"));
+
+        td->p_create_image = VK_CAST(PFN_vkCreateImage_, gdpa(*pDevice, "vkCreateImage"));
+        td->p_destroy_image = VK_CAST(PFN_vkDestroyImage_, gdpa(*pDevice, "vkDestroyImage"));
+        td->p_get_image_mem_req =
+            VK_CAST(PFN_vkGetImageMemoryRequirements_, gdpa(*pDevice, "vkGetImageMemoryRequirements"));
+        td->p_bind_image_mem =
+            VK_CAST(PFN_vkBindImageMemory_, gdpa(*pDevice, "vkBindImageMemory"));
 
         td->p_create_buffer = VK_CAST(PFN_vkCreateBuffer_, gdpa(*pDevice, "vkCreateBuffer"));
         td->p_destroy_buffer = VK_CAST(PFN_vkDestroyBuffer_, gdpa(*pDevice, "vkDestroyBuffer"));
@@ -2306,6 +2739,9 @@ static PFN_vkVoid_ wrapped_vkGetInstanceProcAddr(VkInstance_ instance, const cha
         if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0) {
             return VK_VOID(wrap_vkGetPhysicalDeviceSurfaceFormatsKHR);
         }
+        if (strcmp(pName, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0) {
+            return VK_VOID(wrap_vkGetPhysicalDeviceSurfacePresentModesKHR);
+        }
         if (strcmp(pName, "vkCreateDevice") == 0) {
             return VK_VOID(wrap_vkCreateDevice);
         }
@@ -2329,6 +2765,9 @@ static PFN_vkVoid_ wrapped_vkGetInstanceProcAddr(VkInstance_ instance, const cha
         }
         if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
             return VK_VOID(wrap_vkGetSwapchainImagesKHR);
+        }
+        if (strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+            return VK_VOID(wrap_vkAcquireNextImageKHR);
         }
         if (strcmp(pName, "vkQueuePresentKHR") == 0) {
             return VK_VOID(wrap_vkQueuePresentKHR);
