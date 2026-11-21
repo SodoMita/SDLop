@@ -122,6 +122,13 @@ void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
     if (!sdlop.keyboard_focus || !sdlop.keyboard_focus->text_input_active) {
         return;
     }
+
+    /* stock SDL3: no TEXT_INPUT event for unprintable characters. The
+     * Windows driver feeds WM_CHAR and friends through here, so without this
+     * a bare Ctrl+C arrives as a text event carrying byte 0x03. */
+    if (SDL_iscntrl((unsigned char)utf8[0])) {
+        return;
+    }
     SDL_Event event;
     SDL_zero(event);
     event.text.type = SDL_EVENT_TEXT_INPUT;
