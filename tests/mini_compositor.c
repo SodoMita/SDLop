@@ -151,7 +151,9 @@ static int H_pending_w, H_pending_h; /* buffer attached to the toplevel, 0: none
 static bool H_pending_set;
 static struct wl_resource *H_fractional; /* wp_fractional_scale_v1 of the window */
 static struct wl_list H_outputs;        /* bound wl_output resources */
-static struct wl_event_source *H_signal;
+/* external linkage: an optimizer may drop stores to a never-read static,
+ * which LeakSanitizer then reports as a leaked event source */
+struct wl_event_source *mini_scale_signal_source;
 static bool H_entered;
 
 static uint32_t frame_color(int k)
@@ -1665,7 +1667,9 @@ int main(void)
     M.loop = wl_display_get_event_loop(M.display);
     /* MINI_SCALE_CHANGE trigger: blocked (signalfd) before the socket exists,
      * so the test can't signal too early */
-    H_signal = wl_event_loop_add_signal(M.loop, SIGUSR1, H_signal_cb, NULL);
+    if (getenv("MINI_SCALE_CHANGE")) {
+        mini_scale_signal_source = wl_event_loop_add_signal(M.loop, SIGUSR1, H_signal_cb, NULL);
+    }
     const char *name = getenv("WAYLAND_DISPLAY");
     if (wl_display_add_socket(M.display, name) != 0) {
         fprintf(stderr, "mini: add_socket(%s) failed\n", name ? name : "(default)");
