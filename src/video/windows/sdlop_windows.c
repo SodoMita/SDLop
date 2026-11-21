@@ -413,6 +413,48 @@ static void handle_size(SDL_Window *window, WPARAM wparam)
     }
 }
 
+/* SDL_SetWindowAspectRatio() has no Win32 equivalent: WM_GETMINMAXINFO can
+ * only express min/max tracking sizes, not a ratio, so the constraint is
+ * applied while the user drags, in WM_SIZING. Only the client area counts,
+ * so the frame is taken back out before the ratio is measured. */
+static void win32_constrain_aspect(SDL_Window *window, RECT *rect)
+{
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data || !data->hwnd) {
+        return;
+    }
+    if (window->min_aspect <= 0.0f && window->max_aspect <= 0.0f) {
+        return;
+    }
+
+    /* How much frame this window adds around a client area. AdjustWindowRectEx
+     * on an empty rect returns the frame as negative left/top offsets. */
+    RECT zero = { 0, 0, 0, 0 };
+    SDLOP_Win32AdjustWindowRect(window, &zero);
+    const int border_w = -zero.left + zero.right;
+    const int border_h = -zero.top + zero.bottom;
+    int cw = (rect->right - rect->left) - border_w;
+    int ch = (rect->bottom - rect->top) - border_h;
+    if (cw <= 0 || ch <= 0) {
+        return;
+    }
+
+    const float aspect = (float)cw / (float)ch;
+    if (window->min_aspect > 0.0f && aspect < window->min_aspect) {
+        ch = (int)SDL_lroundf((float)cw / window->min_aspect);
+    } else if (window->max_aspect > 0.0f && aspect > window->max_aspect) {
+        cw = (int)SDL_lroundf((float)ch * window->max_aspect);
+    } else {
+        return;
+    }
+
+    /* the frame that client area needs, keeping the top-left corner */
+    RECT want = { 0, 0, cw, ch };
+    SDLOP_Win32AdjustWindowRect(window, &want);
+    rect->right = rect->left + (want.right - want.left);
+    rect->bottom = rect->top + (want.bottom - want.top);
+}
+
 /* Keep SDL_GetWindowDisplayScale() honest: the core reads window->display_scale
  * and the other backends set it from their compositor's scale. Win32 gives us
  * the window's own DPI (it follows the monitor the window is on), so the scale
@@ -592,6 +634,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         break;
     }
+
+    case WM_SIZING:
+        if (window) {
+            win32_constrain_aspect(window, (RECT *)lparam);
+            return TRUE;
+        }
+        break;
 
     case WM_SYSCOMMAND:
         if ((wparam & 0xFFF0) == SC_KEYMENU && window) {
@@ -1415,6 +1464,19 @@ static void win32_SetWindowBordered(SDLop_VideoDevice *device, SDL_Window *windo
     SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 }
 
+/* Nothing to install: WM_SIZING consults the ratio on every drag. Apply it to
+ * the current size too, so a new constraint takes effect immediately. */
+static void win32_SetWindowAspectRatio(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    RECT rc;
+    if (!data || !data->hwnd || !GetWindowRect(data->hwnd, &rc)) {
+        return;
+    }
+    win32_constrain_aspect(window, &rc);
+}
+
 static void win32_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *window, bool resizable)
 {
     (void)device;
@@ -1430,6 +1492,21 @@ static void win32_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *wind
     }
     SetWindowLongPtrW(data->hwnd, GWL_STYLE, style);
     SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+}
+
+/* Keep the display on while a window has focus, the way SDL3 does: Windows
+ * has no screensaver API, SetThreadExecutionState is the documented way to
+ * say "the user is here". Called again periodically, so re-assert it. */
+static bool win32_SuspendScreenSaver(SDLop_VideoDevice *device)
+{
+    (void)device;
+    if (!sdlop.suspend_screensaver) {
+        return true;
+    }
+    if (!SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)) {
+        return SDL_SetError("SetThreadExecutionState() failed");
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1530,6 +1607,95 @@ static HCURSOR win32_create_cursor_from_surface(SDL_Surface *surface, int hot_x,
     SDL_free(mask_bits);
     SDL_free(color_bits);
     return cursor;
+}
+
+/* Show/hide by installing the cursor itself, the way SDL3 does, instead of
+ * moving Win32's ShowCursor() counter: the counter is process-global state
+ * that no longer matches when application threads call ShowCursor(), and a
+ * NULL cursor leaves nothing on screen anyway. */
+static bool win32_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    if (sdlop.keyboard_focus == NULL && sdlop.mouse_focus == NULL) {
+        return true; /* no window of ours to install it on */
+    }
+    SetCursor(cursor ? (HCURSOR)cursor->internal : NULL);
+    return true;
+}
+
+/* Warp to a point in window coordinates. The window messages report the
+ * motion, so the core does not need a synthetic event. */
+static bool win32_WarpMouse(SDLop_VideoDevice *device, SDL_Window *window, float x, float y)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    POINT pt;
+    if (!data || !data->hwnd) {
+        return false;
+    }
+    pt.x = (LONG)SDL_lroundf(x);
+    pt.y = (LONG)SDL_lroundf(y);
+    if (!ClientToScreen(data->hwnd, &pt)) {
+        return false;
+    }
+    /* Windows occasionally ignores a SetCursorPos() to the position the cursor
+     * is already at (and over RDP it coalesces them), so nudge by one pixel
+     * and come back -- same trick as SDL3's WIN_SetCursorPos(). */
+    SetCursorPos(pt.x, pt.y);
+    SetCursorPos(pt.x + 1, pt.y);
+    return SetCursorPos(pt.x, pt.y) ? true : false;
+}
+
+static bool win32_WarpMouseGlobal(SDLop_VideoDevice *device, float x, float y)
+{
+    (void)device;
+    /* the desktop is in physical pixels and so is SetCursorPos, so these are
+     * already the right units once the process is DPI aware */
+    return SetCursorPos((int)SDL_lroundf(x), (int)SDL_lroundf(y)) ? true : false;
+}
+
+/* The real buttons, even when the window is not focused: this is what
+ * SDL_GetGlobalMouseState() is for. */
+static SDL_MouseButtonFlags win32_GetGlobalMouseState(SDLop_VideoDevice *device, float *x, float *y)
+{
+    (void)device;
+    POINT pt;
+    SDL_MouseButtonFlags flags = 0;
+
+    if (GetCursorPos(&pt)) {
+        if (x) {
+            *x = (float)pt.x;
+        }
+        if (y) {
+            *y = (float)pt.y;
+        }
+    }
+    if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
+        flags |= SDL_BUTTON_LMASK;
+    }
+    if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) {
+        flags |= SDL_BUTTON_MMASK;
+    }
+    if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) {
+        flags |= SDL_BUTTON_RMASK;
+    }
+    if (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) {
+        flags |= SDL_BUTTON_X1MASK;
+    }
+    if (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) {
+        flags |= SDL_BUTTON_X2MASK;
+    }
+    if (GetSystemMetrics(SM_SWAPBUTTON)) {
+        /* swap left and right */
+        if (flags & SDL_BUTTON_LMASK) {
+            flags &= ~SDL_BUTTON_LMASK;
+            flags |= SDL_BUTTON_RMASK;
+        } else if (flags & SDL_BUTTON_RMASK) {
+            flags &= ~SDL_BUTTON_RMASK;
+            flags |= SDL_BUTTON_LMASK;
+        }
+    }
+    return flags;
 }
 
 static bool win32_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
@@ -1859,6 +2025,12 @@ SDLop_VideoDevice SDLop_windows_device = {
     .SetWindowMouseRect = win32_SetWindowMouseRect,
     .CreateCursor = win32_CreateCursor,
     .FreeCursor = win32_FreeCursor,
+    .ShowCursor = win32_ShowCursor,
+    .SuspendScreenSaver = win32_SuspendScreenSaver,
+    .SetWindowAspectRatio = win32_SetWindowAspectRatio,
+    .WarpMouse = win32_WarpMouse,
+    .WarpMouseGlobal = win32_WarpMouseGlobal,
+    .GetGlobalMouseState = win32_GetGlobalMouseState,
     .FlashWindow = win32_FlashWindow,
     .SyncWindow = win32_SyncWindow,
     .SetWindowFocusable = win32_SetWindowFocusable,

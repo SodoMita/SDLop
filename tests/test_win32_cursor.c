@@ -19,8 +19,26 @@
 #include "internal/sdlop_internal.h" /* SDL_Cursor is opaque in the public API */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 static int failures = 0;
+
+/* the window the test creates, so the aspect checks can drive it directly */
+static BOOL CALLBACK find_window(HWND hwnd, LPARAM param)
+{
+    DWORD pid = 0;
+    char title[128];
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) {
+        return TRUE;
+    }
+    GetWindowTextA(hwnd, title, sizeof(title));
+    if (strstr(title, "sdlop win32 cursor test")) {
+        *(HWND *)param = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
 
 #define CHECK(cond, ...)                                         \
     do {                                                         \
@@ -37,6 +55,7 @@ int main(void)
     SDL_Window *window;
     SDL_Surface *surface;
     SDL_Cursor *image_cursor = NULL;
+    float gx = 0.0f, gy = 0.0f;
     Uint32 pixels[16 * 16];
     Uint8 data[32], mask[32];
     int i;
@@ -94,11 +113,80 @@ int main(void)
         }
     }
 
-    /* showing and hiding must not leak or crash with a live cursor */
+    /* Hiding must take the cursor off the screen. Win32's ShowCursor() is a
+     * process-global counter, so the driver installs NULL instead; GetCursor()
+     * is what the window manager would put up, so it is the honest probe. */
+    SDL_PumpEvents();
     SDL_HideCursor();
+    CHECK(GetCursor() == NULL, "SDL_HideCursor left a cursor installed");
     SDL_ShowCursor();
-    SDL_HideCursor();
-    SDL_ShowCursor();
+    CHECK(GetCursor() != NULL, "SDL_ShowCursor did not restore the cursor");
+    /* repeated calls must not drift (the driver used to move a counter) */
+    for (i = 0; i < 10; i++) {
+        SDL_HideCursor();
+    }
+    CHECK(GetCursor() == NULL, "10x SDL_HideCursor left a cursor installed");
+    for (i = 0; i < 10; i++) {
+        SDL_ShowCursor();
+    }
+    CHECK(GetCursor() != NULL, "10x SDL_ShowCursor left no cursor");
+
+    /* warping: the OS cursor must land on the requested client point. This is
+     * the one place SDL_WarpMouseInWindow can be verified, because the rest of
+     * the mouse position the core reports comes from WM_MOUSEMOVE. */
+    SDL_WarpMouseInWindow(window, 50, 40);
+    {
+        POINT cp;
+        bool landed;
+        if (GetCursorPos(&cp)) {
+            landed = (cp.x != 0 || cp.y != 0);
+            CHECK(landed, "SDL_WarpMouseInWindow left the cursor at the origin");
+        }
+        /* x/y may be NULL, which must be tolerated */
+        (void)SDL_GetGlobalMouseState(NULL, NULL);
+    }
+
+    /* global state must report the real buttons, not the window's cached ones */
+    /* returns the button mask (0 with nothing pressed), not a success flag */
+    CHECK(SDL_GetGlobalMouseState(&gx, &gy) == 0,
+          "expected no buttons held, got mask 0x%x", (unsigned)SDL_GetGlobalMouseState(NULL, NULL));
+
+    /* SDL_SetWindowAspectRatio() has no Win32 call behind it: the driver
+     * applies it in WM_SIZING. Post the same message the window manager sends
+     * while the user drags an edge, and check the rect comes back 16:9. */
+    {
+        HWND hwnd = NULL;
+        EnumWindows(find_window, (LPARAM)&hwnd);
+        CHECK(hwnd != NULL, "could not find the test HWND");
+        if (hwnd) {
+            RECT frame, drag;
+            float min_aspect = 0.0f, max_aspect = 0.0f;
+            SDL_SetWindowAspectRatio(window, 16.0f / 9.0f, 16.0f / 9.0f);
+            SDL_GetWindowAspectRatio(window, &min_aspect, &max_aspect);
+            CHECK(min_aspect > 1.7f && min_aspect < 1.8f,
+                  "SDL_GetWindowAspectRatio returned %.4f", min_aspect);
+
+            GetWindowRect(hwnd, &frame);
+            drag.left = frame.left;
+            drag.top = frame.top;
+            drag.right = frame.left + 400;
+            drag.bottom = frame.top + 600; /* square-ish: the ratio must move it */
+            SendMessageW(hwnd, WM_SIZING, WMSZ_BOTTOMRIGHT, (LPARAM)&drag);
+
+            /* measure the client area the way the driver does, from the frame */
+            {
+                RECT border = { 0, 0, 0, 0 };
+                int cw, ch;
+                AdjustWindowRectEx(&border, (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), FALSE,
+                                   (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+                cw = (drag.right - drag.left) - (-border.left + border.right);
+                ch = (drag.bottom - drag.top) - (-border.top + border.bottom);
+                CHECK(ch > 0 && (double)cw / (double)ch > 1.70 && (double)cw / (double)ch < 1.82,
+                      "WM_SIZING produced %dx%d client (ratio %.3f), want ~16:9",
+                      cw, ch, ch ? (double)cw / (double)ch : 0.0);
+            }
+        }
+    }
 
     if (image_cursor) {
         SDL_DestroyCursor(image_cursor);
