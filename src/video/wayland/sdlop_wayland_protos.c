@@ -24,3 +24,4 @@
 #include "xdg-activation-protocol.c"
 #include "viewporter-protocol.c"
 #include "primary-selection-protocol.c"
+#include "fractional-scale-v1-protocol.c"

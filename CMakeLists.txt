@@ -223,6 +223,28 @@ foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
     ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c)
 endforeach()
 
+# protocols newer than some distributions' wayland-protocols, vendored
+# like stock SDL3 does (src/video/wayland/protocols)
+set(SDLOP_WL_VENDORED_DIR ${CMAKE_SOURCE_DIR}/src/video/wayland/protocols)
+set(SDLOP_WL_VENDORED_PROTOCOLS
+  fractional-scale-v1)
+foreach(proto_name ${SDLOP_WL_VENDORED_PROTOCOLS})
+  set(proto_xml ${SDLOP_WL_VENDORED_DIR}/${proto_name}.xml)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${proto_xml} ${WL_GEN_DIR}/${proto_name}-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${proto_xml} ${WL_GEN_DIR}/${proto_name}-protocol.c
+    DEPENDS ${proto_xml})
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/${proto_name}-server-protocol.h ${WL_GEN_DIR}/${proto_name}-server-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header ${proto_xml} ${WL_GEN_DIR}/${proto_name}-server-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${proto_xml} ${WL_GEN_DIR}/${proto_name}-server-protocol.c
+    DEPENDS ${proto_xml})
+  list(APPEND SDLOP_WL_EXTRA_OUTPUTS
+    ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    ${WL_GEN_DIR}/${proto_name}-server-protocol.h ${WL_GEN_DIR}/${proto_name}-server-protocol.c)
+endforeach()
+
 # server-side codegen (used only by tests/test_pointer_lock's mini compositor)
 add_custom_command(
   OUTPUT ${WL_GEN_DIR}/xdg-shell-server-protocol.h ${WL_GEN_DIR}/xdg-shell-server-protocol.c
@@ -673,7 +695,8 @@ if(SDLop_BUILD_TESTS)
       ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
       ${WL_GEN_DIR}/relative-pointer-server-protocol.c
       ${WL_GEN_DIR}/viewporter-server-protocol.c
-      ${WL_GEN_DIR}/primary-selection-server-protocol.c)
+      ${WL_GEN_DIR}/primary-selection-server-protocol.c
+      ${WL_GEN_DIR}/fractional-scale-v1-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -714,6 +737,17 @@ if(SDLop_BUILD_TESTS)
     target_link_libraries(test_wayland_dnd PRIVATE sdlop)
     target_compile_options(test_wayland_dnd PRIVATE -UNDEBUG)
     add_dependencies(test_wayland_dnd mini_compositor)
+    # HiDPI: fractional / preferred buffer / output scales
+    add_executable(test_wayland_hidpi tests/test_wayland_hidpi.c)
+    target_link_libraries(test_wayland_hidpi PRIVATE sdlop)
+    target_compile_options(test_wayland_hidpi PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_hidpi mini_compositor)
+    foreach(hidpi_mode fractional lowdpi buffer output noviewport)
+      add_test(NAME test_wayland_hidpi_${hidpi_mode}
+               COMMAND test_wayland_hidpi $<TARGET_FILE:mini_compositor> ${hidpi_mode})
+      set_tests_properties(test_wayland_hidpi_${hidpi_mode} PROPERTIES TIMEOUT 60)
+    endforeach()
+
     foreach(dnd_mode files text refuse disabled)
       add_test(NAME test_wayland_dnd_${dnd_mode} COMMAND test_wayland_dnd $<TARGET_FILE:mini_compositor> ${dnd_mode})
       set_tests_properties(test_wayland_dnd_${dnd_mode} PROPERTIES TIMEOUT 60)

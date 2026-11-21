@@ -648,8 +648,12 @@ SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window *window)
 
 float SDL_GetWindowPixelDensity(SDL_Window *window)
 {
-    (void)window;
-    return 1.0f; /* SDLop has no high-density path yet */
+    /* stock: pixel size / window size */
+    int w = 0, h = 0, pw = 0, ph = 0;
+    if (!SDL_GetWindowSize(window, &w, &h) || !SDL_GetWindowSizeInPixels(window, &pw, &ph)) {
+        return 0.0f;
+    }
+    return w > 0 ? (float)pw / (float)w : 1.0f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1421,7 +1425,12 @@ bool SDL_GetWindowSizeInPixels(SDL_Window *window, int *w, int *h)
     SDL_GetWindowSize(window, w, h);
     const SDL_DisplayMode *mode;
     SDL_DisplayID displayID = SDL_GetDisplayForWindow(window);
-    if ((window->flags & SDL_WINDOW_FULLSCREEN) && SDL_GetWindowFullscreenMode(window)) {
+    const bool exclusive = (window->flags & SDL_WINDOW_FULLSCREEN) && SDL_GetWindowFullscreenMode(window);
+    if (!exclusive && sdlop.video && sdlop.video->GetWindowSizeInPixels) {
+        sdlop.video->GetWindowSizeInPixels(sdlop.video, window, w, h);
+        return true;
+    }
+    if (exclusive) {
         mode = SDL_GetCurrentDisplayMode(displayID);
     } else {
         mode = SDL_GetDesktopDisplayMode(displayID);

@@ -27,6 +27,7 @@
 #include "keyboard-shortcuts-inhibit-client-protocol.h"
 #include "xdg-activation-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
 #include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
@@ -56,6 +57,7 @@ typedef struct WaylandShmBuffer
 
 typedef struct WaylandWindowData
 {
+    SDL_Window *window;
     struct wl_surface *surface;
     struct xdg_surface *xsurface;
     struct xdg_toplevel *toplevel;
@@ -72,7 +74,20 @@ typedef struct WaylandWindowData
     struct wl_buffer *clear_buffer; /* 1x1 clear colour, scaled by the viewport */
     uint32_t clear_buffer_color;
     struct wp_viewport *viewport;
-    bool viewport_scaled;           /* destination set for clear_buffer */
+    int dest_w, dest_h;             /* last requested viewport destination (-1: none) */
+
+    /* HiDPI (stock scale_factor model): the preferred scale of the surface
+     * comes from wp_fractional_scale_v1, else wl_surface v6
+     * preferred_buffer_scale, else the largest scale of the entered outputs.
+     * SDL_WINDOW_HIGH_PIXEL_DENSITY windows render round(size * scale)
+     * pixels, shown at the logical size by the viewport (or an integer
+     * buffer scale without wp_viewporter, the scale then rounded up). */
+    struct wp_fractional_scale_v1 *fractional;
+    double scale_factor;
+    bool buffer_scale_received;
+    struct wl_output *entered[8];
+    int num_entered;
+    int pixel_w, pixel_h; /* pixel size last reported (PIXEL_SIZE_CHANGED) */
 
     bool configured;
     bool mapped;
@@ -148,6 +163,7 @@ typedef struct WaylandDeviceData
     struct zwp_keyboard_shortcuts_inhibit_manager_v1 *shortcuts_inhibit_manager;
     struct xdg_activation_v1 *activation;
     struct wp_viewporter *viewporter;
+    struct wp_fractional_scale_manager_v1 *fractional_manager;
     struct wl_event_queue *shm_queue; /* wl_buffer.release of window buffers only */
     struct zwp_confined_pointer_v1 *confined_pointer;
     SDL_Window *confine_window;
@@ -404,16 +420,66 @@ static void shm_copy_from_shadow(WaylandWindowData *wd, WaylandShmBuffer *b)
     }
 }
 
-/* SDLop's own buffers (the shm cycle, the 1x1 clear colour) are always 1:1
- * surface pixels. The app can reach the wl_surface
- * (SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER) and may have left a buffer
- * scale or transform pending or committed (e.g. for its own rendering), so
- * reset both with every attach of ours: a 1x1 buffer at scale 2 is even a
- * protocol error (size not a multiple of the scale). */
-static void surface_reset_buffer_geometry(WaylandWindowData *wd)
+/* scale the window's buffers are rendered at (1 unless HIGH_PIXEL_DENSITY) */
+static double window_buffer_scale(SDL_Window *window)
 {
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    return (wd && (window->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY)) ? wd->scale_factor : 1.0;
+}
+
+static int point_to_pixel(int points, double scale)
+{
+    const int p = (int)SDL_lround((double)points * scale);
+    return p > 0 ? p : 1;
+}
+
+void SDLOP_Wayland_GetWindowPixelSize(SDL_Window *window, int *pw, int *ph)
+{
+    const double scale = window_buffer_scale(window);
+    *pw = point_to_pixel(window->w > 0 ? window->w : 1, scale);
+    *ph = point_to_pixel(window->h > 0 ? window->h : 1, scale);
+}
+
+/* viewport destination, requested only when it changes (w <= 0: unset) */
+static void viewport_set_dest(WaylandWindowData *wd, int w, int h)
+{
+    if (!wd->viewport) {
+        return;
+    }
+    if (w <= 0 || h <= 0) {
+        w = h = -1;
+    }
+    if (wd->dest_w != w || wd->dest_h != h) {
+        wp_viewport_set_destination(wd->viewport, w, h);
+        wd->dest_w = w;
+        wd->dest_h = h;
+    }
+}
+
+/* Geometry for a buffer of bw x bh pixels showing the whole window. The app
+ * can reach the wl_surface (SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER) and may
+ * have left a buffer scale or transform pending or committed (e.g. for its
+ * own rendering), so both are set with every attach of ours: a 1x1 buffer at
+ * scale 2 is even a protocol error (size not a multiple of the scale). */
+static void surface_set_buffer_geometry(SDL_Window *window, WaylandWindowData *wd, int bw, int bh)
+{
+    const int w = window->w > 0 ? window->w : 1;
+    const int h = window->h > 0 ? window->h : 1;
+    int32_t scale = 1;
+    if (bw == w && bh == h) {
+        viewport_set_dest(wd, -1, -1);
+    } else if (wd->viewport) {
+        viewport_set_dest(wd, w, h);
+    } else {
+        /* integer scales only without a viewport (scale_factor is rounded
+         * up then); a stale buffer of another size stays unscaled */
+        scale = (int32_t)SDL_lround(window_buffer_scale(window));
+        if (scale < 1 || bw % scale != 0 || bh % scale != 0) {
+            scale = 1;
+        }
+    }
     if (wl_data.compositor_version >= 3) {
-        wl_surface_set_buffer_scale(wd->surface, 1);
+        wl_surface_set_buffer_scale(wd->surface, scale);
     }
     if (wl_data.compositor_version >= 2) {
         wl_surface_set_buffer_transform(wd->surface, WL_OUTPUT_TRANSFORM_NORMAL);
@@ -425,12 +491,9 @@ static void shm_commit(WaylandWindowData *wd, WaylandShmBuffer *b, const SDL_Rec
 {
     /* damage is relative to the previous buffer; after the clear colour (or
      * nothing) everything changed */
-    const bool full = !wd->front || wd->viewport_scaled || !rects || numrects <= 0;
-    if (wd->viewport_scaled) {
-        wp_viewport_set_destination(wd->viewport, -1, -1);
-        wd->viewport_scaled = false;
-    }
-    surface_reset_buffer_geometry(wd);
+    const bool full = !wd->front || !rects || numrects <= 0;
+    SDL_Window *window = wd->window;
+    surface_set_buffer_geometry(window, wd, wd->buffer_w, wd->buffer_h);
     wl_surface_attach(wd->surface, b->buffer, 0, 0);
     if (full) {
         wl_surface_damage_buffer(wd->surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -452,7 +515,12 @@ static bool window_attach_clear(SDL_Window *window, WaylandWindowData *wd)
     const uint32_t color = window_clear_xrgb(window);
     const int w = window->w > 0 ? window->w : 1;
     const int h = window->h > 0 ? window->h : 1;
-    surface_reset_buffer_geometry(wd);
+    if (wl_data.compositor_version >= 3) {
+        wl_surface_set_buffer_scale(wd->surface, 1);
+    }
+    if (wl_data.compositor_version >= 2) {
+        wl_surface_set_buffer_transform(wd->surface, WL_OUTPUT_TRANSFORM_NORMAL);
+    }
     if (wd->viewport) {
         if (!wd->clear_buffer || wd->clear_buffer_color != color) {
             /* immutable once created: a new colour gets a new buffer */
@@ -471,18 +539,20 @@ static bool window_attach_clear(SDL_Window *window, WaylandWindowData *wd)
             wd->clear_buffer_color = color;
         }
         wl_surface_attach(wd->surface, wd->clear_buffer, 0, 0);
-        wp_viewport_set_destination(wd->viewport, w, h);
-        wd->viewport_scaled = true;
+        viewport_set_dest(wd, w, h);
     } else {
-        shm_set_size(wd, w, h);
+        int pw, ph;
+        SDLOP_Wayland_GetWindowPixelSize(window, &pw, &ph);
+        shm_set_size(wd, pw, ph);
         WaylandShmBuffer *b = shm_acquire(wd);
         if (!b) {
             return false;
         }
-        fill_xrgb(b->map, (size_t)w * (size_t)h, color);
+        fill_xrgb(b->map, (size_t)pw * (size_t)ph, color);
         b->stale.x = b->stale.y = 0;
-        b->stale.w = w;
-        b->stale.h = h;
+        b->stale.w = pw;
+        b->stale.h = ph;
+        surface_set_buffer_geometry(window, wd, pw, ph);
         wl_surface_attach(wd->surface, b->buffer, 0, 0);
         b->busy = true;
     }
@@ -518,7 +588,74 @@ static bool window_resize_buffers(SDL_Window *window, int w, int h)
         SDL_SetSurfaceClipRect(window->surface, NULL); /* the old clip may exceed the new size */
     }
     SDLOP_Wayland_GL_WindowResized(window);
+    if (wd->gl_active && !wd->gl_offload_active) {
+        /* native EGL buffers (resized above) get the same geometry with
+         * EGL's next commit */
+        surface_set_buffer_geometry(window, wd, w, h);
+    }
     return true;
+}
+
+/* new pixel size after a size or scale change: resize the buffers and
+ * report it (stock: PIXEL_SIZE_CHANGED only when the pixel size changed) */
+static void window_update_pixel_size(SDL_Window *window, bool force_resize)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    int pw, ph;
+    SDLOP_Wayland_GetWindowPixelSize(window, &pw, &ph);
+    const bool changed = pw != wd->pixel_w || ph != wd->pixel_h;
+    if (changed || force_resize) {
+        window_resize_buffers(window, pw, ph);
+    }
+    if (changed) {
+        wd->pixel_w = pw;
+        wd->pixel_h = ph;
+        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, pw, ph);
+    }
+}
+
+/* a new preferred scale for the window's surface */
+static void window_commit(SDL_Window *window);
+static void window_set_scale_factor(SDL_Window *window, double factor)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || factor <= 0.0) {
+        return;
+    }
+    if (!wd->viewport) {
+        factor = SDL_ceil(factor); /* only integer buffer scales then */
+    }
+    if (SDL_fabs(factor - wd->scale_factor) < 1e-6) {
+        return;
+    }
+    wd->scale_factor = factor;
+    window->display_scale = (float)factor;
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
+    if (window->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY) {
+        const int old_w = wd->pixel_w, old_h = wd->pixel_h;
+        window_update_pixel_size(window, false);
+        if ((wd->pixel_w != old_w || wd->pixel_h != old_h) && !(window->flags & SDL_WINDOW_HIDDEN)) {
+            window_commit(window); /* clear colour at the new size until the app presents */
+        }
+    }
+}
+
+static float wayland_output_scale(struct wl_output *output);
+
+/* without fractional scale / preferred_buffer_scale: the largest scale of
+ * the outputs the surface is on (kept while it is on none) */
+static void window_update_output_scale(SDL_Window *window)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || wd->fractional || wd->buffer_scale_received || wd->num_entered == 0) {
+        return;
+    }
+    float scale = 0.0f;
+    for (int i = 0; i < wd->num_entered; i++) {
+        const float s = wayland_output_scale(wd->entered[i]);
+        scale = s > scale ? s : scale;
+    }
+    window_set_scale_factor(window, scale);
 }
 
 static void window_destroy_buffers(WaylandWindowData *wd)
@@ -545,8 +682,8 @@ static void window_commit(SDL_Window *window)
     if (wd->gl_active && !wd->gl_offload_active) {
         return; /* native Wayland EGL owns buffer management for this window */
     }
-    const int w = window->w > 0 ? window->w : 1;
-    const int h = window->h > 0 ? window->h : 1;
+    int w, h;
+    SDLOP_Wayland_GetWindowPixelSize(window, &w, &h);
     if (wd->front && wd->buffer_w == w && wd->buffer_h == h) {
         /* contents are not modified while attached: re-attaching is fine */
         WaylandShmBuffer *b = wd->front;
@@ -580,8 +717,8 @@ static bool wayland_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     if (!wd) {
         return SDL_SetError("Invalid window");
     }
-    const int w = window->w > 0 ? window->w : 1;
-    const int h = window->h > 0 ? window->h : 1;
+    int w, h;
+    SDLOP_Wayland_GetWindowPixelSize(window, &w, &h);
     shm_set_size(wd, w, h);
     if (!wd->shadow || wd->shadow_w != w || wd->shadow_h != h) {
         void *shadow = malloc((size_t)w * (size_t)h * 4);
@@ -689,11 +826,12 @@ void SDLOP_Wayland_SetGLActive(SDL_Window *window, bool active)
     WaylandWindowData *wd = window ? (WaylandWindowData *)window->driverdata : NULL;
     if (wd) {
         wd->gl_active = active;
-        if (active && wd->viewport_scaled) {
-            /* native EGL buffers must not be scaled to the old size: drop
-             * the clear colour's viewport with EGL's next commit */
-            wp_viewport_set_destination(wd->viewport, -1, -1);
-            wd->viewport_scaled = false;
+        if (active) {
+            /* native EGL buffers (pixel size) replace the clear colour's
+             * geometry with EGL's next commit */
+            int pw, ph;
+            SDLOP_Wayland_GetWindowPixelSize(window, &pw, &ph);
+            surface_set_buffer_geometry(window, wd, pw, ph);
         }
     }
 }
@@ -751,8 +889,8 @@ bool SDLOP_Wayland_AcquireOffloadShm(SDL_Window *window, void **pixels_out, int 
     if (!wd) {
         return SDL_SetError("Invalid window");
     }
-    int w = window->w > 0 ? window->w : 1;
-    int h = window->h > 0 ? window->h : 1;
+    int w, h;
+    SDLOP_Wayland_GetWindowPixelSize(window, &w, &h);
     shm_set_size(wd, w, h);
     if (pixels_out) {
         WaylandShmBuffer *b = wd->offload_buf;
@@ -823,9 +961,8 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
         (wd->pending_w != window->w || wd->pending_h != window->h)) {
         window->w = wd->pending_w;
         window->h = wd->pending_h;
-        window_resize_buffers(window, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
-        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
+        window_update_pixel_size(window, true);
         /* Stock 3.2.10 sends SAFE_AREA_CHANGED with every size change on
          * Wayland (measured: 4 SAFE for 4 resizes) and exactly one
          * MOVED(0,0) per window once a size is applied. The previous guard
@@ -1678,13 +1815,10 @@ static void output_done(void *data, struct wl_output *output)
             }
         }
     }
-    float s = wayland_output_scale(output);
+    /* an output scale change rescales windows on it (without a better
+     * scale source) */
     for (SDL_Window *w = sdlop.windows; w; w = w->next) {
-        WaylandWindowData *wd = (WaylandWindowData *)w->driverdata;
-        if (wd && wd->output == output && w->display_scale != s) {
-            w->display_scale = s;
-            SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
-        }
+        window_update_output_scale(w);
     }
 }
 
@@ -1719,26 +1853,66 @@ static void surface_enter(void *data, struct wl_surface *surface, struct wl_outp
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     (void)surface;
     wd->output = output;
-    float s = wayland_output_scale(output);
-    if (window->display_scale != s) {
-        window->display_scale = s;
-        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
+    bool known = false;
+    for (int i = 0; i < wd->num_entered; i++) {
+        known = known || wd->entered[i] == output;
+    }
+    if (!known && wd->num_entered < (int)SDL_arraysize(wd->entered)) {
+        wd->entered[wd->num_entered++] = output;
+    }
+    window_update_output_scale(window);
+}
+
+static void wayland_GetWindowSizeInPixels(SDLop_VideoDevice *device, SDL_Window *window, int *w, int *h)
+{
+    (void)device;
+    SDLOP_Wayland_GetWindowPixelSize(window, w, h);
+}
+
+static void window_forget_output(SDL_Window *window, struct wl_output *output)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    for (int i = 0; i < wd->num_entered; i++) {
+        if (wd->entered[i] == output) {
+            wd->entered[i] = wd->entered[--wd->num_entered];
+            break;
+        }
+    }
+    if (wd->output == output) {
+        wd->output = wd->num_entered > 0 ? wd->entered[wd->num_entered - 1] : NULL;
     }
 }
 
 static void surface_leave(void *data, struct wl_surface *surface, struct wl_output *output)
 {
     SDL_Window *window = (SDL_Window *)data;
-    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     (void)surface;
-    (void)output;
-    wd->output = NULL; /* scale stays until the next enter (SDL3 behavior) */
+    window_forget_output(window, output);
+    /* the scale follows the remaining outputs; on none it stays until the
+     * next enter (SDL3 behavior) */
+    window_update_output_scale(window);
 }
 
 static void surface_preferred_buffer_scale(void *data, struct wl_surface *surface, int32_t factor)
 {
-    (void)data; (void)surface; (void)factor;
+    SDL_Window *window = (SDL_Window *)data;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    (void)surface;
+    if (wd && !wd->fractional) { /* the fractional scale wins (stock) */
+        wd->buffer_scale_received = true;
+        window_set_scale_factor(window, (double)factor);
+    }
 }
+
+static void fractional_preferred_scale(void *data, struct wp_fractional_scale_v1 *fractional, uint32_t scale)
+{
+    (void)fractional;
+    window_set_scale_factor((SDL_Window *)data, (double)scale / 120.0);
+}
+
+static const struct wp_fractional_scale_v1_listener fractional_listener = {
+    fractional_preferred_scale,
+};
 
 static void surface_preferred_buffer_transform(void *data, struct wl_surface *surface, uint32_t transform)
 {
@@ -1837,7 +2011,10 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     WaylandDeviceData *d = (WaylandDeviceData *)data;
 
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
-        d->compositor_version = version < 4 ? version : 4;
+        /* v6: wl_surface.preferred_buffer_scale (v5 only forbids attach
+         * offsets, which SDLop never uses) */
+        const uint32_t max_version = (uint32_t)wl_compositor_interface.version < 6 ? (uint32_t)wl_compositor_interface.version : 6;
+        d->compositor_version = version < max_version ? version : max_version;
         d->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, d->compositor_version);
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         d->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
@@ -1877,6 +2054,9 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, wp_viewporter_interface.name) == 0 && !d->viewporter &&
                !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_VIEWPORTER, false)) {
         d->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+    } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0 && !d->fractional_manager &&
+               !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE, false)) {
+        d->fractional_manager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
     } else {
         SDLOP_Wayland_Clipboard_Global(registry, name, interface, version);
     }
@@ -1893,9 +2073,8 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
         }
         /* drop window references to the dying output first */
         for (SDL_Window *w = sdlop.windows; w; w = w->next) {
-            WaylandWindowData *wd = (WaylandWindowData *)w->driverdata;
-            if (wd && wd->output == d->outputs[i].output) {
-                wd->output = NULL; /* keeps its last scale until re-enter */
+            if (w->driverdata) {
+                window_forget_output(w, d->outputs[i].output); /* scale kept until re-enter */
             }
         }
         if (d->outputs[i].display_id) {
@@ -1968,6 +2147,7 @@ static bool wayland_Init(SDLop_VideoDevice *device)
      * otherwise the generic in-process clipboard (hooks left NULL) */
     const bool clip = SDLOP_Wayland_Clipboard_Available();
     const bool prim = SDLOP_Wayland_PrimarySelection_Available();
+    device->GetWindowSizeInPixels = wayland_GetWindowSizeInPixels;
     device->SetClipboardData = clip ? SDLOP_Wayland_SetClipboardData : NULL;
     device->GetClipboardData = clip ? SDLOP_Wayland_GetClipboardData : NULL;
     device->HasClipboardData = clip ? SDLOP_Wayland_HasClipboardData : NULL;
@@ -2031,6 +2211,9 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     }
     if (wl_data.wm_base) {
         xdg_wm_base_destroy(wl_data.wm_base);
+    }
+    if (wl_data.fractional_manager) {
+        wp_fractional_scale_manager_v1_destroy(wl_data.fractional_manager);
     }
     if (wl_data.viewporter) {
         wp_viewporter_destroy(wl_data.viewporter);
@@ -2269,12 +2452,36 @@ static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_SetError("wl_compositor_create_surface failed");
     }
     wl_surface_add_listener(wd->surface, &surface_listener, window);
+    wd->window = window;
+    wd->dest_w = wd->dest_h = -1;
     if (wl_data.viewporter) {
         wd->viewport = wp_viewporter_get_viewport(wl_data.viewporter, wd->surface);
     }
+    /* fractional scales need the viewport (stock) */
+    if (wl_data.fractional_manager && wd->viewport) {
+        wd->fractional = wp_fractional_scale_manager_v1_get_fractional_scale(wl_data.fractional_manager, wd->surface);
+        wp_fractional_scale_v1_add_listener(wd->fractional, &fractional_listener, window);
+    }
+    /* initial scale until the compositor tells (stock): the parent's for
+     * popups, else the largest output scale */
+    wd->scale_factor = 1.0;
+    if (SDLOP_WINDOW_IS_POPUP(window) && window->parent && window->parent->driverdata) {
+        wd->scale_factor = ((WaylandWindowData *)window->parent->driverdata)->scale_factor;
+    } else {
+        for (int i = 0; i < wl_data.num_outputs; i++) {
+            if (wl_data.outputs[i].scale > wd->scale_factor) {
+                wd->scale_factor = wl_data.outputs[i].scale;
+            }
+        }
+    }
+    window->display_scale = (float)wd->scale_factor;
     window->driverdata = wd;
+    SDLOP_Wayland_GetWindowPixelSize(window, &wd->pixel_w, &wd->pixel_h);
 
     if (!wayland_create_role_objects(window)) {
+        if (wd->fractional) {
+            wp_fractional_scale_v1_destroy(wd->fractional);
+        }
         if (wd->viewport) {
             wp_viewport_destroy(wd->viewport);
         }
@@ -2322,6 +2529,9 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
         window->surface = NULL;
     }
     destroy_role_objects(wd);
+    if (wd->fractional) {
+        wp_fractional_scale_v1_destroy(wd->fractional);
+    }
     if (wd->viewport) {
         wp_viewport_destroy(wd->viewport);
     }
@@ -2391,12 +2601,19 @@ static bool wayland_SetWindowSize(SDLop_VideoDevice *device, SDL_Window *window)
     (void)device;
     /* clients can only suggest sizes on Wayland; update buffer and let the
      * compositor confirm via configure */
-    window_resize_buffers(window, window->w, window->h);
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    int pw, ph;
+    SDLOP_Wayland_GetWindowPixelSize(window, &pw, &ph);
+    window_resize_buffers(window, pw, ph);
     apply_size_limits(window);
     window_commit(window);
     wl_display_flush(wl_data.display);
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
-    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
+    if (wd) {
+        wd->pixel_w = pw;
+        wd->pixel_h = ph;
+    }
+    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, pw, ph);
     /* stock pairs SAFE_AREA_CHANGED with every size change, including this
      * client-initiated one (measured on 3.2.10 with the behaviour probe) */
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);

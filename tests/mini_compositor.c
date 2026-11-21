@@ -20,6 +20,15 @@
   set_actions -> action(copy) and drop. The run fails (exit 6) unless the
   client read the data and called wl_data_offer.finish - or, with
   MINI_DND_REFUSE=1, unless it accepted nothing and read nothing.
+  MINI_SCALE=<source>:<value> gives the client's window a preferred scale
+  for tests/test_wayland_hidpi.c - fractional:<n/120> (offers
+  wp_fractional_scale_manager_v1), buffer:<n> (wl_compositor v6
+  preferred_buffer_scale) or output:<n> (a wl_output of that scale, entered
+  by the window). MINI_SCALE_CHANGE=<value> switches to another value of the
+  same source on SIGUSR1 (sent by the test when it is ready). Every window
+  commit is checked (buffer size a multiple of the buffer scale, else exit
+  7) and appended to MINI_GEOMETRY_LOG as
+  "buffer=WxH scale=S dest=WxH" (dest -1x-1: no viewport destination).
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -38,8 +47,10 @@
 #include "pointer-constraints-server-protocol.h"
 #include "relative-pointer-server-protocol.h"
 #include "viewporter-server-protocol.h"
+#include "fractional-scale-v1-server-protocol.h"
 #include "primary-selection-server-protocol.h"
 
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +142,17 @@ static int32_t B_dest_w = -1, B_dest_h = -1, B_dest_pending_w, B_dest_pending_h;
 static bool B_dest_set;
 static int32_t B_clear_w, B_clear_h; /* last 1x1 clear destination */
 static int B_clears, B_clears_1x1, B_app_geometry;
+
+/* MINI_SCALE (see the header) */
+static bool H_mode;
+static char H_source[16];
+static int H_value, H_change;
+static int H_pending_w, H_pending_h; /* buffer attached to the toplevel, 0: none */
+static bool H_pending_set;
+static struct wl_resource *H_fractional; /* wp_fractional_scale_v1 of the window */
+static struct wl_list H_outputs;        /* bound wl_output resources */
+static struct wl_event_source *H_signal;
+static bool H_entered;
 
 static uint32_t frame_color(int k)
 {
@@ -331,7 +353,7 @@ static void pool_create_buffer(struct wl_client *client, struct wl_resource *res
     struct wl_resource *buf = wl_resource_create(client, &wl_buffer_interface, 1, id);
     mini_buffer *b = NULL;
     mini_pool *p = wl_resource_get_user_data(res);
-    if (B_mode && p) {
+    if ((B_mode || H_mode) && p) {
         b = calloc(1, sizeof(*b));
         b->pool = p;
         p->refs++;
@@ -369,10 +391,12 @@ static void shm_create_pool(struct wl_client *client, struct wl_resource *res,
 {
     (void)res;
     mini_pool *p = NULL;
-    if (B_mode) {
+    if (B_mode || H_mode) {
         p = calloc(1, sizeof(*p));
         p->refs = 1;
         p->size = (size_t)size;
+    }
+    if (B_mode) { /* H_mode only needs buffer sizes */
         p->map = mmap(NULL, p->size, PROT_READ, MAP_SHARED, fd, 0);
         if (p->map == MAP_FAILED) {
             B_fail(5, "cannot map client shm pool");
@@ -398,6 +422,12 @@ static void surface_attach(struct wl_client *client, struct wl_resource *res,
         return; /* cursor etc.: not checked */
     }
     M.buffer_attached = (buffer != NULL);
+    if (H_mode && res == M.surface_res) {
+        mini_buffer *hb = buffer ? wl_resource_get_user_data(buffer) : NULL;
+        H_pending_w = hb ? hb->w : 0;
+        H_pending_h = hb ? hb->h : 0;
+        H_pending_set = true;
+    }
     if (B_mode) {
         mini_buffer *b = buffer ? wl_resource_get_user_data(buffer) : NULL;
         if (b && b->held) {
@@ -482,11 +512,17 @@ static void B_commit(void)
 }
 
 static void D_maybe_start(void);
+static void H_commit(void);
+static void H_send(int value);
 
 static void surface_commit(struct wl_client *client, struct wl_resource *res)
 {
     (void)client;
     (void)res;
+
+    if (H_mode && res == M.surface_res) {
+        H_commit();
+    }
 
     if (B_mode) {
         if (res != M.surface_res) {
@@ -540,7 +576,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
 static void surface_set_buffer_transform(struct wl_client *client, struct wl_resource *res, int32_t transform)
 {
     (void)client;
-    if (B_mode && res == M.surface_res) {
+    if ((B_mode || H_mode) && res == M.surface_res) {
         B_transform_pending = transform;
         B_transform_set = true;
         if (transform != WL_OUTPUT_TRANSFORM_NORMAL) {
@@ -552,7 +588,7 @@ static void surface_set_buffer_transform(struct wl_client *client, struct wl_res
 static void surface_set_buffer_scale(struct wl_client *client, struct wl_resource *res, int32_t scale)
 {
     (void)client;
-    if (B_mode && res == M.surface_res) {
+    if ((B_mode || H_mode) && res == M.surface_res) {
         B_scale_pending = scale;
         B_scale_set = true;
         if (scale != 1) {
@@ -657,6 +693,9 @@ static void wm_base_get_xdg_surface(struct wl_client *client, struct wl_resource
     st->resource = xs;
     wl_resource_set_implementation(xs, &xdg_surface_impl, st, xdg_surface_res_destroy);
     M.surface_res = surface;
+    if (H_mode && strcmp(H_source, "buffer") == 0) {
+        H_send(H_value);
+    }
 }
 
 static void wm_base_pong(struct wl_client *client, struct wl_resource *res, uint32_t serial)
@@ -838,7 +877,7 @@ static void seat_bind(struct wl_client *client, void *data, uint32_t version, ui
 static void viewport_destroy(struct wl_client *client, struct wl_resource *res)
 {
     (void)client;
-    if (B_mode && wl_resource_get_user_data(res) == M.surface_res) {
+    if ((B_mode || H_mode) && wl_resource_get_user_data(res) == M.surface_res) {
         B_dest_pending_w = B_dest_pending_h = -1;
         B_dest_set = true;
     }
@@ -854,7 +893,7 @@ static void viewport_set_source(struct wl_client *client, struct wl_resource *re
 static void viewport_set_destination(struct wl_client *client, struct wl_resource *res, int32_t w, int32_t h)
 {
     (void)client;
-    if (B_mode && wl_resource_get_user_data(res) == M.surface_res) {
+    if ((B_mode || H_mode) && wl_resource_get_user_data(res) == M.surface_res) {
         B_dest_pending_w = w;
         B_dest_pending_h = h;
         B_dest_set = true;
@@ -1408,6 +1447,146 @@ static void D_maybe_start(void)
     }
 }
 
+/* ---------------- preferred scale (MINI_SCALE) ---------------- */
+
+static void H_send_output_scale(struct wl_resource *o, int scale)
+{
+    if (wl_resource_get_version(o) >= WL_OUTPUT_SCALE_SINCE_VERSION) {
+        wl_output_send_scale(o, scale);
+    }
+    if (wl_resource_get_version(o) >= WL_OUTPUT_DONE_SINCE_VERSION) {
+        wl_output_send_done(o);
+    }
+}
+
+static void H_send(int value)
+{
+    if (strcmp(H_source, "fractional") == 0) {
+        if (H_fractional) {
+            wp_fractional_scale_v1_send_preferred_scale(H_fractional, (uint32_t)value);
+        }
+    } else if (strcmp(H_source, "buffer") == 0) {
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+        if (M.surface_res && wl_resource_get_version(M.surface_res) >= WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION) {
+            wl_surface_send_preferred_buffer_scale(M.surface_res, value);
+        }
+#endif
+    } else {
+        struct wl_resource *o;
+        wl_resource_for_each(o, &H_outputs)
+        {
+            H_send_output_scale(o, value);
+        }
+    }
+    printf("mini: preferred scale %s:%d\n", H_source, value);
+    fflush(stdout);
+}
+
+static int H_signal_cb(int signal_number, void *data)
+{
+    (void)signal_number;
+    (void)data;
+    H_send(H_change);
+    return 0;
+}
+
+static void H_commit(void)
+{
+    B_commit_geometry();
+    if (!H_pending_set) {
+        return;
+    }
+    H_pending_set = false;
+    if (H_pending_w <= 0) {
+        return;
+    }
+    if (H_pending_w % B_scale != 0 || H_pending_h % B_scale != 0) {
+        fprintf(stderr, "mini: %dx%d buffer at buffer scale %d (protocol error)\n", H_pending_w, H_pending_h, B_scale);
+        exit(7);
+    }
+    const char *log = getenv("MINI_GEOMETRY_LOG");
+    FILE *f = log ? fopen(log, "a") : NULL;
+    if (f) {
+        fprintf(f, "buffer=%dx%d scale=%d dest=%dx%d\n", H_pending_w, H_pending_h, B_scale, B_dest_w, B_dest_h);
+        fclose(f);
+    }
+    if (!H_entered && strcmp(H_source, "output") == 0) {
+        struct wl_resource *o;
+        wl_resource_for_each(o, &H_outputs)
+        {
+            if (wl_resource_get_client(o) == wl_resource_get_client(M.surface_res)) {
+                wl_surface_send_enter(M.surface_res, o);
+                H_entered = true;
+            }
+        }
+    }
+}
+
+static void H_fractional_destroy(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    wl_resource_destroy(res);
+}
+
+static void H_fractional_res_destroy(struct wl_resource *res)
+{
+    if (res == H_fractional) {
+        H_fractional = NULL;
+    }
+}
+
+static const struct wp_fractional_scale_v1_interface H_fractional_impl = {
+    .destroy = H_fractional_destroy,
+};
+
+static void H_mgr_get(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *surface)
+{
+    struct wl_resource *r = wl_resource_create(client, &wp_fractional_scale_v1_interface, wl_resource_get_version(res), id);
+    wl_resource_set_implementation(r, &H_fractional_impl, surface, H_fractional_res_destroy);
+    if (!H_fractional) {
+        H_fractional = r; /* the window's surface is the first one asking */
+        wp_fractional_scale_v1_send_preferred_scale(r, (uint32_t)H_value);
+    }
+}
+
+static const struct wp_fractional_scale_manager_v1_interface H_mgr_impl = {
+    .destroy = H_fractional_destroy,
+    .get_fractional_scale = H_mgr_get,
+};
+
+static void H_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wp_fractional_scale_manager_v1_interface, (int)version, id);
+    wl_resource_set_implementation(r, &H_mgr_impl, NULL, NULL);
+}
+
+static void H_output_release(struct wl_client *client, struct wl_resource *res)
+{
+    (void)client;
+    wl_resource_destroy(res);
+}
+
+static const struct wl_output_interface H_output_impl = {
+    .release = H_output_release,
+};
+
+static void H_output_res_destroy(struct wl_resource *res)
+{
+    wl_list_remove(wl_resource_get_link(res));
+}
+
+static void H_output_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *o = wl_resource_create(client, &wl_output_interface, (int)version, id);
+    wl_resource_set_implementation(o, &H_output_impl, NULL, H_output_res_destroy);
+    wl_list_insert(&H_outputs, wl_resource_get_link(o));
+    wl_output_send_geometry(o, 0, 0, 300, 200, WL_OUTPUT_SUBPIXEL_UNKNOWN, "mini", "mini", WL_OUTPUT_TRANSFORM_NORMAL);
+    wl_output_send_mode(o, WL_OUTPUT_MODE_CURRENT, 1920, 1080, 60000);
+    H_send_output_scale(o, H_value);
+}
+
 /* ---------------- lifecycle ---------------- */
 
 static int watchdog_cb(void *data)
@@ -1484,13 +1663,37 @@ int main(void)
         return 1;
     }
     M.loop = wl_display_get_event_loop(M.display);
+    /* MINI_SCALE_CHANGE trigger: blocked (signalfd) before the socket exists,
+     * so the test can't signal too early */
+    H_signal = wl_event_loop_add_signal(M.loop, SIGUSR1, H_signal_cb, NULL);
     const char *name = getenv("WAYLAND_DISPLAY");
     if (wl_display_add_socket(M.display, name) != 0) {
         fprintf(stderr, "mini: add_socket(%s) failed\n", name ? name : "(default)");
         return 1;
     }
 
-    wl_global_create(M.display, &wl_compositor_interface, 4, NULL, compositor_bind);
+    const char *hs = getenv("MINI_SCALE");
+    if (hs && strchr(hs, ':')) {
+        H_mode = true;
+        snprintf(H_source, sizeof(H_source), "%.*s", (int)(strchr(hs, ':') - hs), hs);
+        H_value = atoi(strchr(hs, ':') + 1);
+        H_change = getenv("MINI_SCALE_CHANGE") ? atoi(getenv("MINI_SCALE_CHANGE")) : 0;
+        wl_list_init(&H_outputs);
+        if (strcmp(H_source, "fractional") == 0) {
+            wl_global_create(M.display, &wp_fractional_scale_manager_v1_interface, 1, NULL, H_mgr_bind);
+        } else if (strcmp(H_source, "output") == 0) {
+            wl_global_create(M.display, &wl_output_interface, 2, NULL, H_output_bind);
+        }
+    }
+    int compositor_version = 4;
+    if (H_mode && strcmp(H_source, "buffer") == 0) {
+        if (wl_compositor_interface.version < 6) {
+            fprintf(stderr, "mini: libwayland-server lacks wl_compositor v6\n");
+            return 77;
+        }
+        compositor_version = 6;
+    }
+    wl_global_create(M.display, &wl_compositor_interface, compositor_version, NULL, compositor_bind);
     wl_global_create(M.display, &wl_shm_interface, 1, NULL, shm_bind);
     /* v9 needs libwayland >= 1.22; clamp to what the library implements */
     wl_global_create(M.display, &wl_seat_interface,

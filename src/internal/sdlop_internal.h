@@ -189,6 +189,9 @@ struct SDLop_VideoDevice
     bool (*SetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int vsync);
     bool (*GetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int *vsync);
     SDL_SystemTheme (*GetSystemTheme)(SDLop_VideoDevice *device);
+    /* drawable size (HiDPI); NULL = window size times the display mode's
+     * pixel density */
+    void (*GetWindowSizeInPixels)(SDLop_VideoDevice *device, SDL_Window *window, int *w, int *h);
 
     /* EGL handles of the current context (SDL_EGL_*); NULL = not EGL */
     void *(*EGL_GetDisplay)(SDLop_VideoDevice *device);

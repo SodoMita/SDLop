@@ -19,6 +19,9 @@ struct wl_surface;
 struct wl_display *SDLOP_Wayland_GetDisplay(void);
 uint32_t SDLOP_Wayland_GetSelectionSerial(void);
 struct wl_surface *SDLOP_Wayland_GetWindowSurfaceHandle(SDL_Window *window);
+/* size of the window's buffers: round(size * scale) for
+ * SDL_WINDOW_HIGH_PIXEL_DENSITY windows, else the window size */
+void SDLOP_Wayland_GetWindowPixelSize(SDL_Window *window, int *pw, int *ph);
 
 /* per-window presentation state (WaylandWindowData fields, exposed so the
  * GL module can take over buffer management without EGL types here) */

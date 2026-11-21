@@ -71,6 +71,7 @@
 #define SDLOP_HINT_GL_OFFLOAD_PRIME      "SDLOP_GL_OFFLOAD_PRIME"  /**< bool: kmsdrm: scan out offloaded GL frames via PRIME import (default on; "0" copies through dumb buffers) */
 /* Wayland */
 #define SDLOP_HINT_WAYLAND_NO_VIEWPORTER "SDLOP_WAYLAND_NO_VIEWPORTER" /**< bool: do not use wp_viewporter (the clear colour is then a filled full-size buffer); read at video init */
+#define SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE "SDLOP_WAYLAND_NO_FRACTIONAL_SCALE" /**< bool: do not use wp_fractional_scale_v1 (integer preferred buffer / output scales only); read at video init */
 /* kmsdrm */
 #define SDLOP_HINT_KMSDRM_DEVICE         "SDLOP_KMSDRM_DEVICE"     /**< DRM device: card number or /dev/dri/cardN path (default: probe) */
 #define SDLOP_HINT_KMSDRM_CONNECTOR      "SDLOP_KMSDRM_CONNECTOR"  /**< use only outputs whose name contains this (e.g. HDMI) */
