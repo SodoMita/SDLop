@@ -420,6 +420,10 @@ SDL_DisplayID SDLOP_AddDisplay(const char *name, int w, int h, int refresh_mhz,
                                SDL_DisplayOrientation natural_orientation,
                                void *internal, bool send_event);
 void SDLOP_DelDisplay(SDL_DisplayID displayID, bool send_event);
+/* Set a display's pixel density after AddDisplay (the mode list is built
+ * from the logical size, so a backend on a scaled desktop reports density
+ * here rather than growing AddDisplay's signature for every backend). */
+void SDLOP_SetDisplayPixelDensity(SDL_DisplayID displayID, float pixel_density);
 void SDLOP_SendDisplayEvent(SDL_DisplayID displayID, SDL_EventType type, Sint32 data1, Sint32 data2);
 bool SDLOP_GetDisplayBoundsById(SDL_DisplayID displayID, SDL_Rect *rect);
 int SDLOP_GetDisplayIndexById(SDL_DisplayID displayID); /* -1 when absent */

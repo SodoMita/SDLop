@@ -354,6 +354,19 @@ SDL_DisplayID SDLOP_AddDisplay(const char *name, int w, int h, int refresh_mhz,
     return d->id;
 }
 
+void SDLOP_SetDisplayPixelDensity(SDL_DisplayID displayID, float pixel_density)
+{
+    const int i = SDLOP_GetDisplayIndexById(displayID);
+    if (i < 0 || pixel_density <= 0.0f) {
+        return;
+    }
+    SDLop_Display *d = &sdlop.displays[i];
+    d->desktop_mode.pixel_density = pixel_density;
+    for (int m = 0; m < d->num_fullscreen_modes; m++) {
+        d->fullscreen_modes[m].pixel_density = pixel_density;
+    }
+}
+
 void SDLOP_DelDisplay(SDL_DisplayID displayID, bool send_event)
 {
     int i = SDLOP_GetDisplayIndexById(displayID);

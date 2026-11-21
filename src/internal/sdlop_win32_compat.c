@@ -20,6 +20,9 @@
 #include <io.h>
 #include <wctype.h>
 
+/* MinGW declares these itself (see sdlop_win32.h); defining them again would
+ * both clash with its macro and give a different comparison. */
+#if !defined(__MINGW32__) && !defined(_MSC_VER)
 int strcasecmp(const char *a, const char *b)
 {
     while (*a && *b) {
@@ -51,6 +54,7 @@ int strncasecmp(const char *a, const char *b, size_t n)
     }
     return tolower((unsigned char)*a) - tolower((unsigned char)*b);
 }
+#endif /* !__MINGW32__ (strcasecmp/strncasecmp come from MinGW) */
 
 int wcscasecmp(const wchar_t *a, const wchar_t *b)
 {

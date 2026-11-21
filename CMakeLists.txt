@@ -545,12 +545,12 @@ if(SDLop_BUILD_TESTS)
   # need pkg-config'd headers, and are registered in the !WIN32 branch below.
   if(WIN32)
     set(SDLOP_PORTABLE_TESTS test_ring test_events test_layouts
-        test_core test_main_callbacks test_threads)
+        test_core test_main_callbacks test_threads test_iconv)
   else()
     set(SDLOP_PORTABLE_TESTS test_ring test_scancode test_events test_surface
         test_web test_keycodes test_layouts test_core test_main_callbacks
         test_misc test_threads test_vt_mask test_fbdev_device test_options
-        test_dropin_compat)
+        test_dropin_compat test_iconv)
   endif()
   foreach(t ${SDLOP_PORTABLE_TESTS})
     add_executable(${t} tests/${t}.c)

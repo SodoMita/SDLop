@@ -1476,6 +1476,13 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
                 return SDL_ICONV_EILSEQ;
             }
             if (*outbytesleft < (size_t)n) {
+                /* Same rewind as EILSEQ: the input code point was already
+                 * consumed above, and iconv semantics leave *inbuf at the
+                 * point it stopped, so the caller retries it. Returning
+                 * E2BIG without rewinding silently drops the character. */
+                const size_t consumed = (size_t)(*inbuf - before);
+                *inbuf = before;
+                *inbytesleft += consumed;
                 return SDL_ICONV_E2BIG;
             }
             SDL_memcpy(*outbuf, tmp, (size_t)n);
@@ -1549,6 +1556,11 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
             return SDL_ICONV_ERROR;
         }
         if (*outbytesleft < n) {
+            /* see the ACP path: rewind so the caller's retry does not skip
+             * the code point this call already decoded */
+            const size_t consumed = (size_t)(*inbuf - before);
+            *inbuf = before;
+            *inbytesleft += consumed;
             return SDL_ICONV_E2BIG;
         }
         SDL_memcpy(*outbuf, enc, n);
@@ -1628,11 +1640,16 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
     while (inbytesleft > 0) {
         size_t inbytesleft_save = inbytesleft;
         size_t outbytesleft_save = outbytesleft;
-        const int retCode = SDL_iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
+        /* SDL_iconv returns size_t and the sentinels are (size_t)-1..-4, so
+         * keeping this in an int truncates them (and draws -Wsign-compare). */
+        const size_t retCode = SDL_iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
         if (retCode == SDL_ICONV_E2BIG) {
             const ptrdiff_t diff = outbuf - string;
             char *oldstring = string;
             stringsize = stringsize ? stringsize * 2 : 16;
+            /* The output can be wider than the input (UTF-8 to UTF-16 is 2x,
+             * UTF-32 is 4x) and the conversion resumes where it stopped, so
+             * one doubling is enough as long as the buffer keeps growing. */
             string = (char *)SDL_realloc(string, stringsize + sizeof(Uint32));
             if (!string) {
                 SDL_free(oldstring);

@@ -413,6 +413,24 @@ static void handle_size(SDL_Window *window, WPARAM wparam)
     }
 }
 
+/* Keep SDL_GetWindowDisplayScale() honest: the core reads window->display_scale
+ * and the other backends set it from their compositor's scale. Win32 gives us
+ * the window's own DPI (it follows the monitor the window is on), so the scale
+ * is dpi/96 -- which is what SDL3 ends up at through pixel density. */
+static void win32_update_display_scale(SDL_Window *window, Uint32 dpi)
+{
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data || !dpi) {
+        return;
+    }
+    data->dpi = dpi;
+    const float scale = (float)dpi / (float)USER_DEFAULT_SCREEN_DPI;
+    if (window->display_scale != scale) {
+        window->display_scale = scale;
+        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
+    }
+}
+
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     SDL_Window *window = window_from_hwnd(hwnd);
@@ -626,14 +644,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_DPICHANGED:
         if (window) {
-            SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
             const UINT dpi = HIWORD(wparam);
-            data->dpi = dpi;
             const RECT *suggest = (const RECT *)lparam;
             SetWindowPos(hwnd, NULL, suggest->left, suggest->top,
                          suggest->right - suggest->left, suggest->bottom - suggest->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
-            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, 0, 0);
+            win32_update_display_scale(window, dpi);
         }
         return 0;
 
@@ -676,6 +692,23 @@ static bool win32_register_class(void)
     }
     sdlop_win32.class_registered = true;
     return true;
+}
+
+/* SDL3 reports the desktop mode twice: the logical size (what the application
+ * draws in) and the pixel size. On a scaled display they differ, and the ratio
+ * is what SDL_GetWindowSizeInPixels() and SDL_GetWindowPixelDensity() use.
+ * Win32 hands us both: dmPels* is the physical size, and the primary monitor's
+ * logical size is the one GetSystemMetrics() reports with DPI awareness on. */
+static UINT win32_system_dpi(void)
+{
+    const UINT dpi = GetDpiForSystem();
+    return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
+}
+
+/* Pixel density for a monitor: physical pixels per logical unit. */
+static float win32_monitor_pixel_density(void)
+{
+    return (float)win32_system_dpi() / (float)USER_DEFAULT_SCREEN_DPI;
 }
 
 static void win32_add_displays(SDLop_VideoDevice *device)
@@ -722,11 +755,17 @@ static void win32_add_displays(SDLop_VideoDevice *device)
             mon->refresh_hz = dm.dmDisplayFrequency > 1 ? (int)dm.dmDisplayFrequency : 60;
             char name[128];
             SDL_snprintf(name, sizeof(name), "\\\\.\\DISPLAY%d", idx + 1);
+            /* AddDisplay takes the logical (DPI-independent) size; the
+             * driver's GetWindowSizeInPixels applies the density. */
+            const float density = win32_monitor_pixel_density();
+            const int logical_w = (int)SDL_lroundf((float)dm.dmPelsWidth / density);
+            const int logical_h = (int)SDL_lroundf((float)dm.dmPelsHeight / density);
             SDL_DisplayID id = SDLOP_AddDisplay(name,
-                                                (int)dm.dmPelsWidth, (int)dm.dmPelsHeight,
+                                                logical_w, logical_h,
                                                 mon->refresh_hz * 1000,
                                                 dm.dmPelsWidth >= dm.dmPelsHeight ? SDL_ORIENTATION_LANDSCAPE : SDL_ORIENTATION_PORTRAIT,
                                                 NULL, sdlop.init_done);
+            SDLOP_SetDisplayPixelDensity(id, density);
             mon->displayID = id;
             idx++;
         }
@@ -825,7 +864,7 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_OutOfMemory();
     }
     SDLOP_MUTEX_INIT_ONCE(&data->surfacelock);
-    data->dpi = (Uint32)GetDpiForSystem();
+    data->dpi = (Uint32)GetDpiForWindow(data->hwnd);
     window->driverdata = data;
 
     RECT rc = { 0, 0, window->w, window->h };

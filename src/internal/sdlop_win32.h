@@ -83,9 +83,14 @@ typedef intptr_t ssize_t;
 #define S_IXUSR _S_IEXEC
 #endif
 
-/* <strings.h> */
+/* <strings.h>. MinGW already declares strcasecmp/strncasecmp (as macros over
+ * _stricmp/_strnicmp when not in strict ISO mode), so redeclaring them here
+ * only drops the dllimport attribute and draws -Wattributes. Declare the ones
+ * it really lacks, which sdlop_win32_compat.c then defines. */
+#if !defined(__MINGW32__) && !defined(_MSC_VER)
 int strcasecmp(const char *a, const char *b);
 int strncasecmp(const char *a, const char *b, size_t n);
+#endif
 int wcscasecmp(const wchar_t *a, const wchar_t *b);
 int wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n);
 char *strcasestr(const char *haystack, const char *needle);
