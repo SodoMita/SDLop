@@ -153,7 +153,23 @@ int main(void)
 
     /* SDL_CaptureMouse(): while captured, Win32 keeps sending mouse messages
      * to the window even when the pointer leaves it -- which is what dragging
-     * outside the window needs. */
+     * outside the window needs.
+     *
+     * Capture requires this window to have focus, and focus is ambient: when
+     * ctest runs tests in parallel another test's window can own it. Claim it
+     * explicitly rather than inheriting whatever happens to be focused. */
+    {
+        HWND self = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                                 SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        int tries;
+        if (self) {
+            for (tries = 0; tries < 50 && GetForegroundWindow() != self; tries++) {
+                SetForegroundWindow(self);
+                SDL_PumpEvents();
+                SDL_Delay(10);
+            }
+        }
+    }
     CHECK(SDL_CaptureMouse(true), "SDL_CaptureMouse(true): %s", SDL_GetError());
     CHECK((window->flags & SDL_WINDOW_MOUSE_CAPTURE) != 0,
           "SDL_WINDOW_MOUSE_CAPTURE not set after SDL_CaptureMouse(true)");

@@ -531,6 +531,31 @@ static bool win32_run_hit_test(SDL_Window *window, LPARAM lparam, LRESULT *resul
 
 static void win32_handle_raw_keyboard(const RAWKEYBOARD *raw, Uint64 ts);
 
+/* Does the raw path own keyboard events right now?
+ *
+ * Both raw keyboard paths (SDL_HINT_WINDOWS_RAW_KEYBOARD and the raw input
+ * worker) publish keys, and WM_KEYDOWN publishes the same keys again. Exactly
+ * one of the two may deliver, or every release arrives twice -- measured:
+ * "UP Left Shift UP Left Shift" before this predicate existed.
+ *
+ * While text input is active the IME owns the keyboard: the raw path stands
+ * down for presses, so WM_KEY* is the one that must deliver. Both places ask
+ * this function so they cannot disagree -- an earlier version had the two
+ * conditions written separately and keys disappeared entirely.
+ *
+ * (Defined after the driver's own window_proc needs it, so it lives here as a
+ * forward-declared helper next to the raw keyboard code.) */
+static bool win32_raw_keyboard_owns_keys(void)
+{
+    if (!(SDLOP_RawInputIsSource() || sdlop_win32.raw_keyboard_registered)) {
+        return false;
+    }
+    if (sdlop.keyboard_focus && sdlop.keyboard_focus->text_input_active) {
+        return false;
+    }
+    return true;
+}
+
 /* RIDEV_INPUTSINK requires a real hwndTarget -- the API rejects NULL with
  * ERROR_INVALID_PARAMETER, for the mouse as well as the keyboard. Background
  * input therefore needs a window of its own, and a message-only window is the
@@ -786,12 +811,14 @@ static void win32_handle_raw_keyboard(const RAWKEYBOARD *raw, Uint64 ts)
         code = SDLOP_Win32ScancodeFromScan((Uint16)((raw->Flags & RI_KEY_E0) ? (rawcode | 0xE000) : rawcode));
     }
 
+    if (!win32_raw_keyboard_owns_keys()) {
+        return; /* WM_KEY* delivers these instead */
+    }
     if (down) {
         SDL_Window *focus = sdlop.keyboard_focus;
-        /* With RIDEV_INPUTSINK the packets arrive unfocused on purpose; while
-         * text input is active the IME owns the keyboard, so leave the keys
-         * to WM_KEYDOWN. */
-        if ((!sdlop_win32.raw_keyboard_inputsink && !focus) || (focus && focus->text_input_active)) {
+        /* With RIDEV_INPUTSINK the packets arrive unfocused on purpose; without
+         * it, only deliver while one of our windows has the keyboard. */
+        if (!sdlop_win32.raw_keyboard_inputsink && !focus) {
             return;
         }
     }
@@ -853,6 +880,19 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             Uint16 scan_code = 0;
             const SDL_Scancode sc = scancode_from_msg(&m, &scan_code);
             const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
+            /* The same physical key arrives here *and* as a raw packet when
+             * either raw keyboard path is on (SDL_HINT_WINDOWS_RAW_KEYBOARD,
+             * or the raw input worker). Delivering both sent every release
+             * twice -- measured: "UP Left Shift UP Left Shift". The raw path
+             * owns the keys in that case, as it does for the mouse. */
+            if (win32_raw_keyboard_owns_keys()) {
+                /* System keys still need DefWindowProc (menu activation,
+                 * Alt+F4), which the fall-through below handles. */
+                if (msg != WM_SYSKEYDOWN && msg != WM_SYSKEYUP) {
+                    return 0;
+                }
+                break;
+            }
             if (sc != SDL_SCANCODE_UNKNOWN) {
                 /* the rawcode packs the virtual-key code (high byte) with the
                  * hardware scancode (low byte); the core needs the VK to
