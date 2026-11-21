@@ -15,6 +15,7 @@
 */
 
 #include "internal/sdlop_internal.h"
+#include "internal/sdlop_win32_keymap.h"
 
 #ifdef _WIN32
 
@@ -500,7 +501,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             const SDL_Scancode sc = scancode_from_msg(&m);
             const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
             if (sc != SDL_SCANCODE_UNKNOWN) {
-                const Uint16 raw = (Uint16)((lparam >> 16) & 0xFF);
+                /* the rawcode packs the virtual-key code (high byte) with the
+                 * hardware scancode (low byte); the core needs the VK to
+                 * translate the key */
+                const Uint16 raw = SDLOP_WIN32_RAWCODE(wparam, (lparam >> 16) & 0xFF);
                 const Uint64 ts = SDLOP_Win32Timestamp();
                 const bool repeat = (lparam & (1 << 30)) != 0;
                 SDLOP_SendKeyboardKey(down, repeat, sc, raw, ts);
