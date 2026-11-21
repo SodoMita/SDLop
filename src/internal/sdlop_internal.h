@@ -477,6 +477,10 @@ bool SDLOP_GetStringBoolean(const char *value, bool default_value); /* SDL3's SD
    (SDL_HINT_OVERRIDE beats the environment). Unset/empty -> default_value;
    0/false/off/no -> false; anything else -> true. */
 bool SDLOP_HintFlag(const char *name, bool default_value);
+/* first non-empty SDL_GetHint() of a NULL-terminated name list (each name:
+ * override hint > environment > hint), e.g. a per-API option before the
+ * global one */
+const char *SDLOP_HintFirst(const char *const *names);
 void SDLOP_SendSimpleEvent(SDL_EventType type);  /* type + timestamp only */
 const char *SDLOP_GetExeName(void);  /* basename of /proc/self/exe or NULL */
 const char *SDLOP_GetAppID(void);    /* SDL3 SDL_GetAppID() for WM_CLASS / xdg app_id */

@@ -624,13 +624,9 @@ static const char *const vk_offload_extensions[] = {
 
 SDLOP_VulkanOffloadPolicy SDLOP_VulkanOffload_GetPolicy(void)
 {
-    const char *v = getenv("SDLOP_VULKAN_OFFLOAD");
-    if (!v || !*v) {
-        v = getenv("SDLOP_VK_OFFLOAD");
-    }
-    if (!v || !*v) {
-        v = getenv("SDLOP_OFFLOAD");
-    }
+    /* SDL_SetHint or the environment; the Vulkan options before the global one */
+    static const char *const names[] = { SDLOP_HINT_VULKAN_OFFLOAD, SDLOP_HINT_VK_OFFLOAD, SDLOP_HINT_OFFLOAD, NULL };
+    const char *v = SDLOP_HintFirst(names);
     if (!v || !*v || strcasecmp(v, "auto") == 0) {
         return SDLOP_VK_OFFLOAD_AUTO;
     }

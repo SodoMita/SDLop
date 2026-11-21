@@ -292,6 +292,17 @@ bool SDLOP_HintFlag(const char *name, bool default_value)
     return true;
 }
 
+const char *SDLOP_HintFirst(const char *const *names)
+{
+    for (; names && *names; names++) {
+        const char *value = SDL_GetHint(*names);
+        if (value && *value) {
+            return value;
+        }
+    }
+    return NULL;
+}
+
 bool SDL_GetHintBoolean(const char *name, bool default_value)
 {
     return SDLOP_GetStringBoolean(SDL_GetHint(name), default_value);

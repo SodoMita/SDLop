@@ -167,10 +167,9 @@ static struct
 
 SDLOP_GLOffloadPolicy SDLOP_GLOffload_GetPolicy(void)
 {
-    const char *v = getenv("SDLOP_GL_OFFLOAD");
-    if (!v || !*v) {
-        v = getenv("SDLOP_OFFLOAD");
-    }
+    /* SDL_SetHint or the environment; the GL option before the global one */
+    static const char *const names[] = { SDLOP_HINT_GL_OFFLOAD, SDLOP_HINT_OFFLOAD, NULL };
+    const char *v = SDLOP_HintFirst(names);
     if (!v || !*v || strcasecmp(v, "auto") == 0) {
         return SDLOP_GL_OFFLOAD_AUTO;
     }

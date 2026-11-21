@@ -767,6 +767,11 @@ if (SDLop_BUILD_TOOLS AND NOT EMSCRIPTEN)
   endif()
 endif()
 
+# Options gate: SDLOP_* options are read through hints (settable from code)
+if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  add_test(NAME options_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/options_check.sh ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 # Export gate: every function declared in include/SDL3 is exported by the
 # shared library and nothing undeclared is exported.
 if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)

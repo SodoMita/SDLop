@@ -179,8 +179,7 @@ static bool kmsdrm_can_try_prime(KMSDRM_DeviceData *dev)
     if (kmsdrm_prime_disabled || !dev || dev->drm_fd < 0) {
         return false;
     }
-    const char *env = getenv("SDLOP_GL_OFFLOAD_PRIME");
-    if (env && strcmp(env, "0") == 0) {
+    if (!SDLOP_HintFlag(SDLOP_HINT_GL_OFFLOAD_PRIME, true)) {
         return false;
     }
     if (!SDLOP_GLOffload_HasGBM() || !SDLOP_GBM_Available() ||

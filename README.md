@@ -147,6 +147,8 @@ false, anything else true.
 | `SDLOP_X11_NO_SHM`, `_NO_RENDER`, `_NO_TOUCH` | don't use MIT-SHM / XRender / XInput2 touch |
 | `SDLOP_X11_RELATIVE_WARP` | relative mode by warping instead of XInput2 raw motion |
 | `SDLOP_X11_EGL_PLATFORM` | `x11` skips the EGL xcb platform |
+| `SDLOP_OFFLOAD`, `SDLOP_GL_OFFLOAD`, `SDLOP_VULKAN_OFFLOAD` (`SDLOP_VK_OFFLOAD`) | GPU offload policy: `auto` (default), `0`/`off`, `1`/`force`; the per-API option wins (see Notes) |
+| `SDLOP_GL_OFFLOAD_PRIME` | kmsdrm: `0` copies offloaded GL frames instead of PRIME scan-out |
 | `SDLOP_WAYLAND_NO_VIEWPORTER` | Wayland: don't use `wp_viewporter` (clear colour as a filled full-size buffer) |
 | `SDL_VIDEO_FORCE_EGL` (`SDL_HINT_VIDEO_FORCE_EGL`) | X11: all contexts (desktop GL and GLES) through EGL instead of GLX (stock SDL3 hint) |
 | `SDL_OPENGL_ES_DRIVER` (`SDL_HINT_OPENGL_ES_DRIVER`) | X11: GLES contexts through EGL instead of GLX (stock SDL3 hint) |
@@ -547,6 +549,8 @@ Highlights:
   Configure via `SDLOP_OFFLOAD` (global default: `auto`, `0`/`off`/`false`/`no`,
   or `1`/`on`/`true`/`yes`/`force`), overridden per API by
   `SDLOP_GL_OFFLOAD` and `SDLOP_VULKAN_OFFLOAD` (or `SDLOP_VK_OFFLOAD`).
+  Like every SDLop option these are also hints: `SDL_SetHint(SDLOP_HINT_GL_OFFLOAD, "0")`
+  etc. (environment over a normal hint, `SDL_HINT_OVERRIDE` over both).
 - `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
   content yet. If a window surface exists, it fills the surface and presents
   it (X11 and Wayland).

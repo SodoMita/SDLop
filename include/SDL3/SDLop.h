@@ -63,6 +63,12 @@
 #define SDLOP_HINT_X11_NO_SHM            "SDLOP_X11_NO_SHM"        /**< bool: do not use MIT-SHM */
 #define SDLOP_HINT_X11_NO_TOUCH          "SDLOP_X11_NO_TOUCH"      /**< bool: no XInput2 touch */
 #define SDLOP_HINT_X11_RELATIVE_WARP     "SDLOP_X11_RELATIVE_WARP" /**< bool: relative mode by warping instead of XInput2 raw motion */
+/* GPU offload (headless GPU rendering presented through the window framebuffer) */
+#define SDLOP_HINT_OFFLOAD               "SDLOP_OFFLOAD"           /**< default offload policy for GL and Vulkan: "auto" (default), "0"/"off"/"false"/"no", "1"/"on"/"true"/"yes"/"force" */
+#define SDLOP_HINT_GL_OFFLOAD            "SDLOP_GL_OFFLOAD"        /**< OpenGL offload policy (same values); wins over SDLOP_OFFLOAD. Read when a GL context/window is set up */
+#define SDLOP_HINT_VULKAN_OFFLOAD        "SDLOP_VULKAN_OFFLOAD"    /**< Vulkan offload policy (same values); wins over SDLOP_VK_OFFLOAD and SDLOP_OFFLOAD. Read when Vulkan is loaded / queried */
+#define SDLOP_HINT_VK_OFFLOAD            "SDLOP_VK_OFFLOAD"        /**< alias of SDLOP_VULKAN_OFFLOAD (lower precedence) */
+#define SDLOP_HINT_GL_OFFLOAD_PRIME      "SDLOP_GL_OFFLOAD_PRIME"  /**< bool: kmsdrm: scan out offloaded GL frames via PRIME import (default on; "0" copies through dumb buffers) */
 /* Wayland */
 #define SDLOP_HINT_WAYLAND_NO_VIEWPORTER "SDLOP_WAYLAND_NO_VIEWPORTER" /**< bool: do not use wp_viewporter (the clear colour is then a filled full-size buffer); read at video init */
 /* kmsdrm */
