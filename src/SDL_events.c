@@ -704,11 +704,10 @@ void SDL_PumpEvents(void)
     SDLOP_FreeTemporaryMemory(); /* memory of previously polled events */
     run_main_callbacks(false);
 
-    /* 1. drain raw input ring -> SDL events (POSIX evdev only: Windows
-     * receives its input as window messages in step 2) */
-#ifndef _WIN32
+    /* 1. drain raw input ring -> SDL events. The ring is fed by the evdev
+     * worker on Linux and by the Raw Input worker on Windows (both opt-in
+     * there); with neither running this is a no-op. */
     SDLOP_RawInputPump();
-#endif
 
     /* 2. drain window system (non-blocking) */
     if (sdlop.video) {

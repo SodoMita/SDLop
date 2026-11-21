@@ -849,7 +849,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             if (!(window->flags & SDL_WINDOW_MOUSE_FOCUS)) {
                 set_mouse_focus(window, true);
             }
-            send_mouse_motion(&m, false);
+            /* With the raw input worker running it is the single source of
+             * pointer events (SDLOP_RAW_INPUT=1); letting this through too
+             * would deliver every movement twice. SDLop takes the same
+             * position on Linux: either the raw path supplies input or the
+             * window system does, never both. */
+            if (!SDLOP_RawInputIsSource()) {
+                send_mouse_motion(&m, false);
+            }
         }
         return 0;
     case WM_LBUTTONDOWN:
@@ -866,7 +873,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_XBUTTONDBLCLK:
         if (window) {
             SetFocus(hwnd);
-            send_mouse_button(&m);
+            if (!SDLOP_RawInputIsSource()) {
+                send_mouse_button(&m);
+            }
             if (msg == WM_XBUTTONUP || msg == WM_XBUTTONDOWN || msg == WM_XBUTTONDBLCLK) {
                 return TRUE; /* XBUTTON results must be returned */
             }
@@ -875,7 +884,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL: {
-        if (window) {
+        /* same single-source rule as motion and buttons */
+        if (window && !SDLOP_RawInputIsSource()) {
             const short delta = GET_WHEEL_DELTA_WPARAM(wparam);
             /* SDL units are "lines" (+away from the user); one notch is
              * WHEEL_DELTA and maps to 1.0 */

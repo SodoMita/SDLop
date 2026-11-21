@@ -200,10 +200,15 @@ static bool subsystem_init(SDL_InitFlags flags)
             SDL_ClearError();
         }
 #else
-        /* Windows gets its keys through the window messages; there is no
-         * evdev worker and no xkb keymap to load. */
+        /* Windows gets its keys through the window messages by default; the
+         * raw input worker is opt-in (SDLOP_RAW_INPUT=1) and, when on, feeds
+         * the same rings the evdev worker does. There is no xkb keymap. */
         if (!SDLOP_VideoInit()) {
             return false;
+        }
+        if (!SDLOP_RawInputInit()) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_INPUT, "SDLop raw input unavailable: %s", SDL_GetError());
+            SDL_ClearError();
         }
 #endif
     }
@@ -213,9 +218,9 @@ static bool subsystem_init(SDL_InitFlags flags)
 static void subsystem_quit(SDL_InitFlags flags)
 {
     if (flags & SDL_INIT_VIDEO) {
-#ifndef _WIN32
+        /* the evdev worker on Linux, the Raw Input worker on Windows; a no-op
+         * when neither was started */
         SDLOP_RawInputQuit();
-#endif
         SDLOP_VideoQuit();
         SDLOP_KeyboardQuit();
         SDLOP_DevicesQuit();
