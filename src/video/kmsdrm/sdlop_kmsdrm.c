@@ -60,6 +60,8 @@
 #include "sdlop_kmsdrm.h"
 #include "internal/sdlop_vt.h"
 #include "sdlop_xcursor.h"
+#include "../sdlop_gl_offload.h"
+#include "../sdlop_vk_offload.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -2154,6 +2156,29 @@ static bool kmsdrm_present_sw(KMSDRM_DeviceData *vid, SDL_Window *window)
     return ok;
 }
 
+bool KMSDRM_EnsureSwScanout(SDL_Window *window)
+{
+    KMSDRM_WindowData *windata = window ? (KMSDRM_WindowData *)window->driverdata : NULL;
+    if (!windata || !windata->display) {
+        return SDL_SetError("Invalid window");
+    }
+    if (windata->sw_active) {
+        return true;
+    }
+    KMSDRM_DisplayData *dd = windata->display;
+    if (!kmsdrm_create_dumb(&kmsdrm, windata, dd->mode.hdisplay, dd->mode.vdisplay)) {
+        return false;
+    }
+    kmsdrm_fill_sw(windata, dd->mode.hdisplay, dd->mode.vdisplay, windata->clear_color);
+    windata->crtc_programmed = false;
+    return true;
+}
+
+bool KMSDRM_PresentSw(KMSDRM_DeviceData *vid, SDL_Window *window)
+{
+    return kmsdrm_present_sw(vid ? vid : &kmsdrm, window);
+}
+
 static void kmsdrm_destroy_surfaces(KMSDRM_DeviceData *vid, SDL_Window *window)
 {
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
@@ -2166,7 +2191,7 @@ static void kmsdrm_destroy_surfaces(KMSDRM_DeviceData *vid, SDL_Window *window)
     }
 
     /* GL side */
-    if (windata->gs) {
+    if (windata->gs || windata->gl_offload_active) {
         KMSDRM_DestroyGLSurfaces(windata);
     }
 
@@ -2201,6 +2226,36 @@ bool KMSDRM_RecreateScanout(SDLop_VideoDevice *device, SDL_Window *window,
     uint32_t w = mode->hdisplay, h = mode->vdisplay;
 
     if (windata->gl_active) {
+        if (windata->gl_offload_active) {
+            if (windata->gl_offload_prime) {
+                void *saved_ctx = windata->gl_offload_ctx;
+                KMSDRM_DestroyGLSurfaces(windata);
+                windata->gl_active = true;
+                windata->gl_offload_active = true;
+                windata->gl_offload_prime = true;
+                windata->gl_offload_ctx = saved_ctx;
+                windata->egl_surface_dirty = true;
+                KMSDRM_DeferEvent(window, KMSDRM_DEFER_SIZE);
+                return true;
+            }
+            if (!kmsdrm_create_dumb(vid, windata, w, h)) {
+                return false;
+            }
+            windata->crtc_programmed = false;
+            if (windata->gl_offload_surface && windata->gl_offload_ctx) {
+                if (!SDLOP_GLOffload_ResizeSurface(
+                        (SDLOP_GLOffloadContext *)windata->gl_offload_ctx,
+                        (SDLOP_GLOffloadSurface **)&windata->gl_offload_surface,
+                        (int)w, (int)h)) {
+                    return false;
+                }
+                windata->egl_surface_dirty = false;
+            } else {
+                windata->egl_surface_dirty = true;
+            }
+            KMSDRM_DeferEvent(window, KMSDRM_DEFER_SIZE);
+            return true;
+        }
         /* mode-sized GBM/EGL scanout is stale; drop it and let the GL
          * swap path recreate it at the new size */
         if (windata->waiting_for_flip) {
@@ -3216,11 +3271,25 @@ static bool kmsdrm_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     if (!windata || !dd) {
         return SDL_SetError("Invalid window");
     }
-    if (window->flags & SDL_WINDOW_VULKAN) {
+    if ((window->flags & SDL_WINDOW_VULKAN) && !SDLOP_VulkanOffload_IsActive()) {
         return SDL_SetError("Vulkan is active: window surface is not presentable");
     }
     if (windata->gl_active) {
         return SDL_SetError("OpenGL is active: window surface is not presentable");
+    }
+    if ((window->flags & SDL_WINDOW_VULKAN) && !windata->sw_active) {
+        if (!kmsdrm_ensure_master(&kmsdrm)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO,
+                        "KMSDRM: cannot re-acquire DRM master on %s; modesetting will fail",
+                        kmsdrm.devpath);
+        }
+        bool fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
+        dd->mode = kmsdrm_select_mode_for_window(window, dd, fullscreen);
+        if (!KMSDRM_EnsureSwScanout(window)) {
+            return false;
+        }
+        window->w = (int)dd->mode.hdisplay;
+        window->h = (int)dd->mode.vdisplay;
     }
     if (!windata->sw_active) {
         return SDL_SetError("Software framebuffer is not available");
@@ -3245,7 +3314,7 @@ static bool kmsdrm_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
     if (!windata) {
         return SDL_SetError("Invalid window");
     }
-    if (window->flags & SDL_WINDOW_VULKAN) {
+    if ((window->flags & SDL_WINDOW_VULKAN) && !SDLOP_VulkanOffload_IsActive()) {
         return SDL_SetError("Vulkan is active: window surface is not presentable");
     }
     if (windata->gl_active) {
@@ -3257,6 +3326,10 @@ static bool kmsdrm_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window
 static void kmsdrm_DestroyWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
+    if (window->surface) {
+        SDL_DestroySurface(window->surface);
+        window->surface = NULL;
+    }
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
     if (windata) {
         kmsdrm_destroy_dumb(&kmsdrm, windata);

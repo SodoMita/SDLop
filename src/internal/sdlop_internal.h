@@ -440,10 +440,20 @@ typedef struct SDLOP_GLAttributes
     int release_behavior;   /* SDL_GL_CONTEXT_RELEASE_BEHAVIOR, default FLUSH */
     int reset_notification; /* SDL_GL_CONTEXT_RESET_NOTIFICATION, default NO_NOTIFICATION */
     int no_error;           /* SDL_GL_CONTEXT_NO_ERROR */
+    int accelerated_visual; /* -1 = unset/auto, 0 = software, 1 = hardware */
 } SDLOP_GLAttributes;
 
 extern SDLOP_GLAttributes sdlop_glattrs;
 SDL_GLContext SDLOP_GL_CurrentContext(void);
+void SDLOP_GL_NotifyWindowResized(SDL_Window *window);
+void SDLOP_GL_NotifyWindowDestroyed(SDL_Window *window);
+void SDLOP_GL_Quit(void);
+bool SDLOP_GL_CanCreateWindow(void);
+
+/* Vulkan offload cleanup hooks (SDL_vulkan.c) */
+void SDLOP_Vulkan_NotifyWindowDestroyed(SDL_Window *window);
+void SDLOP_Vulkan_Quit(void);
+bool SDLOP_Vulkan_CanCreateWindow(void);
 
 /* Surface helpers (SDL_surface.c) */
 int SDLOP_BytesPerPixel(SDL_PixelFormat format);

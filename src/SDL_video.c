@@ -88,6 +88,8 @@ void SDLOP_VideoQuit(void)
     while (sdlop.windows) {
         SDL_DestroyWindow(sdlop.windows);
     }
+    SDLOP_GL_Quit();
+    SDLOP_Vulkan_Quit();
     SDLOP_MouseQuit(); /* cursors hold driver resources */
     sdlop.grabbed_window = NULL;
     sdlop.keyboard_grabbed_elsewhere = false;
@@ -774,11 +776,11 @@ SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
         SDL_SetError("Metal support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
         return NULL;
     }
-    if ((flags & SDL_WINDOW_OPENGL) && !sdlop.video->GL_CreateContext) {
+    if ((flags & SDL_WINDOW_OPENGL) && !SDLOP_GL_CanCreateWindow()) {
         SDL_SetError("OpenGL support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
         return NULL;
     }
-    if ((flags & SDL_WINDOW_VULKAN) && !sdlop.video->Vulkan_CreateSurface) {
+    if ((flags & SDL_WINDOW_VULKAN) && !SDLOP_Vulkan_CanCreateWindow()) {
         SDL_SetError("Vulkan support is either not configured in SDL or not available in current SDL video driver (%s) or platform", sdlop.video->name);
         return NULL;
     }
@@ -923,6 +925,8 @@ void SDL_DestroyWindow(SDL_Window *window)
     if (SDL_GL_GetCurrentWindow() == window) {
         SDL_GL_MakeCurrent(window, NULL);
     }
+    SDLOP_GL_NotifyWindowDestroyed(window);
+    SDLOP_Vulkan_NotifyWindowDestroyed(window);
     if (window->surface) {
         /* drivers that own the pixel storage null this out themselves;
          * otherwise (dummy RAM buffers) free it here */
@@ -1022,10 +1026,14 @@ bool SDL_SetWindowSize(SDL_Window *window, int w, int h)
     }
     window->w = w;
     window->h = h;
+    bool ok = true;
     if (sdlop.video && sdlop.video->SetWindowSize) {
-        return sdlop.video->SetWindowSize(sdlop.video, window);
+        ok = sdlop.video->SetWindowSize(sdlop.video, window);
     }
-    return true;
+    if (ok) {
+        SDLOP_GL_NotifyWindowResized(window);
+    }
+    return ok;
 }
 
 bool SDL_GetWindowSize(SDL_Window *window, int *w, int *h)

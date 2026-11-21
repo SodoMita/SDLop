@@ -30,7 +30,7 @@ jobs:
             libwayland-dev libwayland-bin wayland-protocols \
             libxkbcommon-dev libxkbcommon-x11-dev \
             libegl-dev libgbm-dev libdrm-dev libgles-dev \
-            libvulkan-dev mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri \
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers libegl-mesa0 libgl1-mesa-dri \
             libxcb1-dev libxcb-shm0-dev libxcb-xkb-dev libxcb-xinput-dev \
             libxcb-randr0-dev libxcb-render0-dev libxcb-xtest0-dev libx11-6 \
             xkb-data libx11-data x11-xkb-utils \
