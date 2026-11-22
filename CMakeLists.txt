@@ -461,6 +461,17 @@ if(SDLop_BUILD_EXAMPLES)
 
     add_executable(vulkan_stress examples/vulkan_stress.c)
     target_link_libraries(vulkan_stress PRIVATE sdlop Vulkan::Vulkan m)
+
+    # Same stress scene against a stock SDL3 build, for direct comparison.
+    # The reference SDL3 must be built with Vulkan enabled; CI's headless
+    # reference intentionally is not, so this target is not exercised there.
+    if (SDL3_REFERENCE_INCLUDE AND SDL3_REFERENCE_LIB)
+      add_executable(vulkan_stress_sdl3 examples/vulkan_stress.c)
+      target_include_directories(vulkan_stress_sdl3 BEFORE PRIVATE ${SDL3_REFERENCE_INCLUDE})
+      target_link_libraries(vulkan_stress_sdl3 PRIVATE ${SDL3_REFERENCE_LIB} Vulkan::Vulkan m)
+      get_filename_component(_sdl3_ref_lib_dir ${SDL3_REFERENCE_LIB} DIRECTORY)
+      set_target_properties(vulkan_stress_sdl3 PROPERTIES BUILD_RPATH ${_sdl3_ref_lib_dir})
+    endif()
   else()
     message(STATUS "Vulkan not found - skipping Vulkan examples")
   endif()
