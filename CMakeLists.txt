@@ -604,6 +604,13 @@ if(SDLop_BUILD_TESTS)
       set_tests_properties(test_x11_clipboard test_x11_clipboard_noxfixes PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
       set_tests_properties(test_x11_clipboard_noxfixes PROPERTIES ENVIRONMENT "SDLOP_LIB_XCB_XFIXES=none")
       # XDND drag-and-drop target against a raw xcb drag source
+      add_executable(test_x11_hittest tests/test_x11_hittest.c)
+      target_link_libraries(test_x11_hittest PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+      target_include_directories(test_x11_hittest PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_hittest PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_hittest COMMAND test_x11_hittest)
+      set_tests_properties(test_x11_hittest PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
       add_executable(test_x11_dnd tests/test_x11_dnd.c)
       target_link_libraries(test_x11_dnd PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
       target_include_directories(test_x11_dnd PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})

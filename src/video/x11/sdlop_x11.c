@@ -90,6 +90,8 @@ typedef union X11Event32
     X(_NET_WM_STATE_SKIP_TASKBAR)         \
     X(_NET_WM_STATE_SKIP_PAGER)           \
     X(_NET_WM_STATE_MODAL)                \
+    X(_NET_WM_MOVERESIZE)                 \
+    X(_GTK_SHOW_WINDOW_MENU)              \
     X(_NET_WM_STATE_DEMANDS_ATTENTION)    \
     X(_NET_WM_WINDOW_TYPE)                \
     X(_NET_WM_WINDOW_TYPE_NORMAL)         \
@@ -155,6 +157,10 @@ typedef struct X11WindowData
     bool want_grab;               /* relative mode: pointer grab pending */
     bool mouse_grab;              /* SDL_SetWindowMouseGrab: confine wanted */
     bool keyboard_grab;           /* SDL_SetWindowKeyboardGrab: grab wanted */
+
+    int hit_test_result;          /* SDL_HitTestResult under the pointer */
+    bool pending_move;            /* hit-test drag started while unfocused (stock) */
+    int16_t pending_move_x, pending_move_y; /* root coordinates of that press */
 } X11WindowData;
 
 typedef struct X11Monitor
@@ -209,6 +215,7 @@ typedef struct X11DeviceData
 
     xcb_cursor_t blank_cursor;
     xcb_cursor_t current_cursor;  /* what SDL wants shown (blank when hidden) */
+    xcb_cursor_t hit_test_cursors[SDL_HITTEST_RESIZE_LEFT + 1]; /* resize areas, created on demand */
     struct sdlop_xcursor_theme *cursor_theme;
     bool cursor_theme_tried;
     bool render_checked;
@@ -1267,6 +1274,10 @@ static void warp_to_center(SDL_Window *window)
     X11_xcb_warp_pointer(x11.conn, XCB_WINDOW_NONE, wd->xid, 0, 0, 0, 0, (int16_t)x11.warp_cx, (int16_t)x11.warp_cy);
 }
 
+static void update_hit_test(SDL_Window *window, int x, int y, bool force);
+static bool trigger_hit_test(SDL_Window *window, int16_t root_x, int16_t root_y);
+static void send_moveresize(SDL_Window *window, int16_t root_x, int16_t root_y, uint32_t direction);
+
 static void handle_motion(xcb_motion_notify_event_t *mev)
 {
     SDL_Window *window = window_from_xid(mev->event);
@@ -1293,6 +1304,7 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
         window->flags |= SDL_WINDOW_MOUSE_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
     }
+    update_hit_test(window, mev->event_x, mev->event_y, false);
     if (SDLOP_RawInputIsSource()) {
         /* evdev sends the motion; the server's pointer only re-anchors the
            absolute position evdev's relative deltas are added to */
@@ -1346,6 +1358,10 @@ static void handle_button(xcb_button_press_event_t *bev, bool down)
     }
     if (down && x11.relative_window == window && x11.pointer_grabbed == false && wdata(window)->want_grab) {
         grab_pointer(window);
+    }
+    if (down && button == SDL_BUTTON_LEFT && x11.relative_window != window &&
+        trigger_hit_test(window, bev->root_x, bev->root_y)) {
+        return; /* not passed on to the app (stock) */
     }
     if (raw_source) {
         return;
@@ -1960,6 +1976,11 @@ static void x11_Quit(SDLop_VideoDevice *device)
     if (x11.conn) {
         if (x11.blank_cursor) {
             X11_xcb_free_cursor(x11.conn, x11.blank_cursor);
+        }
+        for (size_t i = 0; i < SDL_arraysize(x11.hit_test_cursors); i++) {
+            if (x11.hit_test_cursors[i]) {
+                X11_xcb_free_cursor(x11.conn, x11.hit_test_cursors[i]);
+            }
         }
         if (x11.cursor_theme) {
             sdlop_xcursor_theme_destroy(x11.cursor_theme);
@@ -3129,6 +3150,127 @@ static void x11_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
     cursor->internal = NULL;
 }
 
+/* the cursor a window shows: blank in relative mode, a resize cursor over
+ * SDL_HITTEST_RESIZE_* areas (stock), else SDL's current cursor */
+static uint32_t window_cursor(SDL_Window *window)
+{
+    static const SDL_SystemCursor ids[] = {
+        SDL_SYSTEM_CURSOR_NW_RESIZE, SDL_SYSTEM_CURSOR_N_RESIZE, SDL_SYSTEM_CURSOR_NE_RESIZE,
+        SDL_SYSTEM_CURSOR_E_RESIZE,  SDL_SYSTEM_CURSOR_SE_RESIZE, SDL_SYSTEM_CURSOR_S_RESIZE,
+        SDL_SYSTEM_CURSOR_SW_RESIZE, SDL_SYSTEM_CURSOR_W_RESIZE
+    };
+    X11WindowData *wd = wdata(window);
+    if (x11.relative_window == window) {
+        return x11.blank_cursor;
+    }
+    const int rc = wd ? wd->hit_test_result : SDL_HITTEST_NORMAL;
+    if (window->hit_test && x11.current_cursor != x11.blank_cursor && rc >= SDL_HITTEST_RESIZE_TOPLEFT &&
+        rc <= SDL_HITTEST_RESIZE_LEFT) {
+        if (!x11.hit_test_cursors[rc]) {
+            x11.hit_test_cursors[rc] = create_system_cursor(ids[rc - SDL_HITTEST_RESIZE_TOPLEFT]);
+        }
+        if (x11.hit_test_cursors[rc]) {
+            return x11.hit_test_cursors[rc];
+        }
+    }
+    return x11.current_cursor;
+}
+
+static void update_hit_test(SDL_Window *window, int x, int y, bool force)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd || !window->hit_test || (!force && SDL_GetMouseState(NULL, NULL) != 0)) {
+        return;
+    }
+    const SDL_Point p = { x, y };
+    const int rc = (int)window->hit_test(window, &p, window->hit_test_data);
+    if (rc != wd->hit_test_result || force) {
+        wd->hit_test_result = rc;
+        uint32_t v = window_cursor(window);
+        X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &v);
+    }
+}
+
+/* EWMH interactive move / resize by the WM, which needs the pointer
+ * (implicit grab of the press included) released first (stock) */
+static void send_moveresize(SDL_Window *window, int16_t root_x, int16_t root_y, uint32_t direction)
+{
+    X11WindowData *wd = wdata(window);
+    X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
+    x11.pointer_grabbed = false;
+    x11.confine_window = x11.capture_window = NULL; /* re-confined on the next focus */
+    send_client_message(wd->xid, x11.atom._NET_WM_MOVERESIZE, (uint32_t)root_x, (uint32_t)root_y, direction,
+                        1 /* button */, 1 /* source: application */);
+    x11_flush();
+}
+
+#define NET_WM_MOVERESIZE_MOVE 8
+
+/* a left press on a draggable / resize area: the WM takes over */
+static bool trigger_hit_test(SDL_Window *window, int16_t root_x, int16_t root_y)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd || !window->hit_test) {
+        return false;
+    }
+    if (wd->hit_test_result == SDL_HITTEST_DRAGGABLE) {
+        /* some WMs get confused by a move racing the click-to-focus of the
+         * same press: wait for the focus (stock) */
+        if (window->flags & SDL_WINDOW_INPUT_FOCUS) {
+            send_moveresize(window, root_x, root_y, NET_WM_MOVERESIZE_MOVE);
+        } else {
+            wd->pending_move = true;
+            wd->pending_move_x = root_x;
+            wd->pending_move_y = root_y;
+        }
+        return true;
+    }
+    if (wd->hit_test_result >= SDL_HITTEST_RESIZE_TOPLEFT && wd->hit_test_result <= SDL_HITTEST_RESIZE_LEFT) {
+        /* _NET_WM_MOVERESIZE_SIZE_TOPLEFT (0) .. _SIZE_LEFT (7): SDL's order */
+        send_moveresize(window, root_x, root_y, (uint32_t)(wd->hit_test_result - SDL_HITTEST_RESIZE_TOPLEFT));
+        return true;
+    }
+    return false;
+}
+
+static bool x11_SetWindowHitTest(SDLop_VideoDevice *device, SDL_Window *window, bool enabled)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (wd) {
+        wd->hit_test_result = SDL_HITTEST_NORMAL;
+        wd->pending_move = false;
+        if (enabled && sdlop.mouse_focus == window && sdlop.mouse_has_position) {
+            update_hit_test(window, (int)sdlop.mouse_x, (int)sdlop.mouse_y, true);
+        }
+        uint32_t v = window_cursor(window);
+        X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &v);
+        x11_flush();
+    }
+    return true;
+}
+
+/* the WM's window menu (GTK protocol, understood by mutter, KWin, xfwm4,
+ * openbox ...; stock) at window coordinates x, y */
+static void x11_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *window, int x, int y)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return;
+    }
+    int rx = x, ry = y;
+    xcb_translate_coordinates_reply_t *tr = X11_xcb_translate_coordinates_reply(
+        x11.conn, X11_xcb_translate_coordinates(x11.conn, wd->xid, x11.root, (int16_t)x, (int16_t)y), NULL);
+    if (tr) {
+        rx = tr->dst_x;
+        ry = tr->dst_y;
+        free(tr);
+    }
+    send_client_message(wd->xid, x11.atom._GTK_SHOW_WINDOW_MENU, 0 /* device */, (uint32_t)rx, (uint32_t)ry, 0, 0);
+    x11_flush();
+}
+
 static bool x11_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
 {
     (void)device;
@@ -3139,7 +3281,7 @@ static bool x11_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
         if (!wd) {
             continue;
         }
-        uint32_t v = (x11.relative_window == w) ? x11.blank_cursor : c;
+        uint32_t v = window_cursor(w);
         X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &v);
     }
     x11_flush();
@@ -3346,6 +3488,9 @@ static void x11_dispatch(xcb_generic_event_t *ev)
             sdlop.mouse_has_position = false;
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
         }
+        if (x11.relative_window != window) {
+            update_hit_test(window, en->event_x, en->event_y, false);
+        }
         if (x11.relative_window == window) {
             /* relative mode: no absolute position */
         } else if (SDLOP_RawInputIsSource()) {
@@ -3411,6 +3556,10 @@ static void x11_dispatch(xcb_generic_event_t *ev)
             }
             if (wd->keyboard_grab && x11.keyboard_grab_window != window) {
                 grab_keyboard(window);
+            }
+            if (wd->pending_move) {
+                wd->pending_move = false;
+                send_moveresize(window, wd->pending_move_x, wd->pending_move_y, NET_WM_MOVERESIZE_MOVE);
             }
         } else if (sdlop.keyboard_focus == window) {
             set_keyboard_focus(NULL);
@@ -3659,6 +3808,8 @@ SDLop_VideoDevice SDLop_x11_device = {
     .GetWindowBordersSize = x11_GetWindowBordersSize,
     .SetWindowOpacity = x11_SetWindowOpacity,
     .SetWindowParent = x11_SetWindowParent,
+    .SetWindowHitTest = x11_SetWindowHitTest,
+    .ShowWindowSystemMenu = x11_ShowWindowSystemMenu,
     .SetWindowModal = x11_SetWindowModal,
     .SetWindowBordered = x11_SetWindowBordered,
     .SetWindowResizable = x11_SetWindowResizable,
