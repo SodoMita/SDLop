@@ -468,8 +468,9 @@ bool SDLOP_Wayland_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
         if (!SDLOP_Wayland_AcquireOffloadShm(window, &shm_pixels, &shm_pitch, &shm_w, &shm_h)) {
             return false;
         }
-        if (!SDLOP_GLOffload_ReadToXRGB8888(octx, (SDLOP_GLOffloadSurface *)*slot,
-                                            shm_pixels, shm_pitch, shm_w, shm_h)) {
+        /* transparent windows present ARGB8888 buffers: keep GL's alpha */
+        if (!SDLOP_GLOffload_ReadToARGB8888(octx, (SDLOP_GLOffloadSurface *)*slot, shm_pixels, shm_pitch, shm_w,
+                                            shm_h, (window->flags & SDL_WINDOW_TRANSPARENT) != 0)) {
             return false;
         }
         if (!SDLOP_Wayland_PresentOffloadShm(window)) {

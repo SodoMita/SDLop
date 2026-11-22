@@ -188,6 +188,35 @@ static void test_flip_copy(void)
     for (int i = 0; i < 8; i++) {
         CHECK(simd_dst[i] == expected[i], "RGBA SIMD pixel %d (got 0x%08x)", i, simd_dst[i]);
     }
+
+    /* ARGB8888 with the source alpha (SDL_WINDOW_TRANSPARENT): SIMD body
+     * plus scalar tail (9 pixels), varying alpha per pixel */
+    uint8_t rgba9[9 * 4];
+    uint32_t argb_dst[9];
+    for (int i = 0; i < 9; i++) {
+        rgba9[i * 4 + 0] = (uint8_t)(0x10 + i);
+        rgba9[i * 4 + 1] = (uint8_t)(0x40 + i);
+        rgba9[i * 4 + 2] = (uint8_t)(0x70 + i);
+        rgba9[i * 4 + 3] = (uint8_t)(i * 31);
+    }
+    SDLOP_GLOffload_FlipCopyToARGB8888(rgba9, 9, 1, SDLOP_GL_OFFLOAD_RGBA8888, argb_dst, 36, 9, 1, true);
+    for (int i = 0; i < 9; i++) {
+        const uint32_t want = ((uint32_t)(i * 31) << 24) | ((uint32_t)(0x10 + i) << 16) |
+                              ((uint32_t)(0x40 + i) << 8) | (uint32_t)(0x70 + i);
+        CHECK(argb_dst[i] == want, "RGBA->ARGB keeps alpha, pixel %d (got 0x%08x want 0x%08x)", i, argb_dst[i],
+              want);
+    }
+    /* without keep_alpha the same source is opaque */
+    SDLOP_GLOffload_FlipCopyToARGB8888(rgba9, 9, 1, SDLOP_GL_OFFLOAD_RGBA8888, argb_dst, 36, 9, 1, false);
+    CHECK(argb_dst[0] >> 24 == 0xFF && argb_dst[8] >> 24 == 0xFF, "keep_alpha=false is opaque");
+    /* RGB has no alpha: opaque even when keeping alpha */
+    SDLOP_GLOffload_FlipCopyToARGB8888(rgb8, 8, 1, SDLOP_GL_OFFLOAD_RGB888, simd_dst, 32, 8, 1, true);
+    CHECK(simd_dst[0] == expected[0] && simd_dst[7] == expected[7], "RGB->ARGB opaque (0x%08x)", simd_dst[0]);
+    /* BGRA is copied as is, alpha included */
+    const uint8_t bgra_half[4] = { 0x30, 0x20, 0x10, 0x40 };
+    uint32_t one = 0;
+    SDLOP_GLOffload_FlipCopyToARGB8888(bgra_half, 1, 1, SDLOP_GL_OFFLOAD_BGRA8888, &one, 4, 1, 1, true);
+    CHECK(one == 0x40102030u, "BGRA->ARGB keeps alpha (got 0x%08x)", one);
 }
 
 static void test_gl_attrs(void)

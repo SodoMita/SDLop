@@ -938,11 +938,14 @@ bool SDL_GL_SwapWindow(SDL_Window *window)
                 return false;
             }
         }
-        if (!SDLOP_GLOffload_ReadToXRGB8888(gctx->offload_ctx, gw->surf,
+        /* an ARGB framebuffer (transparent window) gets GL's alpha */
+        const bool keep_alpha = (window->flags & SDL_WINDOW_TRANSPARENT) &&
+                                SDL_ISPIXELFORMAT_ALPHA(window->surface->format);
+        if (!SDLOP_GLOffload_ReadToARGB8888(gctx->offload_ctx, gw->surf,
                                             window->surface->pixels,
                                             window->surface->pitch,
                                             window->surface->w,
-                                            window->surface->h)) {
+                                            window->surface->h, keep_alpha)) {
             return false;
         }
         SDL_Rect rect = { 0, 0, window->surface->w, window->surface->h };
