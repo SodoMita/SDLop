@@ -436,7 +436,7 @@ int main(int argc, char *argv[])
             CHECK(wait_handle(t, last + 7), "transparent window handle '%s'", last + 7);
             SDL_HideWindow(t);
             CHECK(wait_handle(t, NULL), "hidden: no export handle");
-            char unexported[640];
+            char unexported[sizeof(last) + 16]; /* "unexport " + the handle */
             snprintf(unexported, sizeof(unexported), "unexport %s", last + 7);
             CHECK(wait_last("unexport ", unexported), "hidden: export destroyed");
             SDL_ShowWindow(t);
