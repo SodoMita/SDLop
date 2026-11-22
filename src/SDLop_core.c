@@ -6,6 +6,7 @@
 */
 
 #include "internal/sdlop_internal.h"
+#include "internal/sdlop_joystick_internal.h"
 #ifndef __EMSCRIPTEN__
 #ifndef _WIN32
 #include <sys/eventfd.h>
@@ -183,6 +184,16 @@ Uint64 SDLOP_MonotonicNS(void)
 
 static bool subsystem_init(SDL_InitFlags flags)
 {
+    if (flags & SDL_INIT_HAPTIC) {
+        if (!SDLOP_InitHaptics()) {
+            return false;
+        }
+    }
+    if (flags & (SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
+        if (!SDLOP_InitJoysticks()) {
+            return false;
+        }
+    }
     if (flags & SDL_INIT_VIDEO) {
 #ifndef _WIN32
         if (!SDLOP_VideoInit()) {
@@ -217,6 +228,12 @@ static bool subsystem_init(SDL_InitFlags flags)
 
 static void subsystem_quit(SDL_InitFlags flags)
 {
+    if (flags & (SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
+        SDLOP_QuitJoysticks();
+    }
+    if (flags & SDL_INIT_HAPTIC) {
+        SDLOP_QuitHaptics();
+    }
     if (flags & SDL_INIT_VIDEO) {
         /* the evdev worker on Linux, the Raw Input worker on Windows; a no-op
          * when neither was started */

@@ -25,8 +25,9 @@ int main(void) {
   - raw input: **~5–9 µs** kernel-timestamp → your code, via a dedicated
     worker thread (asyncinput-style)
 - **Lean**: windowing + input only. No audio, renderer, GPU, HID, camera,
-  iostream, … (the joystick/gamepad API is exported but reports no devices,
-  so unmodified SDL3 apps still link and run; ~39k lines of C including the X11,
+  iostream, … (Linux evdev joysticks/gamepads are supported; with none attached
+  the API behaves like stock SDL3, so unmodified apps still link and run;
+  ~39k lines of C including the X11,
   Wayland, KMSDRM and web drivers; the SDL surface/blit code is ported).
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
@@ -303,13 +304,14 @@ do not clear the current callback performance gate.
 
 ## API surface (SDL3-compatible)
 
-741 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+770 SDL3 functions; every one is declared in `include/SDL3/` (generated from
 the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
 with the same signature as SDL3, and checked by the `api_exports` test.
 
 | Area | Coverage |
 |---|---|
-| Init / hints / properties / log / error / timers / stdlib | `SDL_Init*`, `SDL_*Hint*`, `SDL_*Property*`, `SDL_Log*`, `SDL_GetTicks*`, `SDL_AddTimer`, `SDL_malloc`…`SDL_vsnprintf`, `SDL_iconv*`, atomics, `SDL_main` + main callbacks (`SDL_AppInit`/`AppIterate`/`AppEvent`/`AppQuit`) |
+| Init / hints / properties / log / error / timers / stdlib | `SDL_Init*`, `SDL_*Hint*`, `SDL_*Property*`, `SDL_Log*`, `SDL_GetTicks*`, `SDL_AddTimer`, `SDL_malloc`…`SDL_vsnprintf`, `SDL_iconv*`, atomics, thread priority (`SDL_SetCurrentThreadPriority`, `SDL_SetLinuxThreadPriority*`, no RealtimeKit), `SDL_main` + main callbacks (`SDL_AppInit`/`AppIterate`/`AppEvent`/`AppQuit`) |
+| Haptics | SDL3's haptic core + dummy backend (`SDL_haptic.c`, `SDL_haptic_dummy.c`): effect validation, rumble state and SDL3 errors; no haptic devices are exposed and joystick rumble remains unsupported |
 | Video | displays + modes, content scale, window create (incl. `WithProperties`), popups/tooltips (parent-relative), min/max size, aspect ratio, bordered / resizable / always-on-top / focusable / modal / parent, opacity, icon, borders size, flash, sync, safe area, fullscreen modes, `SDL_GetWindows`, screensaver |
 | Grabs & mouse | relative mode, mouse/keyboard grab, mouse rect, `SDL_CaptureMouse`, warp (window + global), global mouse state, cursors (`SDL_CreateCursor`, color + animated cursors, system cursors from the XCursor theme, show/hide), device lists (`SDL_GetMice`/`GetKeyboards`/`GetTouchDevices` + names) |
 | Events | queue, `SDL_PeepEvents`, filters + watches, `SDL_WaitEvent*`, user events, `SDL_GetEventDescription` |
@@ -317,13 +319,12 @@ with the same signature as SDL3, and checked by the `api_exports` test.
 | Surfaces | create/convert/duplicate/scale/flip/rotate, palettes, colorspaces, blend modes, color keys, `SDL_BlitSurface*` incl. scaled/tiled/9-grid, float/HDR (PQ, 10-bit) conversions, premultiplied alpha, rects |
 | OpenGL / Vulkan | GLX (X11 desktop GL) and EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks; NULL for GLX contexts, as stock), Vulkan WSI (`SDL_Vulkan_*`) |
 | Filesystem | `SDL_GetBasePath`, `SDL_GetPrefPath`, `SDL_GetUserFolder` (XDG), `SDL_CreateDirectory`, `SDL_EnumerateDirectory`, `SDL_GetPathInfo`, `SDL_CopyFile`, `SDL_RenamePath`, `SDL_RemovePath`, `SDL_GetCurrentDirectory` (no `SDL_GlobDirectory`) |
-| Joystick / gamepad | the whole `SDL_joystick.h` / `SDL_gamepad.h` API, behaving like stock SDL3 with no controller attached: empty device lists, opens fail with an error, NULL handles are harmless, string/label helpers work |
-| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings, system theme (settings portal, `SDL_EVENT_SYSTEM_THEME_CHANGED`) and window progress (Unity launcher API) over a built-in D-Bus client (no libdbus; `SDLOP_NO_DBUS=1` turns it off), file dialogs (`SDL_Show*FileDialog`, `SDL_ShowOpenFolderDialog`: xdg-desktop-portal, else zenity; `SDL_HINT_FILE_DIALOG_DRIVER`; modal to the parent window on X11 and, through xdg-foreign, on Wayland) |
+| Joystick / gamepad | Linux evdev backend (`SDL_joystick_evdev.c`): `/dev/input/event*` enumeration + hotplug (inotify with an mtime-gated fallback, like SDL3), axes/buttons/hats, device events and a generic gamepad mapping; no new dependencies. On Windows the dummy backend is used. With no controller attached the whole `SDL_joystick.h` / `SDL_gamepad.h` API behaves like stock SDL3: empty lists, failing opens, harmless NULL handles, working string/label helpers (`tests/test_evdev_joystick.c` uses uinput) |
+| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings, system theme (settings portal, `SDL_EVENT_SYSTEM_THEME_CHANGED`) and window progress (Unity launcher API) over a built-in D-Bus client (no libdbus; `SDLOP_NO_DBUS=1` turns it off), file dialogs (`SDL_Show*FileDialog`, `SDL_ShowOpenFolderDialog`: xdg-desktop-portal, else zenity; `SDL_HINT_FILE_DIALOG_DRIVER`; modal to the parent window on X11 and, through xdg-foreign, on Wayland). D-Bus, portals and the zenity dialogs are POSIX-only; Windows builds neither |
 
 Unsupported with an SDL error (like a stock SDL3 build without that feature):
 FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).
-Out of scope by design: audio, renderer, GPU, haptics, sensors, camera,
-iostream, and real game controller support.
+Out of scope by design: audio, renderer, GPU, sensors, camera and iostream.
 
 `struct`/enum/constant ABI is byte-identical to SDL3 3.4.20 (verified by an
 offset/value harness compiled against both header sets), and SDLop's exported
@@ -457,8 +458,9 @@ Both load without the "no version information available" warning. Things
 stock SDL3 apps rely on that SDLop now matches: `SDL_CreateWindow` without
 `SDL_Init` initializes video + events (`SDL_WasInit` = `0x4020`), init flag
 dependencies (`GAMEPAD` → `JOYSTICK` → `EVENTS`), GLX contexts on X11, the
-gamepad/joystick API (no devices) and the `SDL_filesystem.h` helpers
-(`tests/test_dropin_compat.c`, `tests/test_glx.c`). An app that calls an
+gamepad/joystick API (real evdev devices when present, no-device behaviour
+otherwise) and the `SDL_filesystem.h` helpers (`tests/test_dropin_compat.c`,
+`tests/test_evdev_joystick.c`, `tests/test_glx.c`). An app that calls an
 SDL3 function outside SDLop's subset still fails to load with "undefined
 symbol": run it with `LD_BIND_NOW=1` to see all of them at once.
 

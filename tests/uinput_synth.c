@@ -90,6 +90,66 @@ UInputDevice *uinput_synth_create(const char *name)
     return dev;
 }
 
+UInputDevice *uinput_synth_create_joystick(const char *name,
+                                           const uint16_t *axes, int num_axes,
+                                           const uint16_t *buttons, int num_buttons)
+{
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        fd = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK);
+    }
+    if (fd < 0) {
+        return NULL;
+    }
+
+    if (ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_ABS) < 0) {
+        close(fd);
+        return NULL;
+    }
+    for (int i = 0; i < num_axes; i++) {
+        struct uinput_abs_setup abs;
+        memset(&abs, 0, sizeof(abs));
+        abs.code = axes[i];
+        abs.absinfo.minimum = -32768;
+        abs.absinfo.maximum = 32767;
+        if (ioctl(fd, UI_SET_ABSBIT, axes[i]) < 0 ||
+            ioctl(fd, UI_ABS_SETUP, &abs) < 0) {
+            close(fd);
+            return NULL;
+        }
+    }
+    for (int i = 0; i < num_buttons; i++) {
+        if (ioctl(fd, UI_SET_KEYBIT, buttons[i]) < 0) {
+            close(fd);
+            return NULL;
+        }
+    }
+
+    struct uinput_setup setup;
+    memset(&setup, 0, sizeof(setup));
+    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "%s", name ? name : "sdlop-joystick");
+    setup.id.bustype = BUS_USB;
+    setup.id.vendor = 0x1234;
+    setup.id.product = 0x5678;
+    setup.id.version = 0x0100;
+    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
+        close(fd);
+        return NULL;
+    }
+
+    UInputDevice *dev = calloc(1, sizeof(*dev));
+    if (!dev) {
+        ioctl(fd, UI_DEV_DESTROY);
+        close(fd);
+        return NULL;
+    }
+    dev->fd = fd;
+    usleep(200 * 1000);
+    return dev;
+}
+
 void uinput_synth_destroy(UInputDevice *dev)
 {
     if (!dev) {
@@ -123,6 +183,11 @@ static bool emit(UInputDevice *dev, uint16_t type, uint16_t code, int32_t value)
 bool uinput_synth_key(UInputDevice *dev, uint16_t code, int32_t value)
 {
     return emit(dev, EV_KEY, code, value);
+}
+
+bool uinput_synth_abs(UInputDevice *dev, uint16_t code, int32_t value)
+{
+    return emit(dev, EV_ABS, code, value);
 }
 
 bool uinput_synth_rel(UInputDevice *dev, uint16_t code, int32_t value)

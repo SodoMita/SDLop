@@ -45,6 +45,9 @@ if(EMSCRIPTEN)
     src/SDL_thread.c
     src/SDL_misc.c
     src/SDL_joystick.c
+    src/SDL_joystick_dummy_backend.c
+    src/SDL_haptic.c
+    src/SDL_haptic_dummy.c
     src/SDL_filesystem.c
     src/SDL_main.c
     src/SDL_rect.c
@@ -373,6 +376,8 @@ set(SDLop_SOURCES
   src/SDL_thread.c
   src/SDL_misc.c
   src/SDL_joystick.c
+  src/SDL_haptic.c
+  src/SDL_haptic_dummy.c
   src/SDL_filesystem.c
   src/SDL_main.c
   src/SDL_rect.c
@@ -415,6 +420,12 @@ set(SDLop_SOURCES
   src/video/fbdev/sdlop_fbdev.c
   src/video/dummy/sdlop_dummy.c
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND SDLop_SOURCES src/SDL_joystick_evdev.c)
+else()
+  list(APPEND SDLop_SOURCES src/SDL_joystick_dummy_backend.c)
+endif()
+
 set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
 if(SDLOP_VIDEO_X11)
   list(APPEND SDLop_SOURCES
@@ -591,6 +602,17 @@ if(SDLop_BUILD_EXAMPLES)
 
     add_executable(vulkan_stress examples/vulkan_stress.c)
     target_link_libraries(vulkan_stress PRIVATE sdlop Vulkan::Vulkan m)
+
+    # Same stress scene against a stock SDL3 build, for direct comparison.
+    # The reference SDL3 must be built with Vulkan enabled; CI's headless
+    # reference intentionally is not, so this target is not exercised there.
+    if (SDL3_REFERENCE_INCLUDE AND SDL3_REFERENCE_LIB)
+      add_executable(vulkan_stress_sdl3 examples/vulkan_stress.c)
+      target_include_directories(vulkan_stress_sdl3 BEFORE PRIVATE ${SDL3_REFERENCE_INCLUDE})
+      target_link_libraries(vulkan_stress_sdl3 PRIVATE ${SDL3_REFERENCE_LIB} Vulkan::Vulkan m)
+      get_filename_component(_sdl3_ref_lib_dir ${SDL3_REFERENCE_LIB} DIRECTORY)
+      set_target_properties(vulkan_stress_sdl3 PROPERTIES BUILD_RPATH ${_sdl3_ref_lib_dir})
+    endif()
   else()
     message(STATUS "Vulkan not found - skipping Vulkan examples")
   endif()
@@ -709,6 +731,14 @@ if(SDLop_BUILD_TESTS)
     target_include_directories(test_evdev_uinput PRIVATE src tests)
     target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
     add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
+
+    # End-to-end evdev joystick/gamepad backend through uinput.
+    add_executable(test_evdev_joystick tests/test_evdev_joystick.c tests/uinput_synth.c)
+    target_link_libraries(test_evdev_joystick PRIVATE sdlop)
+    target_include_directories(test_evdev_joystick PRIVATE src tests)
+    target_compile_options(test_evdev_joystick PRIVATE -UNDEBUG)
+    add_test(NAME test_evdev_joystick COMMAND test_evdev_joystick)
+    set_tests_properties(test_evdev_joystick PROPERTIES TIMEOUT 20)
 
     add_executable(test_wayland tests/test_wayland.c)
     target_link_libraries(test_wayland PRIVATE sdlop)

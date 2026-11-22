@@ -572,6 +572,10 @@ bool SDLOP_Vulkan_CanCreateWindow(void);
 /* Surface helpers (SDL_surface.c) */
 int SDLOP_BytesPerPixel(SDL_PixelFormat format);
 
+/* Haptics (SDL_haptic.c, SDL_haptic_dummy.c) */
+bool SDLOP_InitHaptics(void);                       /* SDL_INIT_HAPTIC */
+void SDLOP_QuitHaptics(void);                       /* SDL_QuitSubSystem() hook */
+
 /* Threads (SDL_thread.c) */
 void SDLOP_ThreadsQuit(void);                       /* SDL_Quit() hook: TLS teardown */
 const char *SDLOP_GetPersistentString(const char *string); /* per-thread intern pool */

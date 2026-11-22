@@ -24,6 +24,7 @@
 */
 
 #include "internal/sdlop_internal.h"
+#include "internal/sdlop_joystick_internal.h"
 #ifndef _WIN32
 #include <poll.h>
 #include <unistd.h>
@@ -798,13 +799,16 @@ void SDL_PumpEvents(void)
     SDLOP_RawInputPump();
     SDLOP_DBus_Pump(); /* session bus signals (theme changes, portal replies) */
 
-    /* 2. drain window system (non-blocking) */
+    /* 2. poll evdev joysticks/gamepads for state changes and hotplug */
+    SDLOP_JoystickPump();
+
+    /* 3. drain window system (non-blocking) */
     if (sdlop.video) {
         sdlop.video->PumpEvents(sdlop.video, -1);
         SDLOP_UpdateCursorAnimation();
     }
 
-    /* 3. events pushed by other threads */
+    /* 4. events pushed by other threads */
     merge_side_queue();
     pumping = false;
 }
@@ -975,9 +979,14 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         SDL_Delay((Uint32)wait_ms);
 #else
         const int dbus_fd = SDLOP_DBus_GetFD(); /* theme changes, portal replies */
-        struct pollfd pfds[3];
+        /* Device fds plus the evdev backend's inotify hotplug fd. */
+        int joy_fds[SDLOP_JOYSTICK_MAX_WAIT_FDS];
+        int num_joy = SDLOP_JoystickGetEventFDs(joy_fds, (int)SDL_arraysize(joy_fds));
+        struct pollfd pfds[SDLOP_JOYSTICK_MAX_WAIT_FDS + 3]; /* wake + video + dbus + joystick/hotplug fds */
         int nfds = 0;
+        int wake_index = -1;
         if (sdlop.wake_fd >= 0) {
+            wake_index = nfds;
             pfds[nfds].fd = sdlop.wake_fd;
             pfds[nfds].events = POLLIN;
             nfds++;
@@ -992,9 +1001,14 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
             pfds[nfds].events = POLLIN;
             nfds++;
         }
+        for (int i = 0; i < num_joy && nfds < (int)SDL_arraysize(pfds); ++i) {
+            pfds[nfds].fd = joy_fds[i];
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
         if (nfds > 0) {
             poll(pfds, (nfds_t)nfds, wait_ms);
-            if (sdlop.wake_fd >= 0 && (pfds[0].revents & POLLIN)) {
+            if (wake_index >= 0 && (pfds[wake_index].revents & POLLIN)) {
                 uint64_t val;
                 (void)!read(sdlop.wake_fd, &val, sizeof(val)); /* reset */
             }

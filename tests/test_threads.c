@@ -11,6 +11,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef SDL_PLATFORM_LINUX
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 static SDL_AtomicInt counter;
 static SDL_AtomicInt detached_finished;
@@ -239,6 +245,24 @@ int main(void)
     (void)SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
     (void)SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
     (void)SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
+
+#ifdef SDL_PLATFORM_LINUX
+    /* SDL_system.h Linux entry points (used by sdl2-compat). Unprivileged
+       threads may only lower their priority (raise the nice value). */
+    {
+        Sint64 tid = (Sint64)syscall(SYS_gettid);
+
+        /* 19 (lowest priority) is always allowed without CAP_SYS_NICE */
+        assert(SDL_SetLinuxThreadPriority(tid, 19));
+        assert(getpriority(PRIO_PROCESS, 0) == 19);
+        assert(SDL_SetLinuxThreadPriorityAndPolicy(tid, SDL_THREAD_PRIORITY_LOW, SCHED_OTHER));
+        assert(getpriority(PRIO_PROCESS, 0) == 19);
+
+        SDL_ClearError();
+        assert(!SDL_SetLinuxThreadPriority(0x7fffffff, 0));
+        assert(strstr(SDL_GetError(), "setpriority") != NULL);
+    }
+#endif
 
     /* --- threads from a thread (name thread runs asserts) --- */
     t = SDL_CreateThread(name_thread, "named", NULL);
