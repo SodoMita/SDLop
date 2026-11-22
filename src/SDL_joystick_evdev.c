@@ -25,6 +25,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SDLOP_MAX_EVDEV_JOYSTICKS 64
@@ -49,6 +50,22 @@ typedef struct SDLOP_EvdevJoystick
 static SDLOP_EvdevJoystick *devices;
 static bool initialized;
 static Uint64 last_scan_ns;
+
+/* Non-joystick event nodes are expensive to probe: on this system opening and
+ * closing all of the keyboard/mouse nodes takes ~140 ms. Remember devices that
+ * failed the joystick probe so later 250 ms rescans only stat() them. The
+ * inode/ctime test makes a recreated node with the same event number get
+ * probed again. */
+typedef struct SDLOP_RejectedDevice
+{
+    char path[PATH_MAX];
+    dev_t rdev;
+    ino_t ino;
+    struct timespec ctime;
+    struct SDLOP_RejectedDevice *next;
+} SDLOP_RejectedDevice;
+
+static SDLOP_RejectedDevice *rejected;
 
 static bool bit_set(const Uint8 *bits, size_t bytes, unsigned int bit)
 {
@@ -271,6 +288,63 @@ static bool device_known(const char *path, dev_t rdev)
     return false;
 }
 
+static bool rejected_matches(const SDLOP_RejectedDevice *r, const struct stat *st)
+{
+    return r->rdev == st->st_rdev && r->ino == st->st_ino &&
+           r->ctime.tv_sec == st->st_ctim.tv_sec &&
+           r->ctime.tv_nsec == st->st_ctim.tv_nsec;
+}
+
+static bool rejected_known(const char *path, const struct stat *st)
+{
+    for (SDLOP_RejectedDevice *r = rejected; r; r = r->next) {
+        if (strcmp(r->path, path) == 0 && rejected_matches(r, st)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void reject_device(const char *path, const struct stat *st)
+{
+    if (rejected_known(path, st)) {
+        return;
+    }
+    SDLOP_RejectedDevice *r = (SDLOP_RejectedDevice *)SDL_calloc(1, sizeof(*r));
+    if (!r) {
+        return;
+    }
+    SDL_snprintf(r->path, sizeof(r->path), "%s", path);
+    r->rdev = st->st_rdev;
+    r->ino = st->st_ino;
+    r->ctime = st->st_ctim;
+    r->next = rejected;
+    rejected = r;
+}
+
+static void prune_rejected_devices(void)
+{
+    for (SDLOP_RejectedDevice **link = &rejected; *link;) {
+        SDLOP_RejectedDevice *r = *link;
+        struct stat st;
+        if (stat(r->path, &st) != 0 || !S_ISCHR(st.st_mode) || !rejected_matches(r, &st)) {
+            *link = r->next;
+            SDL_free(r);
+        } else {
+            link = &r->next;
+        }
+    }
+}
+
+static void clear_rejected_devices(void)
+{
+    while (rejected) {
+        SDLOP_RejectedDevice *r = rejected;
+        rejected = r->next;
+        SDL_free(r);
+    }
+}
+
 static void remove_device(SDLOP_EvdevJoystick *dev)
 {
     SDL_LockJoysticks();
@@ -300,10 +374,14 @@ static void add_device(const char *path)
 {
     struct stat st;
     dev_t rdev = 0;
-    if (stat(path, &st) == 0 && S_ISCHR(st.st_mode)) {
+    bool have_stat = (stat(path, &st) == 0 && S_ISCHR(st.st_mode));
+    if (have_stat) {
         rdev = st.st_rdev;
     }
     if (device_known(path, rdev)) {
+        return;
+    }
+    if (have_stat && rejected_known(path, &st)) {
         return;
     }
 
@@ -325,6 +403,9 @@ static void add_device(const char *path)
     if (!probe_device(path, &desc, name, axes, axes_initial, &num_axes,
                       buttons, buttons_initial, &num_buttons,
                       hats, hats_initial, hat_min, hat_max, &num_hats, fd)) {
+        if (have_stat) {
+            reject_device(path, &st);
+        }
         close(fd);
         return;
     }
@@ -359,6 +440,9 @@ static void add_device(const char *path)
 
 static void scan_devices(void)
 {
+    /* Drop cached negative probes for nodes that vanished or were recreated. */
+    prune_rejected_devices();
+
     /* Remove devices whose node disappeared. */
     for (SDLOP_EvdevJoystick *dev = devices; dev;) {
         SDLOP_EvdevJoystick *next = dev->next;
@@ -450,6 +534,7 @@ void SDLOP_QuitJoysticks(void)
     while (devices) {
         remove_device(devices);
     }
+    clear_rejected_devices();
     SDLOP_JoystickQuitAllDevices();
     initialized = false;
 }
