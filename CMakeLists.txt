@@ -802,6 +802,14 @@ if(SDLop_BUILD_BENCHMARKS)
   else()
     message(STATUS "GLESv2 not found - skipping bench_render")
   endif()
+  # CPU-work proxy for the actual native dispatch loop, with fake full reads
+  # and immediate consumer reclamation. Not a device-latency benchmark.
+  add_executable(bench_raw_dispatch bench/bench_raw_dispatch.c)
+  target_link_libraries(bench_raw_dispatch PRIVATE sdlop)
+  target_include_directories(bench_raw_dispatch PRIVATE src)
+  target_compile_options(bench_raw_dispatch PRIVATE -UNDEBUG)
+  target_link_options(bench_raw_dispatch PRIVATE -Wl,--wrap=read)
+
   add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
   target_link_libraries(bench_raw_latency PRIVATE sdlop)
   target_include_directories(bench_raw_latency PRIVATE src tests)
@@ -815,6 +823,9 @@ if(SDLop_BUILD_BENCHMARKS)
   target_link_options(bench_raw_latency_pipe PRIVATE
     -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
   if(SDLop_BUILD_TESTS)
+    # Validate dispatch checksum/count/drop assertions, never a timing threshold.
+    add_test(NAME raw_dispatch_contract COMMAND bench_raw_dispatch)
+    set_tests_properties(raw_dispatch_contract PROPERTIES TIMEOUT 30)
     add_test(NAME raw_latency_pipe_api COMMAND bench_raw_latency_pipe --api-overhead)
     set_tests_properties(raw_latency_pipe_api PROPERTIES TIMEOUT 30
       ENVIRONMENT "SDLOP_RAW_INPUT=1;SDLOP_DISABLE_RAW_INPUT=0")

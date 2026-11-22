@@ -280,6 +280,10 @@ The [self-audit and pinned SDL3 comparison](docs/input-audit-sdl3.md) documents
 reentrant-pump and continuous-device fixes, checked benchmark transport,
 identical-source rootless measurements, and deferred gaps (including wheel
 selection, frame aggregation, hotplug and focus/VT snapshots).
+The [dispatch optimization follow-up](docs/input-dispatch-optimization.md)
+measures single-writer counter publication and SPSC index caching, with retained
+counter-only experiments, a rootless CPU-work proxy (`bench_raw_dispatch`) and
+explicit latency/throughput tradeoffs. The full callback gate remains uncleared.
 
 ## API surface (SDL3-compatible)
 

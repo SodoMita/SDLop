@@ -6,6 +6,12 @@ runtime dependencies, compositor input rerouting, or upstream code port.
 **Correctness regressions pass; the requested ~5% callback p50/p95 gate remains
 uncleared. This change is for draft review, not performance acceptance.**
 
+The subsequent [native-dispatch optimization](input-dispatch-optimization.md)
+removes the single-writer counter RMW, caches conservative SPSC index limits,
+and fixes fortified-poll test interception. It improves some high-load results
+but retains an uncleared overall gate and reports saturation throughput costs.
+The historical measurements below remain specific to the audit stage.
+
 ## Audit findings and fixes
 
 | Verified location | Reproduction / consequence | Fix / coverage |
