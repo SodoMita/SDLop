@@ -31,3 +31,4 @@
 #include "xdg-toplevel-icon-v1-protocol.c"
 #include "xdg-dialog-v1-protocol.c"
 #include "alpha-modifier-v1-protocol.c"
+#include "pointer-warp-v1-protocol.c"

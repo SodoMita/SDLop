@@ -44,6 +44,16 @@
   (pixels as 8-digit hex), and "dialog", "modal=1|0", "dialog destroyed".
   It also offers wp_alpha_modifier_v1: "alpha=FACTOR" is logged when a
   multiplier is committed.
+  With MINI_TOPLEVEL_LOG, xdg_toplevel move / resize / show_window_menu
+  log "move serial=ok|bad", "resize edge=E serial=ok|bad" and
+  "menu X,Y serial=ok|bad" (ok: the serial of the latest button press).
+  MINI_POINTER_CMD=<file>: on SIGUSR2 the lines of <file> are run as
+  pointer input on the window - "motion X Y", "press BTN", "release BTN"
+  (linux button codes), each followed by a frame.
+  MINI_WARP_LOG=<log> for tests/test_wayland_warp.c: offers
+  wp_pointer_warp_v1 (unless MINI_POINTER_WARP=0) and logs
+  "warp X,Y serial=ok|bad", lock_pointer requests log "lock" and cursor
+  position hints "hint X,Y" (the lock script below is off).
 
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
@@ -69,6 +79,7 @@
 #include "xdg-toplevel-icon-v1-server-protocol.h"
 #include "xdg-dialog-v1-server-protocol.h"
 #include "alpha-modifier-v1-server-protocol.h"
+#include "pointer-warp-v1-server-protocol.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -145,6 +156,8 @@ static const char *TL_log; /* MINI_TOPLEVEL_LOG: icon buffers are read too */
 static struct wl_resource *TL_alpha_surface; /* surface with a pending multiplier */
 static uint32_t TL_alpha_pending;
 static void TL_logs(const char *line);
+static const char *W_log; /* MINI_WARP_LOG */
+static uint32_t W_enter_serial;
 static struct wl_resource *B_pending;     /* attached, not committed */
 static bool B_pending_set;
 static struct wl_resource *B_held[16];
@@ -180,6 +193,9 @@ static struct wl_list H_outputs;        /* bound wl_output resources */
 /* external linkage: an optimizer may drop stores to a never-read static,
  * which LeakSanitizer then reports as a leaked event source */
 struct wl_event_source *mini_scale_signal_source;
+struct wl_event_source *mini_pointer_cmd_source; /* MINI_POINTER_CMD */
+static const char *P_cmd_path;
+static uint32_t P_button_serial; /* latest button press */
 static bool H_entered;
 
 static uint32_t frame_color(int k)
@@ -577,6 +593,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
     if (M.buffer_attached && !M.entered && M.pointer) {
         M.entered = true;
         uint32_t serial = wl_display_next_serial(M.display);
+        W_enter_serial = serial;
         wl_pointer_send_enter(M.pointer, serial, M.surface_res,
                               wl_fixed_from_double(100.0), wl_fixed_from_double(100.0));
         wl_pointer_send_frame(M.pointer);
@@ -673,14 +690,51 @@ static void xdg_toplevel_destroy(struct wl_client *client, struct wl_resource *r
     wl_resource_destroy(res);
 }
 
+static const char *serial_ok(uint32_t serial)
+{
+    return serial && serial == P_button_serial ? "ok" : "bad";
+}
+
+static void toplevel_move(struct wl_client *client, struct wl_resource *res, struct wl_resource *seat, uint32_t serial)
+{
+    (void)client;
+    (void)res;
+    (void)seat;
+    char line[64];
+    snprintf(line, sizeof(line), "move serial=%s", serial_ok(serial));
+    TL_logs(line);
+}
+
+static void toplevel_resize(struct wl_client *client, struct wl_resource *res, struct wl_resource *seat,
+                            uint32_t serial, uint32_t edges)
+{
+    (void)client;
+    (void)res;
+    (void)seat;
+    char line[64];
+    snprintf(line, sizeof(line), "resize edge=%u serial=%s", edges, serial_ok(serial));
+    TL_logs(line);
+}
+
+static void toplevel_menu(struct wl_client *client, struct wl_resource *res, struct wl_resource *seat,
+                          uint32_t serial, int32_t x, int32_t y)
+{
+    (void)client;
+    (void)res;
+    (void)seat;
+    char line[64];
+    snprintf(line, sizeof(line), "menu %d,%d serial=%s", x, y, serial_ok(serial));
+    TL_logs(line);
+}
+
 static const struct xdg_toplevel_interface toplevel_impl = {
     .destroy = xdg_toplevel_destroy,
     .set_parent = (void *)noop,
     .set_title = (void *)noop,
     .set_app_id = (void *)noop,
-    .show_window_menu = (void *)noop,
-    .move = (void *)noop,
-    .resize = (void *)noop,
+    .show_window_menu = toplevel_menu,
+    .move = toplevel_move,
+    .resize = toplevel_resize,
     .set_max_size = (void *)noop,
     .set_min_size = (void *)noop,
     .set_maximized = (void *)noop,
@@ -780,6 +834,46 @@ static int abs_timer_cb(void *data)
     return 1;
 }
 
+static void W_logf(const char *fmt, double x, double y, const char *s)
+{
+    FILE *f = W_log ? fopen(W_log, "a") : NULL;
+    if (f) {
+        fprintf(f, fmt, x, y, s);
+        fputc('\n', f);
+        fclose(f);
+    }
+}
+
+static void W_hint(struct wl_client *client, struct wl_resource *res, wl_fixed_t x, wl_fixed_t y)
+{
+    (void)client;
+    (void)res;
+    W_logf("hint %g,%g%s", wl_fixed_to_double(x), wl_fixed_to_double(y), "");
+}
+
+static void W_warp(struct wl_client *client, struct wl_resource *res, struct wl_resource *surface,
+                   struct wl_resource *pointer, wl_fixed_t x, wl_fixed_t y, uint32_t serial)
+{
+    (void)client;
+    (void)res;
+    (void)surface;
+    (void)pointer;
+    W_logf("warp %g,%g serial=%s", wl_fixed_to_double(x), wl_fixed_to_double(y),
+           serial == W_enter_serial ? "ok" : "bad");
+}
+
+static const struct wp_pointer_warp_v1_interface W_impl = {
+    .destroy = res_destroy,
+    .warp_pointer = W_warp,
+};
+
+static void W_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &wp_pointer_warp_v1_interface, version, id);
+    wl_resource_set_implementation(r, &W_impl, NULL, NULL);
+}
+
 static void locked_destroyed(struct wl_resource *res)
 {
     (void)res;
@@ -793,6 +887,7 @@ static void locked_destroyed(struct wl_resource *res)
 
 static const struct zwp_locked_pointer_v1_interface locked_impl = {
     .destroy = res_destroy,
+    .set_cursor_position_hint = W_hint,
     .set_region = (void *)noop,
 };
 
@@ -808,6 +903,7 @@ static void pc_lock_pointer(struct wl_client *client, struct wl_resource *res, u
     struct wl_resource *locked = wl_resource_create(client, &zwp_locked_pointer_v1_interface, 1, id);
     wl_resource_set_implementation(locked, &locked_impl, NULL, locked_destroyed);
     M.locked = locked;
+    W_logf("lock", 0, 0, NULL);
     zwp_locked_pointer_v1_send_locked(locked);
     printf("mini: lock_pointer -> locked\n");
     fflush(stdout);
@@ -1750,6 +1846,39 @@ static void H_send(int value)
     fflush(stdout);
 }
 
+static int P_signal_cb(int signal_number, void *data)
+{
+    (void)signal_number;
+    (void)data;
+    FILE *f = P_cmd_path ? fopen(P_cmd_path, "r") : NULL;
+    if (!f) {
+        return 0;
+    }
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        double x, y;
+        unsigned btn;
+        if (!M.pointer) {
+            break;
+        }
+        if (sscanf(line, "motion %lf %lf", &x, &y) == 2) {
+            wl_pointer_send_motion(M.pointer, 1000, wl_fixed_from_double(x), wl_fixed_from_double(y));
+        } else if (sscanf(line, "press %u", &btn) == 1) {
+            P_button_serial = wl_display_next_serial(M.display);
+            wl_pointer_send_button(M.pointer, P_button_serial, 1000, btn, WL_POINTER_BUTTON_STATE_PRESSED);
+        } else if (sscanf(line, "release %u", &btn) == 1) {
+            wl_pointer_send_button(M.pointer, wl_display_next_serial(M.display), 1000, btn,
+                                   WL_POINTER_BUTTON_STATE_RELEASED);
+        } else {
+            continue;
+        }
+        wl_pointer_send_frame(M.pointer);
+    }
+    fclose(f);
+    wl_display_flush_clients(M.display);
+    return 0;
+}
+
 static int H_signal_cb(int signal_number, void *data)
 {
     (void)signal_number;
@@ -2078,6 +2207,10 @@ int main(void)
     if (getenv("MINI_SCALE_CHANGE")) {
         mini_scale_signal_source = wl_event_loop_add_signal(M.loop, SIGUSR1, H_signal_cb, NULL);
     }
+    P_cmd_path = getenv("MINI_POINTER_CMD");
+    if (P_cmd_path) {
+        mini_pointer_cmd_source = wl_event_loop_add_signal(M.loop, SIGUSR2, P_signal_cb, NULL);
+    }
     const char *name = getenv("WAYLAND_DISPLAY");
     if (wl_display_add_socket(M.display, name) != 0) {
         fprintf(stderr, "mini: add_socket(%s) failed\n", name ? name : "(default)");
@@ -2150,8 +2283,15 @@ int main(void)
 
     wl_display_add_client_created_listener(M.display, &client_listener);
 
-    M.rel_timer = wl_event_loop_add_timer(M.loop, rel_timer_cb, NULL);
-    M.abs_timer = wl_event_loop_add_timer(M.loop, abs_timer_cb, NULL);
+    W_log = getenv("MINI_WARP_LOG");
+    if (W_log) {
+        if (!(getenv("MINI_POINTER_WARP") && atoi(getenv("MINI_POINTER_WARP")) == 0)) {
+            wl_global_create(M.display, &wp_pointer_warp_v1_interface, 1, NULL, W_bind);
+        }
+    } else { /* the pointer-lock script */
+        M.rel_timer = wl_event_loop_add_timer(M.loop, rel_timer_cb, NULL);
+        M.abs_timer = wl_event_loop_add_timer(M.loop, abs_timer_cb, NULL);
+    }
     M.watchdog = wl_event_loop_add_timer(M.loop, watchdog_cb, NULL);
     B_mode = getenv("MINI_BUFFER_CHECK") && atoi(getenv("MINI_BUFFER_CHECK"));
     if (B_mode) {

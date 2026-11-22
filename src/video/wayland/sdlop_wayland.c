@@ -32,6 +32,7 @@
 #include "xdg-toplevel-icon-v1-client-protocol.h"
 #include "xdg-dialog-v1-client-protocol.h"
 #include "alpha-modifier-v1-client-protocol.h"
+#include "pointer-warp-v1-client-protocol.h"
 #include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
@@ -105,6 +106,7 @@ typedef struct WaylandWindowData
     struct zwp_idle_inhibitor_v1 *idle_inhibitor;
     struct zwp_keyboard_shortcuts_inhibitor_v1 *shortcuts_inhibitor;
     struct xdg_dialog_v1 *dialog;      /* SDL_WINDOW_MODAL (xdg_wm_dialog_v1) */
+    int hit_test_result;               /* SDL_HitTestResult under the pointer */
     struct wp_alpha_modifier_surface_v1 *alpha; /* SDL_SetWindowOpacity, created on first use */
     struct xdg_toplevel_icon_v1 *icon; /* SDL_SetWindowIcon, kept for re-shown toplevels */
     struct wl_buffer **icon_buffers;   /* must outlive the icon */
@@ -165,6 +167,7 @@ typedef struct WaylandDeviceData
     struct xdg_toplevel_icon_manager_v1 *toplevel_icon_manager;
     struct xdg_wm_dialog_v1 *wm_dialog;
     struct wp_alpha_modifier_v1 *alpha_modifier;
+    struct wp_pointer_warp_v1 *pointer_warp;
     struct wp_cursor_shape_device_v1 *cursor_shape_device; /* of `pointer` */
     struct zwp_locked_pointer_v1 *locked_pointer;
     struct zwp_relative_pointer_v1 *relative_pointer;
@@ -1338,32 +1341,33 @@ static struct sdlop_xcursor_theme *wayland_cursor_theme(void)
     return wl_data.cursor_theme;
 }
 
-static bool wayland_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+/* surface: ARGB8888 custom cursor, else the system cursor system_id */
+static WaylandCursor *make_cursor(const SDL_Surface *surface, int hot_x, int hot_y, SDL_SystemCursor system_id)
 {
-    (void)device;
     WaylandCursor *wc = (WaylandCursor *)calloc(1, sizeof(*wc));
     if (!wc) {
-        return SDL_OutOfMemory();
+        SDL_OutOfMemory();
+        return NULL;
     }
-    if (cursor->surface) {
-        SDL_Surface *s = cursor->surface; /* ARGB8888 */
+    if (surface) {
+        const SDL_Surface *s = surface;
         wc->buffer = create_shm_cursor_buffer((const uint32_t *)s->pixels, s->w, s->h, s->pitch / 4);
         wc->w = s->w;
         wc->h = s->h;
-        wc->hot_x = cursor->hot_x;
-        wc->hot_y = cursor->hot_y;
+        wc->hot_x = hot_x;
+        wc->hot_y = hot_y;
     } else if (wl_data.cursor_shape_manager) {
         /* stock: the compositor draws system cursors (theme, scale) */
-        wc->shape = system_cursor_shape(cursor->system_id);
+        wc->shape = system_cursor_shape(system_id);
     } else {
         /* themed (CSS name, fallback, legacy X name - like SDL3's
          * wayland-cursor path); the built-in arrow when nothing matches */
         struct sdlop_xcursor_theme *theme = wayland_cursor_theme();
         if (theme) {
             const char *fallback = NULL;
-            const char *names[3] = { SDLOP_GetCSSCursorName(cursor->system_id, &fallback), NULL, NULL };
+            const char *names[3] = { SDLOP_GetCSSCursorName(system_id, &fallback), NULL, NULL };
             names[1] = fallback;
-            names[2] = cursor->system_id == SDL_SYSTEM_CURSOR_DEFAULT ? "left_ptr" : NULL;
+            names[2] = system_id == SDL_SYSTEM_CURSOR_DEFAULT ? "left_ptr" : NULL;
             for (int i = 0; i < 3 && !wc->buffer; ++i) {
                 struct sdlop_xcursor *xc = names[i] ? sdlop_xcursor_theme_get_cursor(theme, names[i]) : NULL;
                 if (xc && xc->image_count > 0) {
@@ -1388,10 +1392,50 @@ static bool wayland_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
     }
     if (!wc->buffer && !wc->shape) {
         free(wc);
-        return SDL_SetError("Couldn't create Wayland cursor buffer");
+        SDL_SetError("Couldn't create Wayland cursor buffer");
+        return NULL;
+    }
+    return wc;
+}
+
+static void free_cursor_data(WaylandCursor *wc)
+{
+    if (wc) {
+        if (wc->buffer) {
+            wl_buffer_destroy(wc->buffer);
+        }
+        free(wc);
+    }
+}
+
+static bool wayland_CreateCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
+{
+    (void)device;
+    WaylandCursor *wc = make_cursor(cursor->surface, cursor->hot_x, cursor->hot_y, cursor->system_id);
+    if (!wc) {
+        return false;
     }
     cursor->internal = wc;
     return true;
+}
+
+/* resize cursors shown over SDL_HITTEST_RESIZE_* areas (stock) */
+static WaylandCursor *hit_test_cursors[SDL_HITTEST_RESIZE_LEFT + 1];
+
+static WaylandCursor *hit_test_cursor(int result)
+{
+    static const SDL_SystemCursor ids[] = {
+        SDL_SYSTEM_CURSOR_NW_RESIZE, SDL_SYSTEM_CURSOR_N_RESIZE, SDL_SYSTEM_CURSOR_NE_RESIZE,
+        SDL_SYSTEM_CURSOR_E_RESIZE,  SDL_SYSTEM_CURSOR_SE_RESIZE, SDL_SYSTEM_CURSOR_S_RESIZE,
+        SDL_SYSTEM_CURSOR_SW_RESIZE, SDL_SYSTEM_CURSOR_W_RESIZE
+    };
+    if (result < SDL_HITTEST_RESIZE_TOPLEFT || result > SDL_HITTEST_RESIZE_LEFT) {
+        return NULL;
+    }
+    if (!hit_test_cursors[result]) {
+        hit_test_cursors[result] = make_cursor(NULL, 0, 0, ids[result - SDL_HITTEST_RESIZE_TOPLEFT]);
+    }
+    return hit_test_cursors[result];
 }
 
 static void wayland_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
@@ -1415,6 +1459,13 @@ static void apply_cursor(uint32_t serial)
     }
     SDL_Cursor *cursor = SDLOP_GetCurrentCursor();
     WaylandCursor *wc = cursor ? (WaylandCursor *)cursor->internal : NULL;
+    const WaylandWindowData *fd = (const WaylandWindowData *)wl_data.pointer_focus->driverdata;
+    if (wc && fd && wl_data.pointer_focus->hit_test) {
+        WaylandCursor *edge = hit_test_cursor(fd->hit_test_result);
+        if (edge) {
+            wc = edge;
+        }
+    }
     if (!wc || (!wc->buffer && !wc->shape) ||
         (wl_data.locked_pointer && wl_data.relative_lock_window == wl_data.pointer_focus)) {
         wl_pointer_set_cursor(wl_data.pointer, serial, NULL, 0, 0);
@@ -1477,6 +1528,46 @@ static SDL_Window *window_from_surface(struct wl_surface *surface)
     return NULL;
 }
 
+/* SDL_SetWindowHitTest (stock): evaluated on pointer motion while no
+ * button is held; resize areas show resize cursors */
+static void update_hit_test(SDL_Window *window, float x, float y)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || !window->hit_test || SDL_GetMouseState(NULL, NULL) != 0) {
+        return;
+    }
+    const SDL_Point p = { (int)SDL_floorf(x), (int)SDL_floorf(y) };
+    const int rc = (int)window->hit_test(window, &p, window->hit_test_data);
+    if (rc != wd->hit_test_result) {
+        wd->hit_test_result = rc;
+        apply_cursor(wl_data.pointer_serial);
+    }
+}
+
+/* a left press on a draggable / resize area starts the compositor's
+ * interactive move / resize instead of reaching the app (stock) */
+static bool process_hit_test(SDL_Window *window, uint32_t serial)
+{
+    static const uint32_t edges[] = {
+        XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT,     XDG_TOPLEVEL_RESIZE_EDGE_TOP,    XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT,
+        XDG_TOPLEVEL_RESIZE_EDGE_RIGHT,        XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT, XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM,
+        XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT,  XDG_TOPLEVEL_RESIZE_EDGE_LEFT
+    };
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || !window->hit_test || !wd->toplevel || !wl_data.seat || wl_data.locked_pointer) {
+        return false;
+    }
+    if (wd->hit_test_result == SDL_HITTEST_DRAGGABLE) {
+        xdg_toplevel_move(wd->toplevel, wl_data.seat, serial);
+    } else if (wd->hit_test_result >= SDL_HITTEST_RESIZE_TOPLEFT && wd->hit_test_result <= SDL_HITTEST_RESIZE_LEFT) {
+        xdg_toplevel_resize(wd->toplevel, wl_data.seat, serial, edges[wd->hit_test_result - SDL_HITTEST_RESIZE_TOPLEFT]);
+    } else {
+        return false;
+    }
+    wl_display_flush(wl_data.display);
+    return true;
+}
+
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t surface_x, wl_fixed_t surface_y)
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
@@ -1511,6 +1602,11 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
             wl_pointer_set_cursor(pointer, serial, NULL, 0, 0); /* hide */
         }
     } else {
+        WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+        if (wd) {
+            wd->hit_test_result = SDL_HITTEST_NORMAL;
+        }
+        update_hit_test(window, (float)wl_fixed_to_double(surface_x), (float)wl_fixed_to_double(surface_y));
         apply_cursor(serial);
     }
 }
@@ -1544,6 +1640,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     }
     float x = (float)wl_fixed_to_double(surface_x);
     float y = (float)wl_fixed_to_double(surface_y);
+    update_hit_test(window, x, y);
 
     if (SDLOP_RawInputIsSource()) {
         if (sdlop.relative_mode_window == window) {
@@ -1578,11 +1675,17 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     (void)data;
     (void)pointer;
     (void)time;
-    wl_data.input_serial = serial;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        wl_data.input_serial = serial; /* implicit grab serial (popups, menus, move) */
+    }
+    Uint8 btn = wl_button_to_sdl(button);
+    if (btn == SDL_BUTTON_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED && wl_data.pointer_focus &&
+        process_hit_test(wl_data.pointer_focus, serial)) {
+        return; /* not passed on to the app (stock) */
+    }
     if (SDLOP_RawInputIsSource()) {
         return; /* evdev owns buttons */
     }
-    Uint8 btn = wl_button_to_sdl(button);
     if (btn) {
         SDLOP_SendMouseButton(state == WL_POINTER_BUTTON_STATE_PRESSED, btn, SDLOP_NO_POS, SDLOP_NO_POS, SDLOP_MonotonicNS());
     }
@@ -2162,6 +2265,8 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, xdg_toplevel_icon_manager_v1_interface.name) == 0 && !d->toplevel_icon_manager) {
         /* icon_size preferences are ignored (stock) */
         d->toplevel_icon_manager = wl_registry_bind(registry, name, &xdg_toplevel_icon_manager_v1_interface, 1);
+    } else if (strcmp(interface, wp_pointer_warp_v1_interface.name) == 0 && !d->pointer_warp) {
+        d->pointer_warp = wl_registry_bind(registry, name, &wp_pointer_warp_v1_interface, 1);
     } else if (strcmp(interface, wp_alpha_modifier_v1_interface.name) == 0 && !d->alpha_modifier) {
         d->alpha_modifier = wl_registry_bind(registry, name, &wp_alpha_modifier_v1_interface, 1);
     } else if (strcmp(interface, xdg_wm_dialog_v1_interface.name) == 0 && !d->wm_dialog) {
@@ -2333,6 +2438,10 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     if (wl_data.keyboard) {
         wl_keyboard_destroy(wl_data.keyboard);
     }
+    for (size_t i = 0; i < SDL_arraysize(hit_test_cursors); i++) {
+        free_cursor_data(hit_test_cursors[i]);
+        hit_test_cursors[i] = NULL;
+    }
     if (wl_data.cursor_shape_device) {
         wp_cursor_shape_device_v1_destroy(wl_data.cursor_shape_device);
     }
@@ -2347,6 +2456,9 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     }
     if (wl_data.alpha_modifier) {
         wp_alpha_modifier_v1_destroy(wl_data.alpha_modifier);
+    }
+    if (wl_data.pointer_warp) {
+        wp_pointer_warp_v1_destroy(wl_data.pointer_warp);
     }
     if (wl_data.pointer) {
         wl_pointer_destroy(wl_data.pointer);
@@ -3138,6 +3250,98 @@ static void update_confinement(SDL_Window *window)
     wl_display_flush(wl_data.display);
 }
 
+/* Pointer warps (stock): wp_pointer_warp_v1, else the pointer-constraints
+ * trick - a oneshot lock with a cursor position hint, released at once
+ * (only one constraint per surface: a confinement is lifted meanwhile).
+ * Either way only the window with the pointer focus can warp, and the
+ * compositor sends no motion for it. */
+static bool warp_pointer(SDL_Window *window, float x, float y)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || !wl_data.pointer || wl_data.pointer_focus != window) {
+        return false;
+    }
+    if (wl_data.pointer_warp) {
+        /* a position outside the surface is a protocol error */
+        const double cx = SDL_clamp((double)x, 0.0, (double)window->w);
+        const double cy = SDL_clamp((double)y, 0.0, (double)window->h);
+        wp_pointer_warp_v1_warp_pointer(wl_data.pointer_warp, wd->surface, wl_data.pointer, wl_fixed_from_double(cx),
+                                        wl_fixed_from_double(cy), wl_data.pointer_serial);
+    } else if (wl_data.pointer_constraints && !wl_data.locked_pointer) {
+        const bool reconfine = wl_data.confined_pointer != NULL;
+        if (reconfine) {
+            zwp_confined_pointer_v1_destroy(wl_data.confined_pointer);
+            wl_data.confined_pointer = NULL;
+        }
+        SDL_Window *confined = wl_data.confine_window;
+        wl_data.confine_window = NULL;
+        struct zwp_locked_pointer_v1 *lock = zwp_pointer_constraints_v1_lock_pointer(
+            wl_data.pointer_constraints, wd->surface, wl_data.pointer, NULL, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
+        zwp_locked_pointer_v1_set_cursor_position_hint(lock, wl_fixed_from_double(x), wl_fixed_from_double(y));
+        wl_surface_commit(wd->surface); /* the hint is double-buffered */
+        zwp_locked_pointer_v1_destroy(lock);
+        if (reconfine && confined) {
+            update_confinement(confined);
+        }
+    } else {
+        return false;
+    }
+    wl_display_flush(wl_data.display);
+    return true;
+}
+
+static bool wayland_WarpMouse(SDLop_VideoDevice *device, SDL_Window *window, float x, float y)
+{
+    (void)device;
+    warp_pointer(window, x, y);
+    return false; /* no motion from the compositor: the core synthesises it (stock) */
+}
+
+static bool wayland_WarpMouseGlobal(SDLop_VideoDevice *device, float x, float y)
+{
+    (void)device;
+    /* only within the window that has the pointer (stock) */
+    SDL_Window *window = wl_data.pointer_focus;
+    if (!window) {
+        return true;
+    }
+    SDL_Rect bounds = { 0, 0, 0, 0 };
+    SDL_GetDisplayBounds(SDL_GetDisplayForWindow(window), &bounds);
+    const float lx = x - (float)(bounds.x + window->x), ly = y - (float)(bounds.y + window->y);
+    if (lx >= 0.0f && ly >= 0.0f && lx < (float)window->w && ly < (float)window->h && warp_pointer(window, lx, ly)) {
+        SDLOP_SendMouseMotion(lx, ly, 0.0f, 0.0f, 0);
+    }
+    return true;
+}
+
+static bool wayland_SetWindowHitTest(SDLop_VideoDevice *device, SDL_Window *window, bool enabled)
+{
+    (void)device;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (wd) {
+        wd->hit_test_result = SDL_HITTEST_NORMAL;
+        if (enabled && wl_data.pointer_focus == window) {
+            update_hit_test(window, sdlop.mouse_x, sdlop.mouse_y);
+        }
+        if (wl_data.pointer_focus == window) {
+            apply_cursor(wl_data.pointer_serial);
+            wl_display_flush(wl_data.display);
+        }
+    }
+    return true;
+}
+
+/* the compositor's window menu, for the latest button press (stock) */
+static void wayland_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *window, int x, int y)
+{
+    (void)device;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (wd && wd->toplevel && wl_data.seat && wl_data.input_serial) {
+        xdg_toplevel_show_window_menu(wd->toplevel, wl_data.seat, wl_data.input_serial, x, y);
+        wl_display_flush(wl_data.display);
+    }
+}
+
 static bool wayland_SetWindowMouseGrab(SDLop_VideoDevice *device, SDL_Window *window, bool grabbed)
 {
     (void)device;
@@ -3415,6 +3619,10 @@ SDLop_VideoDevice SDLop_wayland_device = {
     .SetWindowMaximumSize = wayland_UpdateSizeLimits,
     .SetWindowParent = wayland_SetWindowParent,
     .SetWindowModal = wayland_SetWindowModal,
+    .WarpMouse = wayland_WarpMouse,
+    .SetWindowHitTest = wayland_SetWindowHitTest,
+    .ShowWindowSystemMenu = wayland_ShowWindowSystemMenu,
+    .WarpMouseGlobal = wayland_WarpMouseGlobal,
     .SetWindowBordered = wayland_SetWindowBordered,
     .SetWindowResizable = wayland_SetWindowResizable,
     .SetWindowMouseGrab = wayland_SetWindowMouseGrab,

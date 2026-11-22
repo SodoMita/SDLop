@@ -12,6 +12,11 @@
       xdg_dialog_v1 with set_modal / unset_modal, a fresh one when re-shown
     - SDL_SetWindowOpacity: wp_alpha_modifier_surface_v1 multiplier,
       committed right away
+    - SDL_SetWindowHitTest: a left press on a draggable / resize area
+      starts xdg_toplevel move / resize with the press serial and is not
+      passed on, resize areas show resize cursors (cursor-shape), normal
+      areas behave normally (pointer input via MINI_POINTER_CMD)
+    - SDL_ShowWindowSystemMenu: xdg_toplevel show_window_menu
     - without the protocols SDL_SetWindowIcon / SDL_SetWindowOpacity fail
       cleanly and SDL_SetWindowModal still succeeds
 
@@ -40,11 +45,14 @@ static int failures = 0;
     } while (0)
 
 static char logpath[256];
+static char cmdpath[256];
+static char cursorlog[256];
+static pid_t server;
 
 /* number of log lines starting with prefix; the last one in last */
-static int count_lines(const char *prefix, char *last, size_t last_size)
+static int count_lines_in(const char *path, const char *prefix, char *last, size_t last_size)
 {
-    FILE *f = fopen(logpath, "r");
+    FILE *f = fopen(path, "r");
     if (last) {
         last[0] = '\0';
     }
@@ -66,6 +74,11 @@ static int count_lines(const char *prefix, char *last, size_t last_size)
     return n;
 }
 
+static int count_lines(const char *prefix, char *last, size_t last_size)
+{
+    return count_lines_in(logpath, prefix, last, last_size);
+}
+
 static bool wait_count(const char *prefix, int want, char *last, size_t last_size)
 {
     const Uint64 end = SDL_GetTicks() + 2000;
@@ -79,14 +92,14 @@ static bool wait_count(const char *prefix, int want, char *last, size_t last_siz
     return false;
 }
 
-/* pump until the last line starting with prefix is want */
-static bool wait_last(const char *prefix, const char *want)
+/* pump until the last line of path starting with prefix is want */
+static bool wait_last_in(const char *path, const char *prefix, const char *want)
 {
     char last[640];
     const Uint64 end = SDL_GetTicks() + 2000;
     while (SDL_GetTicks() < end) {
         SDL_PumpEvents();
-        count_lines(prefix, last, sizeof(last));
+        count_lines_in(path, prefix, last, sizeof(last));
         if (strcmp(last, want) == 0) {
             return true;
         }
@@ -96,6 +109,11 @@ static bool wait_last(const char *prefix, const char *want)
     return false;
 }
 
+static bool wait_last(const char *prefix, const char *want)
+{
+    return wait_last_in(logpath, prefix, want);
+}
+
 static void pump_for(Uint32 ms)
 {
     const Uint64 end = SDL_GetTicks() + ms;
@@ -103,6 +121,45 @@ static void pump_for(Uint32 ms)
         SDL_PumpEvents();
         SDL_Delay(5);
     }
+}
+
+/* run pointer input in the compositor (MINI_POINTER_CMD), then collect
+ * the events it caused */
+static void pointer_cmd(const char *cmds, int *downs, int *ups)
+{
+    FILE *f = fopen(cmdpath, "w");
+    if (f) {
+        fputs(cmds, f);
+        fclose(f);
+    }
+    kill(server, SIGUSR2);
+    *downs = *ups = 0;
+    const Uint64 end = SDL_GetTicks() + 200;
+    while (SDL_GetTicks() < end) {
+        SDL_PumpEvents();
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                (*downs)++;
+            } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                (*ups)++;
+            }
+        }
+        SDL_Delay(5);
+    }
+}
+
+static SDL_HitTestResult hit_test(SDL_Window *win, const SDL_Point *p, void *data)
+{
+    (void)win;
+    (void)data;
+    if (p->y < 20) {
+        return SDL_HITTEST_DRAGGABLE;
+    }
+    if (p->x >= 300 && p->y >= 220) {
+        return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+    }
+    return SDL_HITTEST_NORMAL;
 }
 
 static SDL_Surface *solid(int w, int h, Uint32 argb)
@@ -131,16 +188,20 @@ int main(int argc, char *argv[])
     char sockpath[256];
     snprintf(sockpath, sizeof(sockpath), "%s/wayland-mini", xdg);
     snprintf(logpath, sizeof(logpath), "%s/toplevel.log", xdg);
+    snprintf(cmdpath, sizeof(cmdpath), "%s/pointer.cmd", xdg);
+    snprintf(cursorlog, sizeof(cursorlog), "%s/cursor.log", xdg);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     setenv("WAYLAND_DISPLAY", "wayland-mini", 1);
     setenv("SDL_VIDEODRIVER", "wayland", 1);
     setenv("SDLOP_DISABLE_RAW_INPUT", "1", 1);
     setenv("SDL_TOUCH_MOUSE_EVENTS", "0", 1);
 
-    pid_t server = fork();
+    server = fork();
     if (server == 0) {
+        setenv("MINI_POINTER_CMD", cmdpath, 1);
         if (icons) {
             setenv("MINI_TOPLEVEL_LOG", logpath, 1);
+            setenv("MINI_CURSOR_LOG", cursorlog, 1);
         }
         execl(argv[1], "mini_compositor", (char *)NULL);
         _exit(127);
@@ -213,6 +274,53 @@ int main(int argc, char *argv[])
         CHECK(SDL_GetWindowOpacity(w) == 1.0f, "opacity unchanged (%g)", SDL_GetWindowOpacity(w));
     }
 
+    /* hit test */
+    {
+        const Uint64 until = SDL_GetTicks() + 2000;
+        while (SDL_GetMouseFocus() != w && SDL_GetTicks() < until) {
+            SDL_PumpEvents();
+            SDL_Delay(5);
+        }
+        CHECK(SDL_GetMouseFocus() == w, "pointer entered");
+        CHECK(SDL_SetWindowHitTest(w, hit_test, NULL), "SDL_SetWindowHitTest: %s", SDL_GetError());
+        int downs, ups;
+        pointer_cmd("motion 50 10\npress 272\nrelease 272\n", &downs, &ups);
+        CHECK(downs == 0, "a press on a draggable area is not passed on (%d downs)", downs);
+        if (icons) {
+            CHECK(wait_last("move", "move serial=ok"), "xdg_toplevel.move with the press serial");
+        }
+        pointer_cmd("motion 310 230\n", &downs, &ups);
+        if (icons) {
+            CHECK(wait_last_in(cursorlog, "shape=", "shape=23"), "se-resize cursor over the resize corner");
+        }
+        pointer_cmd("press 272\nrelease 272\n", &downs, &ups);
+        CHECK(downs == 0, "a press on a resize area is not passed on (%d downs)", downs);
+        if (icons) {
+            CHECK(wait_last("resize", "resize edge=10 serial=ok"), "xdg_toplevel.resize bottom-right");
+        }
+        pointer_cmd("motion 150 120\npress 272\nrelease 272\n", &downs, &ups);
+        CHECK(downs == 1 && ups == 1, "normal area: down %d up %d", downs, ups);
+        if (icons) {
+            CHECK(count_lines("move", NULL, 0) == 1 && count_lines("resize", NULL, 0) == 1,
+                  "no move/resize from the normal area");
+            CHECK(wait_last_in(cursorlog, "shape=", "shape=1"), "default cursor again");
+        }
+        /* right button: no hit testing */
+        pointer_cmd("motion 50 10\npress 273\nrelease 273\n", &downs, &ups);
+        CHECK(downs == 1, "right press on the draggable area reaches the app (%d)", downs);
+
+        CHECK(SDL_ShowWindowSystemMenu(w, 40, 50), "SDL_ShowWindowSystemMenu");
+        if (icons) {
+            CHECK(wait_last("menu", "menu 40,50 serial=ok"), "show_window_menu with the press serial");
+        }
+        CHECK(SDL_SetWindowHitTest(w, NULL, NULL), "hit test off");
+        pointer_cmd("motion 50 10\npress 272\nrelease 272\n", &downs, &ups);
+        CHECK(downs == 1, "hit test off: presses reach the app (%d)", downs);
+        if (icons) {
+            CHECK(count_lines("move", NULL, 0) == 1, "no move with the hit test off");
+        }
+    }
+
     /* modal dialogs */
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_PARENT_POINTER, w);
@@ -258,6 +366,8 @@ int main(int argc, char *argv[])
     waitpid(server, &status, 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "compositor exit status %d", status);
     unlink(logpath);
+    unlink(cmdpath);
+    unlink(cursorlog);
     rmdir(xdg);
     if (failures) {
         fprintf(stderr, "test_wayland_toplevel (%s): %d failure(s)\n", mode, failures);

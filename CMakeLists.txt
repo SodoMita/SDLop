@@ -233,7 +233,8 @@ set(SDLOP_WL_VENDORED_PROTOCOLS
   cursor-shape-v1
   xdg-toplevel-icon-v1
   xdg-dialog-v1
-  alpha-modifier-v1)
+  alpha-modifier-v1
+  pointer-warp-v1)
 foreach(proto_name ${SDLOP_WL_VENDORED_PROTOCOLS})
   set(proto_xml ${SDLOP_WL_VENDORED_DIR}/${proto_name}.xml)
   add_custom_command(
@@ -723,7 +724,8 @@ if(SDLop_BUILD_TESTS)
       ${WL_GEN_DIR}/cursor-shape-v1-server-protocol.c
       ${WL_GEN_DIR}/xdg-toplevel-icon-v1-server-protocol.c
       ${WL_GEN_DIR}/xdg-dialog-v1-server-protocol.c
-      ${WL_GEN_DIR}/alpha-modifier-v1-server-protocol.c)
+      ${WL_GEN_DIR}/alpha-modifier-v1-server-protocol.c
+      ${WL_GEN_DIR}/pointer-warp-v1-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -783,6 +785,16 @@ if(SDLop_BUILD_TESTS)
       add_test(NAME test_wayland_toplevel_${toplevel_mode}
                COMMAND test_wayland_toplevel $<TARGET_FILE:mini_compositor> ${toplevel_mode})
       set_tests_properties(test_wayland_toplevel_${toplevel_mode} PROPERTIES TIMEOUT 60)
+    endforeach()
+
+    add_executable(test_wayland_warp tests/test_wayland_warp.c)
+    target_link_libraries(test_wayland_warp PRIVATE sdlop)
+    target_compile_options(test_wayland_warp PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_warp mini_compositor)
+    foreach(warp_mode warp hint)
+      add_test(NAME test_wayland_warp_${warp_mode}
+               COMMAND test_wayland_warp $<TARGET_FILE:mini_compositor> ${warp_mode})
+      set_tests_properties(test_wayland_warp_${warp_mode} PROPERTIES TIMEOUT 60)
     endforeach()
 
     add_executable(test_wayland_textinput tests/test_wayland_textinput.c)
