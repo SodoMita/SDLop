@@ -9,11 +9,14 @@
     3. an SPSC ring drained by SDLop_PollRawEvents()
 
   Windows has no evdev; the equivalent source is Raw Input. This file is the
-  same worker with a Win32 producer: a message-only window on a dedicated
-  thread, registered RIDEV_INPUTSINK so input keeps arriving while the
-  application is unfocused, drained with GetRawInputBuffer() rather than
-  GetRawInputData() - one syscall per batch instead of one per packet, which
-  is the point on high-polling-rate mice (SDL issue #8756).
+  same worker with a Win32 producer: a hidden window on a dedicated thread,
+  registered RIDEV_INPUTSINK so input keeps arriving while the application is
+  unfocused, each packet read with GetRawInputData().
+
+  GetRawInputBuffer() would batch a burst into one syscall, which is what
+  high-polling-rate mice want (SDL issue #8756), but Wine returns 0 from it in
+  every configuration measured here, so it is unusable for testing. Per-message
+  GetRawInputData() is what every Windows version handles identically.
 
   Raw Input yields Windows-native data, so the translation to SDLop's
   evdev-shaped event codes happens here:

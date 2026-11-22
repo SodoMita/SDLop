@@ -652,6 +652,15 @@ if(SDLop_BUILD_TESTS)
     # corrupts this one and vice versa. Measured: test_core failed with
     # "empty [!SDL_HasClipboardText()]" 4 runs out of 8 under -j3.
     set_tests_properties(test_win32_clipboard PROPERTIES RUN_SERIAL TRUE)
+
+    add_executable(test_win32_raw_mouse_e2e tests/test_win32_raw_mouse_e2e.c)
+    target_link_libraries(test_win32_raw_mouse_e2e PRIVATE sdlop)
+    target_include_directories(test_win32_raw_mouse_e2e PRIVATE src)
+    target_compile_options(test_win32_raw_mouse_e2e PRIVATE -UNDEBUG)
+    add_test(NAME test_win32_raw_mouse_e2e COMMAND test_win32_raw_mouse_e2e)
+    # Injected mouse events are global: pressing a button here would be seen by
+    # any test checking the system-wide button state at the same moment.
+    set_tests_properties(test_win32_raw_mouse_e2e PROPERTIES RUN_SERIAL TRUE)
     set_tests_properties(test_win32_raw_keyboard_once PROPERTIES RUN_SERIAL TRUE)
   else()
   # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
