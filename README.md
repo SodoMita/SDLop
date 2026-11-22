@@ -99,6 +99,10 @@ either all from evdev (`/dev/input`) or all from the window system.
   ranges and mouse/pen buttons; absolute coordinates scale to the focused
   window. Direct touchscreens, touchpads and multitouch stay with the window
   system. See [input report fixes and verification](docs/input-report-fixes.md).
+  Terminal device removal releases its held SDL state. If a required device
+  class is lost, both SDL input classes fall back together to the window system;
+  native raw observers can continue on surviving devices. New devices require
+  video reinitialization. See [input lifecycle fixes/tests](docs/input-lifecycle-fixes.md).
 - **fbdev / kmsdrm use evdev by default** (`SDLOP_RAW_INPUT=0` turns that
   off). SDL keyboard events use evdev only while SDLop owns `K_OFF` on the
   foreground VT. A working raw keyboard is required before disabling the

@@ -1,0 +1,1 @@
+api_exports_check: PASS (737 SDL_* + 7 SDLop_* functions declared and exported)

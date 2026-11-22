@@ -5,6 +5,12 @@ Research only: no library, driver or normal CTest changes in this follow-up.
 The two diagnostic tools deliberately return **1 when a gap is reproduced**;
 they are not passing regression gates or proposed fixes.
 
+**Status update:** the eight findings below are fixed by bccc4bd. See
+[implementation, positive regressions and before/after evidence](input-lifecycle-fixes.md).
+The original findings and diagnostic conventions remain here as historical
+research; new positive CTest gates live in `test_input_lifecycle`,
+`test_evdev_recovery` and `test_wayland_keyboard`.
+
 ## Prioritized findings
 
 ### 1. High: terminal raw-device errors leave held state and a busy worker
