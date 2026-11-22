@@ -41,6 +41,11 @@ extern int __real_open(const char *path, int flags, ...);
 extern int __real_open64(const char *path, int flags, ...);
 extern int __real_ioctl(int fd, unsigned long request, ...);
 
+DIR *__wrap_opendir(const char *path);
+int __wrap_open(const char *path, int flags, ...);
+int __wrap_open64(const char *path, int flags, ...);
+int __wrap_ioctl(int fd, unsigned long request, ...);
+
 DIR *__wrap_opendir(const char *path)
 {
     return __real_opendir(active && !strcmp(path, "/dev/input") ? active->directory : path);

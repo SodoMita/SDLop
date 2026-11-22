@@ -4,8 +4,12 @@
 Implements public per-ring drop reporting and recovery of the input states
 currently supported by the evdev SDL adapter. No new dependencies.
 
-**Correctness tests pass; the callback performance acceptance gate is not
-cleared by the current measurements.** This is not a blanket performance
+The optimized/sanitizer results below apply to the revision and queue policy
+recorded when they were collected. They are historical and do not validate the
+later state-first queue-pressure change. A focused native headless build and
+queue-pressure test run for the current worktree is recorded in
+[Current targeted validation](#current-targeted-validation). The callback
+performance gate remains uncleared. This is not a blanket performance
 improvement or a claim to recover missing event history.
 
 ## Verified gaps
@@ -28,7 +32,8 @@ Before these edits:
 ```c
 SDLop_RawInputStats stats;
 if (SDLop_GetRawInputStats(&stats)) {
-    /* Uint64 fields:
+    /* v1 identifiers plus Uint64 counters:
+       stats.version, stats.size
        stats.events_seen
        stats.sdl_ring_dropped
        stats.poll_ring_dropped */
@@ -45,7 +50,9 @@ batch. They report rejected native records, not discarded SDL recovery records,
 kernel losses, event-filter rejection, or synthesized transitions.
 
 Final counters survive quit until raw input is initialized again. Initially
-uninitialized counters are zero; web counters are always zero. The web stub,
+uninitialized counters are zero; web counters are always zero. The public stats
+structure is frozen as v1 and reports its version and size; future incompatible
+layouts must use a new API rather than changing this struct. The web stub,
 shared-library version script, C++ linkage in the extension header, and C++
 link regression were updated along with the declaration. Shared export check:
 737 SDL functions + 7 SDLop extensions declared and exported.
@@ -95,8 +102,12 @@ Overflow of **only the raw polling ring does not trigger SDL recovery**.
 
 ### Applying state safely
 
-- Snapshot diffs honor the three-slot SDL queue reserve. Large diffs resume
-  across pumps instead of changing state while dropping their generated events.
+- Snapshot diffs apply the complete supported state regardless of SDL queue
+  headroom. Keyboard delivery preflights three slots for a possible
+  keymap/key/text sequence (so key-only input may also be dropped with one or
+  two slots free); standalone notifications use the remaining capacity.
+  Anything that cannot fit is dropped, but state does not stall and dropped
+  transitions are not replayed.
 - A failed query is **not** treated as an all-up bitmap. The device remains
   uncertain and retries at most every 100ms while SDL is pumped. EINTR retries.
 - Per-device physical key/button caches preserve another device's held key
@@ -142,8 +153,9 @@ or hardware test. [Fault log](benchmarks/2026-11-21-resync-faults.txt).
 - per-device held-key union and focus-filtered/fresh-press interaction;
 - interrupted query retry, failed query preserving state, subsequent retry
   without new native input;
-- full SDL queue followed by only three free slots, partial snapshot application,
-  then complete delivery after the application drains existing events;
+- full SDL queue during snapshot recovery: key/button state is updated from the
+  complete snapshot even with no event capacity; notifications that cannot fit
+  are dropped and are not replayed after the application drains the queue;
 - 40,004 records without consumption: exactly **7,236 rejects per 32,768-slot
   ring**, then recovery of releases that were actually lost;
 - independent 40,000-record poll-only / SDL-only overflow: exactly 7,232 drops
@@ -151,8 +163,10 @@ or hardware test. [Fault log](benchmarks/2026-11-21-resync-faults.txt).
 - stats queries from callbacks, NULL rejection, exact totals, retention over quit
   and reset on worker reinitialization.
 
-Optimized and ASan+UBSan recovery, damage, backpressure and five worker-contract
-cases all pass. [Contract log](benchmarks/2026-11-21-resync-tests.txt).
+The archived optimized and ASan+UBSan runs predate the current state-first
+queue-pressure contract. They remain historical snapshots, not evidence for
+this later change. See the [evidence index](benchmarks/README.md); rerun the
+current test targets before making a current-build validation claim.
 
 ## Sustained before/after measurements
 
@@ -193,37 +207,77 @@ Logs include every trial:
 - [First attempt](benchmarks/2026-11-21-resync-load-first-attempt.txt)
 - [Final comparison](benchmarks/2026-11-21-resync-load.txt)
 
-## Other validation and limits
+## Current targeted validation
+
+For the current worktree, a temporary headless native build was compiled from
+repository sources because this environment lacks `pkg-config` and the required
+platform development packages for the normal CMake build. It used the dummy video
+driver, temporary xkbcommon declarations to compile the dynamic xkb integration,
+and no-op GL/Vulkan offload link stubs; xkb runtime/layout behavior and graphics
+drivers were not exercised. The real current evdev worker was used by the
+pipe-backed input tests. In that focused run, these test targets passed:
+
+- `test_events`, including overdue-repeat behavior, whole keyboard notification
+  suppression with two queue slots left (a watcher injects a TEXT_INPUT
+  independently of XKB; its nested watch is observed before queue suppression),
+  and final-slot standalone mouse input;
+- `test_evdev_backpressure` and `test_evdev_recovery`, including full-queue state
+  updates, exact raw/drop accounting, snapshot recovery, and no replay (the
+  backpressure test passed three runs and recovery passed three runs);
+- `test_cxx_link` C++ compile/link/run, plus `test_web` against both native and
+  web-keyboard headless variants. A direct test of the web-keyboard variant also
+  checked no text before start, text while active, and no text after stop.
+
+After that run, `test_events` gained explicit counters/assertions confirming that
+both the key-down watch and its nested watcher-injected TEXT_INPUT watch run
+before queue suppression. The revised test passed strict syntax checking, but its
+runtime assertion has not been rerun and is not current runtime evidence.
+
+Strict-warning syntax-only checks passed for the changed native input sources and
+focused tests, the web keyboard implementation, and the C++ test; native
+`SDL_keyboard.c` used the same temporary xkb declarations. The browser-only
+`test_web.c` path also syntax-checked with a small Emscripten-macro shim. `git
+diff --check` also passed after these edits. This is a focused manual build,
+**not** a full CMake/CTest, Emscripten/browser, platform-driver, XKB-runtime, or
+graphics build. No current performance benchmark was run, so the callback
+acceptance gate remains uncleared.
+
+## Historical validation and limits
+
+The following results belong to the earlier state-recovery revision and its
+queue policy; they are retained as dated evidence, not as validation of the
+current queue-pressure edits:
 
 - Eighteen general regression executables were rebuilt and passed, including the
   C++ linkage test, native web shim, ring stress, event/repeat tests, no-XKB
   keycodes, dummy window API and real RAM/PPM framebuffer test. Alongside damage,
-  recovery, backpressure and five worker cases, this is 26 optimized test runs.
+  recovery, backpressure and five worker cases, this was 26 optimized test runs.
 - ASan+UBSan real-library load check: 100,000 reports/mode at 64kHz, complete
   native/SDL delivery and no sanitizer diagnostics. Sanitized timings are not
   used for acceptance.
-- Shared export check passes (737 SDL + 7 SDLop functions). Changed native and
-  web-stub sources pass -Wall -Wextra -Werror syntax checks; git diff --check
-  passes. Web stub was syntax-checked, not run under Emscripten/browser here.
-- CMake remains unavailable; registered CTest targets were manually compiled
-  against the real library. X11/Wayland focus integration, real VT switches,
-  runtime XKB/layout coverage and full graphics configuration remain unavailable.
-- This adds 8,896 bytes of static raw-device/statistics state on x86-64 (nm -S),
-  with no new event-storage allocation.
-- Kernel uinput remains disabled on this host, as verified previously. Mocked
-  EVIOCGKEY tests do not establish correctness under real kernel buffer overflow.
+- Shared export check passed (737 SDL + 7 SDLop functions). Web stub was
+  syntax-checked, not run under Emscripten/browser.
+- CMake/CTest, X11/Wayland focus integration, real VT switches, runtime
+  XKB/layout coverage and full graphics configuration were unavailable in that
+  validation environment.
+- That revision added 8,896 bytes of static raw-device/statistics state on
+  x86-64 (`nm -S`), with no new event-storage allocation.
+- Kernel uinput was disabled on that host, as verified then. Mocked EVIOCGKEY
+  tests do not establish correctness under real kernel buffer overflow.
 
 Recovery restores **current supported state**, not a sequence of missed edges,
 clicks, typed characters, or relative motion. It deliberately discards uncertain
 queued SDL input and may synthesize a down for a currently held key; that uses
-normal SDL key delivery, including enabled text/repeat behavior. A failed or
-removed fd cannot be recovered until queries succeed; hotplug/removal handling
-is still pending. A continuously readable fd or slow callback can delay the
+normal SDL key delivery, including enabled text/repeat behavior. Query failures
+preserve the prior state and retry; terminal fd removal releases that device's
+held state and can trigger all-or-nothing window-system fallback. The worker does
+not discover/reopen replacement devices, so newly added devices require video
+reinitialization. A continuously readable fd or slow callback can delay the
 worker's drain/query boundary. Uncertain autorepeat is stopped conservatively;
 repeat on an unchanged held key need not resume until a fresh press.
 
 Still separate: pending-REL overflow preservation, SDL frame aggregation,
-hotplug/stable device identity, wiring snapshot recovery to focus/VT acquisition,
-and ABS/multitouch support. Do not describe this as completion of every Phase 1
-or focus-lifecycle suggestion. The callback timing gate should be addressed
-before adding further hot-path performance claims.
+hot-add/reopen with stable device identity, wiring snapshot recovery to focus/VT
+acquisition, and ABS/multitouch support. Do not describe this as completion of
+every Phase 1 or focus-lifecycle suggestion. The callback timing gate should be
+addressed before adding further hot-path performance claims.

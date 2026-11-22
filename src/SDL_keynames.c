@@ -138,7 +138,7 @@ void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
     event.text.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
     event.text.windowID = SDLOP_FocusWindowID();
     event.text.text = utf8; /* copied into slot storage by the queue */
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 }
 
 

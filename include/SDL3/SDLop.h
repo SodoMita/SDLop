@@ -275,13 +275,14 @@ extern SDL_DECLSPEC int SDLop_PollRawEvents(SDLop_RawEvent *events, int max_even
 /**
  * Query whether the low-latency evdev worker thread is running.
  *
- * When false (e.g. /dev/input is not readable, or on X11/Wayland without
- * SDLOP_RAW_INPUT=1), SDLop transparently uses window-system input instead.
- * On X11/Wayland evdev initially replaces both SDL keyboard and mouse.
- * If device removal loses either required class, SDL input falls back to the
- * window system after releasing held raw state. The worker can remain running
- * for native callbacks/polling on surviving devices, so this query remains
- * true in that case. Reinitialize video to rescan newly connected devices.
+ * This reports worker availability for native callbacks/polling, not whether
+ * evdev currently owns SDL keyboard/mouse events. When false (e.g. /dev/input
+ * is not readable, or on X11/Wayland without SDLOP_RAW_INPUT=1), SDLop uses
+ * window-system input. On X11/Wayland evdev initially replaces both SDL
+ * keyboard and mouse. If device removal loses either required class, SDL input
+ * falls back to the window system after releasing held raw state. The worker
+ * can remain running for callbacks/polling on surviving devices, so this query
+ * remains true after that fallback. Reinitialize video to rescan new devices.
  */
 extern SDL_DECLSPEC bool SDLop_RawInputAvailable(void);
 
@@ -290,9 +291,13 @@ extern SDL_DECLSPEC bool SDLop_RawInputAvailable(void);
  */
 extern SDL_DECLSPEC Uint64 SDLop_GetRawEventCount(void);
 
-/** Raw transport counters. No fields count synthesized SDL recovery events. */
+/* SDLop_RawInputStats v1. Its field order/layout is frozen; incompatible
+ * future statistics will use a new versioned API rather than changing v1. */
+#define SDLOP_RAW_INPUT_STATS_VERSION 1u
 typedef struct SDLop_RawInputStats
 {
+    Uint32 version;           /**< Set to SDLOP_RAW_INPUT_STATS_VERSION. */
+    Uint32 size;              /**< Set to sizeof(SDLop_RawInputStats). */
     Uint64 events_seen;       /**< Native records dispatched since worker init. */
     Uint64 sdl_ring_dropped;  /**< Native records rejected by the SDL input ring. */
     Uint64 poll_ring_dropped; /**< Native records rejected by the raw polling ring. */
@@ -309,6 +314,9 @@ typedef struct SDLop_RawInputStats
  * Counters reset when the worker initializes; final counts survive quit until
  * the next worker initialization. An inactive/uninitialized worker initially
  * reports zero. The web implementation always reports zero.
+ *
+ * `version` and `size` are output identifiers for the frozen v1 layout; they
+ * are overwritten by the function and are not caller-supplied capacity.
  *
  * \param stats output storage, must not be NULL.
  * \returns true on success, false for a NULL pointer (SDL error set).

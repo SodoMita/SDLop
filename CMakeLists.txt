@@ -1,12 +1,23 @@
 cmake_minimum_required(VERSION 3.13)
 option(SDLOP_SANITIZERS "Build with ASan+UBSan and tune leak checks for GPU tests" OFF)
+option(SDLOP_TSAN "Build with ThreadSanitizer (mutually exclusive with SDLOP_SANITIZERS)" OFF)
 
 project(SDLop VERSION 0.2.0 LANGUAGES C)
+
+if (SDLOP_SANITIZERS AND SDLOP_TSAN)
+  message(FATAL_ERROR "SDLOP_SANITIZERS and SDLOP_TSAN are mutually exclusive (ASan and TSan cannot be combined)")
+endif()
 
 if (SDLOP_SANITIZERS)
   string(APPEND CMAKE_C_FLAGS " -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer")
   string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=address,undefined")
   string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=address,undefined")
+endif()
+
+if (SDLOP_TSAN)
+  string(APPEND CMAKE_C_FLAGS " -fsanitize=thread -fno-omit-frame-pointer")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=thread")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=thread")
 endif()
 
 set(CMAKE_C_STANDARD 11)
@@ -717,7 +728,7 @@ if(SDLop_BUILD_TESTS)
   # process-local transport uses no input devices, root or display server.
   add_executable(test_evdev_backpressure tests/test_evdev_backpressure.c bench/raw_pipe.c)
   target_link_libraries(test_evdev_backpressure PRIVATE sdlop)
-  target_include_directories(test_evdev_backpressure PRIVATE tests)
+  target_include_directories(test_evdev_backpressure PRIVATE src tests)
   target_compile_options(test_evdev_backpressure PRIVATE -UNDEBUG)
   target_link_options(test_evdev_backpressure PRIVATE
     -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)

@@ -113,7 +113,8 @@ static void give_memory_to_thread(TempMem *list)
 /* ------------------------------------------------------------------ */
 
 /* Enough room for high-rate input accumulated between application frames.
- * Still bounded; raw translation applies backpressure before this fills. */
+ * Still bounded; input state translation continues when full, while input
+ * notifications that cannot fit are dropped. */
 #define SDLOP_EVENT_QUEUE_SIZE 8192 /* power of two */
 #define SDLOP_TEXT_SIZE 64
 
@@ -485,13 +486,19 @@ void SDL_SetEventEnabled(Uint32 type, bool enabled)
 /* Push paths                                                          */
 /* ------------------------------------------------------------------ */
 
-static bool push_any_thread(SDL_Event *event)
+static bool push_any_thread(SDL_Event *event, Uint32 reserve_slots, bool drop_input)
 {
     if (!dispatch_watchers(event)) {
         SDL_ClearError();
         return false;
     }
     if (SDLOP_IsMainThread()) {
+        /* Input state has already been updated by its caller. Preserve
+         * watchers/filters, but never turn queue pressure into a state freeze
+         * or a queue-full error for input notifications. */
+        if (drop_input || (reserve_slots && SDLOP_EventQueueFree() < reserve_slots)) {
+            return false;
+        }
         return queue_add(event);
     }
     return side_push(event);
@@ -503,7 +510,17 @@ bool SDLOP_PushEventInternal(SDL_Event *event)
     if (!SDL_EventEnabled(event->type)) {
         return false;
     }
-    return push_any_thread(event);
+    return push_any_thread(event, 0, false);
+}
+
+/* Input state is updated before this call. A compound key translation may
+ * suppress its whole notification sequence when there is insufficient room. */
+bool SDLOP_PushInputEvent(SDL_Event *event)
+{
+    if (!SDL_EventEnabled(event->type)) {
+        return false;
+    }
+    return push_any_thread(event, 1, sdlop.suppress_input_events);
 }
 
 bool SDL_PushEvent(SDL_Event *event)
@@ -514,7 +531,7 @@ bool SDL_PushEvent(SDL_Event *event)
     if (!event->common.timestamp) {
         event->common.timestamp = SDL_GetTicksNS();
     }
-    return push_any_thread(event);
+    return push_any_thread(event, 0, false);
 }
 
 void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1, Sint32 data2)

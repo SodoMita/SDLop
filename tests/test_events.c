@@ -13,6 +13,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct QueuePressureWatchProbe
+{
+    int key_down;
+    int text_input;
+} QueuePressureWatchProbe;
+
+static bool inject_text_from_key_watch(void *userdata, SDL_Event *event)
+{
+    QueuePressureWatchProbe *probe = (QueuePressureWatchProbe *)userdata;
+    if (event->type == SDL_EVENT_KEY_DOWN) {
+        probe->key_down++;
+        SDLOP_SendKeyboardText("pressure-probe", 0);
+    } else if (event->type == SDL_EVENT_TEXT_INPUT &&
+               event->text.text && strcmp(event->text.text, "pressure-probe") == 0) {
+        /* count only the text this watch injected. The key press also emits its
+         * own TEXT_INPUT ("a"), which reaches watchers too because
+         * push_any_thread dispatches watchers before applying queue pressure --
+         * that is intended behaviour, not what this counter is measuring. */
+        probe->text_input++;
+    }
+    return true;
+}
+
 int main(void)
 {
     setenv("SDL_VIDEODRIVER", "dummy", 1);
@@ -127,7 +150,65 @@ int main(void)
     assert(!(SDL_GetModState() & SDL_KMOD_LSHIFT));
     SDL_FlushEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP);
 
-    /* Overdue repeats must not be consumed while the SDL queue is full.
+    /* With only two slots left, drop the whole possible key/layout/text
+     * notification sequence while still applying both key-state changes. */
+    {
+        SDL_FlushEvents(0, 0xFFFFFFFFu);
+        assert(SDL_StartTextInput(w));
+        SDL_Event filler;
+        SDL_zero(filler);
+        filler.type = usertype;
+        while (SDLOP_EventQueueFree() > 2) {
+            assert(SDL_PushEvent(&filler));
+        }
+        assert(SDLOP_EventQueueFree() == 2);
+        SDL_ClearError();
+        QueuePressureWatchProbe probe = { 0, 0 };
+        assert(SDL_AddEventWatch(inject_text_from_key_watch, &probe));
+        SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_A, 30, 0);
+        assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
+        assert(probe.key_down == 1);
+        assert(probe.text_input == 1); /* watch ran on the nested, suppressed text push */
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, 30, 0);
+        assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
+        SDL_RemoveEventWatch(inject_text_from_key_watch, &probe);
+        assert(SDLOP_EventQueueFree() == 2);
+        SDL_Event input;
+        assert(SDL_PeepEvents(&input, 1, SDL_GETEVENT, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP) == 0);
+        assert(SDL_PeepEvents(&input, 1, SDL_GETEVENT, SDL_EVENT_TEXT_INPUT, SDL_EVENT_TEXT_INPUT) == 0);
+        assert(SDL_PeepEvents(&input, 1, SDL_GETEVENT, SDL_EVENT_KEYMAP_CHANGED, SDL_EVENT_KEYMAP_CHANGED) == 0);
+        assert(!*SDL_GetError());
+        SDL_FlushEvents(0, 0xFFFFFFFFu);
+        assert(SDL_StopTextInput(w));
+    }
+
+    /* A standalone mouse notification may use the final slot. A later release
+     * still changes state under pressure, but its notification is not replayed. */
+    {
+        SDL_Event filler;
+        SDL_zero(filler);
+        filler.type = usertype;
+        while (SDLOP_EventQueueFree() > 1) {
+            assert(SDL_PushEvent(&filler));
+        }
+        assert(SDLOP_EventQueueFree() == 1);
+        SDL_ClearError();
+        SDLOP_SendMouseButton(true, SDL_BUTTON_LEFT, SDLOP_NO_POS, SDLOP_NO_POS, 0);
+        assert(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK);
+        assert(SDLOP_EventQueueFree() == 0);
+        SDLOP_SendMouseButton(false, SDL_BUTTON_LEFT, SDLOP_NO_POS, SDLOP_NO_POS, 0);
+        assert(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK));
+        SDL_Event button;
+        assert(SDL_PeepEvents(&button, 1, SDL_GETEVENT,
+                              SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_DOWN) == 1);
+        assert(button.button.button == SDL_BUTTON_LEFT);
+        assert(SDL_PeepEvents(&button, 1, SDL_GETEVENT,
+                              SDL_EVENT_MOUSE_BUTTON_UP, SDL_EVENT_MOUSE_BUTTON_UP) == 0);
+        assert(!*SDL_GetError());
+        SDL_FlushEvents(0, 0xFFFFFFFFu);
+    }
+
+    /* Queue pressure skips overdue repeats instead of retaining a backlog.
      * This does not require an evdev device or libxkbcommon. */
     {
         SDL_FlushEvents(0, 0xFFFFFFFFu);
@@ -142,16 +223,21 @@ int main(void)
         sdlop.repeat_active = true;
         sdlop.repeat_scancode = SDL_SCANCODE_A;
         sdlop.repeat_rawcode = 30;
-        sdlop.repeat_interval_ms = 1000;
+        sdlop.repeat_interval_ms = 25;
         Uint64 due = SDLOP_MonotonicNS() - 1;
         sdlop.repeat_next_ns = due;
         SDLOP_KeyboardProcessRepeats();
-        assert(sdlop.repeat_next_ns == due);
+        Uint64 rescheduled = sdlop.repeat_next_ns;
+        assert(rescheduled > due); /* skipped, not retained as a queue backlog */
         assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
         SDL_FlushEvents(0, 0xFFFFFFFFu);
         SDLOP_KeyboardProcessRepeats();
-        assert(sdlop.repeat_next_ns > due);
+        assert(sdlop.repeat_next_ns == rescheduled);
         SDL_Event repeated;
+        assert(SDL_PeepEvents(&repeated, 1, SDL_GETEVENT, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_DOWN) == 0);
+        SDL_Delay(35);
+        SDLOP_KeyboardProcessRepeats();
+        assert(sdlop.repeat_next_ns > rescheduled);
         assert(SDL_PeepEvents(&repeated, 1, SDL_GETEVENT, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_DOWN) == 1);
         assert(repeated.key.scancode == SDL_SCANCODE_A && repeated.key.repeat);
         SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, 30, 0);
