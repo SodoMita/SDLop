@@ -388,12 +388,14 @@ static void pump(event_log *log, int ms)
 /* inject what is queued and collect the results */
 static void flush_and_collect(event_log *log)
 {
+    /* collect from the start: SDL may already deliver some of the events
+     * while the injector is still busy (seen under ASan) */
+    memset(log, 0, sizeof(*log));
     Uint64 end = SDL_GetTicks() + 1000;
     while (atomic_load(&inject_pending) > 0 && SDL_GetTicks() < end) {
-        pump(NULL, 2);
+        pump(log, 2);
     }
-    memset(log, 0, sizeof(*log));
-    pump(log, 80);
+    pump(log, 250); /* generous: sanitizer builds are slow */
 }
 
 static bool near(float a, float b)
