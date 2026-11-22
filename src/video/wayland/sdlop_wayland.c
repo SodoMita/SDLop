@@ -1972,6 +1972,9 @@ static const struct wl_pointer_listener pointer_listener = {
     pointer_axis_discrete,
     pointer_axis_value120,
     pointer_axis_relative_direction,
+#ifdef WL_POINTER_WARP_SINCE_VERSION
+    NULL, /* warp (newer wayland headers): the seat is bound at v9 at most, never sent */
+#endif
 };
 
 /* ------------------------------------------------------------------ */
