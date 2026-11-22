@@ -764,6 +764,7 @@ void SDL_PumpEvents(void)
 
     /* 1. drain raw input ring -> SDL events */
     SDLOP_RawInputPump();
+    SDLOP_DBus_Pump(); /* session bus signals (theme changes, portal replies) */
 
     /* 2. drain window system (non-blocking) */
     if (sdlop.video) {

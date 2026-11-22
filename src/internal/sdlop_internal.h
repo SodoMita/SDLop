@@ -596,4 +596,89 @@ void SDLOP_QuitLog(void);
 void SDLOP_QuitHints(void);
 void SDLOP_QuitProperties(void);
 
+/* ---- D-Bus session bus client (SDL_dbus.c) ---- */
+enum
+{
+    SDLOP_DBUS_METHOD_CALL = 1,
+    SDLOP_DBUS_METHOD_RETURN = 2,
+    SDLOP_DBUS_ERROR = 3,
+    SDLOP_DBUS_SIGNAL = 4
+};
+typedef struct SDLop_DBusMsg SDLop_DBusMsg;
+typedef struct
+{
+    const Uint8 *data;
+    size_t pos, end;
+    bool swap;
+    const char *sig, *sig_end; /* struct/variant/top level: remaining types */
+    bool array;
+    const char *elem, *elem_end; /* array: the element type */
+} SDLop_DBusIter;
+typedef struct
+{
+    size_t len_pos, start;
+} SDLop_DBusArray;
+/* signals and async replies; return true when the message was consumed */
+typedef bool (*SDLop_DBusHandler)(SDLop_DBusMsg *msg, void *userdata);
+
+bool SDLOP_DBus_Connect(void);
+bool SDLOP_DBus_IsConnected(void);
+const char *SDLOP_DBus_UniqueName(void);
+void SDLOP_DBus_Pump(void); /* from SDL_PumpEvents: dispatches signals */
+void SDLOP_DBus_Quit(void);
+SDLop_DBusMsg *SDLOP_DBus_Call(SDLop_DBusMsg *m, int timeout_ms); /* reply or NULL (error set) */
+bool SDLOP_DBus_Send(SDLop_DBusMsg *m);                             /* no reply wanted */
+Uint32 SDLOP_DBus_CallAsync(SDLop_DBusMsg *m); /* serial (0: failed); the reply goes to the handlers */
+SDLop_DBusMsg *SDLOP_DBus_WaitReply(Uint32 serial, int timeout_ms); /* ... unless taken here first */
+bool SDLOP_DBus_AddMatch(const char *rule);
+bool SDLOP_DBus_RemoveMatch(const char *rule);
+bool SDLOP_DBus_AddHandler(SDLop_DBusHandler fn, void *userdata);
+void SDLOP_DBus_RemoveHandler(SDLop_DBusHandler fn, void *userdata);
+
+SDLop_DBusMsg *SDLOP_DBus_NewMessage(Uint8 type, const char *dest, const char *path, const char *iface,
+                                     const char *member, const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewMethodCall(const char *dest, const char *path, const char *iface, const char *member,
+                                        const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewSignal(const char *path, const char *iface, const char *member, const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewReply(const SDLop_DBusMsg *call, const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewError(const SDLop_DBusMsg *call, const char *error_name, const char *text);
+void SDLOP_DBus_FreeMessage(SDLop_DBusMsg *m);
+Uint8 SDLOP_DBus_MessageType(const SDLop_DBusMsg *m);
+Uint32 SDLOP_DBus_MessageSerial(const SDLop_DBusMsg *m);
+Uint32 SDLOP_DBus_MessageReplySerial(const SDLop_DBusMsg *m);
+const char *SDLOP_DBus_MessageField(const SDLop_DBusMsg *m, char which); /* p i m e d s g */
+void SDLOP_DBus_SetSender(SDLop_DBusMsg *m, const char *sender);
+void SDLOP_DBus_SetDestination(SDLop_DBusMsg *m, const char *dest);
+void SDLOP_DBus_SetNoReply(SDLop_DBusMsg *m);
+Uint8 *SDLOP_DBus_Serialize(SDLop_DBusMsg *m, Uint32 serial, size_t *len);
+int SDLOP_DBus_Parse(const Uint8 *buf, size_t len, SDLop_DBusMsg **out, size_t *consumed);
+
+void SDLOP_DBus_PutByte(SDLop_DBusMsg *m, Uint8 v);
+void SDLOP_DBus_PutBool(SDLop_DBusMsg *m, bool v);
+void SDLOP_DBus_PutU32(SDLop_DBusMsg *m, Uint32 v);
+void SDLOP_DBus_PutDouble(SDLop_DBusMsg *m, double v);
+void SDLOP_DBus_PutString(SDLop_DBusMsg *m, const char *s); /* also object paths */
+void SDLOP_DBus_PutSignature(SDLop_DBusMsg *m, const char *sig);
+SDLop_DBusArray SDLOP_DBus_OpenArray(SDLop_DBusMsg *m, char elem_type);
+void SDLOP_DBus_CloseArray(SDLop_DBusMsg *m, const SDLop_DBusArray *a);
+void SDLOP_DBus_OpenStruct(SDLop_DBusMsg *m); /* also dict entries */
+void SDLOP_DBus_PutDictVariantKey(SDLop_DBusMsg *m, const char *key, const char *value_sig);
+
+bool SDLOP_DBus_IterInit(const SDLop_DBusMsg *msg, SDLop_DBusIter *it);
+int SDLOP_DBus_IterType(const SDLop_DBusIter *it); /* signature char, 0 at the end */
+bool SDLOP_DBus_IterNext(SDLop_DBusIter *it);      /* false at the end */
+bool SDLOP_DBus_IterRecurse(const SDLop_DBusIter *it, SDLop_DBusIter *sub);
+bool SDLOP_DBus_IterGetByte(const SDLop_DBusIter *it, Uint8 *v);
+bool SDLOP_DBus_IterGetBool(const SDLop_DBusIter *it, bool *v);
+bool SDLOP_DBus_IterGetU32(const SDLop_DBusIter *it, Uint32 *v);
+bool SDLOP_DBus_IterGetI32(const SDLop_DBusIter *it, Sint32 *v);
+bool SDLOP_DBus_IterGetDouble(const SDLop_DBusIter *it, double *v);
+bool SDLOP_DBus_IterGetString(const SDLop_DBusIter *it, const char **v);
+
+/* desktop integration over D-Bus (SDL_desktop.c) */
+void SDLOP_Desktop_Init(void); /* async theme lookup + change subscription */
+SDL_SystemTheme SDLOP_Desktop_GetSystemTheme(void);
+void SDLOP_Desktop_UpdateProgress(SDL_Window *window);
+void SDLOP_Desktop_Quit(void);
+
 #endif /* sdlop_internal_h_ */

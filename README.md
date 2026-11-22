@@ -244,7 +244,7 @@ with the same signature as SDL3, and checked by the `api_exports` test.
 | OpenGL / Vulkan | GLX (X11 desktop GL) and EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks; NULL for GLX contexts, as stock), Vulkan WSI (`SDL_Vulkan_*`) |
 | Filesystem | `SDL_GetBasePath`, `SDL_GetPrefPath`, `SDL_GetUserFolder` (XDG), `SDL_CreateDirectory`, `SDL_EnumerateDirectory`, `SDL_GetPathInfo`, `SDL_CopyFile`, `SDL_RenamePath`, `SDL_RemovePath`, `SDL_GetCurrentDirectory` (no `SDL_GlobDirectory`) |
 | Joystick / gamepad | the whole `SDL_joystick.h` / `SDL_gamepad.h` API, behaving like stock SDL3 with no controller attached: empty device lists, opens fail with an error, NULL handles are harmless, string/label helpers work |
-| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings |
+| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings, system theme (settings portal, `SDL_EVENT_SYSTEM_THEME_CHANGED`) and window progress (Unity launcher API) over a built-in D-Bus client (no libdbus; `SDLOP_NO_DBUS=1` turns it off) |
 
 Unsupported with an SDL error (like a stock SDL3 build without that feature):
 FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).

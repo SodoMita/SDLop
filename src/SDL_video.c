@@ -41,6 +41,10 @@ static const char *default_driver_order(void)
 
 static void video_post_init(void)
 {
+    /* desktop sessions: system theme from the settings portal (async) */
+    if (strcmp(sdlop.video->name, "wayland") == 0 || strcmp(sdlop.video->name, "x11") == 0) {
+        SDLOP_Desktop_Init();
+    }
     sdlop.grabbed_window = NULL;
     sdlop.suspend_screensaver = false;
     /* stock SDL3 inhibits the screensaver unless the app opts in */
@@ -109,6 +113,8 @@ void SDLOP_VideoQuit(void)
         sdlop.video = NULL;
     }
     SDLOP_RemoveAllPens();
+    SDLOP_Desktop_Quit();
+    SDLOP_DBus_Quit();
     /* drivers are responsible for DelDisplay at Quit; make sure nothing leaks */
     for (int i = 0; i < sdlop.num_displays; i++) {
         SDLop_Display *d = &sdlop.displays[i];
@@ -1993,7 +1999,8 @@ bool SDL_SetWindowProgressState(SDL_Window *window, SDL_ProgressState state)
         return SDL_InvalidParamError("state");
     }
     window->progress_state = state;
-    return true; /* stock SDL3 forwards this over DBus (Unity launcher API) */
+    SDLOP_Desktop_UpdateProgress(window); /* Unity launcher API over D-Bus (stock) */
+    return true;
 }
 
 SDL_ProgressState SDL_GetWindowProgressState(SDL_Window *window)
@@ -2008,6 +2015,7 @@ bool SDL_SetWindowProgressValue(SDL_Window *window, float value)
     CHECK_WINDOW(window, false);
     CHECK_WINDOW_NOT_POPUP(window, false);
     window->progress_value = SDL_clamp(value, 0.0f, 1.0f);
+    SDLOP_Desktop_UpdateProgress(window);
     return true;
 }
 
@@ -2110,7 +2118,15 @@ bool SDL_DisableScreenSaver(void)
 SDL_SystemTheme SDL_GetSystemTheme(void)
 {
     if (sdlop.video && sdlop.video->GetSystemTheme) {
-        return sdlop.video->GetSystemTheme(sdlop.video);
+        const SDL_SystemTheme t = sdlop.video->GetSystemTheme(sdlop.video);
+        if (t != SDL_SYSTEM_THEME_UNKNOWN) {
+            return t;
+        }
+    }
+    /* desktop sessions (dummy too, for headless tools and tests); consoles
+     * have no theme, like stock */
+    if (sdlop.video && strcmp(sdlop.video->name, "kmsdrm") != 0 && strcmp(sdlop.video->name, "fbdev") != 0) {
+        return SDLOP_Desktop_GetSystemTheme();
     }
     return SDL_SYSTEM_THEME_UNKNOWN;
 }
