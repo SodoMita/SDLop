@@ -220,6 +220,7 @@ typedef struct X11DeviceData
     int32_t xkb_device_id;
     bool detectable_repeat;
     bool has_xi2;
+    bool has_xi24; /* XI 2.4: touchpad gesture events */
     bool has_sync;                /* SYNC >= 3.0 (resize sync counters) */
     bool has_shape;               /* SHAPE >= 1.1 (input shapes) */
     xcb_atom_t icc_atom;          /* _ICC_PROFILE, or _ICC_PROFILE_<n> on screen n > 0 */
@@ -1331,25 +1332,77 @@ static void select_raw_motion(bool on)
     free(X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, x11.root, 1, &em.head)));
 }
 
-/* XI2.2 multitouch on our windows (SDL3 xinput2_select_touch). With a
- * touch selection the server stops emulating the pointer for these
- * sequences; the core synthesizes the SDL_TOUCH_MOUSEID mouse instead. */
-static void select_touch(xcb_window_t xid)
+/* XI 2.4 gesture events (wire numbers: older xcb-proto lacks them) */
+#define X11_XI_GESTURE_PINCH_BEGIN 27
+#define X11_XI_GESTURE_PINCH_UPDATE 28
+#define X11_XI_GESTURE_PINCH_END 29
+#define X11_XI_MASK_GESTURE_PINCH ((1u << 27) | (1u << 28) | (1u << 29))
+
+static bool select_master_events(xcb_window_t xid, uint32_t mask)
 {
-    if (!x11.has_xi2 || SDLOP_HintFlag("SDLOP_X11_NO_TOUCH", false)) {
-        return;
-    }
     struct {
         xcb_input_event_mask_t head;
         uint32_t mask;
     } em;
     em.head.deviceid = X11_XI_ALL_MASTER_DEVICES;
     em.head.mask_len = 1;
-    em.mask = XCB_INPUT_XI_EVENT_MASK_TOUCH_BEGIN | XCB_INPUT_XI_EVENT_MASK_TOUCH_UPDATE |
-              XCB_INPUT_XI_EVENT_MASK_TOUCH_END;
-    /* BadAccess if another client holds the touch selection: then the
-     * pointer emulation simply keeps working */
-    free(X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, xid, 1, &em.head)));
+    em.mask = mask;
+    xcb_generic_error_t *err =
+        X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, xid, 1, &em.head));
+    free(err);
+    return err == NULL;
+}
+
+/* XI2.2 multitouch on our windows (SDL3 xinput2_select_touch). With a
+ * touch selection the server stops emulating the pointer for these
+ * sequences; the core synthesizes the SDL_TOUCH_MOUSEID mouse instead.
+ * XI 2.4 touchpad pinches go in the same per-window master mask. */
+static void select_touch(xcb_window_t xid)
+{
+    if (!x11.has_xi2) {
+        return;
+    }
+    const uint32_t touch = SDLOP_HintFlag("SDLOP_X11_NO_TOUCH", false)
+                               ? 0
+                               : (XCB_INPUT_XI_EVENT_MASK_TOUCH_BEGIN | XCB_INPUT_XI_EVENT_MASK_TOUCH_UPDATE |
+                                  XCB_INPUT_XI_EVENT_MASK_TOUCH_END);
+    const uint32_t gesture =
+        x11.has_xi24 && !SDLOP_HintFlag("SDLOP_X11_NO_GESTURES", false) ? X11_XI_MASK_GESTURE_PINCH : 0;
+    if (!(touch | gesture)) {
+        return;
+    }
+    /* BadAccess if another client holds the touch (or gesture) selection:
+     * then try them one by one; pointer emulation keeps working anyway */
+    if (!select_master_events(xid, touch | gesture) && touch && gesture) {
+        if (!select_master_events(xid, gesture)) {
+            select_master_events(xid, touch);
+        }
+    }
+}
+
+/* XI 2.4 pinch (stock: scale passed through, it's relative to the start) */
+static void handle_pinch(const xcb_ge_generic_event_t *ge)
+{
+    const uint8_t *b = (const uint8_t *)ge;
+    const size_t size = 36 + (size_t)ge->length * 4; /* + xcb's full_sequence */
+    if (size < 72) {
+        return;
+    }
+    xcb_window_t event_win;
+    int32_t scale_fp;
+    memcpy(&event_win, b + 24, 4);
+    memcpy(&scale_fp, b + 68, 4); /* wire offset 64, after full_sequence */
+    SDL_Window *window = window_from_xid(event_win);
+    if (!window) {
+        return;
+    }
+    if (ge->event_type == X11_XI_GESTURE_PINCH_BEGIN) {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_BEGIN, 0, window, 0.0f);
+    } else if (ge->event_type == X11_XI_GESTURE_PINCH_UPDATE) {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_UPDATE, 0, window, (float)scale_fp / 65536.0f);
+    } else {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_END, 0, window, 0.0f);
+    }
 }
 
 static void warp_to_center(SDL_Window *window)
@@ -1560,6 +1613,10 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
         return;
     }
     if (SDLOP_X11_Pen_HandleEvent(ge)) {
+        return;
+    }
+    if (ge->event_type >= X11_XI_GESTURE_PINCH_BEGIN && ge->event_type <= X11_XI_GESTURE_PINCH_END) {
+        handle_pinch(ge);
         return;
     }
     if (ge->event_type != XCB_INPUT_RAW_MOTION || !x11.relative_window) {
@@ -2250,14 +2307,16 @@ static bool x11_Init(SDLop_VideoDevice *device)
         }
     }
 
-    /* XInput2 >= 2.2 for raw motion (relative mouse) */
+    /* XInput2 >= 2.2 for raw motion (relative mouse), touch and pens;
+     * 2.4 adds touchpad gestures (the server answers with what it has) */
     if (SDLOP_X11_HAVE(XINPUT)) {
         const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_input_id);
         if (ext && ext->present) {
             xcb_input_xi_query_version_reply_t *v = X11_xcb_input_xi_query_version_reply(
-                x11.conn, X11_xcb_input_xi_query_version(x11.conn, 2, 2), NULL);
+                x11.conn, X11_xcb_input_xi_query_version(x11.conn, 2, 4), NULL);
             if (v && (v->major_version > 2 || (v->major_version == 2 && v->minor_version >= 2))) {
                 x11.has_xi2 = true;
+                x11.has_xi24 = v->major_version > 2 || v->minor_version >= 4;
                 x11.xi_opcode = ext->major_opcode;
             }
             free(v);

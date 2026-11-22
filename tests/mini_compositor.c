@@ -56,6 +56,10 @@
   "tprox" (proximity_in on the window), "tout", "tmotion X Y",
   "tpressure P" (0..65535), "ttilt X Y", "tdown", "tup", "tbutton CODE 1|0",
   "tremove" (tool removed) and "tframe" - no implicit frames here.
+  MINI_GESTURES=<version> for tests/test_wayland_pinch.c: offers
+  zwp_pointer_gestures_v1; MINI_POINTER_CMD lines "pinch_begin FINGERS",
+  "pinch_update SCALE" and "pinch_end [1 = cancelled]" drive the pinch
+  object of the pointer (begin targets the window surface).
   MINI_WARP_LOG=<log> for tests/test_wayland_warp.c: offers
   wp_pointer_warp_v1 (unless MINI_POINTER_WARP=0) and logs
   "warp X,Y serial=ok|bad", lock_pointer requests log "lock" and cursor
@@ -87,6 +91,7 @@
 #include "alpha-modifier-v1-server-protocol.h"
 #include "pointer-warp-v1-server-protocol.h"
 #include "tablet-v2-server-protocol.h"
+#include "pointer-gestures-unstable-v1-server-protocol.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -1151,6 +1156,90 @@ static bool TB_command(const char *line)
     return true;
 }
 
+/* ---------------- zwp_pointer_gestures_v1 (MINI_GESTURES) ---------------- */
+
+static struct wl_resource *GS_pinch;
+
+static void GS_pinch_gone(struct wl_resource *res)
+{
+    if (GS_pinch == res) {
+        GS_pinch = NULL;
+    }
+}
+
+static const struct zwp_pointer_gesture_pinch_v1_interface GS_pinch_impl = {
+    .destroy = res_destroy,
+};
+static const struct zwp_pointer_gesture_swipe_v1_interface GS_swipe_impl = {
+    .destroy = res_destroy,
+};
+static const struct zwp_pointer_gesture_hold_v1_interface GS_hold_impl = {
+    .destroy = res_destroy,
+};
+
+static void GS_get_swipe(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *pointer)
+{
+    (void)pointer;
+    struct wl_resource *r = wl_resource_create(client, &zwp_pointer_gesture_swipe_v1_interface,
+                                               wl_resource_get_version(res), id);
+    wl_resource_set_implementation(r, &GS_swipe_impl, NULL, NULL);
+}
+
+static void GS_get_pinch(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *pointer)
+{
+    (void)pointer;
+    struct wl_resource *r = wl_resource_create(client, &zwp_pointer_gesture_pinch_v1_interface,
+                                               wl_resource_get_version(res), id);
+    wl_resource_set_implementation(r, &GS_pinch_impl, NULL, GS_pinch_gone);
+    GS_pinch = r;
+}
+
+static void GS_get_hold(struct wl_client *client, struct wl_resource *res, uint32_t id, struct wl_resource *pointer)
+{
+    (void)pointer;
+    struct wl_resource *r = wl_resource_create(client, &zwp_pointer_gesture_hold_v1_interface,
+                                               wl_resource_get_version(res), id);
+    wl_resource_set_implementation(r, &GS_hold_impl, NULL, NULL);
+}
+
+static const struct zwp_pointer_gestures_v1_interface GS_impl = {
+    .get_swipe_gesture = GS_get_swipe,
+    .get_pinch_gesture = GS_get_pinch,
+    .release = res_destroy,
+    .get_hold_gesture = GS_get_hold,
+};
+
+static void GS_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &zwp_pointer_gestures_v1_interface, version, id);
+    wl_resource_set_implementation(r, &GS_impl, NULL, NULL);
+}
+
+/* one MINI_POINTER_CMD line for the pinch; false if it isn't one */
+static bool GS_command(const char *line)
+{
+    unsigned n;
+    double scale;
+    if (strncmp(line, "pinch_", 6) != 0) {
+        return false;
+    }
+    if (!GS_pinch) {
+        return true;
+    }
+    const uint32_t t = 2000;
+    if (sscanf(line, "pinch_begin %u", &n) == 1) {
+        if (M.surface_res) {
+            zwp_pointer_gesture_pinch_v1_send_begin(GS_pinch, wl_display_next_serial(M.display), t, M.surface_res, n);
+        }
+    } else if (sscanf(line, "pinch_update %lf", &scale) == 1) {
+        zwp_pointer_gesture_pinch_v1_send_update(GS_pinch, t, 0, 0, wl_fixed_from_double(scale), 0);
+    } else if (strncmp(line, "pinch_end", 9) == 0) {
+        zwp_pointer_gesture_pinch_v1_send_end(GS_pinch, wl_display_next_serial(M.display), t, atoi(line + 9) ? 1 : 0);
+    }
+    return true;
+}
+
 /* ---------------- xdg_toplevel_icon_manager_v1 (MINI_TOPLEVEL_LOG) ---------------- */
 
 static void TL_logs(const char *line)
@@ -1996,7 +2085,7 @@ static int P_signal_cb(int signal_number, void *data)
     while (fgets(line, sizeof(line), f)) {
         double x, y;
         unsigned btn;
-        if (TB_command(line)) {
+        if (TB_command(line) || GS_command(line)) {
             continue;
         }
         if (!M.pointer) {
@@ -2420,6 +2509,10 @@ int main(void)
     T_log = getenv("MINI_TEXT_INPUT");
     if (T_log) {
         wl_global_create(M.display, &zwp_text_input_manager_v3_interface, 1, NULL, T_mgr_bind);
+    }
+    if (getenv("MINI_GESTURES") && atoi(getenv("MINI_GESTURES")) > 0) {
+        const int v = atoi(getenv("MINI_GESTURES"));
+        wl_global_create(M.display, &zwp_pointer_gestures_v1_interface, v > 3 ? 3 : v, NULL, GS_bind);
     }
     if (getenv("MINI_TABLET") && strcmp(getenv("MINI_TABLET"), "0") != 0) {
         wl_global_create(M.display, &zwp_tablet_manager_v2_interface, 1, NULL, TB_mgr_bind);

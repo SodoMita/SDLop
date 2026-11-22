@@ -325,6 +325,22 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
     SDLOP_PushEventInternal(&event);
 }
 
+/* stock SDL_SendPinch: the backends pass the protocol's scale through
+ * (Wayland and XI 2.4 both report it relative to the gesture start) */
+void SDLOP_SendPinch(Uint32 type, Uint64 timestamp_ns, SDL_Window *window, float scale)
+{
+    if (!SDL_EventEnabled(type)) {
+        return;
+    }
+    SDL_Event event;
+    SDL_zero(event);
+    event.pinch.type = type;
+    event.pinch.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
+    event.pinch.scale = scale;
+    event.pinch.windowID = window ? window->id : 0;
+    SDLOP_PushEventInternal(&event);
+}
+
 
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
 {

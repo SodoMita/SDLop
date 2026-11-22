@@ -63,6 +63,7 @@
 #define SDLOP_HINT_X11_NO_SHM            "SDLOP_X11_NO_SHM"        /**< bool: do not use MIT-SHM */
 #define SDLOP_HINT_X11_NO_XIM           "SDLOP_X11_NO_XIM"        /**< bool: no input method (XIM via libX11) for text input */
 #define SDLOP_HINT_X11_NO_TOUCH          "SDLOP_X11_NO_TOUCH"      /**< bool: no XInput2 touch */
+#define SDLOP_HINT_X11_NO_GESTURES       "SDLOP_X11_NO_GESTURES"   /**< bool: do not select XInput 2.4 touchpad pinch events */
 #define SDLOP_HINT_X11_NO_PEN            "SDLOP_X11_NO_PEN"        /**< bool: no XInput2 pens (tablets stay plain mice); read at video init */
 #define SDLOP_HINT_X11_NO_XSETTINGS     "SDLOP_X11_NO_XSETTINGS"  /**< bool: do not read XSETTINGS (content scale from Gdk/WindowScalingFactor, Xft/DPI); read at video init */
 #define SDLOP_HINT_X11_RELATIVE_WARP     "SDLOP_X11_RELATIVE_WARP" /**< bool: relative mode by warping instead of XInput2 raw motion */
@@ -76,6 +77,7 @@
 #define SDLOP_HINT_WAYLAND_NO_VIEWPORTER "SDLOP_WAYLAND_NO_VIEWPORTER" /**< bool: do not use wp_viewporter (the clear colour is then a filled full-size buffer); read at video init */
 #define SDLOP_HINT_WAYLAND_NO_CURSOR_SHAPE "SDLOP_WAYLAND_NO_CURSOR_SHAPE" /**< bool: draw system cursors from the theme instead of wp_cursor_shape_v1; read at video init */
 #define SDLOP_HINT_WAYLAND_NO_TEXT_INPUT "SDLOP_WAYLAND_NO_TEXT_INPUT" /**< bool: do not use zwp_text_input_v3 (IME); read at video init */
+#define SDLOP_HINT_WAYLAND_NO_POINTER_GESTURES "SDLOP_WAYLAND_NO_POINTER_GESTURES" /**< bool: do not bind zwp_pointer_gestures_v1 (no SDL_EVENT_PINCH_*); read at video init */
 #define SDLOP_HINT_WAYLAND_NO_TABLET "SDLOP_WAYLAND_NO_TABLET" /**< bool: do not use zwp_tablet_manager_v2 (pens); read at video init */
 #define SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE "SDLOP_WAYLAND_NO_FRACTIONAL_SCALE" /**< bool: do not use wp_fractional_scale_v1 (integer preferred buffer / output scales only); read at video init */
 /* kmsdrm */

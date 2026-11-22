@@ -79,6 +79,8 @@ static unsigned char fake_infos[1024];
 static size_t fake_infos_len = 0;
 static int fake_infos_count = 0;
 #define XI_QUERY_DEVICE 48
+/* diagnostics */
+static atomic_int stat_queries = 0, stat_query_replies = 0, stat_rewrites = 0;
 
 static int connect_real_server(void)
 {
@@ -172,6 +174,7 @@ static void track_requests(proxy_conn *pc, const unsigned char *p, size_t n)
             pc->cseq++;
             if (pc->chdr[0] == xi_opcode && pc->chdr[1] == XI_QUERY_DEVICE && pc->nquery < 16) {
                 pc->query_seq[pc->nquery++] = pc->cseq;
+                atomic_fetch_add(&stat_queries, 1);
             }
         }
         pc->cskip = total > pc->chdr_len ? total - pc->chdr_len : 0;
@@ -185,6 +188,7 @@ static bool is_query_reply(proxy_conn *pc, uint16_t seq)
     for (int i = 0; i < pc->nquery; i++) {
         if (pc->query_seq[i] == seq) {
             pc->query_seq[i] = pc->query_seq[--pc->nquery];
+            atomic_fetch_add(&stat_query_replies, 1);
             return true;
         }
     }
@@ -254,6 +258,7 @@ static void *proxy_thread(void *arg)
                 last_seq = (uint16_t)(sbuf[off + 2] | (sbuf[off + 3] << 8));
                 if (pc->inject && sbuf[off] == 1 && is_query_reply(pc, last_seq) && atomic_load(&fake_present)) {
                     /* flush what precedes, then the grown reply */
+                    atomic_fetch_add(&stat_rewrites, 1);
                     unsigned char *msg = malloc(need + fake_infos_len);
                     memcpy(msg, sbuf + off, need);
                     memcpy(msg + need, fake_infos, fake_infos_len);
@@ -829,9 +834,14 @@ int main(int argc, char *argv[])
     CHECK(i >= 0 && log.ev[i].ptouch.which == eraser && log.ev[i].ptouch.eraser, "eraser: PEN_DOWN eraser=true");
 
     /* --- unplug ------------------------------------------------------- */
+    printf("test_x11_pen: before unplug: %d XIQueryDevice requests, %d replies, %d rewritten\n",
+           atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites));
     atomic_store(&fake_present, false);
     queue_hierarchy(XCB_INPUT_HIERARCHY_MASK_SLAVE_REMOVED);
     flush_and_collect(&log);
+    printf("test_x11_pen: after unplug: %d XIQueryDevice requests, %d replies, %d rewritten; types %d %d\n",
+           atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites),
+           (int)SDL_GetPenDeviceType(stylus), (int)SDL_GetPenDeviceType(eraser));
     int outs = 0;
     for (i = 0; i < log.n; i++) {
         outs += log.ev[i].type == SDL_EVENT_PEN_PROXIMITY_OUT;

@@ -235,7 +235,8 @@ set(SDLOP_WL_VENDORED_PROTOCOLS
   xdg-toplevel-icon-v1
   xdg-dialog-v1
   alpha-modifier-v1
-  pointer-warp-v1)
+  pointer-warp-v1
+  pointer-gestures-unstable-v1)
 foreach(proto_name ${SDLOP_WL_VENDORED_PROTOCOLS})
   set(proto_xml ${SDLOP_WL_VENDORED_DIR}/${proto_name}.xml)
   add_custom_command(
@@ -820,7 +821,8 @@ if(SDLop_BUILD_TESTS)
       ${WL_GEN_DIR}/xdg-toplevel-icon-v1-server-protocol.c
       ${WL_GEN_DIR}/xdg-dialog-v1-server-protocol.c
       ${WL_GEN_DIR}/alpha-modifier-v1-server-protocol.c
-      ${WL_GEN_DIR}/pointer-warp-v1-server-protocol.c)
+      ${WL_GEN_DIR}/pointer-warp-v1-server-protocol.c
+      ${WL_GEN_DIR}/pointer-gestures-unstable-v1-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
@@ -889,6 +891,16 @@ if(SDLop_BUILD_TESTS)
     foreach(pen_mode on off)
       add_test(NAME test_wayland_pen_${pen_mode} COMMAND test_wayland_pen $<TARGET_FILE:mini_compositor> ${pen_mode})
       set_tests_properties(test_wayland_pen_${pen_mode} PROPERTIES TIMEOUT 60)
+    endforeach()
+
+    add_executable(test_wayland_pinch tests/test_wayland_pinch.c)
+    target_link_libraries(test_wayland_pinch PRIVATE sdlop m)
+    target_compile_options(test_wayland_pinch PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_pinch mini_compositor)
+    foreach(pinch_mode v3 v1 off)
+      add_test(NAME test_wayland_pinch_${pinch_mode}
+               COMMAND test_wayland_pinch $<TARGET_FILE:mini_compositor> ${pinch_mode})
+      set_tests_properties(test_wayland_pinch_${pinch_mode} PROPERTIES TIMEOUT 60)
     endforeach()
 
     add_executable(test_wayland_warp tests/test_wayland_warp.c)

@@ -33,6 +33,7 @@
 #include "xdg-dialog-v1-client-protocol.h"
 #include "alpha-modifier-v1-client-protocol.h"
 #include "pointer-warp-v1-client-protocol.h"
+#include "pointer-gestures-unstable-v1-client-protocol.h"
 #include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
@@ -168,6 +169,10 @@ typedef struct WaylandDeviceData
     struct xdg_wm_dialog_v1 *wm_dialog;
     struct wp_alpha_modifier_v1 *alpha_modifier;
     struct wp_pointer_warp_v1 *pointer_warp;
+    /* touchpad pinch (stock: zwp_pointer_gestures_v1 up to v3) */
+    struct zwp_pointer_gestures_v1 *pointer_gestures;
+    struct zwp_pointer_gesture_pinch_v1 *gesture_pinch; /* of `pointer` */
+    SDL_Window *pinch_focus;
     struct wp_cursor_shape_device_v1 *cursor_shape_device; /* of `pointer` */
     struct zwp_locked_pointer_v1 *locked_pointer;
     struct zwp_relative_pointer_v1 *relative_pointer;
@@ -1621,6 +1626,83 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     }
 }
 
+/* ---- touchpad pinch: SDL_EVENT_PINCH_* (stock handle_pinch_*) ---- */
+
+static void pinch_begin(void *data, struct zwp_pointer_gesture_pinch_v1 *pinch, uint32_t serial, uint32_t time,
+                        struct wl_surface *surface, uint32_t fingers)
+{
+    (void)data;
+    (void)pinch;
+    (void)serial;
+    (void)time;
+    (void)fingers;
+    SDL_Window *window = surface ? window_from_surface(surface) : NULL;
+    if (window) {
+        wl_data.pinch_focus = window;
+        SDLOP_SendPinch(SDL_EVENT_PINCH_BEGIN, 0, window, 0.0f);
+    }
+}
+
+static void pinch_update(void *data, struct zwp_pointer_gesture_pinch_v1 *pinch, uint32_t time, wl_fixed_t dx,
+                         wl_fixed_t dy, wl_fixed_t scale, wl_fixed_t rotation)
+{
+    (void)data;
+    (void)pinch;
+    (void)time;
+    (void)dx;
+    (void)dy;
+    (void)rotation;
+    if (wl_data.pinch_focus) {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_UPDATE, 0, wl_data.pinch_focus, (float)wl_fixed_to_double(scale));
+    }
+}
+
+static void pinch_end(void *data, struct zwp_pointer_gesture_pinch_v1 *pinch, uint32_t serial, uint32_t time,
+                      int32_t cancelled)
+{
+    (void)data;
+    (void)pinch;
+    (void)serial;
+    (void)time;
+    (void)cancelled;
+    if (wl_data.pinch_focus) {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_END, 0, wl_data.pinch_focus, 0.0f);
+        wl_data.pinch_focus = NULL;
+    }
+}
+
+static const struct zwp_pointer_gesture_pinch_v1_listener pinch_listener = {
+    pinch_begin,
+    pinch_update,
+    pinch_end,
+};
+
+/* once both the gestures global and the pointer exist (either can come first) */
+static void ensure_pinch_gesture(void)
+{
+    if (wl_data.pointer_gestures && wl_data.pointer && !wl_data.gesture_pinch) {
+        wl_data.gesture_pinch = zwp_pointer_gestures_v1_get_pinch_gesture(wl_data.pointer_gestures, wl_data.pointer);
+        zwp_pointer_gesture_pinch_v1_add_listener(wl_data.gesture_pinch, &pinch_listener, NULL);
+    }
+}
+
+static void destroy_pinch_gesture(void)
+{
+    if (wl_data.pinch_focus) {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_END, 0, wl_data.pinch_focus, 0.0f); /* stock: end active gestures */
+        wl_data.pinch_focus = NULL;
+    }
+    if (wl_data.gesture_pinch) {
+        if (zwp_pointer_gesture_pinch_v1_get_version(wl_data.gesture_pinch) >=
+            ZWP_POINTER_GESTURE_PINCH_V1_DESTROY_SINCE_VERSION) {
+            zwp_pointer_gesture_pinch_v1_destroy(wl_data.gesture_pinch);
+        } else {
+            wl_proxy_destroy((struct wl_proxy *)wl_data.gesture_pinch);
+        }
+        wl_data.gesture_pinch = NULL;
+    }
+}
+
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
@@ -2200,9 +2282,11 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !d->pointer) {
         d->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+        ensure_pinch_gesture();
         d->pointer_id = sdlop_device_next_id();
         send_mouse_device_event(true, d->pointer_id);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
+        destroy_pinch_gesture();
         if (d->cursor_shape_device) {
             wp_cursor_shape_device_v1_destroy(d->cursor_shape_device);
             d->cursor_shape_device = NULL;
@@ -2278,6 +2362,11 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         d->toplevel_icon_manager = wl_registry_bind(registry, name, &xdg_toplevel_icon_manager_v1_interface, 1);
     } else if (strcmp(interface, wp_pointer_warp_v1_interface.name) == 0 && !d->pointer_warp) {
         d->pointer_warp = wl_registry_bind(registry, name, &wp_pointer_warp_v1_interface, 1);
+    } else if (strcmp(interface, zwp_pointer_gestures_v1_interface.name) == 0 && !d->pointer_gestures &&
+               !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_POINTER_GESTURES, false)) {
+        d->pointer_gestures =
+            wl_registry_bind(registry, name, &zwp_pointer_gestures_v1_interface, version < 3 ? version : 3);
+        ensure_pinch_gesture();
     } else if (strcmp(interface, wp_alpha_modifier_v1_interface.name) == 0 && !d->alpha_modifier) {
         d->alpha_modifier = wl_registry_bind(registry, name, &wp_alpha_modifier_v1_interface, 1);
     } else if (strcmp(interface, xdg_wm_dialog_v1_interface.name) == 0 && !d->wm_dialog) {
@@ -2472,6 +2561,15 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     }
     if (wl_data.pointer_warp) {
         wp_pointer_warp_v1_destroy(wl_data.pointer_warp);
+    }
+    destroy_pinch_gesture();
+    if (wl_data.pointer_gestures) {
+        if (zwp_pointer_gestures_v1_get_version(wl_data.pointer_gestures) >=
+            ZWP_POINTER_GESTURES_V1_RELEASE_SINCE_VERSION) {
+            zwp_pointer_gestures_v1_release(wl_data.pointer_gestures);
+        } else {
+            zwp_pointer_gestures_v1_destroy(wl_data.pointer_gestures);
+        }
     }
     if (wl_data.pointer) {
         wl_pointer_destroy(wl_data.pointer);
@@ -2954,6 +3052,9 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     SDLOP_Wayland_GL_WindowDestroyed(window);
     SDLOP_Wayland_TextInput_WindowDestroyed(window);
     SDLOP_Wayland_Tablet_WindowDestroyed(window);
+    if (wl_data.pinch_focus == window) {
+        wl_data.pinch_focus = NULL;
+    }
     if (window->surface) {
         SDL_DestroySurface(window->surface);
         window->surface = NULL;

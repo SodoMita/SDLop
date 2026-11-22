@@ -381,6 +381,8 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
                      float dx, float dy, float pressure, SDL_WindowID windowID,
                      Uint64 timestamp_ns);
 void SDLOP_ResetTouchMouse(void); /* SDL_Init / SDL_Quit */
+/* SDL_EVENT_PINCH_BEGIN/UPDATE/END (touchpad gestures) */
+void SDLOP_SendPinch(Uint32 type, Uint64 timestamp_ns, SDL_Window *window, float scale);
 /* a mouse event made up by touch/pen emulation; fx/fy are window pixels */
 void SDLOP_SendSyntheticMouse(Uint32 type, SDL_Window *window, float fx, float fy, Uint8 button,
                               SDL_MouseID which, Uint64 timestamp_ns);
