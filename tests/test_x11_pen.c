@@ -835,27 +835,28 @@ int main(int argc, char *argv[])
     CHECK(i >= 0 && log.ev[i].ptouch.which == eraser && log.ev[i].ptouch.eraser, "eraser: PEN_DOWN eraser=true");
 
     /* --- unplug ------------------------------------------------------- */
-    fprintf(stderr, "test_x11_pen: before unplug: %d XIQueryDevice requests, %d replies, %d rewritten, %d injections\n",
-            atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites),
-            atomic_load(&stat_injections));
+    const int q0 = atomic_load(&stat_queries), r0 = atomic_load(&stat_query_replies),
+              w0 = atomic_load(&stat_rewrites), j0 = atomic_load(&stat_injections);
     atomic_store(&fake_present, false);
     queue_hierarchy(XCB_INPUT_HIERARCHY_MASK_SLAVE_REMOVED);
     flush_and_collect(&log);
-    fprintf(stderr, "test_x11_pen: after unplug: %d XIQueryDevice requests, %d replies, %d rewritten, %d injections; types %d %d\n",
-            atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites),
-            atomic_load(&stat_injections), (int)SDL_GetPenDeviceType(stylus), (int)SDL_GetPenDeviceType(eraser));
+    int late_pen = -1;
     if (SDL_GetPenDeviceType(stylus) != SDL_PEN_DEVICE_TYPE_INVALID) {
         event_log late;
         memset(&late, 0, sizeof(late));
         pump(&late, 1500);
-        fprintf(stderr, "test_x11_pen: 1.5 s later: %d events, %d pen events, types %d %d\n", late.n, count_pen(&late),
-                (int)SDL_GetPenDeviceType(stylus), (int)SDL_GetPenDeviceType(eraser));
+        late_pen = count_pen(&late);
     }
+    char diag[256];
+    snprintf(diag, sizeof(diag), "queries %d->%d replies %d->%d rewrites %d->%d injections %d->%d late %d types %d %d",
+             q0, atomic_load(&stat_queries), r0, atomic_load(&stat_query_replies), w0, atomic_load(&stat_rewrites), j0,
+             atomic_load(&stat_injections), late_pen, (int)SDL_GetPenDeviceType(stylus),
+             (int)SDL_GetPenDeviceType(eraser));
     int outs = 0;
     for (i = 0; i < log.n; i++) {
         outs += log.ev[i].type == SDL_EVENT_PEN_PROXIMITY_OUT;
     }
-    CHECK(outs == 2, "unplugging: proximity out for both pens (%d)", outs);
+    CHECK(outs == 2, "unplugging: proximity out for both pens (%d; %s)", outs, diag);
     CHECK(SDL_GetPenDeviceType(stylus) == SDL_PEN_DEVICE_TYPE_INVALID &&
               SDL_GetPenDeviceType(eraser) == SDL_PEN_DEVICE_TYPE_INVALID,
           "removed pens are gone");
