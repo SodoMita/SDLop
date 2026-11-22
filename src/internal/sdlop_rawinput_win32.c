@@ -798,6 +798,40 @@ void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
     SDL_free(old);
 }
 
+/* The core calls this on focus/grab transitions to drop a half-finished
+ * pointer frame. Win32 Raw Input has no such frame: each packet carries a
+ * complete relative delta and every axis it moved is published immediately, so
+ * a dropped or partial frame cannot occur the way it can with evdev's
+ * axis-until-SYN_REPORT batching. Nothing to reset. */
+/* The core asks whether the raw path may deliver keys before posting its own
+ * keyboard events. On Win32 the raw worker only runs when the app opted in
+ * (SDLOP_RAW_INPUT=1), and when it is not running the window-message path owns
+ * the keyboard, so this is always true. */
+/* Real counters, not placeholders: the SPSC rings already track producer-side
+ * drops, and event_count is the same atomic the evdev worker publishes. The
+ * contract matches the Linux implementation -- independently sampled fields,
+ * not a transactional snapshot. */
+bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
+{
+    if (!stats) {
+        return SDL_SetError("NULL stats pointer");
+    }
+    stats->events_seen = atomic_load_explicit(&winraw.event_count, memory_order_relaxed);
+    stats->sdl_ring_dropped = SDLOP_RingDropped(&winraw.sdl_ring);
+    stats->poll_ring_dropped = SDLOP_RingDropped(&winraw.poll_ring);
+    return true;
+}
+
+bool SDLOP_RawInputKeyboardAllowed(void)
+{
+    return true;
+}
+
+void SDLOP_RawInputResetPointerFrame(void)
+{
+    /* intentionally empty */
+}
+
 bool SDLop_RawInputAvailable(void)
 {
     return winraw.running != 0;

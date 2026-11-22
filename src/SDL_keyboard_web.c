@@ -257,6 +257,11 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     }
 }
 
+void SDLOP_KeyboardClearComposition(void)
+{
+    /* DOM owns composition on the web. */
+}
+
 void SDLOP_KeyboardProcessRepeats(void)
 {
     if (!sdlop.repeat_active) {
@@ -372,6 +377,10 @@ void SDLOP_RawInputQuit(void)
 {
 }
 
+void SDLOP_RawInputResetPointerFrame(void)
+{
+}
+
 void SDLOP_RawInputPump(void)
 {
 }
@@ -404,4 +413,13 @@ bool SDLop_RawInputAvailable(void)
 Uint64 SDLop_GetRawEventCount(void)
 {
     return 0;
+}
+
+bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
+{
+    if (!stats) {
+        return SDL_InvalidParamError("stats");
+    }
+    SDL_zero(*stats);
+    return true;
 }

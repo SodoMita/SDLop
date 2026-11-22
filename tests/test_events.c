@@ -127,6 +127,38 @@ int main(void)
     assert(!(SDL_GetModState() & SDL_KMOD_LSHIFT));
     SDL_FlushEvents(SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP);
 
+    /* Overdue repeats must not be consumed while the SDL queue is full.
+     * This does not require an evdev device or libxkbcommon. */
+    {
+        SDL_FlushEvents(0, 0xFFFFFFFFu);
+        SDL_Event filler;
+        SDL_zero(filler);
+        filler.type = usertype;
+        int filled = 0;
+        while (filled < 100000 && SDL_PushEvent(&filler)) { filled++; }
+        assert(filled > 0 && filled < 100000);
+        SDL_ClearError();
+        assert(SDLOP_EventQueueFree() == 0);
+        sdlop.repeat_active = true;
+        sdlop.repeat_scancode = SDL_SCANCODE_A;
+        sdlop.repeat_rawcode = 30;
+        sdlop.repeat_interval_ms = 1000;
+        Uint64 due = SDLOP_MonotonicNS() - 1;
+        sdlop.repeat_next_ns = due;
+        SDLOP_KeyboardProcessRepeats();
+        assert(sdlop.repeat_next_ns == due);
+        assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
+        SDL_FlushEvents(0, 0xFFFFFFFFu);
+        SDLOP_KeyboardProcessRepeats();
+        assert(sdlop.repeat_next_ns > due);
+        SDL_Event repeated;
+        assert(SDL_PeepEvents(&repeated, 1, SDL_GETEVENT, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_DOWN) == 1);
+        assert(repeated.key.scancode == SDL_SCANCODE_A && repeated.key.repeat);
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, 30, 0);
+        sdlop.repeat_active = false;
+        SDL_FlushEvents(0, 0xFFFFFFFFu);
+    }
+
     /* xkb-backed checks: skip gracefully when libxkbcommon (dlopen'd at
      * run time) is not installed on this system. Windows has no xkb at all -
      * the driver gets key text from WM_CHAR/WM_UNICHAR instead - so the

@@ -13,6 +13,7 @@
 #include "internal/sdlop_internal.h"
 #include "internal/scancode_evdev.h"
 #include "sdlop_wayland_internal.h"
+#include "sdlop_wayland_scroll.h"
 
 /* dlopen-ed libwayland-client (SDL3-style); must precede every
  * *-client-protocol.h include (their inlines compile against the
@@ -132,7 +133,7 @@ typedef struct WaylandDeviceData
 
     SDL_Window *pointer_focus;
     SDL_Window *touch_focus;
-    float axis_x_acc, axis_y_acc;
+    SDLOP_WaylandScroll scroll;
 
     /* relative mouse mode (pointer lock) */
     struct zwp_pointer_constraints_v1 *pointer_constraints;
@@ -930,7 +931,6 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys)
 {
     (void)keyboard;
-    (void)keys;
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)d;
     SDL_Window *window = NULL;
@@ -950,6 +950,28 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
         sdlop.keyboard_focus = window;
         window->flags |= SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
+        /* Restore only held modifiers, never action keys/text/repeats, and
+         * never mix seat keyboard events into a running raw source. */
+        if (!SDLOP_RawInputIsSource()) {
+            uint32_t *key;
+            wl_array_for_each(key, keys) {
+                if (*key > SDLOP_EVDEV_KEY_MAX) { continue; }
+                SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[*key];
+                switch (sc) {
+                case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT:
+                case SDL_SCANCODE_LCTRL: case SDL_SCANCODE_RCTRL:
+                case SDL_SCANCODE_LALT: case SDL_SCANCODE_RALT:
+                case SDL_SCANCODE_LGUI: case SDL_SCANCODE_RGUI:
+                case SDL_SCANCODE_MODE:
+                    if (!sdlop.keystate[sc]) {
+                        SDLOP_SendKeyboardKey(true, false, sc, (Uint16)*key, 0);
+                    }
+                    break;
+                default: break;
+                }
+            }
+            sdlop.repeat_active = false;
+        }
     }
 }
 
@@ -1002,8 +1024,8 @@ static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32
 {
     (void)data;
     (void)keyboard;
-    if (rate > 0 && delay > 0) {
-        SDLOP_RawInputSetRepeatInfo((Uint32)delay, (Uint32)(1000 / rate));
+    if (rate >= 0 && delay >= 0) {
+        SDLOP_RawInputSetRepeatInfo((Uint32)delay, rate ? (Uint32)(1000 / SDL_min(rate, 1000)) : 0);
     }
 }
 
@@ -1253,6 +1275,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
         return;
     }
     d->pointer_serial = serial;
+    d->scroll = (SDLOP_WaylandScroll){ 0 };
     d->pointer_focus = window;
     sdlop.mouse_focus = window;
     window->flags |= SDL_WINDOW_MOUSE_FOCUS;
@@ -1291,6 +1314,8 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     (void)surface;
     SDL_Window *window = d->pointer_focus;
     d->pointer_focus = NULL;
+    SDLOP_RawInputResetPointerFrame();
+    d->scroll = (SDLOP_WaylandScroll){ 0 };
     sdlop.mouse_has_position = false;
     if (sdlop.mouse_focus == window) {
         sdlop.mouse_focus = NULL;
@@ -1364,11 +1389,16 @@ static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, 
     if (SDLOP_RawInputIsSource()) {
         return;
     }
-    float v = (float)wl_fixed_to_double(value) / 10.0f; /* weston: 10 units per detent */
-    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        d->axis_y_acc -= v;
-    } else {
-        d->axis_x_acc += v;
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL && axis != WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        return;
+    }
+    SDLOP_WaylandScrollContinuous(&d->scroll, axis == WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                  (float)wl_fixed_to_double(value));
+    /* wl_pointer versions before 5 have no frame/discrete events. */
+    if (d->seat_version < 5) {
+        float x, y;
+        SDLOP_WaylandScrollTake(&d->scroll, &x, &y);
+        SDLOP_SendMouseWheel(x, y, SDLOP_MonotonicNS());
     }
 }
 
@@ -1376,9 +1406,10 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
-    if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) { /* accumulators stay empty under raw input */
-        SDLOP_SendMouseWheel(d->axis_x_acc, d->axis_y_acc, SDLOP_MonotonicNS());
-        d->axis_x_acc = d->axis_y_acc = 0.0f;
+    float x, y;
+    SDLOP_WaylandScrollTake(&d->scroll, &x, &y);
+    if (!SDLOP_RawInputIsSource() && (x != 0.0f || y != 0.0f)) {
+        SDLOP_SendMouseWheel(x, y, SDLOP_MonotonicNS());
     }
     /* relative mouse mode: flush accumulated relative-pointer motion
      * (skipped when the raw evdev worker owns the mouse) */
@@ -1407,10 +1438,12 @@ static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t t
 
 static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete)
 {
-    (void)data;
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
-    (void)axis;
-    (void)discrete;
+    if (!SDLOP_RawInputIsSource() &&
+        (axis == WL_POINTER_AXIS_VERTICAL_SCROLL || axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)) {
+        SDLOP_WaylandScrollDiscrete(&d->scroll, axis == WL_POINTER_AXIS_VERTICAL_SCROLL, discrete);
+    }
 }
 
 static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120)
@@ -1420,11 +1453,8 @@ static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32
     if (SDLOP_RawInputIsSource()) {
         return;
     }
-    float v = (float)value120 / 120.0f;
-    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        d->axis_y_acc += v;
-    } else {
-        d->axis_x_acc += v;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL || axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        SDLOP_WaylandScroll120(&d->scroll, axis == WL_POINTER_AXIS_VERTICAL_SCROLL, value120);
     }
 }
 
@@ -1797,6 +1827,7 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
+        d->scroll = (SDLOP_WaylandScroll){ 0 };
         send_mouse_device_event(false, d->pointer_id);
         d->pointer_id = 0;
     }

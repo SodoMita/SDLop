@@ -300,6 +300,7 @@ typedef struct SDLop_Globals
     SDL_Scancode repeat_scancode;
     Uint16 repeat_rawcode;
     bool repeat_active;
+    bool repeat_disabled;
     Uint64 repeat_next_ns;      /* absolute CLOCK_MONOTONIC deadline */
     Uint32 repeat_delay_ms;
     Uint32 repeat_interval_ms;
@@ -329,6 +330,8 @@ extern SDLop_Globals sdlop;
 
 /* Push an event into the SDL event queue (main thread only). */
 bool SDLOP_PushEventInternal(SDL_Event *event);
+/* Main-thread-only queue headroom, for input translation backpressure. */
+Uint32 SDLOP_EventQueueFree(void);
 
 /* Post a window event (RESIZED, FOCUS_*, CLOSE_REQUESTED, ...). */
 void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1, Sint32 data2);
@@ -382,6 +385,7 @@ void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locke
                                   Uint32 base_group, Uint32 latched_group, Uint32 locked_group); /* x11/wayland */
 bool SDLOP_KeyboardKeyRepeats(SDL_Scancode sc);
 void SDLOP_KeyboardProcessRepeats(void);
+void SDLOP_KeyboardClearComposition(void);
 void SDLOP_KeyboardQuit(void);
 /* Resolve scancode (evdev raw code) -> SDL_Keycode + text using xkb.
  * Returns the keycode; fills text_utf8 (may write "") when non-NULL. */
@@ -404,6 +408,8 @@ bool SDLOP_RawInputIsSource(void);
    DetachConsole as soon as it is given back. */
 void SDLOP_RawInputAttachConsole(int console_fd);
 void SDLOP_RawInputDetachConsole(void);
+void SDLOP_RawInputResetPointerFrame(void); /* focus/grab transition, main thread */
+bool SDLOP_RawInputKeyboardAllowed(void); /* main-thread repeat ownership */
 void SDLOP_RawInputPump(void);      /* drain raw ring -> SDL events (main thread) */
 void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms);
 

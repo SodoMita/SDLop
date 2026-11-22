@@ -1,0 +1,64 @@
+Identical test_evdev_callbacks, five alternating-order paired trials. Baseline 9b19243 vs callback allocation/reclamation fix.
+Thread-CPU percentiles of 1000 blocks of 10 absent unregister calls; clocks amortized, no baseline subtraction.
+The test allocation wrapper records each allocation, so timing includes that instrumentation; not native callback/device latency.
+Baseline exit=1 is expected: no-op allocation and leaked ownership fail. Both builds deliver all native records.
+
+=== pair 1 pre-opt2 ===
+exit=1
+absent unregister: allocations=10000/10000, thread-CPU block-average p50=62.4 p95=259.8 ns/call
+callback snapshots: allocated=11020 freed_after_join=4; empty_unregister_allocations=1; native delivery=501/501
+test_evdev_callbacks: FAIL (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 1 headless ===
+exit=0
+absent unregister: allocations=0/10000, thread-CPU block-average p50=37.1 p95=37.5 ns/call
+callback snapshots: allocated=1018 freed_after_join=1018; empty_unregister_allocations=0; native delivery=501/501
+test_evdev_callbacks: PASS (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 2 headless ===
+exit=0
+absent unregister: allocations=0/10000, thread-CPU block-average p50=37.5 p95=38.2 ns/call
+callback snapshots: allocated=1018 freed_after_join=1018; empty_unregister_allocations=0; native delivery=501/501
+test_evdev_callbacks: PASS (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 2 pre-opt2 ===
+exit=1
+absent unregister: allocations=10000/10000, thread-CPU block-average p50=62.6 p95=257.3 ns/call
+callback snapshots: allocated=11020 freed_after_join=4; empty_unregister_allocations=1; native delivery=501/501
+test_evdev_callbacks: FAIL (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 3 pre-opt2 ===
+exit=1
+absent unregister: allocations=10000/10000, thread-CPU block-average p50=87.9 p95=300.4 ns/call
+callback snapshots: allocated=11020 freed_after_join=4; empty_unregister_allocations=1; native delivery=501/501
+test_evdev_callbacks: FAIL (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 3 headless ===
+exit=0
+absent unregister: allocations=0/10000, thread-CPU block-average p50=62.9 p95=65.6 ns/call
+callback snapshots: allocated=1018 freed_after_join=1018; empty_unregister_allocations=0; native delivery=501/501
+test_evdev_callbacks: PASS (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 4 headless ===
+exit=0
+absent unregister: allocations=0/10000, thread-CPU block-average p50=63.3 p95=67.1 ns/call
+callback snapshots: allocated=1018 freed_after_join=1018; empty_unregister_allocations=0; native delivery=501/501
+test_evdev_callbacks: PASS (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 4 pre-opt2 ===
+exit=1
+absent unregister: allocations=10000/10000, thread-CPU block-average p50=102.5 p95=422.2 ns/call
+callback snapshots: allocated=11020 freed_after_join=4; empty_unregister_allocations=1; native delivery=501/501
+test_evdev_callbacks: FAIL (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 5 pre-opt2 ===
+exit=1
+absent unregister: allocations=10000/10000, thread-CPU block-average p50=109.8 p95=362.6 ns/call
+callback snapshots: allocated=11020 freed_after_join=4; empty_unregister_allocations=1; native delivery=501/501
+test_evdev_callbacks: FAIL (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+=== pair 5 headless ===
+exit=0
+absent unregister: allocations=0/10000, thread-CPU block-average p50=37.1 p95=53.5 ns/call
+callback snapshots: allocated=1018 freed_after_join=1018; empty_unregister_allocations=0; native delivery=501/501
+test_evdev_callbacks: PASS (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)

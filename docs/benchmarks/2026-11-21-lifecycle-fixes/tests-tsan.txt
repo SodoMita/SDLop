@@ -1,0 +1,38 @@
+PASS: nested SDL_PumpEvents cannot reorder a pending motion ahead of its button
+PASS: SYN_DROPPED discard, key/button diff, partial-wheel reset, native raw stream
+PASS: per-device recovery preserves another keyboard's held key
+PASS: focus-filtered keys do not hide another keyboard's fresh press
+PASS: failed query preserves state and retries on later pumps
+PASS: full SDL queue and incremental snapshot application retain every transition
+PASS: exact independent ring-drop counts (7236 each) and lost-release recovery
+PASS: poll-only overflow does not trigger SDL recovery
+PASS: SDL-only overflow recovers; callbacks remain per native event
+PASS: counters survive quit and reset on worker reinitialization
+PASS: terminal EOF retires devices, queue-safe releases preserve union; last removal enables seat fallback without synthetic raw callbacks
+test_evdev_recovery: PASS
+$ test_input_lifecycle unplug
+unplug: reads_returning_ENODEV_in_50ms=1 held_A=0 held_left=0 raw_source=0
+unplug: PASS
+exit=0
+$ test_input_lifecycle repeat-grab
+repeat-grab: keyboard_grabbed_elsewhere=1 repeated_keys=0 text_events=0
+repeat-grab: PASS
+exit=0
+$ test_input_lifecycle wheel
+wheel: wheel_events=1 total_y=1.00 focus_present=1
+wheel: PASS
+exit=0
+$ test_input_lifecycle wheel-focus
+wheel-focus: wheel_events=0 total_y=0.00 focus_present=0
+wheel-focus: PASS
+exit=0
+$ test_input_lifecycle key-alias
+key-alias: KEY_PRINT_still_down=1 SDL_PRINTSCREEN_down=1 premature_keyups=0
+key-alias: PASS
+exit=0
+$ test_input_lifecycle compose
+compose: dead_key_while_disabled_then_start_E='e' (wanted 'e')
+compose: dead_key_then_stop_start_E='e' (wanted 'e')
+compose: dead_key_then_ClearComposition_E='e' (wanted 'e')
+compose: PASS
+exit=0

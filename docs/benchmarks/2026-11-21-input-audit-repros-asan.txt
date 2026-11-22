@@ -1,0 +1,26 @@
+$ repro_input_audit_asan unplug
+unplug: reads_returning_ENODEV_in_50ms=43310 held_A=1 held_left=1 raw_source=1
+unplug: REPRODUCED
+exit=1
+$ repro_input_audit_asan repeat-grab
+repeat-grab: keyboard_grabbed_elsewhere=1 repeated_keys=1 text_events=1
+repeat-grab: REPRODUCED
+exit=1
+$ repro_input_audit_asan wheel
+wheel: wheel_events=2 total_y=2.00 focus_present=1
+wheel: REPRODUCED
+exit=1
+$ repro_input_audit_asan wheel-focus
+wheel-focus: wheel_events=1 total_y=0.50 focus_present=0
+wheel-focus: REPRODUCED
+exit=1
+$ repro_input_audit_asan key-alias
+key-alias: KEY_PRINT_still_down=1 SDL_PRINTSCREEN_down=0 premature_keyups=1
+key-alias: REPRODUCED
+exit=1
+$ repro_input_audit_asan compose
+compose: dead_key_while_disabled_then_start_E='é' (wanted 'e')
+compose: dead_key_then_stop_start_E='é' (wanted 'e')
+compose: dead_key_then_ClearComposition_E='é' (wanted 'e')
+compose: REPRODUCED
+exit=1

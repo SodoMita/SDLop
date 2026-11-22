@@ -16,6 +16,7 @@
 */
 
 #include <SDL3/SDL.h>
+#include <SDL3/SDLop.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -269,6 +270,12 @@ static void test_browser_driver(void)
 
 int main(void)
 {
+    SDLop_RawInputStats stats;
+    CHECK(SDLop_GetRawInputStats(&stats), "raw stats available without input init");
+    CHECK(!stats.events_seen && !stats.sdl_ring_dropped && !stats.poll_ring_dropped,
+          "raw counters initially zero (web always zero)");
+    CHECK(!SDLop_GetRawInputStats(NULL), "NULL stats output rejected");
+    SDL_ClearError();
 #ifndef __EMSCRIPTEN__
     /* headless compositors never deliver a keymap; the table checks need
      * one, exactly like a session with a real keyboard layout */

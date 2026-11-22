@@ -1,0 +1,72 @@
+Identical bench/bench_events.c, GCC12.2 -O2 -g, static Release upstream SDL3 3.4.20 f00dc919ca35b9756316e86c4777392de442f9b2.
+Dummy video, no raw worker. User-event queue API throughput, NOT device/callback latency.
+Five paired trials; alternating order. SDLop fixed single-thread queue; upstream locked reusable linked queue and poll sentinel. Different contracts.
+
+=== pair 1 headless ===
+$ build-validation/headless/bench_events
+exit=0
+SDLop push+poll:     17.4 ns/push+drain  (57.48 M events pushed/s, 1000000 returned)
+SDLop empty pump:     10.2 ns/call
+
+
+=== pair 1 sdl3-reference ===
+$ build-validation/sdl3-reference/bench_events
+exit=0
+SDL3  push+poll:     50.8 ns/push+drain  (19.69 M events pushed/s, 1000000 returned)
+SDL3  empty pump:     45.4 ns/call
+
+
+=== pair 2 sdl3-reference ===
+$ build-validation/sdl3-reference/bench_events
+exit=0
+SDL3  push+poll:     66.1 ns/push+drain  (15.14 M events pushed/s, 1000000 returned)
+SDL3  empty pump:     56.8 ns/call
+
+
+=== pair 2 headless ===
+$ build-validation/headless/bench_events
+exit=0
+SDLop push+poll:     26.2 ns/push+drain  (38.24 M events pushed/s, 1000000 returned)
+SDLop empty pump:     16.9 ns/call
+
+
+=== pair 3 headless ===
+$ build-validation/headless/bench_events
+exit=0
+SDLop push+poll:     26.0 ns/push+drain  (38.46 M events pushed/s, 1000000 returned)
+SDLop empty pump:     16.1 ns/call
+
+
+=== pair 3 sdl3-reference ===
+$ build-validation/sdl3-reference/bench_events
+exit=0
+SDL3  push+poll:     50.1 ns/push+drain  (19.97 M events pushed/s, 1000000 returned)
+SDL3  empty pump:     39.3 ns/call
+
+
+=== pair 4 sdl3-reference ===
+$ build-validation/sdl3-reference/bench_events
+exit=0
+SDL3  push+poll:     42.5 ns/push+drain  (23.54 M events pushed/s, 1000000 returned)
+SDL3  empty pump:     38.7 ns/call
+
+
+=== pair 4 headless ===
+$ build-validation/headless/bench_events
+exit=0
+SDLop push+poll:     18.3 ns/push+drain  (54.69 M events pushed/s, 1000000 returned)
+SDLop empty pump:     16.7 ns/call
+
+
+=== pair 5 headless ===
+$ build-validation/headless/bench_events
+exit=0
+SDLop push+poll:     17.6 ns/push+drain  (56.92 M events pushed/s, 1000000 returned)
+SDLop empty pump:      9.1 ns/call
+
+
+=== pair 5 sdl3-reference ===
+$ build-validation/sdl3-reference/bench_events
+exit=0
+SDL3  push+poll:     46.0 ns/push+drain  (21.76 M events pushed/s, 1000000 returned)
+SDL3  empty pump:     39.9 ns/call

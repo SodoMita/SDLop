@@ -320,7 +320,7 @@ static void compose_init(void)
     }
 }
 
-static void compose_reset(void)
+void SDLOP_KeyboardClearComposition(void)
 {
     if (compose_st) {
         SDLOP_XKB_xkb_compose_state_reset(compose_st);
@@ -356,7 +356,7 @@ static bool set_keymap(struct xkb_keymap *new_keymap)
     /* the state sync that follows a new keymap is part of setting it */
     suppress_layout_event = true;
     compose_init();
-    compose_reset();
+    SDLOP_KeyboardClearComposition();
     if (replacing) {
         SDL_Event event;
         SDL_zero(event);
@@ -644,6 +644,14 @@ void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 l
     (void)depressed; (void)latched; (void)locked;
 }
 
+/* No xkb compose state exists on Win32, so there is nothing to reset. The
+ * callers in SDL_keynames.c/SDL_keyboard.c are platform-agnostic, so they need
+ * this symbol on every build. */
+void SDLOP_KeyboardClearComposition(void)
+{
+    /* intentionally empty */
+}
+
 #endif /* _WIN32 */
 
 
@@ -792,7 +800,8 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
 
     /* text: from the live state (modifiers, active layout), through
      * compose for dead keys / the Compose key */
-    if (key_event && text_utf8 && text_size) {
+    if (key_event && text_utf8 && text_size && sdlop.keyboard_focus &&
+        sdlop.keyboard_focus->text_input_active) {
         if (compose_key(xk, text_utf8, text_size)) {
             return key;
         }
@@ -917,7 +926,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
 
     /* key repeat management (raw path has no server-generated repeats) */
     if (down && !repeat) {
-        if (key_repeats) {
+        if (key_repeats && !sdlop.repeat_disabled) {
             sdlop.repeat_scancode = scancode;
             sdlop.repeat_rawcode = rawcode;
             sdlop.repeat_active = true;
@@ -934,8 +943,16 @@ void SDLOP_KeyboardProcessRepeats(void)
     if (!sdlop.repeat_active) {
         return;
     }
+    if (sdlop.repeat_disabled || !sdlop.keyboard_focus || sdlop.keyboard_grabbed_elsewhere ||
+        !SDLOP_RawInputKeyboardAllowed()) {
+        sdlop.repeat_active = false; /* cancel, never replay a grab/VT backlog */
+        return;
+    }
     Uint64 now = SDLOP_MonotonicNS();
-    while (sdlop.repeat_active && (Sint64)(now - sdlop.repeat_next_ns) >= 0) {
+    /* Keep overdue repeats pending when input/event traffic fills the queue.
+     * A key can emit a layout change, key event and text event. */
+    while (sdlop.repeat_active && SDLOP_EventQueueFree() >= 3 &&
+           (Sint64)(now - sdlop.repeat_next_ns) >= 0) {
         SDLOP_SendKeyboardKey(true, true, sdlop.repeat_scancode, sdlop.repeat_rawcode, sdlop.repeat_next_ns);
         sdlop.repeat_next_ns += (Uint64)sdlop.repeat_interval_ms * 1000000ull;
     }
@@ -965,7 +982,7 @@ void SDL_ResetKeyboard(void)
         }
     }
     sdlop.repeat_active = false;
-    compose_reset(); /* focus loss abandons a pending dead key */
+    SDLOP_KeyboardClearComposition(); /* focus loss abandons a pending dead key */
 }
 
 SDL_Keymod SDL_GetModState(void)

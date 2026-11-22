@@ -15,6 +15,10 @@
 
 int main()
 {
+    SDLop_RawInputStats raw_stats = {};
+    if (!SDLop_GetRawInputStats(&raw_stats) || raw_stats.events_seen != 0) {
+        return 1;
+    }
     if (!SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy")) {
         return 1;
     }

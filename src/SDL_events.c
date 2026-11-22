@@ -112,7 +112,9 @@ static void give_memory_to_thread(TempMem *list)
 /* Queue storage                                                       */
 /* ------------------------------------------------------------------ */
 
-#define SDLOP_EVENT_QUEUE_SIZE 512 /* power of two */
+/* Enough room for high-rate input accumulated between application frames.
+ * Still bounded; raw translation applies backpressure before this fills. */
+#define SDLOP_EVENT_QUEUE_SIZE 8192 /* power of two */
 #define SDLOP_TEXT_SIZE 64
 
 typedef struct SDLOP_EventSlot
@@ -129,6 +131,11 @@ static Uint32 queue_tail; /* next read index */
 static inline Uint32 queue_count(void)
 {
     return queue_head - queue_tail;
+}
+
+Uint32 SDLOP_EventQueueFree(void)
+{
+    return SDLOP_EVENT_QUEUE_SIZE - queue_count();
 }
 
 static inline SDLOP_EventSlot *slot_at(Uint32 i)
@@ -701,6 +708,14 @@ void SDL_PumpEvents(void)
     if (!SDLOP_IsMainThread()) {
         return; /* SDL3: only the main thread pumps */
     }
+    /* Event watches can call public event APIs. Nested backend/raw pumping
+     * would reorder the outer event and can invalidate an in-progress input
+     * recovery snapshot. Only the outermost pump advances producers. */
+    static bool pumping;
+    if (pumping) {
+        return;
+    }
+    pumping = true;
     SDLOP_FreeTemporaryMemory(); /* memory of previously polled events */
     run_main_callbacks(false);
 
@@ -717,6 +732,7 @@ void SDL_PumpEvents(void)
 
     /* 3. events pushed by other threads */
     merge_side_queue();
+    pumping = false;
 }
 
 int SDL_PeepEvents(SDL_Event *events, int numevents, SDL_EventAction action, Uint32 minType, Uint32 maxType)

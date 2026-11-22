@@ -1,0 +1,66 @@
+RUN test_ring
+test_ring: PASS (4000000 single + 4000000 mixed/batch events, 30 capacity/record layouts, cached limits, 64-bit wrap/empty/overflow OK)
+RUN test_scancode
+test_scancode: PASS (768 evdev codes mapped)
+RUN test_events
+test_events: PASS
+RUN test_layouts
+test_layouts: PASS
+RUN test_core
+test_core: all checks passed
+RUN test_keycodes
+test_keycodes: keymap xkbcommon default
+test_keycodes: PASS
+RUN test_surface
+test_surface: PASS
+RUN test_input_transport
+test_input_transport: PASS (writes, EINTR, backpressure, timeout, short/error, spurious readiness)
+RUN test_wayland_scroll
+PASS: Wayland discrete/value120 precedence, sign, fractions, frame reset
+RUN test_evdev_absolute
+PASS: real-worker raw repeat emits one TEXT_INPUT per repeat, no kernel duplicates
+PASS: real-worker raw repeat emits one TEXT_INPUT per repeat, no kernel duplicates
+PASS: absolute discovery, frames, coordinates, pen contact, focus, relative deltas, SYN_DROPPED
+RUN test_evdev_dispatch
+test_evdev_dispatch: PASS (2048-record fairness, short/EINTR limits, EAGAIN boundary, ordering/publication/counts)
+RUN test_evdev_worker wake
+forced mid-batch drain: eventfd wakes=100/100 SDL_WaitEvent avg=31.6us max=72.4us
+test_evdev_worker wake: PASS
+RUN test_evdev_worker busy
+continuously readable fd: notification_before_EAGAIN=yes
+test_evdev_worker busy: PASS
+RUN test_evdev_worker monotonic
+clock mode=monotonic setup_requests=1 callback/poll_stamp=575239275000 timestamp_ok=yes
+test_evdev_worker monotonic: PASS
+RUN test_evdev_worker negotiated-authoritative
+clock mode=negotiated-authoritative setup_requests=1 callback/poll_stamp=1795344472547291000 timestamp_ok=yes
+test_evdev_worker negotiated-authoritative: PASS
+RUN test_evdev_worker fallback-monotonic
+clock mode=fallback-monotonic setup_requests=1 callback/poll_stamp=575302674000 timestamp_ok=yes
+test_evdev_worker fallback-monotonic: PASS
+RUN test_evdev_worker fallback-realtime
+clock mode=fallback-realtime setup_requests=1 callback/poll_stamp=575334875794 timestamp_ok=yes
+test_evdev_worker fallback-realtime: PASS
+RUN test_evdev_callbacks
+absent unregister: allocations=0/10000, thread-CPU block-average p50=31.4 p95=31.7 ns/call
+callback snapshots: allocated=1018 freed_after_join=1018; empty_unregister_allocations=0; native delivery=501/501
+test_evdev_callbacks: PASS (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+RUN test_evdev_backpressure
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+test_evdev_backpressure: PASS (0 failures)
+RUN test_evdev_recovery
+PASS: nested SDL_PumpEvents cannot reorder a pending motion ahead of its button
+PASS: SYN_DROPPED discard, key/button diff, partial-wheel reset, native raw stream
+PASS: per-device recovery preserves another keyboard's held key
+PASS: focus-filtered keys do not hide another keyboard's fresh press
+PASS: failed query preserves state and retries on later pumps
+PASS: full SDL queue and incremental snapshot application retain every transition
+PASS: exact independent ring-drop counts (7236 each) and lost-release recovery
+PASS: poll-only overflow does not trigger SDL recovery
+PASS: SDL-only overflow recovers; callbacks remain per native event
+PASS: counters survive quit and reset on worker reinitialization
+test_evdev_recovery: PASS
+RUN test_evdev_syn_dropped
+SYN_DROPPED: stuck_button=0 damaged_motions=0 recovery_releases=1 state_queries=1 raw=4/4 callbacks=4/4
+test_evdev_syn_dropped: PASS
