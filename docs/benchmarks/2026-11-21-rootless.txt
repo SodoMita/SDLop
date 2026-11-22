@@ -1,0 +1,214 @@
+Rootless SDLop input baseline — 2026-11-21
+Library implementation: unchanged from 5b2b746b12e878465f3d97a6a263aaf043b493ff
+Build: GCC 12.2.0, -O2 -g, Linux dummy/fbdev configuration (37 real translation units)
+No sanitizers in these timing runs. Missing xkb runtime/keymap data; built-in keycode fallback.
+Host: Linux-6.1.158+-x86_64-with-glibc2.36; CPUs visible: 2; uid=1001
+No root, sudo, /dev/input or /dev/uinput used.
+Pipe timings include producer write, pipe/epoll/read scheduling and consumer costs; NOT hardware/evdev latency.
+API numbers are ns/call: percentiles of 1000 block averages of 1000 calls each, plus 10 warm-up blocks.
+All API timing includes loop/check costs and amortized clock overhead; nothing subtracted.
+Shared sandbox: scheduling/power noise is uncontrolled; maxima are diagnostic, not guarantees.
+
+=== repetition 1: ./build-validation/headless/bench_raw_latency_pipe --api-overhead; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    1.5 p95=    2.8 p99=    3.6 max=   34.8
+SDL_PollEvent (empty)            p50=   13.3 p95=   18.6 p99=   34.7 max=   65.9
+SDL_WaitEventTimeout (empty, 0)  p50=   56.2 p95=   79.2 p99=   92.3 max=  119.0
+SDL_PushEvent + SDL_PollEvent    p50=   11.4 p95=   11.6 p99=   26.7 max=   46.2
+
+
+=== repetition 1: ./build-validation/headless/bench_raw_latency_pipe; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=3.6us avg=5.4us p50=4.7us p95=6.9us p99=18.9us max=204.2us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=3.8us avg=6.0us p50=5.2us p95=8.2us p99=20.5us max=204.8us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=3.9us avg=6.0us p50=5.2us p95=8.3us p99=20.3us max=204.7us
+
+mode=wait load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=26.9us avg=49.4us p50=47.5us p95=63.6us p99=86.3us max=153.1us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=31.1us avg=67.8us p50=65.0us p95=87.8us p99=113.3us max=181.9us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=31.0us avg=67.6us p50=64.9us p95=87.4us p99=113.1us max=181.5us
+
+
+=== repetition 1: ./build-validation/headless/bench_raw_latency_pipe --stress; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=1.5us avg=23.1us p50=27.4us p95=51.5us p99=60.1us max=65.3us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=1.6us avg=24.8us p50=29.5us p95=52.4us p99=63.8us max=68.8us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=1.7us avg=27.9us p50=32.7us p95=60.1us p99=68.3us max=72.6us
+
+mode=wait load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=0.7us avg=16.8us p50=15.4us p95=41.6us p99=54.2us max=86.2us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=3.6us avg=40.7us p50=37.7us p95=88.8us p99=107.5us max=146.6us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=3.9us avg=43.9us p50=40.8us p95=91.7us p99=109.2us max=145.7us
+
+
+=== repetition 2: ./build-validation/headless/bench_raw_latency_pipe --api-overhead; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    1.5 p95=    2.3 p99=    2.3 max=   21.3
+SDL_PollEvent (empty)            p50=   13.3 p95=   13.3 p99=   31.9 max=   88.2
+SDL_WaitEventTimeout (empty, 0)  p50=   56.5 p95=   86.3 p99=  112.3 max=  124.5
+SDL_PushEvent + SDL_PollEvent    p50=   11.2 p95=   11.5 p99=   28.5 max=   38.5
+
+
+=== repetition 2: ./build-validation/headless/bench_raw_latency_pipe; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=3.6us avg=5.5us p50=4.7us p95=8.0us p99=20.7us max=246.5us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=3.8us avg=6.1us p50=5.2us p95=10.1us p99=24.1us max=247.1us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=3.8us avg=6.1us p50=5.2us p95=10.4us p99=24.1us max=247.0us
+
+mode=wait load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=10.0us avg=41.6us p50=38.8us p95=55.9us p99=78.2us max=128.1us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=15.3us avg=60.7us p50=59.4us p95=82.2us p99=105.2us max=163.0us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=15.2us avg=60.5us p50=59.2us p95=82.1us p99=105.0us max=162.8us
+
+
+=== repetition 2: ./build-validation/headless/bench_raw_latency_pipe --stress; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=1.6us avg=14.4us p50=2.7us p95=68.5us p99=72.2us max=90.6us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=2.2us avg=15.6us p50=3.5us p95=69.7us p99=78.4us max=101.8us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=2.1us avg=16.9us p50=3.3us p95=80.7us p99=90.1us max=104.2us
+
+mode=wait load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=0.7us avg=15.9us p50=10.7us p95=49.9us p99=107.3us max=147.1us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=2.8us avg=59.2us p50=48.8us p95=144.6us p99=168.3us max=198.2us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=4.8us avg=62.2us p50=50.8us p95=147.2us p99=170.8us max=197.1us
+
+
+=== repetition 3: ./build-validation/headless/bench_raw_latency_pipe --api-overhead; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    1.5 p95=    2.9 p99=    3.9 max=   43.9
+SDL_PollEvent (empty)            p50=   13.3 p95=   14.6 p99=   33.3 max=   61.4
+SDL_WaitEventTimeout (empty, 0)  p50=   56.4 p95=   89.7 p99=  110.0 max=  139.5
+SDL_PushEvent + SDL_PollEvent    p50=   11.6 p95=   12.4 p99=   29.4 max=  115.6
+
+
+=== repetition 3: ./build-validation/headless/bench_raw_latency_pipe; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=3.6us avg=4.9us p50=4.5us p95=7.0us p99=19.3us max=45.0us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=3.7us avg=5.4us p50=4.8us p95=8.0us p99=20.7us max=45.7us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=3.7us avg=5.4us p50=4.8us p95=8.2us p99=20.6us max=45.5us
+
+mode=wait load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=15.1us avg=41.5us p50=38.4us p95=58.7us p99=86.3us max=134.3us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=21.5us avg=62.0us p50=59.1us p95=84.1us p99=114.1us max=173.6us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=21.4us avg=61.8us p50=59.0us p95=83.9us p99=113.8us max=173.4us
+
+
+=== repetition 3: ./build-validation/headless/bench_raw_latency_pipe --stress; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=1.5us avg=2.2us p50=2.1us p95=2.5us p99=4.7us max=39.1us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=1.7us avg=2.5us p50=2.3us p95=2.8us p99=6.3us max=39.6us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=1.7us avg=2.5us p50=2.3us p95=2.9us p99=6.6us max=39.5us
+
+mode=wait load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=0.6us avg=12.6us p50=11.0us p95=30.4us p99=47.6us max=95.1us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=8.0us avg=39.3us p50=39.7us p95=65.3us p99=83.2us max=113.2us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=12.4us avg=42.0us p50=42.5us p95=66.3us p99=84.5us max=112.1us
+
+
+=== repetition 4: ./build-validation/headless/bench_raw_latency_pipe --api-overhead; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    2.0 p95=    2.1 p99=    3.6 max=   21.2
+SDL_PollEvent (empty)            p50=   13.3 p95=   20.7 p99=   29.4 max=   63.9
+SDL_WaitEventTimeout (empty, 0)  p50=   56.4 p95=   74.5 p99=   94.0 max=  108.6
+SDL_PushEvent + SDL_PollEvent    p50=   11.6 p95=   15.3 p99=   26.6 max=   47.5
+
+
+=== repetition 4: ./build-validation/headless/bench_raw_latency_pipe; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=3.6us avg=4.8us p50=4.5us p95=7.0us p99=11.5us max=29.3us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=3.8us avg=5.2us p50=4.8us p95=7.8us p99=13.4us max=29.9us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=3.8us avg=5.3us p50=4.8us p95=8.1us p99=13.4us max=29.8us
+
+mode=wait load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=6.4us avg=49.7us p50=47.0us p95=72.9us p99=98.6us max=172.3us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=10.4us avg=69.3us p50=66.1us p95=95.8us p99=121.1us max=178.2us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=10.2us avg=69.1us p50=66.0us p95=95.6us p99=120.8us max=178.0us
+
+
+=== repetition 4: ./build-validation/headless/bench_raw_latency_pipe --stress; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=16.9us avg=38.8us p50=39.1us p95=49.1us p99=53.8us max=69.5us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=20.1us avg=42.4us p50=42.5us p95=56.0us p99=66.9us max=90.3us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=22.5us avg=47.2us p50=48.5us p95=60.2us p99=68.0us max=89.3us
+
+mode=wait load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=0.5us avg=17.5us p50=15.1us p95=46.3us p99=55.2us max=81.9us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=7.5us avg=44.4us p50=43.4us p95=82.4us p99=98.6us max=121.6us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=12.1us avg=47.2us p50=45.7us p95=84.4us p99=100.5us max=120.6us
+
+
+=== repetition 5: ./build-validation/headless/bench_raw_latency_pipe --api-overhead; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    1.5 p95=    2.5 p99=    3.1 max=   37.9
+SDL_PollEvent (empty)            p50=   13.3 p95=   16.5 p99=   29.4 max=   92.1
+SDL_WaitEventTimeout (empty, 0)  p50=   56.7 p95=   88.6 p99=  105.2 max=  130.8
+SDL_PushEvent + SDL_PollEvent    p50=   11.5 p95=   12.1 p99=   26.4 max=   35.9
+
+
+=== repetition 5: ./build-validation/headless/bench_raw_latency_pipe; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=3.6us avg=4.8us p50=4.4us p95=6.6us p99=16.7us max=47.6us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=3.7us avg=5.2us p50=4.7us p95=7.6us p99=18.8us max=70.5us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=3.8us avg=5.3us p50=4.8us p95=7.7us p99=17.3us max=70.1us
+
+mode=wait load=paced events=2000 gap=200us burst=1
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=19.0us avg=44.6us p50=43.6us p95=60.6us p99=86.8us max=133.8us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=36.5us avg=63.9us p50=61.6us p95=84.0us p99=107.4us max=193.5us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=36.4us avg=63.7us p50=61.5us p95=83.8us p99=107.3us max=193.3us
+
+
+=== repetition 5: ./build-validation/headless/bench_raw_latency_pipe --stress; exit=0 ===
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=1.5us avg=3.1us p50=3.0us p95=3.5us p99=6.9us max=45.3us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=1.7us avg=3.3us p50=3.2us p95=3.9us p99=7.7us max=45.8us
+pipe stamp -> SDL_PollEvent    n=2000/2000 missing=0 invalid=0  min=1.7us avg=3.3us p50=3.2us p95=4.0us p99=7.8us max=45.7us
+
+mode=wait load=stress events=2000 gap=200us burst=64
+pipe stamp -> worker callback  n=2000/2000 missing=0 invalid=0  min=0.6us avg=19.7us p50=19.3us p95=36.8us p99=59.7us max=79.7us
+pipe stamp -> SDLop_PollRawEvents n=2000/2000 missing=0 invalid=0  min=4.7us avg=42.6us p50=40.8us p95=75.8us p99=102.8us max=125.8us
+pipe stamp -> SDL_WaitEventTimeout n=2000/2000 missing=0 invalid=0  min=5.1us avg=46.5us p50=44.7us p95=80.2us p99=107.5us max=125.0us

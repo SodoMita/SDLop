@@ -842,7 +842,10 @@ void SDLOP_KeyboardProcessRepeats(void)
         return;
     }
     Uint64 now = SDLOP_MonotonicNS();
-    while (sdlop.repeat_active && (Sint64)(now - sdlop.repeat_next_ns) >= 0) {
+    /* Keep overdue repeats pending when input/event traffic fills the queue.
+     * A key can emit a layout change, key event and text event. */
+    while (sdlop.repeat_active && SDLOP_EventQueueFree() >= 3 &&
+           (Sint64)(now - sdlop.repeat_next_ns) >= 0) {
         SDLOP_SendKeyboardKey(true, true, sdlop.repeat_scancode, sdlop.repeat_rawcode, sdlop.repeat_next_ns);
         sdlop.repeat_next_ns += (Uint64)sdlop.repeat_interval_ms * 1000000ull;
     }

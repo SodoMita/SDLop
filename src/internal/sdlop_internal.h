@@ -324,6 +324,8 @@ extern SDLop_Globals sdlop;
 
 /* Push an event into the SDL event queue (main thread only). */
 bool SDLOP_PushEventInternal(SDL_Event *event);
+/* Main-thread-only queue headroom, for input translation backpressure. */
+Uint32 SDLOP_EventQueueFree(void);
 
 /* Post a window event (RESIZED, FOCUS_*, CLOSE_REQUESTED, ...). */
 void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1, Sint32 data2);

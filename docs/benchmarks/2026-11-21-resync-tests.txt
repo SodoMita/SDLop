@@ -1,0 +1,82 @@
+Real dummy/fbdev library, optimized and ASan+UBSan contracts. Fault transport and kernel state are mocked, not uinput.
+headless test_evdev_recovery None exit=0
+PASS: SYN_DROPPED discard, key/button diff, partial-wheel reset, native raw stream
+PASS: per-device recovery preserves another keyboard's held key
+PASS: focus-filtered keys do not hide another keyboard's fresh press
+PASS: failed query preserves state and retries on later pumps
+PASS: full SDL queue and incremental snapshot application retain every transition
+PASS: exact independent ring-drop counts (7236 each) and lost-release recovery
+PASS: poll-only overflow does not trigger SDL recovery
+PASS: SDL-only overflow recovers; callbacks remain per native event
+PASS: counters survive quit and reset on worker reinitialization
+test_evdev_recovery: PASS
+
+headless test_evdev_syn_dropped None exit=0
+SYN_DROPPED: stuck_button=0 damaged_motions=0 recovery_releases=1 state_queries=1 raw=4/4 callbacks=4/4
+test_evdev_syn_dropped: PASS
+
+headless test_evdev_backpressure None exit=0
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+test_evdev_backpressure: PASS (0 failures)
+
+headless test_evdev_worker wake exit=0
+forced mid-batch drain: eventfd wakes=100/100 SDL_WaitEvent avg=45.0us max=115.4us
+test_evdev_worker wake: PASS
+
+headless test_evdev_worker monotonic exit=0
+clock mode=monotonic setup_requests=1 callback/poll_stamp=5069187353000 timestamp_ok=yes
+test_evdev_worker monotonic: PASS
+
+headless test_evdev_worker negotiated-authoritative exit=0
+clock mode=negotiated-authoritative setup_requests=1 callback/poll_stamp=1795304224143876000 timestamp_ok=yes
+test_evdev_worker negotiated-authoritative: PASS
+
+headless test_evdev_worker fallback-monotonic exit=0
+clock mode=fallback-monotonic setup_requests=1 callback/poll_stamp=5069193531000 timestamp_ok=yes
+test_evdev_worker fallback-monotonic: PASS
+
+headless test_evdev_worker fallback-realtime exit=0
+clock mode=fallback-realtime setup_requests=1 callback/poll_stamp=5069196778116 timestamp_ok=yes
+test_evdev_worker fallback-realtime: PASS
+
+headless-san test_evdev_recovery None exit=0
+PASS: SYN_DROPPED discard, key/button diff, partial-wheel reset, native raw stream
+PASS: per-device recovery preserves another keyboard's held key
+PASS: focus-filtered keys do not hide another keyboard's fresh press
+PASS: failed query preserves state and retries on later pumps
+PASS: full SDL queue and incremental snapshot application retain every transition
+PASS: exact independent ring-drop counts (7236 each) and lost-release recovery
+PASS: poll-only overflow does not trigger SDL recovery
+PASS: SDL-only overflow recovers; callbacks remain per native event
+PASS: counters survive quit and reset on worker reinitialization
+test_evdev_recovery: PASS
+
+headless-san test_evdev_syn_dropped None exit=0
+SYN_DROPPED: stuck_button=0 damaged_motions=0 recovery_releases=1 state_queries=1 raw=4/4 callbacks=4/4
+test_evdev_syn_dropped: PASS
+
+headless-san test_evdev_backpressure None exit=0
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+test_evdev_backpressure: PASS (0 failures)
+
+headless-san test_evdev_worker wake exit=0
+forced mid-batch drain: eventfd wakes=100/100 SDL_WaitEvent avg=41.8us max=72.2us
+test_evdev_worker wake: PASS
+
+headless-san test_evdev_worker monotonic exit=0
+clock mode=monotonic setup_requests=1 callback/poll_stamp=5072277777000 timestamp_ok=yes
+test_evdev_worker monotonic: PASS
+
+headless-san test_evdev_worker negotiated-authoritative exit=0
+clock mode=negotiated-authoritative setup_requests=1 callback/poll_stamp=1795304227244329000 timestamp_ok=yes
+test_evdev_worker negotiated-authoritative: PASS
+
+headless-san test_evdev_worker fallback-monotonic exit=0
+clock mode=fallback-monotonic setup_requests=1 callback/poll_stamp=5072305916000 timestamp_ok=yes
+test_evdev_worker fallback-monotonic: PASS
+
+headless-san test_evdev_worker fallback-realtime exit=0
+clock mode=fallback-realtime setup_requests=1 callback/poll_stamp=5072323360105 timestamp_ok=yes
+test_evdev_worker fallback-realtime: PASS

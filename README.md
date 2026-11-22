@@ -243,8 +243,43 @@ mostly from mapping and filling a full-size buffer during the configure
 handshake. The clear colour is now a 1×1 buffer scaled by `wp_viewporter`.
 
 Reproduce: `cmake --build build && ./build/bench_events && ./build/bench_events_sdl3`
-and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
+and `./build/bench_raw_latency` (needs `/dev/uinput` access; sudo only if necessary), and
 `SDL_VIDEODRIVER=x11|wayland ./build/bench_render` for the rendering numbers.
+The raw-input benchmark reports kernel-timestamp → callback, raw polling,
+SDL polling and SDL waiting distributions (including p99/max). Use `--stress`
+for burst injection concurrent with main-thread draining.
+**No root or input devices are needed for API overhead:** run
+`./build/bench_raw_latency_pipe --api-overhead`. The same pipe-backed executable
+without that flag (or with `--stress`) exercises the real worker and consumers
+using userspace timestamps, not kernel evdev/hardware timing. See the
+[baseline methodology, measured rootless results and validation status](docs/input-latency-baseline.md)
+for modes, prerequisites and regression-gate instructions.
+
+For sustained input, use e.g.
+`./build/bench_raw_latency_pipe --reports 1000000 --rate 16000 --axes 2`.
+The default is 160,000 reports at 16 kHz per mode; report count, mean rate,
+burst size and axis count are configurable. Reports are not native events:
+X + Y + SYN at 16 kHz is 48,000 native records/s. The
+[pre-fix million-report load results](docs/input-load-sustained.md) include the
+losses observed at higher rates, not just short-run latency percentiles.
+The subsequent [input loss reduction report](docs/input-loss-reduction.md)
+describes queue backpressure, larger bounded buffers, bulk raw polling, and
+repeated before/after results—including memory/latency tradeoffs and the
+unavailable kernel-uinput validation. The follow-up
+[worker wakeup and clock-selection report](docs/input-worker-wakeup-clock.md)
+covers the forced wakeup-race regression, EVIOCSCLOCKID setup/fallback, and
+remaining callback-tail acceptance limits.
+
+`SDLop_GetRawInputStats` reports independent SDL/raw-poll ring drop counts.
+The SDL adapter now handles `SYN_DROPPED` and SDL raw-ring overflow by querying
+current key/button state; raw callbacks remain native and unfiltered by recovery.
+This restores current supported state, not missing motion or event history.
+See [state recovery and counters](docs/input-state-recovery.md) for fault tests,
+limitations, and the **currently uncleared callback performance gate**.
+The [self-audit and pinned SDL3 comparison](docs/input-audit-sdl3.md) documents
+reentrant-pump and continuous-device fixes, checked benchmark transport,
+identical-source rootless measurements, and deferred gaps (including wheel
+selection, frame aggregation, hotplug and focus/VT snapshots).
 
 ## API surface (SDL3-compatible)
 

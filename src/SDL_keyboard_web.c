@@ -405,3 +405,12 @@ Uint64 SDLop_GetRawEventCount(void)
 {
     return 0;
 }
+
+bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
+{
+    if (!stats) {
+        return SDL_InvalidParamError("stats");
+    }
+    SDL_zero(*stats);
+    return true;
+}

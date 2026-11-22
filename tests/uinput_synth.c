@@ -7,11 +7,13 @@
 */
 
 #include "uinput_synth.h"
+#include "input_transport.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,33 +100,37 @@ void uinput_synth_destroy(UInputDevice *dev)
     free(dev);
 }
 
-static void emit(UInputDevice *dev, uint16_t type, uint16_t code, int32_t value)
+static bool emit(UInputDevice *dev, uint16_t type, uint16_t code, int32_t value)
 {
+    if (!dev) {
+        errno = EINVAL;
+        return false;
+    }
     struct input_event ie;
     memset(&ie, 0, sizeof(ie));
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-        ie.input_event_sec = ts.tv_sec;
-        ie.input_event_usec = (suseconds_t)(ts.tv_nsec / 1000);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
+        return false;
     }
+    ie.input_event_sec = ts.tv_sec;
+    ie.input_event_usec = (suseconds_t)(ts.tv_nsec / 1000);
     ie.type = type;
     ie.code = code;
     ie.value = value;
-    ssize_t unused = write(dev->fd, &ie, sizeof(ie));
-    (void)unused;
+    return input_write_record(dev->fd, &ie, sizeof(ie));
 }
 
-void uinput_synth_key(UInputDevice *dev, uint16_t code, int32_t value)
+bool uinput_synth_key(UInputDevice *dev, uint16_t code, int32_t value)
 {
-    emit(dev, EV_KEY, code, value);
+    return emit(dev, EV_KEY, code, value);
 }
 
-void uinput_synth_rel(UInputDevice *dev, uint16_t code, int32_t value)
+bool uinput_synth_rel(UInputDevice *dev, uint16_t code, int32_t value)
 {
-    emit(dev, EV_REL, code, value);
+    return emit(dev, EV_REL, code, value);
 }
 
-void uinput_synth_syn(UInputDevice *dev)
+bool uinput_synth_syn(UInputDevice *dev)
 {
-    emit(dev, EV_SYN, SYN_REPORT, 0);
+    return emit(dev, EV_SYN, SYN_REPORT, 0);
 }

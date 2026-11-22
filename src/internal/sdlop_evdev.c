@@ -36,10 +36,15 @@
 
 #define SDLOP_MAX_DEVICES     32
 #define SDLOP_MAX_EPOLL_EVENTS 16
-#define SDLOP_SDL_RING_SIZE   2048 /* power of two */
-#define SDLOP_POLL_RING_SIZE  1024 /* power of two */
+/* Bounded burst headroom: 32K native records is ~171ms at 64K two-axis
+ * reports/s, or ~20ms at 1.6M records/s. Init clears/prefaults this storage
+ * before starting the worker; publication still does exactly the same work. */
+#define SDLOP_SDL_RING_SIZE   32768 /* power of two */
+#define SDLOP_POLL_RING_SIZE  32768 /* power of two */
 #define SDLOP_MAX_CALLBACKS   8
 #define SDLOP_MAX_EVENTS_PER_READ 64
+#define SDLOP_MAX_READS_PER_DEVICE 32 /* bound wakeup/control starvation */
+#define SDLOP_KEY_WORDS (KEY_MAX / (8 * sizeof(unsigned long)) + 1)
 
 /* ------------------------------------------------------------------ */
 /* State                                                               */
@@ -51,6 +56,23 @@ typedef struct SDLOP_RawDevice
     Uint32 index;
     bool is_keyboard;
     bool is_pointer;
+    bool clock_monotonic; /* EVIOCSCLOCKID succeeded for this fd */
+
+    /* Main-thread SDL adapter state (never touched by the worker). */
+    unsigned long keys[SDLOP_KEY_WORDS];
+    float hi_res_x, hi_res_y;
+    bool syncing, wait_report, requested;
+    Uint64 retry_ns;
+    unsigned int sync_code;
+    uint64_t sync_generation, request_generation;
+
+    /* Worker writes only after a request, then release-publishes ready.
+     * Main does not request again until it has finished reading the snapshot.
+     * The boundary is the SDL ring head after draining/querying this fd. */
+    atomic_bool snapshot_ready;
+    bool snapshot_ok;
+    unsigned long snapshot_keys[SDLOP_KEY_WORDS];
+    uint64_t snapshot_boundary, snapshot_dropped;
 } SDLOP_RawDevice;
 
 typedef struct SDLOP_CallbackSet
@@ -67,7 +89,7 @@ static struct
     _Atomic bool running; /* worker loop flag: written by main, read by worker */
     pthread_t thread;
     int epoll_fd;
-    int control_fd; /* eventfd used to wake the worker for shutdown */
+    int control_fd; /* shutdown and slow-path state-query requests */
     SDLOP_RawDevice devices[SDLOP_MAX_DEVICES];
     int num_devices;
     bool have_keyboard;
@@ -80,10 +102,16 @@ static struct
     _Alignas(SDLOP_CACHELINE) SDLop_RawEvent poll_ring_storage[SDLOP_POLL_RING_SIZE];
     SDLOP_Ring poll_ring;
 
-    atomic_uint_least64_t event_count;
+    _Alignas(SDLOP_CACHELINE) atomic_uint_least64_t event_count;
+    /* Drop snapshots change only after a lossy batch. Keep these separately
+     * cached from the per-event count and from main-thread recovery state. */
+    _Alignas(SDLOP_CACHELINE) atomic_uint_least64_t sdl_dropped, poll_dropped;
+    _Alignas(SDLOP_CACHELINE) atomic_uint resync_requests; /* main -> worker */
+    _Alignas(SDLOP_CACHELINE) uint64_t observed_dropped; /* main thread */
+    bool have_sync; /* main-thread slow path active */
 
     /* callbacks (RCU-style snapshot pointer swap) */
-    SDLOP_CallbackSet *callbacks;
+    _Alignas(SDLOP_CACHELINE) SDLOP_CallbackSet *callbacks;
     pthread_mutex_t cb_mutex;
 } raw;
 
@@ -127,6 +155,11 @@ static int open_input_devices(void)
             continue; /* no permission or busy */
         }
 
+        /* Select the evdev clock before the first read. Older/non-evdev
+         * sources may reject this; only those retain timestamp guessing. */
+        int clock_id = CLOCK_MONOTONIC;
+        bool clock_monotonic = ioctl(fd, EVIOCSCLOCKID, &clock_id) == 0;
+
         /* what can this device do? */
         unsigned long evbits[EV_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
         if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) < 0) {
@@ -137,6 +170,7 @@ static int open_input_devices(void)
         SDLOP_RawDevice *dev = &raw.devices[raw.num_devices];
         dev->fd = fd;
         dev->index = (Uint32)raw.num_devices;
+        dev->clock_monotonic = clock_monotonic;
         dev->is_keyboard = dev->is_pointer = false;
 
         if (test_bit(evbits, EV_KEY)) {
@@ -192,6 +226,52 @@ static void dispatch_callbacks(const SDLop_RawEvent *event)
     }
 }
 
+/* Drain only on the worker. Recovery reuses the same publication/callback
+ * path before querying kernel state; queries never run in the event loop. */
+static bool drain_device_events(SDLOP_RawDevice *dev, struct input_event *batch,
+                                Uint64 mono_now, Uint64 rt_offset_ns)
+{
+    /* UINT64_MAX disables guessing without adding a clock-mode
+     * branch to each event. Clock negotiation is per device. */
+    const Uint64 device_rt_offset = dev->clock_monotonic ? UINT64_MAX : rt_offset_ns;
+    /* Level-triggered epoll will report remaining input again. A permanently
+     * readable source must not postpone wakeups/shutdown/other devices forever.
+     * Recovery queries require a genuine EAGAIN boundary, so exhausting this
+     * budget returns false and lets the adapter retry its snapshot later. */
+    for (int reads = 0; reads < SDLOP_MAX_READS_PER_DEVICE; reads++) {
+        ssize_t got = read(dev->fd, batch, SDLOP_MAX_EVENTS_PER_READ * sizeof(*batch));
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            return got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        }
+        int count = (int)(got / (ssize_t)sizeof(struct input_event));
+        for (int j = 0; j < count; j++) {
+            const struct input_event *ie = &batch[j];
+            if (ie->type == EV_MSC && ie->code == MSC_SCAN) {
+                continue; /* redundant */
+            }
+            SDLop_RawEvent ev2;
+            ev2.device = dev->index;
+            ev2.type = ie->type;
+            ev2.code = ie->code;
+            ev2.value = ie->value;
+            ev2.timestamp_ns = (Uint64)ie->input_event_sec * 1000000000ull + (Uint64)ie->input_event_usec * 1000ull;
+            if (ev2.timestamp_ns > mono_now + 2000000000ull && ev2.timestamp_ns > device_rt_offset) {
+                /* fallback realtime-stamped source: normalize */
+                ev2.timestamp_ns -= device_rt_offset;
+            }
+
+            SDLOP_RingPush(&raw.sdl_ring, &ev2);
+            SDLOP_RingPush(&raw.poll_ring, &ev2);
+            dispatch_callbacks(&ev2);
+            atomic_fetch_add_explicit(&raw.event_count, 1, memory_order_relaxed);
+        }
+    }
+    return false;
+}
+
 static void *worker_main(void *arg)
 {
     (void)arg;
@@ -214,10 +294,9 @@ static void *worker_main(void *arg)
     struct epoll_event evs[SDLOP_MAX_EPOLL_EVENTS];
     struct input_event batch[SDLOP_MAX_EVENTS_PER_READ];
 
-    /* Some event sources (notably uinput-injected events) carry
-     * CLOCK_REALTIME stamps instead of CLOCK_MONOTONIC. Measure the
-     * offset once so we can normalize: timestamps more than 2s "in the
-     * future" relative to monotonic are realtime and get shifted. */
+    /* Fallback for devices that rejected EVIOCSCLOCKID: preserve the old
+     * realtime -> monotonic heuristic. Successfully negotiated devices
+     * bypass it entirely. The offset is sampled only at worker startup. */
     Uint64 rt_offset_ns = 0;
     {
         struct timespec mono, real;
@@ -228,6 +307,7 @@ static void *worker_main(void *arg)
         rt_offset_ns = r - m;
     }
 
+    uint64_t published_sdl_dropped = 0, published_poll_dropped = 0;
     while (raw.running) {
         int n = epoll_wait(raw.epoll_fd, evs, SDLOP_MAX_EPOLL_EVENTS, -1);
         if (n < 0) {
@@ -236,48 +316,74 @@ static void *worker_main(void *arg)
             }
             break;
         }
-        bool ring_was_empty = SDLOP_RingEmpty(&raw.sdl_ring);
+        /* Only this thread writes head. Comparing publication snapshots
+         * detects a successful push even if the consumer empties the ring
+         * mid-batch. No extra operations on the per-event publication path. */
+        uint64_t sdl_head_before = atomic_load_explicit(&raw.sdl_ring.head, memory_order_relaxed);
         bool quit_requested = false;
         Uint64 mono_now = SDLOP_MonotonicNS();
         for (int i = 0; i < n; i++) {
             if (evs[i].data.u32 == 0xFFFFFFFFu) {
-                quit_requested = true;
-                break;
-            }
-            SDLOP_RawDevice *dev = &raw.devices[evs[i].data.u32];
-            for (;;) {
-                ssize_t got = read(dev->fd, batch, sizeof(batch));
-                if (got <= 0) {
+                uint64_t control;
+                ssize_t result;
+                do {
+                    result = read(raw.control_fd, &control, sizeof(control));
+                } while (result < 0 && errno == EINTR);
+                if (!raw.running) {
+                    quit_requested = true;
                     break;
                 }
-                int count = (int)(got / (ssize_t)sizeof(struct input_event));
-                for (int j = 0; j < count; j++) {
-                    const struct input_event *ie = &batch[j];
-                    if (ie->type == EV_MSC && ie->code == MSC_SCAN) {
-                        continue; /* redundant */
-                    }
-                    SDLop_RawEvent ev2;
-                    ev2.device = dev->index;
-                    ev2.type = ie->type;
-                    ev2.code = ie->code;
-                    ev2.value = ie->value;
-                    ev2.timestamp_ns = (Uint64)ie->input_event_sec * 1000000000ull + (Uint64)ie->input_event_usec * 1000ull;
-                    if (ev2.timestamp_ns > mono_now + 2000000000ull && ev2.timestamp_ns > rt_offset_ns) {
-                        /* realtime-stamped source: normalize to monotonic */
-                        ev2.timestamp_ns -= rt_offset_ns;
-                    }
-
-                    SDLOP_RingPush(&raw.sdl_ring, &ev2);
-                    SDLOP_RingPush(&raw.poll_ring, &ev2);
-                    dispatch_callbacks(&ev2);
-                    atomic_fetch_add_explicit(&raw.event_count, 1, memory_order_relaxed);
+                continue;
+            }
+            SDLOP_RawDevice *dev = &raw.devices[evs[i].data.u32];
+            (void)drain_device_events(dev, batch, mono_now, rt_offset_ns);
+        }
+        bool recovered = false;
+        unsigned int requests = atomic_load_explicit(&raw.resync_requests, memory_order_acquire);
+        if (requests && !quit_requested && raw.running) {
+            requests = atomic_exchange_explicit(&raw.resync_requests, 0, memory_order_acquire);
+            for (int i = 0; i < raw.num_devices; i++) {
+                if (!(requests & (1u << i))) {
+                    continue;
                 }
+                SDLOP_RawDevice *dev = &raw.devices[i];
+                bool drained = drain_device_events(dev, batch, SDLOP_MonotonicNS(), rt_offset_ns);
+                memset(dev->snapshot_keys, 0, sizeof(dev->snapshot_keys));
+                int result = -1;
+                if (drained) {
+                    do {
+                        result = ioctl(dev->fd, EVIOCGKEY(sizeof(dev->snapshot_keys)), dev->snapshot_keys);
+                    } while (result < 0 && errno == EINTR);
+                }
+                dev->snapshot_ok = result >= 0;
+                dev->snapshot_boundary = atomic_load_explicit(&raw.sdl_ring.head, memory_order_relaxed);
+                dev->snapshot_dropped = raw.sdl_ring.dropped;
+                atomic_store_explicit(&dev->snapshot_ready, true, memory_order_release);
+                recovered = true;
             }
         }
-        if (ring_was_empty && !SDLOP_RingEmpty(&raw.sdl_ring) && sdlop.wake_fd >= 0) {
+        /* Publish only changed counters at batch boundaries. Unconditional
+         * zero stores would invalidate the consumer's cache on every pump. */
+        if (raw.sdl_ring.dropped != published_sdl_dropped) {
+            published_sdl_dropped = raw.sdl_ring.dropped;
+            atomic_store_explicit(&raw.sdl_dropped, published_sdl_dropped, memory_order_release);
+        }
+        if (raw.poll_ring.dropped != published_poll_dropped) {
+            published_poll_dropped = raw.poll_ring.dropped;
+            atomic_store_explicit(&raw.poll_dropped, published_poll_dropped, memory_order_relaxed);
+        }
+        if (((atomic_load_explicit(&raw.sdl_ring.head, memory_order_relaxed) != sdl_head_before &&
+              !SDLOP_RingEmpty(&raw.sdl_ring)) || recovered) && sdlop.wake_fd >= 0) {
+            /* Notify after successful publication regardless of the INITIAL
+             * empty state. If already empty now, the consumer has consumed
+             * all published records and has no pending raw work to wake for.
+             * This avoids unnecessary syscalls while actively polling.
+             * EAGAIN means the eventfd is already readable; retry EINTR. */
             uint64_t one = 1;
-            ssize_t unused = write(sdlop.wake_fd, &one, sizeof(one));
-            (void)unused;
+            ssize_t result;
+            do {
+                result = write(sdlop.wake_fd, &one, sizeof(one));
+            } while (result < 0 && errno == EINTR);
         }
         if (quit_requested || !raw.running) {
             break;
@@ -423,8 +529,10 @@ void SDLOP_RawInputQuit(void)
     /* wake the worker via its control eventfd, then join */
     if (raw.control_fd >= 0) {
         uint64_t one = 1;
-        ssize_t unused = write(raw.control_fd, &one, sizeof(one));
-        (void)unused;
+        ssize_t result;
+        do {
+            result = write(raw.control_fd, &one, sizeof(one));
+        } while (result < 0 && errno == EINTR);
     }
     pthread_join(raw.thread, NULL);
     for (int i = 0; i < raw.num_devices; i++) {
@@ -513,7 +621,7 @@ static bool raw_console_foreground(void)
 /* Ctrl+Alt+Fn: the kernel's own VT switch chord, but the console keyboard is
    in K_OFF, so its events arrive here instead. Returns true when the event was
    the chord and must not surface as an SDL key event. */
-static bool sdlop_vt_handle_chord(const SDLop_RawEvent *ev)
+static bool sdlop_vt_handle_chord(const SDLop_RawEvent *ev, bool allow_switch)
 {
     if (!raw_console_foreground()) {
         return false;
@@ -542,7 +650,7 @@ static bool sdlop_vt_handle_chord(const SDLop_RawEvent *ev)
     }
     const int fn = (ev->code == KEY_F11) ? 11 : (ev->code == KEY_F12) ? 12 :
                    (ev->code >= KEY_F1 && ev->code <= KEY_F10) ? (int)ev->code - (int)KEY_F1 + 1 : 0;
-    if (!fn || !(chord.modifiers & 3) || !(chord.modifiers & 12) || ev->value != 1) {
+    if (!allow_switch || !fn || !(chord.modifiers & 3) || !(chord.modifiers & 12) || ev->value != 1) {
         return false;
     }
     chord.fn_swallowed = ev->code;
@@ -581,9 +689,9 @@ static bool winsys_keyboard_focus(void)
     return sdlop.keyboard_focus && !sdlop.keyboard_grabbed_elsewhere;
 }
 
-static void pump_event(const SDLop_RawEvent *ev)
+static void pump_event(const SDLop_RawEvent *ev, bool recovering)
 {
-    static float hi_res_x_acc, hi_res_y_acc;
+    SDLOP_RawDevice *dev = &raw.devices[ev->device];
     const bool winsys = raw.winsys;
 
     switch (ev->type) {
@@ -615,7 +723,7 @@ static void pump_event(const SDLop_RawEvent *ev)
             SDLOP_SendKeyboardKey(ev->value != 0, false, sc, ev->code, ev->timestamp_ns);
             return;
         }
-        if (sdlop_vt_handle_chord(ev)) {
+        if (sdlop_vt_handle_chord(ev, !recovering)) {
             return;
         }
         if (raw_console_foreground() && sc != SDL_SCANCODE_UNKNOWN) {
@@ -653,10 +761,10 @@ static void pump_event(const SDLop_RawEvent *ev)
             SDLOP_SendMouseWheel((float)ev->value, 0.0f, ev->timestamp_ns);
             break;
         case SDLop_REL_WHEEL_HI_RES:
-            hi_res_y_acc += (float)ev->value / 120.0f;
+            dev->hi_res_y += (float)ev->value / 120.0f;
             break;
         case SDLop_REL_HWHEEL_HI_RES:
-            hi_res_x_acc += (float)ev->value / 120.0f;
+            dev->hi_res_x += (float)ev->value / 120.0f;
             break;
         default:
             break;
@@ -664,9 +772,9 @@ static void pump_event(const SDLop_RawEvent *ev)
         break;
     }
     case SDLop_EV_SYN:
-        if (ev->code == SDLop_SYN_REPORT && (hi_res_x_acc != 0.0f || hi_res_y_acc != 0.0f)) {
-            SDLOP_SendMouseWheel(hi_res_x_acc, hi_res_y_acc, ev->timestamp_ns);
-            hi_res_x_acc = hi_res_y_acc = 0.0f;
+        if (ev->code == SDLop_SYN_REPORT && (dev->hi_res_x != 0.0f || dev->hi_res_y != 0.0f)) {
+            SDLOP_SendMouseWheel(dev->hi_res_x, dev->hi_res_y, ev->timestamp_ns);
+            dev->hi_res_x = dev->hi_res_y = 0.0f;
         }
         break;
     default:
@@ -674,15 +782,170 @@ static void pump_event(const SDLop_RawEvent *ev)
     }
 }
 
+/* SDL key/button state is the union of per-device states. Recovery of one
+ * keyboard must not release a key still held on another keyboard. */
+static void pump_key(const SDLop_RawEvent *ev, bool recovering)
+{
+    if (ev->code > KEY_MAX) {
+        return;
+    }
+    SDLOP_RawDevice *dev = &raw.devices[ev->device];
+    bool was_down = test_bit(dev->keys, ev->code);
+    if (ev->value == 2) {
+        if (was_down) {
+            pump_event(ev, recovering);
+        }
+        return;
+    }
+    bool down = ev->value != 0;
+    if (was_down == down) {
+        return; /* includes stale/duplicate transitions following a snapshot */
+    }
+    unsigned int word = ev->code / (8 * sizeof(unsigned long));
+    unsigned long mask = 1ul << (ev->code % (8 * sizeof(unsigned long)));
+    if (down) {
+        dev->keys[word] |= mask;
+    } else {
+        dev->keys[word] &= ~mask;
+    }
+    for (int i = 0; i < raw.num_devices; i++) {
+        if ((Uint32)i != ev->device && test_bit(raw.devices[i].keys, ev->code)) {
+            /* A prior physical press may have been focus-filtered. Do not
+             * suppress a fresh focused press unless SDL saw a press too. */
+            Uint8 button = mouse_button_from_btn(ev->code);
+            bool delivered = button ? (sdlop.mouse_buttons & SDL_BUTTON_MASK(button)) != 0 :
+                (ev->code <= SDLOP_EVDEV_KEY_MAX &&
+                 sdlop.keystate[sdlop_evdev_to_scancode[ev->code]]);
+            if (!down || delivered) {
+                return;
+            }
+        }
+    }
+    pump_event(ev, recovering);
+}
+
+static void begin_sync(SDLOP_RawDevice *dev, bool wait_report)
+{
+    dev->syncing = true;
+    dev->wait_report = wait_report;
+    dev->sync_generation++;
+    dev->sync_code = 0;
+    dev->retry_ns = 0;
+    dev->hi_res_x = dev->hi_res_y = 0.0f; /* damaged partial wheel frame */
+    raw.have_sync = true;
+    sdlop.repeat_active = false; /* don't repeat uncertain key state */
+}
+
+static void request_snapshot(SDLOP_RawDevice *dev)
+{
+    dev->request_generation = dev->sync_generation;
+    dev->requested = true;
+    atomic_store_explicit(&dev->snapshot_ready, false, memory_order_relaxed);
+    atomic_fetch_or_explicit(&raw.resync_requests, 1u << dev->index, memory_order_release);
+    uint64_t one = 1;
+    ssize_t result;
+    do {
+        result = write(raw.control_fd, &one, sizeof(one));
+    } while (result < 0 && errno == EINTR);
+}
+
+/* Main-thread recovery slow path. The snapshot is immutable until the next
+ * request. Consume all ring records preceding its publication boundary before
+ * diffing it; do not replay stale queued key transitions after the diff.
+ * Returns false when the SDL queue needs draining before recovery can finish. */
+static bool pump_recovery(void)
+{
+    bool any = false;
+    uint64_t tail = atomic_load_explicit(&raw.sdl_ring.tail, memory_order_relaxed);
+    for (int i = 0; i < raw.num_devices; i++) {
+        SDLOP_RawDevice *dev = &raw.devices[i];
+        if (!dev->syncing) {
+            continue;
+        }
+        if (dev->requested && atomic_load_explicit(&dev->snapshot_ready, memory_order_acquire)) {
+            if (dev->request_generation != dev->sync_generation ||
+                dev->snapshot_dropped < raw.observed_dropped || !dev->snapshot_ok) {
+                /* Never turn a failed query into an all-keys-up snapshot.
+                 * Retry failures at most every 100ms while pumping. */
+                bool failed = !dev->snapshot_ok;
+                dev->requested = false;
+                atomic_store_explicit(&dev->snapshot_ready, false, memory_order_relaxed);
+                dev->retry_ns = failed ? SDLOP_MonotonicNS() + 100000000ull : 0;
+                dev->sync_code = 0;
+            } else if (!dev->wait_report && (int64_t)(tail - dev->snapshot_boundary) >= 0) {
+                while (dev->sync_code <= KEY_MAX) {
+                    unsigned int code = dev->sync_code;
+                    bool down = test_bit(dev->snapshot_keys, code);
+                    if (down != test_bit(dev->keys, code)) {
+                        if (SDLOP_EventQueueFree() < 3) {
+                            return false;
+                        }
+                        SDLop_RawEvent ev = { .device = dev->index, .type = EV_KEY,
+                                             .code = (Uint16)code, .value = down };
+                        pump_key(&ev, true);
+                    }
+                    dev->sync_code++;
+                }
+                dev->requested = dev->syncing = false;
+                atomic_store_explicit(&dev->snapshot_ready, false, memory_order_relaxed);
+            }
+        }
+        if (dev->syncing) {
+            any = true;
+            if (!dev->wait_report && !dev->requested &&
+                (!dev->retry_ns || SDLOP_MonotonicNS() >= dev->retry_ns)) {
+                request_snapshot(dev);
+            }
+        }
+    }
+    raw.have_sync = any;
+    return true;
+}
+
 void SDLOP_RawInputPump(void)
 {
     if (!raw.running) {
         return;
     }
+    uint64_t dropped = atomic_load_explicit(&raw.sdl_dropped, memory_order_acquire);
+    if (dropped != raw.observed_dropped) {
+        raw.observed_dropped = dropped;
+        /* The missing records have no device identity in a full ring. Recover
+         * every device, without modifying any already-published ring entry. */
+        for (int i = 0; i < raw.num_devices; i++) {
+            begin_sync(&raw.devices[i], false);
+        }
+    }
     SDLop_RawEvent ev;
     int n = 0;
-    while (SDLOP_RingPop(&raw.sdl_ring, &ev)) {
-        pump_event(&ev);
+    /* Reserve layout + key + text headroom before any SDL state change. */
+    while (SDLOP_EventQueueFree() >= 3) {
+        if (raw.have_sync) {
+            /* Acquire head BEFORE checking snapshot readiness. Any record
+             * published after a snapshot boundary then also makes ready
+             * visible before we decide whether to discard that record. Do
+             * not pop a newer record if this head snapshot was empty. */
+            uint64_t head = atomic_load_explicit(&raw.sdl_ring.head, memory_order_acquire);
+            if (!pump_recovery() ||
+                atomic_load_explicit(&raw.sdl_ring.tail, memory_order_relaxed) == head) {
+                break;
+            }
+        }
+        if (!SDLOP_RingPop(&raw.sdl_ring, &ev)) {
+            break;
+        }
+        SDLOP_RawDevice *dev = &raw.devices[ev.device];
+        if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
+            begin_sync(dev, true);
+        } else if (dev->syncing) {
+            if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+                dev->wait_report = false;
+            }
+        } else if (ev.type == EV_KEY) {
+            pump_key(&ev, false);
+        } else {
+            pump_event(&ev, false);
+        }
         if (++n >= SDLOP_SDL_RING_SIZE) {
             break;
         }
@@ -721,9 +984,9 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
     set->count = count + 1;
     atomic_store_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, set, memory_order_release);
     pthread_mutex_unlock(&raw.cb_mutex);
-    /* previous set intentionally not freed: worker thread may still read it.
-     * Bounded leak (one small struct per registration), like asyncinput's
-     * fixed callback table. */
+    /* Previous set intentionally not freed: worker thread may still read it.
+     * One retained allocation per list replacement; the callback-count limit
+     * does not bound repeated registration/unregistration churn. */
     (void)old;
     return true;
 }
@@ -756,11 +1019,7 @@ int SDLop_PollRawEvents(SDLop_RawEvent *events, int max_events)
     if (!events || max_events <= 0) {
         return -1;
     }
-    int n = 0;
-    while (n < max_events && SDLOP_RingPop(&raw.poll_ring, &events[n])) {
-        n++;
-    }
-    return n;
+    return (int)SDLOP_RingPopBatch(&raw.poll_ring, events, (uint32_t)max_events);
 }
 
 bool SDLop_RawInputAvailable(void)
@@ -771,6 +1030,17 @@ bool SDLop_RawInputAvailable(void)
 Uint64 SDLop_GetRawEventCount(void)
 {
     return atomic_load_explicit(&raw.event_count, memory_order_relaxed);
+}
+
+bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
+{
+    if (!stats) {
+        return SDL_InvalidParamError("stats");
+    }
+    stats->events_seen = atomic_load_explicit(&raw.event_count, memory_order_relaxed);
+    stats->sdl_ring_dropped = atomic_load_explicit(&raw.sdl_dropped, memory_order_acquire);
+    stats->poll_ring_dropped = atomic_load_explicit(&raw.poll_dropped, memory_order_relaxed);
+    return true;
 }
 
 void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms)

@@ -19,6 +19,7 @@ SDL3_0.0.0 {
     SDLop_PollRawEvents;
     SDLop_RawInputAvailable;
     SDLop_GetRawEventCount;
+    SDLop_GetRawInputStats;
     SDLop_SetWindowClearColor;
   local:
     *;

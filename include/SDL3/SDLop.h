@@ -27,6 +27,10 @@
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_video.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * \name Options
  *
@@ -131,6 +135,7 @@ typedef struct SDLop_RawEvent
 
 /* SYN codes */
 #define SDLop_SYN_REPORT    0
+#define SDLop_SYN_DROPPED   3
 
 /* Common keys (evdev KEY_* values) */
 #define SDLop_KEY_ESC       1
@@ -222,8 +227,9 @@ typedef struct SDLop_RawEvent
 /**
  * Raw event callback, invoked on the input worker thread.
  *
- * Keep it fast: it runs on the lowest-latency path. The event pointer is
- * only valid for the duration of the call.
+ * Keep it fast, non-blocking and thread-safe: it runs on the input worker,
+ * not the SDL thread. The event pointer is only valid during the call.
+ * Recovery never replaces native callback records with synthesized SDL events.
  */
 typedef void (*SDLop_RawEventCallback)(const SDLop_RawEvent *event, void *userdata);
 
@@ -238,6 +244,12 @@ extern bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *user
 
 /**
  * Unregister a previously registered raw event callback.
+ *
+ * This publishes a new callback list; it is not a worker synchronization
+ * barrier. A callback from the previous list may still be in flight. Keep its
+ * userdata alive until the worker has stopped (SDL_Quit joins the worker).
+ * Register/unregister must not race with input initialization or shutdown;
+ * never call SDL_Quit from the worker callback itself.
  */
 extern void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb);
 
@@ -271,6 +283,31 @@ extern bool SDLop_RawInputAvailable(void);
  */
 extern Uint64 SDLop_GetRawEventCount(void);
 
+/** Raw transport counters. No fields count synthesized SDL recovery events. */
+typedef struct SDLop_RawInputStats
+{
+    Uint64 events_seen;       /**< Native records dispatched since worker init. */
+    Uint64 sdl_ring_dropped;  /**< Native records rejected by the SDL input ring. */
+    Uint64 poll_ring_dropped; /**< Native records rejected by the raw polling ring. */
+} SDLop_RawInputStats;
+
+/**
+ * Read raw transport counters without consuming events or resetting counts.
+ *
+ * Safe from any thread, including a raw callback, provided input init/quit is
+ * not concurrent. Fields are independently sampled, not a transactional
+ * snapshot. Drop counts are published at worker batch boundaries and can lag
+ * events_seen during a batch. They do not count kernel evdev losses, SDL event
+ * filters, or records deliberately discarded during SDL state recovery.
+ * Counters reset when the worker initializes; final counts survive quit until
+ * the next worker initialization. An inactive/uninitialized worker initially
+ * reports zero. The web implementation always reports zero.
+ *
+ * \param stats output storage, must not be NULL.
+ * \returns true on success, false for a NULL pointer (SDL error set).
+ */
+extern bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats);
+
 /**
  * Set the background color a window is presented with.
  *
@@ -278,5 +315,9 @@ extern Uint64 SDLop_GetRawEventCount(void);
  * a rendering API. Takes effect on the next present.
  */
 extern void SDLop_SetWindowClearColor(SDL_Window *window, Uint8 r, Uint8 g, Uint8 b);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SDLop_h_ */

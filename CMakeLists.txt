@@ -517,6 +517,65 @@ if(SDLop_BUILD_TESTS)
   target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
   add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
 
+  # Deterministic queue-pressure test through the real evdev worker. The
+  # process-local transport uses no input devices, root or display server.
+  add_executable(test_evdev_backpressure tests/test_evdev_backpressure.c bench/raw_pipe.c)
+  target_link_libraries(test_evdev_backpressure PRIVATE sdlop)
+  target_include_directories(test_evdev_backpressure PRIVATE tests)
+  target_compile_options(test_evdev_backpressure PRIVATE -UNDEBUG)
+  target_link_options(test_evdev_backpressure PRIVATE
+    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
+  add_test(NAME test_evdev_backpressure COMMAND test_evdev_backpressure)
+  set_tests_properties(test_evdev_backpressure PROPERTIES TIMEOUT 15)
+
+  # Force the real worker's consumer-drains-mid-batch wakeup interleaving,
+  # and verify EVIOCSCLOCKID setup/fallback without kernel input devices.
+  add_executable(test_evdev_worker tests/test_evdev_worker.c)
+  target_link_libraries(test_evdev_worker PRIVATE sdlop)
+  target_include_directories(test_evdev_worker PRIVATE src tests)
+  target_compile_options(test_evdev_worker PRIVATE -UNDEBUG)
+  target_link_options(test_evdev_worker PRIVATE
+    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl
+    -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=epoll_wait)
+  foreach(mode wake busy monotonic negotiated-authoritative fallback-monotonic fallback-realtime)
+    add_test(NAME evdev_worker_${mode} COMMAND test_evdev_worker ${mode})
+    set_tests_properties(evdev_worker_${mode} PROPERTIES TIMEOUT 15)
+  endforeach()
+
+  add_executable(test_evdev_syn_dropped tests/test_evdev_syn_dropped.c)
+  target_link_libraries(test_evdev_syn_dropped PRIVATE sdlop)
+  target_include_directories(test_evdev_syn_dropped PRIVATE tests)
+  target_compile_options(test_evdev_syn_dropped PRIVATE -UNDEBUG)
+  target_link_options(test_evdev_syn_dropped PRIVATE
+    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
+  add_test(NAME test_evdev_syn_dropped COMMAND test_evdev_syn_dropped)
+  set_tests_properties(test_evdev_syn_dropped PROPERTIES TIMEOUT 15)
+
+  add_executable(test_evdev_recovery tests/test_evdev_recovery.c)
+  target_link_libraries(test_evdev_recovery PRIVATE sdlop)
+  target_include_directories(test_evdev_recovery PRIVATE src tests)
+  target_compile_options(test_evdev_recovery PRIVATE -UNDEBUG)
+  target_link_options(test_evdev_recovery PRIVATE
+    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl
+    -Wl,--wrap=epoll_wait)
+  add_test(NAME test_evdev_recovery COMMAND test_evdev_recovery)
+  set_tests_properties(test_evdev_recovery PROPERTIES TIMEOUT 30)
+
+  add_executable(test_input_transport tests/test_input_transport.c)
+  target_include_directories(test_input_transport PRIVATE tests)
+  target_compile_options(test_input_transport PRIVATE -UNDEBUG)
+  target_link_options(test_input_transport PRIVATE
+    -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=clock_gettime)
+  add_test(NAME test_input_transport COMMAND test_input_transport)
+  set_tests_properties(test_input_transport PROPERTIES TIMEOUT 5)
+
+  # Benchmark accounting is testable without input devices or a display.
+  add_executable(test_raw_latency_bench tests/test_raw_latency_bench.c tests/uinput_synth.c)
+  target_link_libraries(test_raw_latency_bench PRIVATE sdlop)
+  target_include_directories(test_raw_latency_bench PRIVATE tests)
+  target_compile_options(test_raw_latency_bench PRIVATE -UNDEBUG)
+  add_test(NAME test_raw_latency_bench COMMAND test_raw_latency_bench)
+
   add_executable(test_wayland tests/test_wayland.c)
   target_link_libraries(test_wayland PRIVATE sdlop)
   target_include_directories(test_wayland PRIVATE src)
@@ -746,6 +805,20 @@ if(SDLop_BUILD_BENCHMARKS)
   add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
   target_link_libraries(bench_raw_latency PRIVATE sdlop)
   target_include_directories(bench_raw_latency PRIVATE src tests)
+
+  # Same real worker/API pipeline, with process-local pipe-backed evdev
+  # discovery. Needs neither root, /dev/input, uinput nor a display server.
+  add_executable(bench_raw_latency_pipe bench/bench_raw_latency.c bench/raw_pipe.c)
+  target_compile_definitions(bench_raw_latency_pipe PRIVATE SDLOP_BENCH_PIPE=1)
+  target_link_libraries(bench_raw_latency_pipe PRIVATE sdlop)
+  target_include_directories(bench_raw_latency_pipe PRIVATE tests)
+  target_link_options(bench_raw_latency_pipe PRIVATE
+    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
+  if(SDLop_BUILD_TESTS)
+    add_test(NAME raw_latency_pipe_api COMMAND bench_raw_latency_pipe --api-overhead)
+    set_tests_properties(raw_latency_pipe_api PROPERTIES TIMEOUT 30
+      ENVIRONMENT "SDLOP_RAW_INPUT=1;SDLOP_DISABLE_RAW_INPUT=0")
+  endif()
 endif()
 
 # ABI parity gate: builds tools/abi_probe.c against these headers and against

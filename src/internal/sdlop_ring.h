@@ -74,6 +74,34 @@ static inline bool SDLOP_RingPop(SDLOP_Ring *ring, void *elem)
     return true;
 }
 
+/* Consumer-only bulk pop: one acquire/release pair for the entire batch.
+ * The producer cannot reuse any copied slot until tail is published below.
+ * A snapshot of head bounds the read; newly arriving events wait for the
+ * next call. No allocation and no modification of published entries. */
+static inline uint32_t SDLOP_RingPopBatch(SDLOP_Ring *ring, void *elems, uint32_t max_elems)
+{
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+    uint64_t available = head - tail;
+    uint32_t count = available < max_elems ? (uint32_t)available : max_elems;
+    if (!count) {
+        return 0;
+    }
+    uint32_t index = (uint32_t)tail & ring->mask;
+    uint32_t first = ring->mask + 1 - index;
+    if (first > count) {
+        first = count;
+    }
+    size_t first_bytes = (size_t)first * ring->elem_size;
+    memcpy(elems, ring->data + (size_t)index * ring->elem_size, first_bytes);
+    if (first < count) {
+        memcpy((unsigned char *)elems + first_bytes, ring->data,
+               (size_t)(count - first) * ring->elem_size);
+    }
+    atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
+    return count;
+}
+
 static inline bool SDLOP_RingEmpty(SDLOP_Ring *ring)
 {
     return atomic_load_explicit(&ring->head, memory_order_acquire) ==

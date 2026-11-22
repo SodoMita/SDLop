@@ -29,6 +29,39 @@ static void *producer(void *arg)
     return NULL;
 }
 
+static void test_batch(void)
+{
+    uint64_t batch[137]; /* deliberately not a divisor of the capacity */
+    SDLOP_RingInit(&ring, storage, CAPACITY, sizeof(uint64_t));
+    assert(SDLOP_RingPopBatch(&ring, batch, 137) == 0);
+    uint64_t value = 99;
+    assert(SDLOP_RingPush(&ring, &value));
+    assert(SDLOP_RingPopBatch(&ring, batch, 0) == 0);
+    assert(SDLOP_RingCount(&ring) == 1);
+    assert(SDLOP_RingPopBatch(&ring, batch, 137) == 1 && batch[0] == 99);
+
+    /* Full wrapped read spanning the end of the backing storage. */
+    uint64_t full[CAPACITY + 7];
+    for (uint64_t i = 0; i < CAPACITY; i++) {
+        assert(SDLOP_RingPush(&ring, &i));
+    }
+    assert(SDLOP_RingPopBatch(&ring, full, CAPACITY + 7) == CAPACITY);
+    for (uint64_t i = 0; i < CAPACITY; i++) { assert(full[i] == i); }
+    assert(SDLOP_RingEmpty(&ring));
+
+    /* The same four-million-record concurrent producer, with bulk reads. */
+    SDLOP_RingInit(&ring, storage, CAPACITY, sizeof(uint64_t));
+    pthread_t t;
+    assert(pthread_create(&t, NULL, producer, NULL) == 0);
+    uint64_t expected = 0;
+    while (expected < TOTAL) {
+        uint32_t n = SDLOP_RingPopBatch(&ring, batch, 137);
+        for (uint32_t i = 0; i < n; i++) { assert(batch[i] == expected++); }
+    }
+    pthread_join(t, NULL);
+    assert(SDLOP_RingEmpty(&ring));
+}
+
 int main(void)
 {
     SDLOP_RingInit(&ring, storage, CAPACITY, sizeof(uint64_t));
@@ -67,6 +100,7 @@ int main(void)
     }
     assert(!SDLOP_RingPop(&ring, &v));
 
-    printf("test_ring: PASS (%d events transferred, overflow drop OK)\n", TOTAL);
+    test_batch();
+    printf("test_ring: PASS (%d single + %d batch events, wrap/empty/overflow OK)\n", TOTAL, TOTAL);
     return 0;
 }
