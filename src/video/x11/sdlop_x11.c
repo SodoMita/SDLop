@@ -92,6 +92,8 @@ typedef union X11Event32
     X(_NET_WM_STATE_MODAL)                \
     X(_NET_WM_MOVERESIZE)                 \
     X(_GTK_SHOW_WINDOW_MENU)              \
+    X(_NET_WM_SYNC_REQUEST)               \
+    X(_NET_WM_SYNC_REQUEST_COUNTER)       \
     X(_NET_WM_STATE_DEMANDS_ATTENTION)    \
     X(_NET_WM_WINDOW_TYPE)                \
     X(_NET_WM_WINDOW_TYPE_NORMAL)         \
@@ -161,7 +163,19 @@ typedef struct X11WindowData
     int hit_test_result;          /* SDL_HitTestResult under the pointer */
     bool pending_move;            /* hit-test drag started while unfocused (stock) */
     int16_t pending_move_x, pending_move_y; /* root coordinates of that press */
+
+    /* _NET_WM_SYNC_REQUEST (SDL_HINT_VIDEO_X11_ENABLE_XSYNC_EXT) */
+    uint32_t sync_counter;        /* XSync counter, 0 = not used */
+    xcb_sync_int64_t sync_value;  /* value of the last request */
+    int sync_state;               /* SYNC_IDLE / SYNC_REQUESTED / SYNC_CONFIGURED */
 } X11WindowData;
+
+enum
+{
+    SYNC_IDLE,
+    SYNC_REQUESTED,  /* request seen, waiting for the ConfigureNotify */
+    SYNC_CONFIGURED  /* configured: the next present updates the counter */
+};
 
 typedef struct X11Monitor
 {
@@ -193,6 +207,7 @@ typedef struct X11DeviceData
     int32_t xkb_device_id;
     bool detectable_repeat;
     bool has_xi2;
+    bool has_sync;                /* SYNC >= 3.0 (resize sync counters) */
     uint8_t xi_opcode;
     /* XI2.2 touch sequences: per-finger last position for dx/dy, and
      * the window the sequence started on (SDL3 semantics) */
@@ -771,6 +786,20 @@ static void fb_put(X11WindowData *wd, int x, int y, int w, int h)
     }
 }
 
+/* _NET_WM_SYNC_REQUEST: after the first frame drawn for the configure
+ * that followed the request, set the counter to the requested value so
+ * the WM knows the client caught up (stock X11_HandlePresent) */
+void SDLOP_X11_HandlePresent(SDL_Window *window)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd || !wd->sync_counter || wd->sync_state != SYNC_CONFIGURED) {
+        return;
+    }
+    X11_xcb_sync_set_counter(x11.conn, wd->sync_counter, wd->sync_value);
+    wd->sync_state = SYNC_IDLE;
+    x11_flush();
+}
+
 static void fb_present(SDL_Window *window, const SDL_Rect *rects, int numrects)
 {
     X11WindowData *wd = wdata(window);
@@ -784,6 +813,7 @@ static void fb_present(SDL_Window *window, const SDL_Rect *rects, int numrects)
     } else {
         fb_put(wd, 0, 0, wd->fb_w, wd->fb_h);
     }
+    SDLOP_X11_HandlePresent(window);
     if (wd->fb_shm) {
         /* the server reads SHM asynchronously; don't let the app scribble
          * over pixels that are still being copied (SDL3 does XSync too) */
@@ -1916,6 +1946,17 @@ static bool x11_Init(SDLop_VideoDevice *device)
         }
     }
 
+    /* SYNC >= 3.0 for _NET_WM_SYNC_REQUEST counters */
+    if (SDLOP_X11_HAVE(SYNC)) {
+        const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_sync_id);
+        if (ext && ext->present) {
+            xcb_sync_initialize_reply_t *v =
+                X11_xcb_sync_initialize_reply(x11.conn, X11_xcb_sync_initialize(x11.conn, 3, 1), NULL);
+            x11.has_sync = v && v->major_version >= 3;
+            free(v);
+        }
+    }
+
     /* XInput2 >= 2.2 for raw motion (relative mouse) */
     if (SDLOP_X11_HAVE(XINPUT)) {
         const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_input_id);
@@ -2056,8 +2097,18 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
 
     /* ICCCM / EWMH bookkeeping (swa: WM_PROTOCOLS + _NET_WM_PID) */
-    xcb_atom_t protocols[2] = { x11.atom.WM_DELETE_WINDOW, x11.atom._NET_WM_PING };
-    set_property(wd->xid, x11.atom.WM_PROTOCOLS, XCB_ATOM_ATOM, 32, 2, protocols);
+    xcb_atom_t protocols[3] = { x11.atom.WM_DELETE_WINDOW, x11.atom._NET_WM_PING, XCB_NONE };
+    uint32_t nprotocols = 2;
+    /* resize sync (opt-in as in stock; Vulkan presents bypass SDL) */
+    if (x11.has_sync && !(window->flags & SDL_WINDOW_VULKAN) &&
+        SDL_GetHintBoolean(SDL_HINT_VIDEO_X11_ENABLE_XSYNC_EXT, false)) {
+        xcb_sync_int64_t zero = { 0, 0 };
+        wd->sync_counter = X11_xcb_generate_id(x11.conn);
+        X11_xcb_sync_create_counter(x11.conn, wd->sync_counter, zero);
+        set_property(wd->xid, x11.atom._NET_WM_SYNC_REQUEST_COUNTER, XCB_ATOM_CARDINAL, 32, 1, &wd->sync_counter);
+        protocols[nprotocols++] = x11.atom._NET_WM_SYNC_REQUEST;
+    }
+    set_property(wd->xid, x11.atom.WM_PROTOCOLS, XCB_ATOM_ATOM, 32, nprotocols, protocols);
     uint32_t pid = (uint32_t)getpid();
     set_property(wd->xid, x11.atom._NET_WM_PID, XCB_ATOM_CARDINAL, 32, 1, &pid);
     char host[256];
@@ -2288,6 +2339,9 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     fb_free(wd);
     X11_xcb_free_gc(x11.conn, wd->gc);
+    if (wd->sync_counter) {
+        X11_xcb_sync_destroy_counter(x11.conn, wd->sync_counter);
+    }
     X11_xcb_destroy_window(x11.conn, wd->xid);
     if (wd->colormap) {
         X11_xcb_free_colormap(x11.conn, wd->colormap);
@@ -3376,6 +3430,9 @@ static SDL_MouseButtonFlags x11_GetGlobalMouseState(SDLop_VideoDevice *device, f
 static void handle_configure(SDL_Window *window, xcb_configure_notify_event_t *ce, bool synthetic)
 {
     X11WindowData *wd = wdata(window);
+    if (wd->sync_state == SYNC_REQUESTED) {
+        wd->sync_state = SYNC_CONFIGURED;
+    }
     int x = ce->x, y = ce->y;
     if (!synthetic && wd->parent != x11.root) {
         /* real events are relative to the WM frame; synthetic ones (sent
@@ -3424,6 +3481,14 @@ static void handle_client_message(SDL_Window *window, xcb_client_message_event_t
     xcb_atom_t proto = cm->data.data32[0];
     if (proto == x11.atom.WM_DELETE_WINDOW) {
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
+    } else if (proto == x11.atom._NET_WM_SYNC_REQUEST) {
+        /* data: protocol, timestamp, value low, value high */
+        X11WindowData *wd = wdata(window);
+        if (wd && wd->sync_counter) {
+            wd->sync_value.lo = cm->data.data32[2];
+            wd->sync_value.hi = (int32_t)cm->data.data32[3];
+            wd->sync_state = SYNC_REQUESTED;
+        }
     } else if (proto == x11.atom._NET_WM_PING) {
         /* EWMH: answer by bouncing the message to the root */
         X11Event32 reply;

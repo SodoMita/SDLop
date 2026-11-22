@@ -1142,10 +1142,11 @@ bool SDLOP_X11_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, voi
 bool SDLOP_X11_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
-    if (current_is_glx()) {
-        return glx_SwapBuffers(window);
+    const bool ok = current_is_glx() ? glx_SwapBuffers(window) : egl_SwapBuffers(window);
+    if (ok) {
+        SDLOP_X11_HandlePresent(window);
     }
-    return egl_SwapBuffers(window);
+    return ok;
 }
 
 void SDLOP_X11_GL_DeleteContext(SDLop_VideoDevice *device, void *context)

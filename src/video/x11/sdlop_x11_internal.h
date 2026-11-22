@@ -38,6 +38,8 @@ void *SDLOP_X11_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *wind
 void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window);
 bool SDLOP_X11_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, void *context);
 bool SDLOP_X11_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window);
+/* after a frame reached the window: answers a pending _NET_WM_SYNC_REQUEST */
+void SDLOP_X11_HandlePresent(SDL_Window *window);
 void SDLOP_X11_GL_DeleteContext(SDLop_VideoDevice *device, void *context);
 SDL_FunctionPointer SDLOP_X11_GL_GetProcAddress(SDLop_VideoDevice *device, const char *proc);
 bool SDLOP_X11_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval);

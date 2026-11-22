@@ -12,7 +12,7 @@
   Library names can be overridden per module (SDLOP_LIB_XCB,
   SDLOP_LIB_XCB_SHM, SDLOP_LIB_XCB_XKB, SDLOP_LIB_XKBCOMMON_X11,
   SDLOP_LIB_XCB_XINPUT, SDLOP_LIB_XCB_RANDR,
-  SDLOP_LIB_XCB_RENDER, SDLOP_LIB_XCB_XFIXES). Setting an optional module's
+  SDLOP_LIB_XCB_RENDER, SDLOP_LIB_XCB_XFIXES, SDLOP_LIB_XCB_SYNC). Setting an optional module's
   variable to "none" disables it, which is how the fallback paths are
   tested.
 
@@ -70,6 +70,37 @@ xcb_xfixes_query_version_reply_t *xcb_xfixes_query_version_reply(xcb_connection_
                                                                  xcb_generic_error_t **e);
 xcb_void_cookie_t xcb_xfixes_select_selection_input(xcb_connection_t *c, xcb_window_t window, xcb_atom_t selection,
                                                     uint32_t event_mask);
+#endif
+#if defined(__has_include)
+#if __has_include(<xcb/sync.h>)
+#include <xcb/sync.h>
+#define SDLOP_HAVE_XCB_SYNC_H 1
+#endif
+#endif
+#ifndef SDLOP_HAVE_XCB_SYNC_H
+/* libxcb-sync is dlopen-ed (optional, _NET_WM_SYNC_REQUEST); declared here
+ * exactly as xcb/sync.h has them when its headers are missing */
+typedef uint32_t xcb_sync_counter_t;
+typedef struct xcb_sync_int64_t {
+    int32_t hi;
+    uint32_t lo;
+} xcb_sync_int64_t;
+typedef struct xcb_sync_initialize_cookie_t { unsigned int sequence; } xcb_sync_initialize_cookie_t;
+typedef struct xcb_sync_initialize_reply_t {
+    uint8_t response_type, pad0;
+    uint16_t sequence;
+    uint32_t length;
+    uint8_t major_version, minor_version;
+    uint8_t pad1[22];
+} xcb_sync_initialize_reply_t;
+extern xcb_extension_t xcb_sync_id;
+xcb_sync_initialize_cookie_t xcb_sync_initialize(xcb_connection_t *c, uint8_t desired_major_version,
+                                                 uint8_t desired_minor_version);
+xcb_sync_initialize_reply_t *xcb_sync_initialize_reply(xcb_connection_t *c, xcb_sync_initialize_cookie_t cookie,
+                                                       xcb_generic_error_t **e);
+xcb_void_cookie_t xcb_sync_create_counter(xcb_connection_t *c, xcb_sync_counter_t id, xcb_sync_int64_t initial_value);
+xcb_void_cookie_t xcb_sync_destroy_counter(xcb_connection_t *c, xcb_sync_counter_t counter);
+xcb_void_cookie_t xcb_sync_set_counter(xcb_connection_t *c, xcb_sync_counter_t counter, xcb_sync_int64_t value);
 #endif
 #include <xkbcommon/xkbcommon-x11.h>
 

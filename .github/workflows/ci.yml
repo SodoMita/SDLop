@@ -32,7 +32,7 @@ jobs:
             libegl-dev libgbm-dev libdrm-dev libgles-dev \
             libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers libegl-mesa0 libgl1-mesa-dri \
             libxcb1-dev libxcb-shm0-dev libxcb-xkb-dev libxcb-xinput-dev \
-            libxcb-randr0-dev libxcb-render0-dev libxcb-xfixes0-dev libxcb-xtest0-dev libx11-6 libxcb-imdkit-dev \
+            libxcb-randr0-dev libxcb-render0-dev libxcb-xfixes0-dev libxcb-sync-dev libxcb-xtest0-dev libx11-6 libxcb-imdkit-dev \
             xkb-data libx11-data x11-xkb-utils \
             xvfb xauth openbox
 
