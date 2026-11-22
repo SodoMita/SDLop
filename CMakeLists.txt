@@ -562,6 +562,20 @@ if(SDLop_BUILD_TESTS)
   add_test(NAME test_evdev_dispatch COMMAND test_evdev_dispatch)
   set_tests_properties(test_evdev_dispatch PROPERTIES TIMEOUT 15)
 
+  add_executable(test_wayland_scroll tests/test_wayland_scroll.c)
+  target_compile_options(test_wayland_scroll PRIVATE -UNDEBUG)
+  add_test(NAME test_wayland_scroll COMMAND test_wayland_scroll)
+
+  add_executable(test_evdev_absolute tests/test_evdev_absolute.c)
+  target_link_libraries(test_evdev_absolute PRIVATE sdlop)
+  target_include_directories(test_evdev_absolute PRIVATE src tests)
+  target_compile_options(test_evdev_absolute PRIVATE -UNDEBUG)
+  target_link_options(test_evdev_absolute PRIVATE
+    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
+  add_test(NAME test_evdev_absolute COMMAND test_evdev_absolute)
+  add_test(NAME test_evdev_text_repeat COMMAND test_evdev_absolute --repeat-only)
+  set_tests_properties(test_evdev_absolute test_evdev_text_repeat PROPERTIES TIMEOUT 30)
+
   add_executable(test_evdev_syn_dropped tests/test_evdev_syn_dropped.c)
   target_link_libraries(test_evdev_syn_dropped PRIVATE sdlop)
   target_include_directories(test_evdev_syn_dropped PRIVATE tests)

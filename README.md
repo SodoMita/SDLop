@@ -95,7 +95,10 @@ either all from evdev (`/dev/input`) or all from the window system.
   keys/buttons SDL reported down always pass, and a drag that started in our
   window keeps its motion. All or nothing: if the worker cannot read both a
   keyboard and a pointer, SDLop logs why and uses window-system input for
-  both. Touch stays with the window system.
+  both. Raw pointers may use REL_X/Y or single-contact ABS_X/Y with valid
+  ranges and mouse/pen buttons; absolute coordinates scale to the focused
+  window. Direct touchscreens, touchpads and multitouch stay with the window
+  system. See [input report fixes and verification](docs/input-report-fixes.md).
 - **fbdev / kmsdrm use evdev by default** (`SDLOP_RAW_INPUT=0` turns that
   off). SDL keyboard events use evdev only while SDLop owns `K_OFF` on the
   foreground VT. A working raw keyboard is required before disabling the

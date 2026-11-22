@@ -57,10 +57,14 @@ typedef struct SDLOP_RawDevice
     bool is_keyboard;
     bool is_pointer;
     bool clock_monotonic; /* EVIOCSCLOCKID succeeded for this fd */
+    bool has_abs;
 
     /* Main-thread SDL adapter state (never touched by the worker). */
     unsigned long keys[SDLOP_KEY_WORDS];
     float hi_res_x, hi_res_y;
+    int abs_value[2], abs_min[2], abs_max[2];
+    float abs_last[2]; /* normalized relative-mode baseline */
+    bool abs_dirty, abs_valid, abs_recovered;
     bool syncing, wait_report, requested;
     Uint64 retry_ns;
     unsigned int sync_code;
@@ -72,6 +76,7 @@ typedef struct SDLOP_RawDevice
     atomic_bool snapshot_ready;
     bool snapshot_ok;
     unsigned long snapshot_keys[SDLOP_KEY_WORDS];
+    struct input_absinfo snapshot_abs[2];
     uint64_t snapshot_boundary, snapshot_dropped;
 } SDLOP_RawDevice;
 
@@ -171,14 +176,18 @@ static int open_input_devices(void)
         }
 
         SDLOP_RawDevice *dev = &raw.devices[raw.num_devices];
+        memset(dev, 0, sizeof(*dev)); /* a previous rejected fd may have used this slot */
         dev->fd = fd;
         dev->index = (Uint32)raw.num_devices;
         dev->clock_monotonic = clock_monotonic;
         dev->is_keyboard = dev->is_pointer = false;
 
+        bool pointer_button = false, touchpad = false;
         if (test_bit(evbits, EV_KEY)) {
             unsigned long keybits[KEY_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
             if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0) {
+                pointer_button = test_bit(keybits, BTN_LEFT) || test_bit(keybits, BTN_TOOL_PEN);
+                touchpad = test_bit(keybits, BTN_TOOL_FINGER);
                 if (test_bit(keybits, KEY_W) || test_bit(keybits, KEY_A)) {
                     dev->is_keyboard = true;
                 }
@@ -190,6 +199,33 @@ static int open_input_devices(void)
                 if (test_bit(relbits, REL_X) && test_bit(relbits, REL_Y)) {
                     dev->is_pointer = true;
                 }
+            }
+        }
+
+        if (test_bit(evbits, EV_ABS) && pointer_button && !touchpad) {
+            unsigned long props[INPUT_PROP_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
+            /* Legacy devices may not implement EVIOCGPROP. Direct touch
+             * surfaces need a touch translator, not mouse emulation here. */
+            (void)ioctl(fd, EVIOCGPROP(sizeof(props)), props);
+            unsigned long bits[ABS_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
+            if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(bits)), bits) >= 0 &&
+                test_bit(bits, ABS_X) && test_bit(bits, ABS_Y) &&
+                !test_bit(bits, ABS_MT_POSITION_X) && !test_bit(props, INPUT_PROP_DIRECT)) { /* not a multitouch translator */
+                bool valid = true;
+                for (int axis = 0; axis < 2; axis++) {
+                    int result;
+                    struct input_absinfo initial = { 0 };
+                    struct input_absinfo *info = &initial;
+                    do {
+                        result = ioctl(fd, EVIOCGABS(ABS_X + axis), info);
+                    } while (result < 0 && errno == EINTR);
+                    if (result < 0 || info->maximum <= info->minimum) { valid = false; }
+                    dev->abs_min[axis] = info->minimum;
+                    dev->abs_max[axis] = info->maximum;
+                    dev->abs_value[axis] = info->value;
+                }
+                dev->has_abs = valid;
+                dev->is_pointer |= valid;
             }
         }
 
@@ -362,6 +398,17 @@ static void *worker_main(void *arg)
                     do {
                         result = ioctl(dev->fd, EVIOCGKEY(sizeof(dev->snapshot_keys)), dev->snapshot_keys);
                     } while (result < 0 && errno == EINTR);
+                }
+                if (result >= 0 && dev->has_abs) {
+                    for (int axis = 0; axis < 2; axis++) {
+                        int queried;
+                        do {
+                            queried = ioctl(dev->fd, EVIOCGABS(ABS_X + axis), &dev->snapshot_abs[axis]);
+                        } while (queried < 0 && errno == EINTR);
+                        if (queried < 0 || dev->snapshot_abs[axis].maximum <= dev->snapshot_abs[axis].minimum) {
+                            result = -1;
+                        }
+                    }
                 }
                 dev->snapshot_ok = result >= 0;
                 dev->snapshot_boundary = atomic_load_explicit(&raw.sdl_ring.head, memory_order_relaxed);
@@ -613,7 +660,8 @@ bool SDLOP_RawInputIsSource(void)
 static Uint8 mouse_button_from_btn(Uint16 code)
 {
     switch (code) {
-    case BTN_LEFT:   return SDL_BUTTON_LEFT;
+    case BTN_LEFT:
+    case BTN_TOUCH:  return SDL_BUTTON_LEFT;
     case BTN_RIGHT:  return SDL_BUTTON_RIGHT;
     case BTN_MIDDLE: return SDL_BUTTON_MIDDLE;
     case BTN_SIDE:   return SDL_BUTTON_X1;
@@ -702,6 +750,41 @@ static bool winsys_keyboard_focus(void)
     return sdlop.keyboard_focus && !sdlop.keyboard_grabbed_elsewhere;
 }
 
+/* Translate single-contact ABS_X/Y devices in window coordinates. Cache
+ * physical axes until SYN_REPORT (or a pointer button) to keep X/Y coherent. */
+static void pump_absolute(SDLOP_RawDevice *dev, Uint64 timestamp)
+{
+    if (!dev->has_abs || !dev->abs_dirty) { return; }
+    dev->abs_dirty = false;
+    if (!raw.winsys && !raw_console_foreground()) {
+        dev->abs_valid = false;
+        return;
+    }
+    SDL_Window *w = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.keyboard_focus;
+    if (!w || w->w <= 0 || w->h <= 0 ||
+        (raw.winsys && !winsys_pointer_focus() && !sdlop.mouse_buttons)) {
+        dev->abs_valid = false;
+        return;
+    }
+    float n[2];
+    for (int axis = 0; axis < 2; axis++) {
+        double range = (double)dev->abs_max[axis] - dev->abs_min[axis];
+        n[axis] = (float)SDL_clamp(((double)dev->abs_value[axis] - dev->abs_min[axis]) / range, 0.0, 1.0);
+    }
+    if (sdlop.relative_mode_window) {
+        if (dev->abs_valid) {
+            SDLOP_SendMouseMotion(SDLOP_NO_POS, SDLOP_NO_POS,
+                                  (n[0] - dev->abs_last[0]) * (w->w - 1),
+                                  (n[1] - dev->abs_last[1]) * (w->h - 1), timestamp);
+        }
+    } else {
+        SDLOP_SendMouseMotion(n[0] * (w->w - 1), n[1] * (w->h - 1), 0, 0, timestamp);
+    }
+    dev->abs_last[0] = n[0];
+    dev->abs_last[1] = n[1];
+    dev->abs_valid = true;
+}
+
 static void pump_event(const SDLop_RawEvent *ev, bool recovering)
 {
     SDLOP_RawDevice *dev = &raw.devices[ev->device];
@@ -709,11 +792,9 @@ static void pump_event(const SDLop_RawEvent *ev, bool recovering)
 
     switch (ev->type) {
     case SDLop_EV_KEY: {
-        if (ev->code >= BTN_LEFT && ev->code <= BTN_EXTRA) {
+        if (mouse_button_from_btn(ev->code)) {
             Uint8 btn = mouse_button_from_btn(ev->code);
-            if (!btn) {
-                return;
-            }
+            pump_absolute(dev, ev->timestamp_ns);
             if (winsys && !winsys_pointer_focus() &&
                 !(ev->value == 0 && (sdlop.mouse_buttons & SDL_BUTTON_MASK(btn)))) {
                 return;
@@ -784,7 +865,14 @@ static void pump_event(const SDLop_RawEvent *ev, bool recovering)
         }
         break;
     }
+    case SDLop_EV_ABS:
+        if (dev->has_abs && (ev->code == ABS_X || ev->code == ABS_Y)) {
+            dev->abs_value[ev->code - ABS_X] = ev->value;
+            dev->abs_dirty = true;
+        }
+        break;
     case SDLop_EV_SYN:
+        if (ev->code == SDLop_SYN_REPORT) { pump_absolute(dev, ev->timestamp_ns); }
         if (ev->code == SDLop_SYN_REPORT && (dev->hi_res_x != 0.0f || dev->hi_res_y != 0.0f)) {
             SDLOP_SendMouseWheel(dev->hi_res_x, dev->hi_res_y, ev->timestamp_ns);
             dev->hi_res_x = dev->hi_res_y = 0.0f;
@@ -822,7 +910,12 @@ static void pump_key(const SDLop_RawEvent *ev, bool recovering)
         dev->keys[word] &= ~mask;
     }
     for (int i = 0; i < raw.num_devices; i++) {
-        if ((Uint32)i != ev->device && test_bit(raw.devices[i].keys, ev->code)) {
+        bool held = (Uint32)i != ev->device && test_bit(raw.devices[i].keys, ev->code);
+        if (mouse_button_from_btn(ev->code) == SDL_BUTTON_LEFT) {
+            held |= (ev->code != BTN_LEFT || (Uint32)i != ev->device) && test_bit(raw.devices[i].keys, BTN_LEFT);
+            held |= (ev->code != BTN_TOUCH || (Uint32)i != ev->device) && test_bit(raw.devices[i].keys, BTN_TOUCH);
+        }
+        if (held) {
             /* A prior physical press may have been focus-filtered. Do not
              * suppress a fresh focused press unless SDL saw a press too. */
             Uint8 button = mouse_button_from_btn(ev->code);
@@ -845,6 +938,7 @@ static void begin_sync(SDLOP_RawDevice *dev, bool wait_report)
     dev->sync_code = 0;
     dev->retry_ns = 0;
     dev->hi_res_x = dev->hi_res_y = 0.0f; /* damaged partial wheel frame */
+    dev->abs_dirty = dev->abs_valid = dev->abs_recovered = false;
     raw.have_sync = true;
     sdlop.repeat_active = false; /* don't repeat uncertain key state */
 }
@@ -853,6 +947,7 @@ static void request_snapshot(SDLOP_RawDevice *dev)
 {
     dev->request_generation = dev->sync_generation;
     dev->requested = true;
+    dev->abs_recovered = false;
     atomic_store_explicit(&dev->snapshot_ready, false, memory_order_relaxed);
     atomic_fetch_or_explicit(&raw.resync_requests, 1u << dev->index, memory_order_release);
     uint64_t one = 1;
@@ -886,6 +981,18 @@ static bool pump_recovery(void)
                 dev->retry_ns = failed ? SDLOP_MonotonicNS() + 100000000ull : 0;
                 dev->sync_code = 0;
             } else if (!dev->wait_report && (int64_t)(tail - dev->snapshot_boundary) >= 0) {
+                if (dev->has_abs && !dev->abs_recovered) {
+                    if (SDLOP_EventQueueFree() < 3) { return false; }
+                    for (int axis = 0; axis < 2; axis++) {
+                        dev->abs_value[axis] = dev->snapshot_abs[axis].value;
+                        dev->abs_min[axis] = dev->snapshot_abs[axis].minimum;
+                        dev->abs_max[axis] = dev->snapshot_abs[axis].maximum;
+                    }
+                    dev->abs_dirty = true;
+                    dev->abs_valid = false; /* never invent lost relative history */
+                    pump_absolute(dev, 0);
+                    dev->abs_recovered = true;
+                }
                 while (dev->sync_code <= KEY_MAX) {
                     unsigned int code = dev->sync_code;
                     bool down = test_bit(dev->snapshot_keys, code);

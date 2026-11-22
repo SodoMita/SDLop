@@ -495,6 +495,24 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         wl_pointer_send_enter(M.pointer, serial, M.surface_res,
                               wl_fixed_from_double(100.0), wl_fixed_from_double(100.0));
         wl_pointer_send_frame(M.pointer);
+        if (getenv("SDLOP_TEST_SCROLL")) {
+            wl_pointer_send_axis(M.pointer, 1, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(-1));
+            if (wl_resource_get_version(M.pointer) >= 8) {
+                wl_pointer_send_axis_value120(M.pointer, WL_POINTER_AXIS_VERTICAL_SCROLL, -120);
+            } else {
+                wl_pointer_send_axis_discrete(M.pointer, WL_POINTER_AXIS_VERTICAL_SCROLL, -1);
+            }
+            wl_pointer_send_frame(M.pointer);
+            wl_pointer_send_axis(M.pointer, 2, WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_int(1));
+            if (wl_resource_get_version(M.pointer) >= 8) {
+                wl_pointer_send_axis_value120(M.pointer, WL_POINTER_AXIS_HORIZONTAL_SCROLL, 60);
+            } else {
+                wl_pointer_send_axis_discrete(M.pointer, WL_POINTER_AXIS_HORIZONTAL_SCROLL, 2);
+            }
+            wl_pointer_send_frame(M.pointer);
+            wl_pointer_send_axis(M.pointer, 3, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(-5));
+            wl_pointer_send_frame(M.pointer);
+        }
         printf("mini: sent pointer enter\n");
         fflush(stdout);
         if (M.touch) {
