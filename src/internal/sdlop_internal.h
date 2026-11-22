@@ -381,6 +381,49 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
                      float dx, float dy, float pressure, SDL_WindowID windowID,
                      Uint64 timestamp_ns);
 void SDLOP_ResetTouchMouse(void); /* SDL_Init / SDL_Quit */
+/* a mouse event made up by touch/pen emulation; fx/fy are window pixels */
+void SDLOP_SendSyntheticMouse(Uint32 type, SDL_Window *window, float fx, float fy, Uint8 button,
+                              SDL_MouseID which, Uint64 timestamp_ns);
+
+/* Pens (SDL_pen.c; stock SDL_pen_c.h). Timestamps are monotonic ns, 0 = now. */
+#define SDLOP_PEN_CAPABILITY_PRESSURE (1u << 0)
+#define SDLOP_PEN_CAPABILITY_XTILT (1u << 1)
+#define SDLOP_PEN_CAPABILITY_YTILT (1u << 2)
+#define SDLOP_PEN_CAPABILITY_DISTANCE (1u << 3)
+#define SDLOP_PEN_CAPABILITY_ROTATION (1u << 4)
+#define SDLOP_PEN_CAPABILITY_SLIDER (1u << 5)
+#define SDLOP_PEN_CAPABILITY_TANGENTIAL_PRESSURE (1u << 6)
+#define SDLOP_PEN_CAPABILITY_ERASER (1u << 7)
+typedef enum SDLop_PenSubtype
+{
+    SDLOP_PEN_TYPE_UNKNOWN,
+    SDLOP_PEN_TYPE_ERASER,
+    SDLOP_PEN_TYPE_PEN,
+    SDLOP_PEN_TYPE_PENCIL,
+    SDLOP_PEN_TYPE_BRUSH,
+    SDLOP_PEN_TYPE_AIRBRUSH
+} SDLop_PenSubtype;
+typedef struct SDLop_PenInfo
+{
+    Uint32 capabilities; /* SDLOP_PEN_CAPABILITY_* */
+    float max_tilt;      /* degrees, -1 unknown */
+    Uint32 wacom_id;
+    int num_buttons; /* -1 unknown */
+    SDLop_PenSubtype subtype;
+    SDL_PenDeviceType device_type;
+} SDLop_PenInfo;
+SDL_PenID SDLOP_AddPen(const char *name, const SDLop_PenInfo *info, void *handle, SDL_Window *window,
+                       bool in_proximity, Uint64 timestamp_ns);
+void SDLOP_RemovePen(SDL_PenID id, SDL_Window *window, Uint64 timestamp_ns);
+void SDLOP_RemoveAllPens(void); /* video quit: no events */
+SDL_PenID SDLOP_FindPenByHandle(void *handle);
+void *SDLOP_GetPenHandle(SDL_PenID id);
+SDL_PenInputFlags SDLOP_GetPenStatus(SDL_PenID id, float *axes, int num_axes);
+void SDLOP_SendPenProximity(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, bool in);
+void SDLOP_SendPenTouch(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, bool eraser, bool down);
+void SDLOP_SendPenMotion(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, float x, float y);
+void SDLOP_SendPenAxis(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, SDL_PenAxis axis, float value);
+void SDLOP_SendPenButton(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, Uint8 button, bool down);
 
 /* Input device registry (SDL_devices.c): sends *_ADDED / *_REMOVED */
 void SDLOP_AddMouse(SDL_MouseID id, const char *name);

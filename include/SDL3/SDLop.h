@@ -75,6 +75,7 @@
 #define SDLOP_HINT_WAYLAND_NO_VIEWPORTER "SDLOP_WAYLAND_NO_VIEWPORTER" /**< bool: do not use wp_viewporter (the clear colour is then a filled full-size buffer); read at video init */
 #define SDLOP_HINT_WAYLAND_NO_CURSOR_SHAPE "SDLOP_WAYLAND_NO_CURSOR_SHAPE" /**< bool: draw system cursors from the theme instead of wp_cursor_shape_v1; read at video init */
 #define SDLOP_HINT_WAYLAND_NO_TEXT_INPUT "SDLOP_WAYLAND_NO_TEXT_INPUT" /**< bool: do not use zwp_text_input_v3 (IME); read at video init */
+#define SDLOP_HINT_WAYLAND_NO_TABLET "SDLOP_WAYLAND_NO_TABLET" /**< bool: do not use zwp_tablet_manager_v2 (pens); read at video init */
 #define SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE "SDLOP_WAYLAND_NO_FRACTIONAL_SCALE" /**< bool: do not use wp_fractional_scale_v1 (integer preferred buffer / output scales only); read at video init */
 /* kmsdrm */
 #define SDLOP_HINT_KMSDRM_DEVICE         "SDLOP_KMSDRM_DEVICE"     /**< DRM device: card number or /dev/dri/cardN path (default: probe) */

@@ -860,8 +860,4 @@ void SDL_GDKSuspendComplete(void)
     SDL_Unsupported(); /* GDK only */
 }
 
-SDL_PenDeviceType SDL_GetPenDeviceType(SDL_PenID instance_id)
-{
-    (void)instance_id;
-    return SDL_PEN_DEVICE_TYPE_INVALID; /* SDLop reports no pens */
-}
+

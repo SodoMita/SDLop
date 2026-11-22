@@ -50,6 +50,12 @@
   MINI_POINTER_CMD=<file>: on SIGUSR2 the lines of <file> are run as
   pointer input on the window - "motion X Y", "press BTN", "release BTN"
   (linux button codes), each followed by a frame.
+  MINI_TABLET=1 for tests/test_wayland_pen.c: offers zwp_tablet_manager_v2
+  with one tablet and two tools (a pen with pressure+tilt, an eraser);
+  MINI_POINTER_CMD lines then also drive the current tool: "tsel pen|eraser",
+  "tprox" (proximity_in on the window), "tout", "tmotion X Y",
+  "tpressure P" (0..65535), "ttilt X Y", "tdown", "tup", "tbutton CODE 1|0",
+  "tremove" (tool removed) and "tframe" - no implicit frames here.
   MINI_WARP_LOG=<log> for tests/test_wayland_warp.c: offers
   wp_pointer_warp_v1 (unless MINI_POINTER_WARP=0) and logs
   "warp X,Y serial=ok|bad", lock_pointer requests log "lock" and cursor
@@ -80,6 +86,7 @@
 #include "xdg-dialog-v1-server-protocol.h"
 #include "alpha-modifier-v1-server-protocol.h"
 #include "pointer-warp-v1-server-protocol.h"
+#include "tablet-v2-server-protocol.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -1013,6 +1020,137 @@ static void C_mgr_bind(struct wl_client *client, void *data, uint32_t version, u
     wl_resource_set_implementation(r, &C_mgr_impl, NULL, NULL);
 }
 
+/* ---------------- zwp_tablet_manager_v2 (MINI_TABLET) ---------------- */
+
+static struct wl_resource *TB_tools[2]; /* pen, eraser */
+static struct wl_resource *TB_tablet;
+static int TB_cur;
+
+static void TB_tool_set_cursor(struct wl_client *client, struct wl_resource *res, uint32_t serial,
+                               struct wl_resource *surface, int32_t hx, int32_t hy)
+{
+    (void)client;
+    (void)res;
+    (void)serial;
+    (void)surface;
+    (void)hx;
+    (void)hy;
+}
+
+static void TB_tool_gone(struct wl_resource *res)
+{
+    for (int i = 0; i < 2; i++) {
+        if (TB_tools[i] == res) {
+            TB_tools[i] = NULL;
+        }
+    }
+}
+
+static const struct zwp_tablet_tool_v2_interface TB_tool_impl = {
+    .set_cursor = TB_tool_set_cursor,
+    .destroy = res_destroy,
+};
+
+static void TB_tablet_gone(struct wl_resource *res)
+{
+    if (TB_tablet == res) {
+        TB_tablet = NULL;
+    }
+}
+
+static const struct zwp_tablet_v2_interface TB_tablet_impl = {
+    .destroy = res_destroy,
+};
+
+static const struct zwp_tablet_seat_v2_interface TB_seat_impl = {
+    .destroy = res_destroy,
+};
+
+static void TB_get_tablet_seat(struct wl_client *client, struct wl_resource *res, uint32_t id,
+                               struct wl_resource *seat)
+{
+    (void)seat;
+    struct wl_resource *ts = wl_resource_create(client, &zwp_tablet_seat_v2_interface, wl_resource_get_version(res), id);
+    wl_resource_set_implementation(ts, &TB_seat_impl, NULL, NULL);
+    struct wl_resource *tab = wl_resource_create(client, &zwp_tablet_v2_interface, wl_resource_get_version(res), 0);
+    wl_resource_set_implementation(tab, &TB_tablet_impl, NULL, TB_tablet_gone);
+    TB_tablet = tab;
+    zwp_tablet_seat_v2_send_tablet_added(ts, tab);
+    zwp_tablet_v2_send_name(tab, "mini tablet");
+    zwp_tablet_v2_send_id(tab, 0x56a, 0x1);
+    zwp_tablet_v2_send_done(tab);
+    for (int i = 0; i < 2; i++) {
+        struct wl_resource *tool =
+            wl_resource_create(client, &zwp_tablet_tool_v2_interface, wl_resource_get_version(res), 0);
+        wl_resource_set_implementation(tool, &TB_tool_impl, NULL, TB_tool_gone);
+        zwp_tablet_seat_v2_send_tool_added(ts, tool);
+        zwp_tablet_tool_v2_send_type(tool, i == 0 ? ZWP_TABLET_TOOL_V2_TYPE_PEN : ZWP_TABLET_TOOL_V2_TYPE_ERASER);
+        zwp_tablet_tool_v2_send_hardware_id_wacom(tool, 0, 0x802 + (uint32_t)i);
+        zwp_tablet_tool_v2_send_capability(tool, ZWP_TABLET_TOOL_V2_CAPABILITY_PRESSURE);
+        if (i == 0) {
+            zwp_tablet_tool_v2_send_capability(tool, ZWP_TABLET_TOOL_V2_CAPABILITY_TILT);
+        }
+        zwp_tablet_tool_v2_send_done(tool);
+        TB_tools[i] = tool;
+    }
+}
+
+static const struct zwp_tablet_manager_v2_interface TB_mgr_impl = {
+    .get_tablet_seat = TB_get_tablet_seat,
+    .destroy = res_destroy,
+};
+
+static void TB_mgr_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &zwp_tablet_manager_v2_interface, version, id);
+    wl_resource_set_implementation(r, &TB_mgr_impl, NULL, NULL);
+}
+
+/* one MINI_POINTER_CMD line for the tablet; false if it isn't one */
+static bool TB_command(const char *line)
+{
+    if (strncmp(line, "tsel ", 5) == 0) {
+        TB_cur = strncmp(line + 5, "eraser", 6) == 0 ? 1 : 0;
+        return true;
+    }
+    if (line[0] != 't' || strncmp(line, "tsel", 4) == 0) {
+        return false;
+    }
+    struct wl_resource *tool = TB_tools[TB_cur];
+    double x, y;
+    unsigned v, st;
+    if (!tool) {
+        return true;
+    }
+    if (strncmp(line, "tprox", 5) == 0) {
+        if (M.surface_res && TB_tablet) {
+            zwp_tablet_tool_v2_send_proximity_in(tool, wl_display_next_serial(M.display), TB_tablet, M.surface_res);
+        }
+    } else if (strncmp(line, "tout", 4) == 0) {
+        zwp_tablet_tool_v2_send_proximity_out(tool);
+    } else if (sscanf(line, "tmotion %lf %lf", &x, &y) == 2) {
+        zwp_tablet_tool_v2_send_motion(tool, wl_fixed_from_double(x), wl_fixed_from_double(y));
+    } else if (sscanf(line, "tpressure %u", &v) == 1) {
+        zwp_tablet_tool_v2_send_pressure(tool, v);
+    } else if (sscanf(line, "ttilt %lf %lf", &x, &y) == 2) {
+        zwp_tablet_tool_v2_send_tilt(tool, wl_fixed_from_double(x), wl_fixed_from_double(y));
+    } else if (strncmp(line, "tdown", 5) == 0) {
+        zwp_tablet_tool_v2_send_down(tool, wl_display_next_serial(M.display));
+    } else if (strncmp(line, "tup", 3) == 0) {
+        zwp_tablet_tool_v2_send_up(tool);
+    } else if (sscanf(line, "tbutton %u %u", &v, &st) == 2) {
+        zwp_tablet_tool_v2_send_button(tool, wl_display_next_serial(M.display), v,
+                                       st ? ZWP_TABLET_TOOL_V2_BUTTON_STATE_PRESSED
+                                          : ZWP_TABLET_TOOL_V2_BUTTON_STATE_RELEASED);
+    } else if (strncmp(line, "tremove", 7) == 0) {
+        zwp_tablet_tool_v2_send_removed(tool);
+    } else if (strncmp(line, "tframe", 6) == 0) {
+        zwp_tablet_tool_v2_send_frame(tool, 1000);
+    }
+    return true;
+}
+
 /* ---------------- xdg_toplevel_icon_manager_v1 (MINI_TOPLEVEL_LOG) ---------------- */
 
 static void TL_logs(const char *line)
@@ -1858,6 +1996,9 @@ static int P_signal_cb(int signal_number, void *data)
     while (fgets(line, sizeof(line), f)) {
         double x, y;
         unsigned btn;
+        if (TB_command(line)) {
+            continue;
+        }
         if (!M.pointer) {
             break;
         }
@@ -2279,6 +2420,9 @@ int main(void)
     T_log = getenv("MINI_TEXT_INPUT");
     if (T_log) {
         wl_global_create(M.display, &zwp_text_input_manager_v3_interface, 1, NULL, T_mgr_bind);
+    }
+    if (getenv("MINI_TABLET") && strcmp(getenv("MINI_TABLET"), "0") != 0) {
+        wl_global_create(M.display, &zwp_tablet_manager_v2_interface, 1, NULL, TB_mgr_bind);
     }
 
     wl_display_add_client_created_listener(M.display, &client_listener);

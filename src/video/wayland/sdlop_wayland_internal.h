@@ -85,4 +85,13 @@ bool SDLOP_Wayland_TextInput_ClearComposition(SDL_Window *window);
 void SDLOP_Wayland_TextInput_WindowDestroyed(SDL_Window *window);
 void SDLOP_Wayland_TextInput_Quit(void);
 
+/* tablet module (sdlop_wayland_tablet.c) */
+bool SDLOP_Wayland_Tablet_Global(struct wl_registry *registry, uint32_t name, const char *interface,
+                                 uint32_t version); /* true = handled */
+void SDLOP_Wayland_Tablet_SeatAdded(struct wl_seat *seat);
+void SDLOP_Wayland_Tablet_WindowDestroyed(SDL_Window *window);
+void SDLOP_Wayland_Tablet_Quit(void);
+SDL_Window *SDLOP_Wayland_WindowFromSurface(struct wl_surface *surface);
+struct wp_cursor_shape_manager_v1 *SDLOP_Wayland_GetCursorShapeManager(void);
+
 #endif /* sdlop_wayland_internal_h_ */

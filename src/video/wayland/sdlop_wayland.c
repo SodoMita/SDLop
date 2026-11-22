@@ -1528,6 +1528,16 @@ static SDL_Window *window_from_surface(struct wl_surface *surface)
     return NULL;
 }
 
+SDL_Window *SDLOP_Wayland_WindowFromSurface(struct wl_surface *surface)
+{
+    return window_from_surface(surface);
+}
+
+struct wp_cursor_shape_manager_v1 *SDLOP_Wayland_GetCursorShapeManager(void)
+{
+    return wl_data.cursor_shape_manager;
+}
+
 /* SDL_SetWindowHitTest (stock): evaluated on pointer motion while no
  * button is held; resize areas show resize cursors */
 static void update_hit_test(SDL_Window *window, float x, float y)
@@ -2248,6 +2258,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         wl_seat_add_listener(d->seat, &seat_listener, d);
         SDLOP_Wayland_Clipboard_SeatAdded(d->seat);
         SDLOP_Wayland_TextInput_SeatAdded(d->seat);
+        SDLOP_Wayland_Tablet_SeatAdded(d->seat);
     } else if (strcmp(interface, wl_output_interface.name) == 0 && d->num_outputs < SDLOP_MAX_OUTPUTS) {
         struct wl_output *o = wl_registry_bind(registry, name, &wl_output_interface, version < 4 ? version : 4);
         d->outputs[d->num_outputs].output = o;
@@ -2292,7 +2303,8 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
                !SDLOP_HintFlag(SDLOP_HINT_WAYLAND_NO_FRACTIONAL_SCALE, false)) {
         d->fractional_manager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
     } else {
-        if (!SDLOP_Wayland_TextInput_Global(registry, name, interface, version)) {
+        if (!SDLOP_Wayland_TextInput_Global(registry, name, interface, version) &&
+            !SDLOP_Wayland_Tablet_Global(registry, name, interface, version)) {
             SDLOP_Wayland_Clipboard_Global(registry, name, interface, version);
         }
     }
@@ -2363,16 +2375,16 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     wl_registry_add_listener(wl_data.registry, &registry_listener, &wl_data);
     if (wl_display_roundtrip(wl_data.display) < 0) {
         SDLOP_Wayland_Clipboard_Quit();
-    SDLOP_Wayland_TextInput_Quit();
         SDLOP_Wayland_TextInput_Quit();
+        SDLOP_Wayland_Tablet_Quit();
         wl_display_disconnect(wl_data.display);
         wl_data.display = NULL;
         return SDL_SetError("Wayland registry roundtrip failed");
     }
     if (!wl_data.compositor || !wl_data.wm_base || !wl_data.shm) {
         SDLOP_Wayland_Clipboard_Quit();
-    SDLOP_Wayland_TextInput_Quit();
         SDLOP_Wayland_TextInput_Quit();
+        SDLOP_Wayland_Tablet_Quit();
         wl_display_disconnect(wl_data.display);
         wl_data.display = NULL;
         return SDL_SetError("Wayland compositor missing required globals (wl_compositor/xdg_wm_base/wl_shm)");
@@ -2412,6 +2424,7 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     SDLOP_Wayland_GL_Deinit();
     SDLOP_Wayland_Clipboard_Quit();
     SDLOP_Wayland_TextInput_Quit();
+    SDLOP_Wayland_Tablet_Quit();
     wayland_release_pointer_lock();
     if (wl_data.confined_pointer) {
         zwp_confined_pointer_v1_destroy(wl_data.confined_pointer);
@@ -2940,6 +2953,7 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     SDLOP_Wayland_GL_WindowDestroyed(window);
     SDLOP_Wayland_TextInput_WindowDestroyed(window);
+    SDLOP_Wayland_Tablet_WindowDestroyed(window);
     if (window->surface) {
         SDL_DestroySurface(window->surface);
         window->surface = NULL;

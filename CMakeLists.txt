@@ -55,6 +55,7 @@ if(EMSCRIPTEN)
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
+    src/SDL_pen.c
     src/SDL_devices.c
     src/SDL_video.c
     src/SDL_surface.c
@@ -375,6 +376,7 @@ set(SDLop_SOURCES
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
+  src/SDL_pen.c
   src/SDL_devices.c
   src/SDL_video.c
   src/SDL_surface.c
@@ -388,6 +390,7 @@ set(SDLop_SOURCES
   src/video/wayland/sdlop_wayland.c
   src/video/wayland/sdlop_wayland_clipboard.c
   src/video/wayland/sdlop_wayland_textinput.c
+  src/video/wayland/sdlop_wayland_tablet.c
   src/video/wayland/sdlop_wayland_dyn.c
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
@@ -868,6 +871,15 @@ if(SDLop_BUILD_TESTS)
       add_test(NAME test_wayland_toplevel_${toplevel_mode}
                COMMAND test_wayland_toplevel $<TARGET_FILE:mini_compositor> ${toplevel_mode})
       set_tests_properties(test_wayland_toplevel_${toplevel_mode} PROPERTIES TIMEOUT 60)
+    endforeach()
+
+    add_executable(test_wayland_pen tests/test_wayland_pen.c)
+    target_link_libraries(test_wayland_pen PRIVATE sdlop m)
+    target_compile_options(test_wayland_pen PRIVATE -UNDEBUG)
+    add_dependencies(test_wayland_pen mini_compositor)
+    foreach(pen_mode on off)
+      add_test(NAME test_wayland_pen_${pen_mode} COMMAND test_wayland_pen $<TARGET_FILE:mini_compositor> ${pen_mode})
+      set_tests_properties(test_wayland_pen_${pen_mode} PROPERTIES TIMEOUT 60)
     endforeach()
 
     add_executable(test_wayland_warp tests/test_wayland_warp.c)
