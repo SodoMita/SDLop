@@ -55,11 +55,53 @@ static void test_batch(void)
     assert(pthread_create(&t, NULL, producer, NULL) == 0);
     uint64_t expected = 0;
     while (expected < TOTAL) {
-        uint32_t n = SDLOP_RingPopBatch(&ring, batch, 137);
+        uint32_t n;
+        if (expected & 1) {
+            n = SDLOP_RingPop(&ring, batch) ? 1 : 0;
+        } else {
+            n = SDLOP_RingPopBatch(&ring, batch, 137);
+        }
         for (uint32_t i = 0; i < n; i++) { assert(batch[i] == expected++); }
     }
     pthread_join(t, NULL);
     assert(SDLOP_RingEmpty(&ring));
+}
+
+/* Mixed single/bulk reads must share one coherent consumer cache. Start
+ * close to UINT64_MAX so both publication indices wrap during the test. */
+static void test_mixed_wrap(void)
+{
+    SDLOP_RingInit(&ring, storage, CAPACITY, sizeof(uint64_t));
+    uint64_t start = UINT64_MAX - CAPACITY;
+    atomic_store(&ring.head, start);
+    atomic_store(&ring.tail, start);
+    ring.cached_head = ring.cached_tail = start;
+    uint64_t written = 0, read = 0, rejected = 0, batch[137];
+    uint32_t random = 1;
+    for (int i = 0; i < 200000; i++) {
+        random = random * 1664525u + 1013904223u;
+        if (random & 0x10000u) {
+            bool ok = SDLOP_RingPush(&ring, &written);
+            assert(ok == (written - read < CAPACITY));
+            if (ok) { written++; } else { rejected++; }
+        } else if (random & 0x20000u) {
+            uint32_t max = random % 138;
+            uint32_t n = SDLOP_RingPopBatch(&ring, batch, max);
+            uint64_t available = written - read;
+            assert(n == (available < max ? available : max));
+            for (uint32_t j = 0; j < n; j++) { assert(batch[j] == read++); }
+        } else {
+            uint64_t value;
+            bool ok = SDLOP_RingPop(&ring, &value);
+            assert(ok == (written != read));
+            if (ok) { assert(value == read++); }
+        }
+        assert(SDLOP_RingCount(&ring) == written - read);
+        assert(SDLOP_RingDropped(&ring) == rejected);
+    }
+    assert(written > 2 * CAPACITY); /* actually crossed the wrap point */
+    while (SDLOP_RingPop(&ring, batch)) { assert(batch[0] == read++); }
+    assert(read == written && SDLOP_RingEmpty(&ring));
 }
 
 int main(void)
@@ -101,6 +143,7 @@ int main(void)
     assert(!SDLOP_RingPop(&ring, &v));
 
     test_batch();
-    printf("test_ring: PASS (%d single + %d batch events, wrap/empty/overflow OK)\n", TOTAL, TOTAL);
+    test_mixed_wrap();
+    printf("test_ring: PASS (%d single + %d mixed/batch events, cached limits, 64-bit wrap/empty/overflow OK)\n", TOTAL, TOTAL);
     return 0;
 }

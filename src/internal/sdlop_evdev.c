@@ -234,6 +234,11 @@ static bool drain_device_events(SDLOP_RawDevice *dev, struct input_event *batch,
     /* UINT64_MAX disables guessing without adding a clock-mode
      * branch to each event. Clock negotiation is per device. */
     const Uint64 device_rt_offset = dev->clock_monotonic ? UINT64_MAX : rt_offset_ns;
+    /* The worker is the only writer until it joins at shutdown. Publish the
+     * same per-event value as before, without a locked read-modify-write for
+     * a counter no other thread increments. Callbacks still observe the count
+     * of events completed before the current callback. */
+    uint64_t event_count = atomic_load_explicit(&raw.event_count, memory_order_relaxed);
     /* Level-triggered epoll will report remaining input again. A permanently
      * readable source must not postpone wakeups/shutdown/other devices forever.
      * Recovery queries require a genuine EAGAIN boundary, so exhausting this
@@ -266,7 +271,7 @@ static bool drain_device_events(SDLOP_RawDevice *dev, struct input_event *batch,
             SDLOP_RingPush(&raw.sdl_ring, &ev2);
             SDLOP_RingPush(&raw.poll_ring, &ev2);
             dispatch_callbacks(&ev2);
-            atomic_fetch_add_explicit(&raw.event_count, 1, memory_order_relaxed);
+            atomic_store_explicit(&raw.event_count, ++event_count, memory_order_relaxed);
         }
     }
     return false;
