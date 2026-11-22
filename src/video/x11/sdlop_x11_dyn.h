@@ -71,6 +71,16 @@ xcb_xfixes_query_version_reply_t *xcb_xfixes_query_version_reply(xcb_connection_
                                                                  xcb_generic_error_t **e);
 xcb_void_cookie_t xcb_xfixes_select_selection_input(xcb_connection_t *c, xcb_window_t window, xcb_atom_t selection,
                                                     uint32_t event_mask);
+typedef uint32_t xcb_xfixes_barrier_t;
+#define XCB_XFIXES_BARRIER_DIRECTIONS_POSITIVE_X 1
+#define XCB_XFIXES_BARRIER_DIRECTIONS_POSITIVE_Y 2
+#define XCB_XFIXES_BARRIER_DIRECTIONS_NEGATIVE_X 4
+#define XCB_XFIXES_BARRIER_DIRECTIONS_NEGATIVE_Y 8
+xcb_void_cookie_t xcb_xfixes_create_pointer_barrier(xcb_connection_t *c, xcb_xfixes_barrier_t barrier,
+                                                    xcb_window_t window, uint16_t x1, uint16_t y1, uint16_t x2,
+                                                    uint16_t y2, uint32_t directions, uint16_t num_devices,
+                                                    const uint16_t *devices);
+xcb_void_cookie_t xcb_xfixes_delete_pointer_barrier(xcb_connection_t *c, xcb_xfixes_barrier_t barrier);
 #endif
 #if defined(__has_include)
 #if __has_include(<xcb/sync.h>)

@@ -253,6 +253,10 @@ typedef struct X11DeviceData
     bool render_checked;
     xcb_render_pictformat_t argb_format; /* 0 = no ARGB cursors */
     SDL_Window *confine_window;   /* pointer grabbed by SDL_SetWindowMouseGrab */
+    bool has_barriers;            /* XFixes >= 5 pointer barriers */
+    SDL_Window *barrier_window;   /* window whose SDL_SetWindowMouseRect is fenced in */
+    SDL_Rect barrier_rect;        /* ...in root coordinates */
+    xcb_xfixes_barrier_t barriers[4];
     SDL_Window *capture_window;   /* pointer grabbed by SDL_CaptureMouse */
     SDL_Window *keyboard_grab_window;
     Uint64 screensaver_reset_ns;
@@ -1392,8 +1396,8 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
     }
     if ((window->flags & SDL_WINDOW_INPUT_FOCUS) && !SDL_RectEmpty(&window->mouse_rect) &&
         !(window->flags & SDL_WINDOW_MOUSE_CAPTURE)) {
-        /* SDL_SetWindowMouseRect: keep the pointer inside (SDL3 X11 uses
-         * XFixes barriers; warping back has the same visible effect) */
+        /* SDL_SetWindowMouseRect: XFixes barriers fence the pointer in;
+         * without them (or before they are up) warp it back */
         const SDL_Rect *r = &window->mouse_rect;
         int cx = SDL_clamp((int)mev->event_x, r->x, r->x + r->w - 1);
         int cy = SDL_clamp((int)mev->event_y, r->y, r->y + r->h - 1);
@@ -1774,6 +1778,8 @@ static void apply_monitor_to_display(const X11Monitor *mon)
     sdlop.displays[idx].bounds = mon->rect;
     sdlop.displays[idx].content_scale = x11.content_scale;
 }
+
+static void destroy_barriers(void);
 
 static X11ModeSave *x11_mode_save(SDL_DisplayID id)
 {
@@ -2272,6 +2278,17 @@ static bool x11_Init(SDLop_VideoDevice *device)
 
     SDLOP_X11_Clipboard_Init();
     SDLOP_X11_DnD_Init();
+    /* pointer barriers for SDL_SetWindowMouseRect: XFixes 5 */
+    x11.has_barriers = false;
+    if (SDLOP_X11_HAVE(XFIXES)) {
+        const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_xfixes_id);
+        if (ext && ext->present) {
+            xcb_xfixes_query_version_reply_t *v = X11_xcb_xfixes_query_version_reply(
+                x11.conn, X11_xcb_xfixes_query_version(x11.conn, 5, 0), NULL);
+            x11.has_barriers = v && v->major_version >= 5;
+            free(v);
+        }
+    }
 
     x11_flush();
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
@@ -2285,6 +2302,7 @@ static bool x11_Init(SDLop_VideoDevice *device)
 static void x11_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    destroy_barriers();
     SDLOP_X11_GL_Quit(); /* also releases libEGL */
     for (int i = 0; i < x11.num_monitors; i++) {
         SDLOP_DelDisplay(x11.monitors[i].display_id, false);
@@ -2602,6 +2620,9 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     SDLOP_X11_DnD_WindowDestroyed(window);
     SDLOP_X11_XIM_WindowDestroyed(window);
+    if (x11.barrier_window == window) {
+        destroy_barriers(); /* they are tied to the window anyway */
+    }
     if (x11.relative_window == window) {
         if (x11.pointer_grabbed) {
             X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
@@ -3190,11 +3211,89 @@ static bool x11_SetWindowKeyboardGrab(SDLop_VideoDevice *device, SDL_Window *win
     return true;
 }
 
+static void destroy_barriers(void)
+{
+    for (int i = 0; i < 4; i++) {
+        if (x11.barriers[i]) {
+            X11_xcb_xfixes_delete_pointer_barrier(x11.conn, x11.barriers[i]);
+            x11.barriers[i] = 0;
+        }
+    }
+    x11.barrier_window = NULL;
+    memset(&x11.barrier_rect, 0, sizeof(x11.barrier_rect));
+}
+
+/* stock X11_ConfineCursorWithFlags, kept in step with focus, mapping,
+ * geometry and capture: four barriers along the mouse rect's edges, each
+ * spanning all displays so the pointer can't slip out at a corner. Called
+ * after every event batch and on SDL_SetWindowMouseRect; idempotent. */
+static void x11_update_barriers(void)
+{
+    if (!x11.has_barriers) {
+        return;
+    }
+    SDL_Window *want = NULL;
+    SDL_Rect r = { 0, 0, 0, 0 };
+    SDL_Window *w = sdlop.keyboard_focus;
+    X11WindowData *wd = w ? wdata(w) : NULL;
+    if (wd && wd->mapped && !SDL_RectEmpty(&w->mouse_rect) &&
+        !(w->flags & (SDL_WINDOW_MOUSE_CAPTURE | SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
+        const SDL_Rect wr = wd->cfg_known ? current_rect(w) : (SDL_Rect){ w->x, w->y, w->w, w->h };
+        const SDL_Rect *mr = &w->mouse_rect;
+        const int x1 = wr.x + SDL_max(mr->x, 0);
+        const int y1 = wr.y + SDL_max(mr->y, 0);
+        const int x2 = SDL_min(wr.x + mr->x + mr->w, wr.x + wr.w);
+        const int y2 = SDL_min(wr.y + mr->y + mr->h, wr.y + wr.h);
+        if (x2 > x1 && y2 > y1) {
+            want = w;
+            r = (SDL_Rect){ x1, y1, x2 - x1, y2 - y1 };
+        }
+    }
+    if (want == x11.barrier_window &&
+        (!want || (r.x == x11.barrier_rect.x && r.y == x11.barrier_rect.y && r.w == x11.barrier_rect.w &&
+                   r.h == x11.barrier_rect.h))) {
+        return;
+    }
+    destroy_barriers();
+    if (want) {
+        SDL_Rect span = { 0, 0, x11.screen->width_in_pixels, x11.screen->height_in_pixels };
+        for (int i = 0; i < sdlop.num_displays; i++) {
+            SDL_Rect u;
+            SDL_GetRectUnion(&span, &sdlop.displays[i].bounds, &u);
+            span = u;
+        }
+        const int sx1 = span.x, sy1 = span.y, sx2 = span.x + span.w, sy2 = span.y + span.h;
+        const int x2 = r.x + r.w, y2 = r.y + r.h;
+        const struct
+        {
+            int x1, y1, x2, y2;
+            uint32_t dir;
+        } b[4] = {
+            /* the pointer may cross each line inwards only */
+            { r.x, sy1, r.x, sy2, XCB_XFIXES_BARRIER_DIRECTIONS_POSITIVE_X },
+            { x2, sy1, x2, sy2, XCB_XFIXES_BARRIER_DIRECTIONS_NEGATIVE_X },
+            { sx1, r.y, sx2, r.y, XCB_XFIXES_BARRIER_DIRECTIONS_POSITIVE_Y },
+            { sx1, y2, sx2, y2, XCB_XFIXES_BARRIER_DIRECTIONS_NEGATIVE_Y },
+        };
+        for (int i = 0; i < 4; i++) {
+            x11.barriers[i] = X11_xcb_generate_id(x11.conn);
+            X11_xcb_xfixes_create_pointer_barrier(x11.conn, x11.barriers[i], wdata(want)->xid, (uint16_t)b[i].x1,
+                                                  (uint16_t)b[i].y1, (uint16_t)b[i].x2, (uint16_t)b[i].y2,
+                                                  b[i].dir, 0, NULL);
+        }
+        x11.barrier_window = want;
+        x11.barrier_rect = r;
+    }
+    x11_flush();
+}
+
 static bool x11_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
     (void)window;
-    return true; /* enforced in handle_motion */
+    /* handle_motion warps back where barriers aren't available */
+    x11_update_barriers();
+    return true;
 }
 
 static bool x11_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL_FlashOperation operation)
@@ -4196,6 +4295,7 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         x11.displays_dirty = false;
         x11_update_displays(true);
     }
+    x11_update_barriers(); /* focus, mapping, geometry may have moved */
     if (sdlop.suspend_screensaver) {
         /* SDL3 X11: XResetScreenSaver every 30 s while inhibited */
         Uint64 now = SDLOP_MonotonicNS();

@@ -192,6 +192,8 @@ SDLOP_X11_DATA(XFIXES, xcb_xfixes_id)
 SDLOP_X11_SYM(XFIXES, xcb_xfixes_query_version)
 SDLOP_X11_SYM(XFIXES, xcb_xfixes_query_version_reply)
 SDLOP_X11_SYM(XFIXES, xcb_xfixes_select_selection_input)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_create_pointer_barrier)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_delete_pointer_barrier)
 
 /* --------------------------------------------------------------- SYNC */
 SDLOP_X11_MODULE(SYNC)
