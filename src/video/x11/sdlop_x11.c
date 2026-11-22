@@ -212,6 +212,7 @@ typedef struct X11DeviceData
     bool has_xi2;
     bool has_sync;                /* SYNC >= 3.0 (resize sync counters) */
     bool has_shape;               /* SHAPE >= 1.1 (input shapes) */
+    xcb_atom_t icc_atom;          /* _ICC_PROFILE, or _ICC_PROFILE_<n> on screen n > 0 */
     uint8_t xi_opcode;
     /* XI2.2 touch sequences: per-finger last position for dx/dy, and
      * the window the sequence started on (SDL3 semantics) */
@@ -2007,6 +2008,20 @@ static bool x11_Init(SDLop_VideoDevice *device)
         x11_Quit(device);
         return SDL_SetError("Could not intern X11 atoms");
     }
+    /* ICC Profiles in X Specification: the root's _ICC_PROFILE (screen 0)
+     * or _ICC_PROFILE_<n> */
+    {
+        char icc[32];
+        if (x11.screen_num > 0) {
+            snprintf(icc, sizeof(icc), "_ICC_PROFILE_%d", x11.screen_num);
+        } else {
+            snprintf(icc, sizeof(icc), "_ICC_PROFILE");
+        }
+        xcb_intern_atom_reply_t *r = X11_xcb_intern_atom_reply(
+            x11.conn, X11_xcb_intern_atom(x11.conn, 0, (uint16_t)strlen(icc), icc), NULL);
+        x11.icc_atom = r ? r->atom : XCB_NONE;
+        free(r);
+    }
 
     /* MIT-SHM (env SDLOP_X11_NO_SHM=1 or SDLOP_LIB_XCB_SHM=none disables) */
     if (SDLOP_X11_HAVE(SHM) && !SDLOP_HintFlag("SDLOP_X11_NO_SHM", false)) {
@@ -3496,6 +3511,32 @@ static bool x11_UpdateWindowShape(SDLop_VideoDevice *device, SDL_Window *window,
     return true;
 }
 
+/* SDL_GetWindowICCProfile: the screen's profile from the root window */
+static void *x11_GetWindowICCProfile(SDLop_VideoDevice *device, SDL_Window *window, size_t *size)
+{
+    (void)device;
+    (void)window;
+    xcb_get_property_reply_t *r =
+        x11.icc_atom ? X11_xcb_get_property_reply(x11.conn,
+                                                  X11_xcb_get_property(x11.conn, 0, x11.root, x11.icc_atom,
+                                                                       XCB_GET_PROPERTY_TYPE_ANY, 0, 1u << 24),
+                                                  NULL)
+                     : NULL;
+    const int len = (r && r->format == 8 && r->type != XCB_NONE) ? X11_xcb_get_property_value_length(r) : 0;
+    if (len <= 0) {
+        free(r);
+        SDL_SetError("Screen is not calibrated.");
+        return NULL;
+    }
+    void *data = SDL_malloc((size_t)len);
+    if (data) {
+        memcpy(data, X11_xcb_get_property_value(r), (size_t)len);
+        *size = (size_t)len;
+    }
+    free(r);
+    return data;
+}
+
 static void x11_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *window, int x, int y)
 {
     (void)device;
@@ -3887,6 +3928,13 @@ static void x11_dispatch(xcb_generic_event_t *ev)
         if (pn->window == x11.root) {
             if (pn->atom == x11.atom.RESOURCE_MANAGER) {
                 x11.displays_dirty = true; /* Xft.dpi may have changed */
+            } else if (pn->atom == x11.icc_atom && x11.icc_atom) {
+                /* all windows live on this screen */
+                for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+                    if (wdata(w)) {
+                        SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_ICCPROF_CHANGED, 0, 0);
+                    }
+                }
             }
             break;
         }
@@ -4073,6 +4121,7 @@ SDLop_VideoDevice SDLop_x11_device = {
     .SetWindowHitTest = x11_SetWindowHitTest,
     .ShowWindowSystemMenu = x11_ShowWindowSystemMenu,
     .UpdateWindowShape = x11_UpdateWindowShape,
+    .GetWindowICCProfile = x11_GetWindowICCProfile,
     .SetWindowModal = x11_SetWindowModal,
     .SetWindowBordered = x11_SetWindowBordered,
     .SetWindowResizable = x11_SetWindowResizable,
