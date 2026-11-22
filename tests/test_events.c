@@ -150,6 +150,23 @@ int main(void)
     {
         SDL_FlushEvents(0, 0xFFFFFFFFu);
         assert(SDL_StartTextInput(w));
+        SDL_ClearError();
+        QueuePressureWatchProbe probe = { 0, 0 };
+        assert(SDL_AddEventWatch(inject_text_from_key_watch, &probe));
+
+        /* Unpressured baseline: the watch always sees the KEY_DOWN and the
+         * nested probe text, plus the translated key text only when a keymap
+         * compiled (the default keymap is optional at init). Queue pressure
+         * must not change what watches observe, only what the queue keeps. */
+        SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_A, 30, 0);
+        assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
+        assert(probe.key_down == 1);
+        assert(probe.text_input == 1 || probe.text_input == 2);
+        const int text_per_press = probe.text_input;
+        SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, 30, 0);
+        assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
+        SDL_FlushEvents(0, 0xFFFFFFFFu);
+
         SDL_Event filler;
         SDL_zero(filler);
         filler.type = usertype;
@@ -158,12 +175,12 @@ int main(void)
         }
         assert(SDLOP_EventQueueFree() == 2);
         SDL_ClearError();
-        QueuePressureWatchProbe probe = { 0, 0 };
-        assert(SDL_AddEventWatch(inject_text_from_key_watch, &probe));
+        probe.key_down = 0;
+        probe.text_input = 0;
         SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_A, 30, 0);
         assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
         assert(probe.key_down == 1);
-        assert(probe.text_input == 1); /* watch ran on the nested, suppressed text push */
+        assert(probe.text_input == text_per_press); /* watch ran on the nested, suppressed text push */
         SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, 30, 0);
         assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
         SDL_RemoveEventWatch(inject_text_from_key_watch, &probe);
