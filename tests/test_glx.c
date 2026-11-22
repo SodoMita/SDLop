@@ -442,6 +442,23 @@ static void check_fb_attributes(void)
         }
         SDL_DestroyWindow(w);
     }
+    /* an unsatisfiable request (64-bit accumulation channels: no driver has
+     * them) fails loudly, as in stock; in particular it must not fall back
+     * to an EGL context, which has no accumulation buffer at all */
+    reset_attrs();
+    SDL_GL_SetAttribute(SDL_GL_ACCUM_RED_SIZE, 64);
+    w = SDL_CreateWindow("test_glx fb", 32, 32, SDL_WINDOW_OPENGL);
+    if (w) {
+        SDL_ClearError();
+        SDL_GLContext ctx = SDL_GL_CreateContext(w);
+        CHECK(ctx == NULL, "fb accum 64: no context for an unsatisfiable request (EGL fallback?)");
+        CHECK(strstr(SDL_GetError(), "GLX") != NULL, "fb accum 64: error names GLX ('%s')", SDL_GetError());
+        if (ctx) {
+            SDL_GL_DestroyContext(ctx);
+        }
+        SDL_DestroyWindow(w);
+    }
+
     /* no context current: the request is reported */
     reset_attrs();
     request_fb(0, 0, 0);

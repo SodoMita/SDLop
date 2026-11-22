@@ -17,7 +17,10 @@
       for ES when SDL_HINT_OPENGL_ES_DRIVER ("SDL_OPENGL_ES_DRIVER") is
       true (both env or SDL_SetHint, as in stock), and as a fallback when
       GLX is unusable (no libGL, no GLX extension, no framebuffer config
-      for SDLop's window visual).
+      for SDLop's window visual). Never when GLX works but no config
+      satisfies the SDL_GL_* attributes: SDL_GL_CreateContext fails then,
+      as in stock, instead of silently dropping what EGL can't express
+      (stereo, accumulation, float, sRGB, exact buffer size).
 
   Framebuffer config: the driver's best glXChooseFBConfig match for the
   SDL_GL_* sizes, and SDL_WINDOW_OPENGL windows are created with its X
@@ -757,8 +760,11 @@ static bool glx_init(void)
  * used, which is what stock does (it takes the first config regardless of
  * the window's visual); Mesa accepts a context config of the window's depth
  * on that drawable. */
+static bool glx_no_match; /* the last glx_pick_config: no config fits the attributes */
+
 static bool glx_pick_config(xcb_visualid_t visual, GLXFBConfig_ *out, xcb_visualid_t *out_visual, bool prefer_argb)
 {
+    glx_no_match = false;
     int attribs[64];
     int n = 0;
     attribs[n++] = GLX_X_RENDERABLE_;  attribs[n++] = 1;
@@ -809,7 +815,9 @@ static bool glx_pick_config(xcb_visualid_t visual, GLXFBConfig_ *out, xcb_visual
         if (configs) {
             glx.XFree(configs);
         }
-        return SDL_SetError("glXChooseFBConfig found no matching config");
+        glx_no_match = true;
+        return SDL_SetError("Couldn't find matching GLX visual: no framebuffer config satisfies the SDL_GL_* "
+                            "attributes");
     }
     int exact = -1, compatible = -1;
     xcb_visualid_t compatible_vid = 0;
@@ -1114,6 +1122,13 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
             SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO, "SDLop: %s, trying EGL", SDL_GetError());
             SDL_ClearError();
             return egl_CreateContext(visual);
+        }
+        if (glx_no_match) {
+            /* GLX works but nothing satisfies the requested sizes/buffers:
+             * fail like stock (X11_GL_GetVisual). EGL has no stereo, accum,
+             * float or sRGB attributes and would hand out a context without
+             * them as if the request had been met. */
+            return NULL;
         }
     }
     if (!force_egl() && (!es || !SDL_GetHintBoolean(SDL_HINT_OPENGL_ES_DRIVER, false))) {
