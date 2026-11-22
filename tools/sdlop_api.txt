@@ -588,6 +588,10 @@ SDL_ResetAssertionReport
 SDL_SetAssertionHandler
 SDL_ShowMessageBox
 SDL_ShowSimpleMessageBox
+SDL_ShowFileDialogWithProperties
+SDL_ShowOpenFileDialog
+SDL_ShowOpenFolderDialog
+SDL_ShowSaveFileDialog
 SDL_StringToGUID
 SDL_UnregisterApp
 SDL_EGL_GetCurrentConfig

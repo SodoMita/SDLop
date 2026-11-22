@@ -1282,6 +1282,25 @@ static void rgba_row_to_xrgb_sse2(const uint8_t *src, uint32_t *dst, int n)
         dst[x] = rgba_word_to_xrgb(((const uint32_t *)src)[x]);
     }
 }
+
+/* the same swizzle, alpha kept (SDL_WINDOW_TRANSPARENT targets) */
+static void rgba_row_to_argb_sse2(const uint8_t *src, uint32_t *dst, int n)
+{
+    const __m128i mask_rb = _mm_set1_epi32(0x00FF00FF);
+    const __m128i mask_ga = _mm_set1_epi32((int)0xFF00FF00u);
+    int x = 0;
+    for (; x + 4 <= n; x += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(src + (size_t)x * 4u));
+        __m128i rb = _mm_and_si128(v, mask_rb); /* 00BB00RR */
+        rb = _mm_or_si128(_mm_slli_epi32(rb, 16), _mm_srli_epi32(rb, 16)); /* 00RR00BB */
+        __m128i out = _mm_or_si128(_mm_and_si128(v, mask_ga), _mm_and_si128(rb, mask_rb));
+        _mm_storeu_si128((__m128i *)(dst + x), out);
+    }
+    for (; x < n; x++) {
+        const uint32_t v = ((const uint32_t *)src)[x];
+        dst[x] = (v & 0xFF00FF00u) | ((v & 0x000000FFu) << 16) | ((v >> 16) & 0x000000FFu);
+    }
+}
 #endif
 
 #if defined(SDLOP_HAVE_SSSE3_TARGET)
@@ -1338,6 +1357,16 @@ void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
                                         void *dst_pixels, int dst_pitch,
                                         int dst_w, int dst_h)
 {
+    SDLOP_GLOffload_FlipCopyToARGB8888(src_bottom_up, src_w, src_h, src_format, dst_pixels, dst_pitch, dst_w, dst_h,
+                                       false);
+}
+
+void SDLOP_GLOffload_FlipCopyToARGB8888(const uint8_t *src_bottom_up,
+                                        int src_w, int src_h,
+                                        SDLOP_GLOffloadPixelFormat src_format,
+                                        void *dst_pixels, int dst_pitch,
+                                        int dst_w, int dst_h, bool keep_alpha)
+{
     if (!src_bottom_up || !dst_pixels || src_w <= 0 || src_h <= 0 ||
         dst_w <= 0 || dst_h <= 0 || dst_pitch <= 0) {
         return;
@@ -1355,7 +1384,17 @@ void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
         uint8_t *dst_row = dst_base + (size_t)y * (size_t)dst_pitch;
 
         if (src_format == SDLOP_GL_OFFLOAD_BGRA8888) {
-            memcpy(dst_row, src_row, row_bytes);
+            memcpy(dst_row, src_row, row_bytes); /* the source's alpha as is */
+        } else if (src_format == SDLOP_GL_OFFLOAD_RGBA8888 && keep_alpha) {
+#if defined(__x86_64__) || defined(_M_X64)
+            rgba_row_to_argb_sse2(src_row, (uint32_t *)dst_row, copy_w);
+#else
+            const uint32_t *src32 = (const uint32_t *)src_row;
+            uint32_t *dst32 = (uint32_t *)dst_row;
+            for (int x = 0; x < copy_w; x++) {
+                dst32[x] = (rgba_word_to_xrgb(src32[x]) & 0x00FFFFFFu) | (src32[x] & 0xFF000000u);
+            }
+#endif
         } else if (src_format == SDLOP_GL_OFFLOAD_RGBA8888) {
 #if defined(__x86_64__) || defined(_M_X64)
             rgba_row_to_xrgb_sse2(src_row, (uint32_t *)dst_row, copy_w);
@@ -1366,7 +1405,7 @@ void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
                 dst32[x] = rgba_word_to_xrgb(src32[x]);
             }
 #endif
-        } else {
+        } else { /* RGB888: no alpha to keep (opaque) */
 #if defined(SDLOP_HAVE_SSSE3_TARGET)
             if (have_ssse3()) {
                 rgb_row_to_xrgb_ssse3(src_row, (uint32_t *)dst_row, copy_w);
@@ -1387,6 +1426,14 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
                                     SDLOP_GLOffloadSurface *surf,
                                     void *dst_pixels, int dst_pitch,
                                     int dst_w, int dst_h)
+{
+    return SDLOP_GLOffload_ReadToARGB8888(ctx, surf, dst_pixels, dst_pitch, dst_w, dst_h, false);
+}
+
+bool SDLOP_GLOffload_ReadToARGB8888(SDLOP_GLOffloadContext *ctx,
+                                    SDLOP_GLOffloadSurface *surf,
+                                    void *dst_pixels, int dst_pitch,
+                                    int dst_w, int dst_h, bool keep_alpha)
 {
     if (!offload.available || offload.dpy == EGL_NO_DISPLAY || !ctx || !surf || !dst_pixels) {
         return SDL_SetError("Invalid offload readback arguments");
@@ -1416,6 +1463,9 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
             read_format = GL_RGBA_;
         }
     }
+    if (keep_alpha && read_format == GL_RGB_) {
+        read_format = 0; /* RGB has no alpha: use a four-channel format */
+    }
     if (!read_format) {
         if (!offload.read_format_checked) {
             offload.read_format_checked = true;
@@ -1433,6 +1483,9 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
             }
         }
         read_format = offload.read_format;
+        if (keep_alpha && read_format == GL_RGB_) {
+            read_format = GL_RGBA_; /* always supported, keeps alpha */
+        }
     }
 
     size_t needed = (size_t)surf->w * (size_t)surf->h * 4u;
@@ -1562,8 +1615,8 @@ bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
         (read_format == GL_BGRA_) ? SDLOP_GL_OFFLOAD_BGRA8888 :
         (read_format == GL_RGB_)  ? SDLOP_GL_OFFLOAD_RGB888 :
                                     SDLOP_GL_OFFLOAD_RGBA8888;
-    SDLOP_GLOffload_FlipCopyToXRGB8888(offload.staging, surf->w, surf->h, src_format,
-                                        dst_pixels, dst_pitch, dst_w, dst_h);
+    SDLOP_GLOffload_FlipCopyToARGB8888(offload.staging, surf->w, surf->h, src_format,
+                                        dst_pixels, dst_pitch, dst_w, dst_h, keep_alpha);
     return read_err == GL_NO_ERROR_;
 }
 

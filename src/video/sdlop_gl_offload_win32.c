@@ -22,6 +22,17 @@
 
 #include "internal/sdlop_internal.h"
 
+/* SDL_gl.c calls this for a transparent window's GL swap. There is no GL
+ * offload context on Win32 (GetPolicy() is NEVER, so ctx is always NULL),
+ * and returning false makes SDL_GL_SwapWindow report the failure rather than
+ * silently drop the frame's alpha. */
+bool SDLOP_GLOffload_ReadToARGB8888(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSurface *surf,
+                                    void *dst_pixels, int dst_pitch, int dst_w, int dst_h, bool keep_alpha)
+{
+    (void)ctx; (void)surf; (void)dst_pixels; (void)dst_pitch; (void)dst_w; (void)dst_h; (void)keep_alpha;
+    return SDL_SetError("GL offload readback is not available on this platform");
+}
+
 void SDLOP_GLOffload_SetPreferGBM(bool prefer)
 {
     (void)prefer;

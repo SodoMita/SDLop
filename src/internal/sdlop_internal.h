@@ -63,6 +63,7 @@ struct SDL_Window
     SDL_WindowFlags pending_flags;    /* grabs requested while hidden */
     int popup_offset_x, popup_offset_y; /* tooltip / popup menu: offset from parent */
     bool is_destroying;
+    bool is_dropping;                 /* drag-and-drop in progress (SDL_dropevents.c) */
 };
 
 #define SDLOP_WINDOW_IS_POPUP(w) ((w) && ((w)->flags & (SDL_WINDOW_TOOLTIP | SDL_WINDOW_POPUP_MENU)) != 0)
@@ -81,7 +82,9 @@ typedef struct SDLop_Display
     float content_scale;
     SDL_DisplayOrientation natural_orientation;
     SDL_DisplayOrientation current_orientation;
-    SDL_DisplayMode desktop_mode;   /* sdlop reports desktop mode == current mode */
+    SDL_DisplayMode desktop_mode;   /* the mode outside exclusive fullscreen */
+    SDL_DisplayMode current_mode;   /* set by an exclusive fullscreen mode switch; w == 0: desktop mode */
+    SDL_Window *fullscreen_window;  /* window whose exclusive mode the display is in */
     SDL_DisplayMode *fullscreen_modes;   /* sorted largest first; desktop mode always present */
     int num_fullscreen_modes;
     SDL_PropertiesID props;              /* display properties group (0 until first access) */
@@ -160,6 +163,9 @@ struct SDLop_VideoDevice
     char *(*GetPrimarySelectionText)(SDLop_VideoDevice *device);
     bool (*HasPrimarySelectionText)(SDLop_VideoDevice *device);
 
+    /* drag-and-drop target on/off (SDL_EVENT_DROP_FILE/TEXT enabled) */
+    void (*AcceptDragAndDrop)(SDL_Window *window, bool accept);
+
     /* SDL 3.4 window management (same contracts as SDL_sysvideo.h; NULL =
      * SDL_Unsupported() where stock SDL3 reports that) */
     bool supports_popups;            /* SDL_WINDOW_TOOLTIP / SDL_WINDOW_POPUP_MENU */
@@ -184,11 +190,18 @@ struct SDLop_VideoDevice
     bool (*SetWindowFocusable)(SDLop_VideoDevice *device, SDL_Window *window, bool focusable);
     bool (*SetWindowHitTest)(SDLop_VideoDevice *device, SDL_Window *window, bool enabled);
     bool (*UpdateWindowShape)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *shape);
+    /* real mode switch for exclusive fullscreen (stock SetDisplayMode); `mode` is one of the
+     * display's fullscreen modes, or its desktop mode to restore. Optional: without it
+     * exclusive modes are emulated (the window just covers the display). */
+    bool (*SetDisplayMode)(SDLop_VideoDevice *device, SDLop_Display *display, const SDL_DisplayMode *mode);
     bool (*SuspendScreenSaver)(SDLop_VideoDevice *device);
     void *(*GetWindowICCProfile)(SDLop_VideoDevice *device, SDL_Window *window, size_t *size);
     bool (*SetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int vsync);
     bool (*GetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int *vsync);
     SDL_SystemTheme (*GetSystemTheme)(SDLop_VideoDevice *device);
+    /* drawable size (HiDPI); NULL = window size times the display mode's
+     * pixel density */
+    void (*GetWindowSizeInPixels)(SDLop_VideoDevice *device, SDL_Window *window, int *w, int *h);
 
     /* EGL handles of the current context (SDL_EGL_*); NULL = not EGL */
     void *(*EGL_GetDisplay)(SDLop_VideoDevice *device);
@@ -205,8 +218,11 @@ struct SDLop_VideoDevice
     bool (*CaptureMouse)(SDLop_VideoDevice *device, SDL_Window *window); /* NULL window = release */
     SDL_MouseButtonFlags (*GetGlobalMouseState)(SDLop_VideoDevice *device, float *x, float *y);
 
-    /* Text input / IME */
+    /* Text input / IME (stock contracts; NULL = nothing to do) */
     bool (*UpdateTextInputArea)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*StartTextInput)(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props);
+    bool (*StopTextInput)(SDLop_VideoDevice *device, SDL_Window *window);
+    bool (*ClearComposition)(SDLop_VideoDevice *device, SDL_Window *window);
 };
 
 /* Cursor object (SDL_mouse.c) */
@@ -239,6 +255,20 @@ bool SDLOP_HasInternalClipboardData(const char *mime_type);
 const char *const *SDLOP_GetClipboardOfferMimeTypes(size_t *count);
 /* a foreign owner took the selection (owner=false) or our own offer changed */
 void SDLOP_SendClipboardUpdate(bool owner, char **mime_types, size_t num_mime_types);
+/* the system took the clipboard from us: drop the app's offer (cleanup runs) */
+void SDLOP_CancelClipboardData(void);
+
+/* SDL_dropevents.c */
+bool SDLOP_SendDropFile(SDL_Window *window, const char *source, const char *file);
+bool SDLOP_SendDropPosition(SDL_Window *window, float x, float y);
+bool SDLOP_SendDropText(SDL_Window *window, const char *text);
+bool SDLOP_SendDropComplete(SDL_Window *window);
+/* text/uri-list (local files -> DROP_FILE) or text (DROP_TEXT per line),
+ * then DROP_COMPLETE; tokenizes `data` in place */
+void SDLOP_SendDropPayload(SDL_Window *window, bool uri_list, char *data);
+bool SDLOP_IsAcceptingDragAndDrop(void);
+void SDLOP_ToggleDragAndDropSupport(void);
+int SDLOP_URIToLocal(const char *src, char *dst); /* file: URI -> path (in place ok); -1 = not local */
 const void *SDLCALL SDLOP_ClipboardTextCallback(void *userdata, const char *mime_type, size_t *size);
 
 /* Provided by backends */
@@ -300,11 +330,11 @@ typedef struct SDLop_Globals
     SDL_Scancode repeat_scancode;
     Uint16 repeat_rawcode;
     bool repeat_active;
-    bool repeat_disabled;
     bool suppress_input_events; /* main-thread-only compound key delivery */
     Uint64 repeat_next_ns;      /* absolute CLOCK_MONOTONIC deadline */
     Uint32 repeat_delay_ms;
     Uint32 repeat_interval_ms;
+    bool repeat_disabled;       /* the window system turned key repeat off */
 
     /* xkb (set by the wayland driver, else defaults) */
     void *xkb_context;          /* struct xkb_context* */
@@ -343,6 +373,15 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
  * timestamp_ns: CLOCK_MONOTONIC ns (0 = now). */
 void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16 rawcode, Uint64 timestamp_ns);
 void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns);
+/* IME composition (stock SDL_SendEditingText / ...Candidates): only while
+ * the focused window has text input active; start/length in characters */
+void SDLOP_SendEditingText(const char *utf8, int start, int length);
+void SDLOP_SendEditingTextCandidates(char **candidates, int num_candidates, int selected_candidate, bool horizontal);
+/* SDL_PROP_TEXTINPUT_* with stock defaults (props 0 = all defaults) */
+SDL_TextInputType SDLOP_GetTextInputType(SDL_PropertiesID props);
+SDL_Capitalization SDLOP_GetTextInputCapitalization(SDL_PropertiesID props);
+bool SDLOP_GetTextInputAutocorrect(SDL_PropertiesID props);
+bool SDLOP_GetTextInputMultiline(SDL_PropertiesID props);
 
 /* Mouse. Absolute x/y are window-relative; pass SDLOP_NO_POS to leave
  * the stored position untouched (relative-only motion). */
@@ -353,6 +392,51 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
                      float dx, float dy, float pressure, SDL_WindowID windowID,
                      Uint64 timestamp_ns);
 void SDLOP_ResetTouchMouse(void); /* SDL_Init / SDL_Quit */
+/* SDL_EVENT_PINCH_BEGIN/UPDATE/END (touchpad gestures) */
+void SDLOP_SendPinch(Uint32 type, Uint64 timestamp_ns, SDL_Window *window, float scale);
+/* a mouse event made up by touch/pen emulation; fx/fy are window pixels */
+void SDLOP_SendSyntheticMouse(Uint32 type, SDL_Window *window, float fx, float fy, Uint8 button,
+                              SDL_MouseID which, Uint64 timestamp_ns);
+
+/* Pens (SDL_pen.c; stock SDL_pen_c.h). Timestamps are monotonic ns, 0 = now. */
+#define SDLOP_PEN_CAPABILITY_PRESSURE (1u << 0)
+#define SDLOP_PEN_CAPABILITY_XTILT (1u << 1)
+#define SDLOP_PEN_CAPABILITY_YTILT (1u << 2)
+#define SDLOP_PEN_CAPABILITY_DISTANCE (1u << 3)
+#define SDLOP_PEN_CAPABILITY_ROTATION (1u << 4)
+#define SDLOP_PEN_CAPABILITY_SLIDER (1u << 5)
+#define SDLOP_PEN_CAPABILITY_TANGENTIAL_PRESSURE (1u << 6)
+#define SDLOP_PEN_CAPABILITY_ERASER (1u << 7)
+typedef enum SDLop_PenSubtype
+{
+    SDLOP_PEN_TYPE_UNKNOWN,
+    SDLOP_PEN_TYPE_ERASER,
+    SDLOP_PEN_TYPE_PEN,
+    SDLOP_PEN_TYPE_PENCIL,
+    SDLOP_PEN_TYPE_BRUSH,
+    SDLOP_PEN_TYPE_AIRBRUSH
+} SDLop_PenSubtype;
+typedef struct SDLop_PenInfo
+{
+    Uint32 capabilities; /* SDLOP_PEN_CAPABILITY_* */
+    float max_tilt;      /* degrees, -1 unknown */
+    Uint32 wacom_id;
+    int num_buttons; /* -1 unknown */
+    SDLop_PenSubtype subtype;
+    SDL_PenDeviceType device_type;
+} SDLop_PenInfo;
+SDL_PenID SDLOP_AddPen(const char *name, const SDLop_PenInfo *info, void *handle, SDL_Window *window,
+                       bool in_proximity, Uint64 timestamp_ns);
+void SDLOP_RemovePen(SDL_PenID id, SDL_Window *window, Uint64 timestamp_ns);
+void SDLOP_RemoveAllPens(void); /* video quit: no events */
+SDL_PenID SDLOP_FindPenByHandle(void *handle);
+void *SDLOP_GetPenHandle(SDL_PenID id);
+SDL_PenInputFlags SDLOP_GetPenStatus(SDL_PenID id, float *axes, int num_axes);
+void SDLOP_SendPenProximity(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, bool in);
+void SDLOP_SendPenTouch(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, bool eraser, bool down);
+void SDLOP_SendPenMotion(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, float x, float y);
+void SDLOP_SendPenAxis(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, SDL_PenAxis axis, float value);
+void SDLOP_SendPenButton(Uint64 timestamp_ns, SDL_PenID id, SDL_Window *window, Uint8 button, bool down);
 
 /* Input device registry (SDL_devices.c): sends *_ADDED / *_REMOVED */
 void SDLOP_AddMouse(SDL_MouseID id, const char *name);
@@ -364,6 +448,7 @@ void SDLOP_RemoveTouch(SDL_TouchID id);
 void SDLOP_TrackTouch(Uint32 type, SDL_TouchID touchID, SDL_FingerID fingerID, float x, float y, float pressure);
 void SDLOP_DevicesQuit(void);
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns);
+void SDLOP_SendMouseWheelDirection(float x, float y, SDL_MouseWheelDirection direction, Uint64 timestamp_ns);
 
 /* Timestamp helpers */
 Uint64 SDLOP_MonotonicNS(void);
@@ -415,6 +500,9 @@ void SDLOP_RawInputResetPointerFrame(void); /* focus/grab transition, main threa
 bool SDLOP_RawInputKeyboardAllowed(void); /* main-thread repeat ownership */
 void SDLOP_RawInputPump(void);      /* drain raw ring -> SDL events (main thread) */
 void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms);
+void SDLOP_RawInputTestFeed(const SDLop_RawEvent *ev, bool winsys); /* tests only */
+int SDLOP_RawInputTestAddDevice(bool keyboard, bool pointer, bool absolute, int min_x, int max_x, int min_y, int max_y,
+                                bool touch_is_left); /* tests only */
 
 /* Video core helpers (SDL_video.c) */
 bool SDLOP_VideoInit(void);
@@ -438,6 +526,14 @@ bool SDLOP_GetDisplayBoundsById(SDL_DisplayID displayID, SDL_Rect *rect);
 int SDLOP_GetDisplayIndexById(SDL_DisplayID displayID); /* -1 when absent */
 SDL_DisplayID SDLOP_GetDisplayIdAtIndex(int index);      /* 0 when absent */
 bool SDLOP_AddFullscreenDisplayMode(SDL_DisplayID displayID, const SDL_DisplayMode *mode);
+/* drivers: the display is now in `mode` (NULL = its desktop mode); sends
+ * SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED on a change */
+void SDLOP_SetCurrentDisplayMode(SDL_DisplayID displayID, const SDL_DisplayMode *mode);
+/* exclusive fullscreen: apply (enter) or give back (leave) the window's
+ * fullscreen mode on its display (stock SDL_UpdateFullscreenMode) */
+void SDLOP_UpdateFullscreenMode(SDL_Window *window, bool enter);
+/* true shortly after a real mode switch, while focus churn from it is expected */
+bool SDLOP_DisplayModeSwitchPending(void);
 void SDLOP_UpdateWindowDisplay(SDL_Window *window);      /* re-resolves window->displayID */
 
 /* GL attributes (SDL_gl.c) */
@@ -516,5 +612,99 @@ void SDLOP_QuitFilesystem(void); /* SDL_filesystem.c: drop path caches */
 void SDLOP_QuitLog(void);
 void SDLOP_QuitHints(void);
 void SDLOP_QuitProperties(void);
+
+/* ---- D-Bus session bus client (SDL_dbus.c) ---- */
+enum
+{
+    SDLOP_DBUS_METHOD_CALL = 1,
+    SDLOP_DBUS_METHOD_RETURN = 2,
+    SDLOP_DBUS_ERROR = 3,
+    SDLOP_DBUS_SIGNAL = 4
+};
+typedef struct SDLop_DBusMsg SDLop_DBusMsg;
+typedef struct
+{
+    const Uint8 *data;
+    size_t pos, end;
+    bool swap;
+    const char *sig, *sig_end; /* struct/variant/top level: remaining types */
+    bool array;
+    const char *elem, *elem_end; /* array: the element type */
+} SDLop_DBusIter;
+typedef struct
+{
+    size_t len_pos, start;
+} SDLop_DBusArray;
+/* signals and async replies; return true when the message was consumed */
+typedef bool (*SDLop_DBusHandler)(SDLop_DBusMsg *msg, void *userdata);
+
+bool SDLOP_DBus_Connect(void);
+bool SDLOP_DBus_IsConnected(void);
+const char *SDLOP_DBus_UniqueName(void);
+void SDLOP_DBus_Pump(void); /* from SDL_PumpEvents: dispatches signals */
+int SDLOP_DBus_GetFD(void); /* the session bus socket, -1 if not connected (SDL_WaitEvent polls it) */
+void SDLOP_DBus_Quit(void);
+SDLop_DBusMsg *SDLOP_DBus_Call(SDLop_DBusMsg *m, int timeout_ms); /* reply or NULL (error set) */
+bool SDLOP_DBus_Send(SDLop_DBusMsg *m);                             /* no reply wanted */
+Uint32 SDLOP_DBus_CallAsync(SDLop_DBusMsg *m); /* serial (0: failed); the reply goes to the handlers */
+SDLop_DBusMsg *SDLOP_DBus_WaitReply(Uint32 serial, int timeout_ms); /* ... unless taken here first */
+bool SDLOP_DBus_AddMatch(const char *rule);
+bool SDLOP_DBus_RemoveMatch(const char *rule);
+bool SDLOP_DBus_AddHandler(SDLop_DBusHandler fn, void *userdata);
+void SDLOP_DBus_RemoveHandler(SDLop_DBusHandler fn, void *userdata);
+
+SDLop_DBusMsg *SDLOP_DBus_NewMessage(Uint8 type, const char *dest, const char *path, const char *iface,
+                                     const char *member, const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewMethodCall(const char *dest, const char *path, const char *iface, const char *member,
+                                        const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewSignal(const char *path, const char *iface, const char *member, const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewReply(const SDLop_DBusMsg *call, const char *body_sig);
+SDLop_DBusMsg *SDLOP_DBus_NewError(const SDLop_DBusMsg *call, const char *error_name, const char *text);
+void SDLOP_DBus_FreeMessage(SDLop_DBusMsg *m);
+Uint8 SDLOP_DBus_MessageType(const SDLop_DBusMsg *m);
+Uint32 SDLOP_DBus_MessageSerial(const SDLop_DBusMsg *m);
+Uint32 SDLOP_DBus_MessageReplySerial(const SDLop_DBusMsg *m);
+const char *SDLOP_DBus_MessageField(const SDLop_DBusMsg *m, char which); /* p i m e d s g */
+void SDLOP_DBus_SetSender(SDLop_DBusMsg *m, const char *sender);
+void SDLOP_DBus_SetDestination(SDLop_DBusMsg *m, const char *dest);
+void SDLOP_DBus_SetNoReply(SDLop_DBusMsg *m);
+Uint8 *SDLOP_DBus_Serialize(SDLop_DBusMsg *m, Uint32 serial, size_t *len);
+int SDLOP_DBus_Parse(const Uint8 *buf, size_t len, SDLop_DBusMsg **out, size_t *consumed);
+
+void SDLOP_DBus_PutByte(SDLop_DBusMsg *m, Uint8 v);
+void SDLOP_DBus_PutBool(SDLop_DBusMsg *m, bool v);
+void SDLOP_DBus_PutU32(SDLop_DBusMsg *m, Uint32 v);
+void SDLOP_DBus_PutDouble(SDLop_DBusMsg *m, double v);
+void SDLOP_DBus_PutString(SDLop_DBusMsg *m, const char *s); /* also object paths */
+void SDLOP_DBus_PutSignature(SDLop_DBusMsg *m, const char *sig);
+SDLop_DBusArray SDLOP_DBus_OpenArray(SDLop_DBusMsg *m, char elem_type);
+void SDLOP_DBus_CloseArray(SDLop_DBusMsg *m, const SDLop_DBusArray *a);
+void SDLOP_DBus_OpenStruct(SDLop_DBusMsg *m); /* also dict entries */
+void SDLOP_DBus_PutDictVariantKey(SDLop_DBusMsg *m, const char *key, const char *value_sig);
+
+bool SDLOP_DBus_IterInit(const SDLop_DBusMsg *msg, SDLop_DBusIter *it);
+int SDLOP_DBus_IterType(const SDLop_DBusIter *it); /* signature char, 0 at the end */
+bool SDLOP_DBus_IterNext(SDLop_DBusIter *it);      /* false at the end */
+bool SDLOP_DBus_IterRecurse(const SDLop_DBusIter *it, SDLop_DBusIter *sub);
+bool SDLOP_DBus_IterGetByte(const SDLop_DBusIter *it, Uint8 *v);
+bool SDLOP_DBus_IterGetBool(const SDLop_DBusIter *it, bool *v);
+bool SDLOP_DBus_IterGetU32(const SDLop_DBusIter *it, Uint32 *v);
+bool SDLOP_DBus_IterGetI32(const SDLop_DBusIter *it, Sint32 *v);
+bool SDLOP_DBus_IterGetDouble(const SDLop_DBusIter *it, double *v);
+bool SDLOP_DBus_IterGetString(const SDLop_DBusIter *it, const char **v);
+
+/* desktop integration over D-Bus (SDL_desktop.c) */
+void SDLOP_Desktop_Init(void); /* async theme lookup + change subscription */
+SDL_SystemTheme SDLOP_Desktop_GetSystemTheme(void);
+void SDLOP_Desktop_UpdateProgress(SDL_Window *window);
+void SDLOP_Desktop_Quit(void);
+void SDLOP_Dialog_Quit(void); /* SDL_dialog.c: drops pending portal requests */
+
+/* child processes (SDL_misc.c; not on Emscripten) */
+bool SDLOP_ProgramInPath(const char *prog);
+/* run argv (extra_env: NULL-terminated "NAME=value" overrides); with
+ * output, capture stdout (malloc'ed). Exit status, or -1 */
+int SDLOP_RunProcess(const char *const *argv, const char *const *extra_env, char **output, bool wait_for_exit);
+bool SDLOP_ZenityVersion(int *major, int *minor);
 
 #endif /* sdlop_internal_h_ */

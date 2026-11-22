@@ -116,7 +116,9 @@ static void query_pointer(xcb_window_t w, int *x, int *y)
 }
 
 /* can another client grab the pointer? (fails while SDLop holds a grab) */
-static bool pointer_grabbable(void)
+static int grab_status = -1; /* of the last failed probe, for the message */
+
+static bool pointer_grabbable_once(void)
 {
     const xcb_setup_t *setup = xcb_get_setup(obs);
     xcb_window_t root = xcb_setup_roots_iterator(setup).data->root;
@@ -125,12 +127,30 @@ static bool pointer_grabbable(void)
                               XCB_CURRENT_TIME),
         NULL);
     bool ok = r && r->status == XCB_GRAB_STATUS_SUCCESS;
+    grab_status = r ? r->status : -1;
     free(r);
     if (ok) {
         xcb_ungrab_pointer(obs, XCB_CURRENT_TIME);
         xcb_flush(obs);
     }
     return ok;
+}
+
+/* Requests on two X connections are not ordered: SDLop's flushed ungrab
+ * may still be unread by the server when our grab arrives, so SDLop's
+ * connection does a round trip first (SDL_SyncWindow). The window manager
+ * may also hold a short grab right after a raise/focus change: "released"
+ * means grabbable within a moment, a grab SDLop kept would never be. */
+static bool pointer_grabbable(SDL_Window *w)
+{
+    SDL_SyncWindow(w);
+    for (int i = 0; i < 20; i++) {
+        if (pointer_grabbable_once()) {
+            return true;
+        }
+        SDL_Delay(10);
+    }
+    return false;
 }
 #endif
 
@@ -353,7 +373,8 @@ static void test_grabs(SDL_Window *w)
         CHECK(SDL_GetGrabbedWindow() == w, "grabbed window");
 #ifdef SDLOP_TEST_HAVE_XCB
         if (is_x11) {
-            CHECK(!pointer_grabbable(), "X pointer grabbed by SDLop");
+            SDL_SyncWindow(w);
+            CHECK(!pointer_grabbable_once(), "X pointer grabbed by SDLop");
         }
 #endif
     }
@@ -361,7 +382,7 @@ static void test_grabs(SDL_Window *w)
     CHECK(!SDL_GetWindowMouseGrab(w), "mouse ungrab readback");
 #ifdef SDLOP_TEST_HAVE_XCB
     if (is_x11) {
-        CHECK(pointer_grabbable(), "X pointer released");
+        CHECK(pointer_grabbable(w), "X pointer released (grab status %d)", grab_status);
     }
 #endif
     bool kg = SDL_SetWindowKeyboardGrab(w, true);

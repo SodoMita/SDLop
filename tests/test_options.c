@@ -122,6 +122,28 @@ static void test_fbdev_options(const char *dump)
     SDL_ResetHints();
 }
 
+/* SDL_Init on X11; a server that briefly refuses connections (busy CI
+ * runner, many parallel clients) is retried, then the part is skipped:
+ * the options under test are not about connecting to X */
+static bool init_x11(const char *what)
+{
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (SDL_Init(SDL_INIT_VIDEO)) {
+            return true;
+        }
+        if (!strstr(SDL_GetError(), "connect")) {
+            break; /* a real failure: report it */
+        }
+        SDL_Delay(100 + 100 * attempt);
+    }
+    if (strstr(SDL_GetError(), "connect")) {
+        printf("test_options: X11 part SKIP at '%s' (%s)\n", what, SDL_GetError());
+        return false;
+    }
+    CHECK(false, "SDL_Init (%s): %s", what, SDL_GetError());
+    return false;
+}
+
 static void test_x11_raw_default(void)
 {
     if (!getenv("DISPLAY") || !*getenv("DISPLAY")) {
@@ -143,31 +165,20 @@ static void test_x11_raw_default(void)
        pointer SDLop must fall back to window-system input, not fail */
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
     SDL_SetHint(SDLOP_HINT_RAW_INPUT, "1");
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-        /* The X server can be briefly unavailable under a parallel ctest run
-         * (measured: "Could not connect to X display :100"). Hint precedence
-         * is not an X11 property, so a busy display is a skip, not a failure. */
-        printf("test_options: X11 part SKIP (%s)\n", SDL_GetError());
-        SDL_unsetenv_unsafe("SDLOP_RAW_INPUT");
-        SDL_ResetHints();
-        return;
+    if (init_x11("SDLOP_RAW_INPUT=1")) {
+        printf("test_options: X11 with SDLOP_RAW_INPUT=1 -> evdev %s\n",
+               SDLop_RawInputAvailable() ? "is the input source" : "unavailable, window-system input");
+        SDL_Quit();
     }
-    printf("test_options: X11 with SDLOP_RAW_INPUT=1 -> evdev %s\n",
-           SDLop_RawInputAvailable() ? "is the input source" : "unavailable, window-system input");
-    SDL_Quit();
 
     /* SDL_HINT_OVERRIDE beats an environment request */
     SDL_setenv_unsafe("SDLOP_RAW_INPUT", "1", 1);
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
     SDL_SetHintWithPriority(SDLOP_HINT_RAW_INPUT, "0", SDL_HINT_OVERRIDE);
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-        printf("test_options: X11 part SKIP (%s)\n", SDL_GetError());
-        SDL_unsetenv_unsafe("SDLOP_RAW_INPUT");
-        SDL_ResetHints();
-        return;
+    if (init_x11("override")) {
+        CHECK(!SDLop_RawInputAvailable(), "override SDLOP_RAW_INPUT=0 beats the environment");
+        SDL_Quit();
     }
-    CHECK(!SDLop_RawInputAvailable(), "override SDLOP_RAW_INPUT=0 beats the environment");
-    SDL_Quit();
     SDL_unsetenv_unsafe("SDLOP_RAW_INPUT");
     SDL_ResetHints();
 }

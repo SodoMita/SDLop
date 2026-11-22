@@ -14,6 +14,8 @@
   - the first finger synthesizes the SDL_TOUCH_MOUSEID left-button mouse
   - updates for unknown touches / other windows are ignored
   - destroying the window cancels its active touches (FINGER_CANCELED)
+  - with an XI 2.4 server: injected GesturePinchBegin/Update/End become
+    SDL_EVENT_PINCH_BEGIN/UPDATE (scale passed through)/END
 
   Skips without DISPLAY, XInput 2.2, or when the server needs
   authorization the proxy cannot forward (xvfb-run -a with cookies works:
@@ -95,7 +97,9 @@ static int connect_real_server(void)
 static bool write_all(int fd, const unsigned char *p, size_t n)
 {
     while (n > 0) {
-        ssize_t w = write(fd, p, n);
+        /* the peer may already be gone during teardown; a bare write() then
+         * raises SIGPIPE and kills the whole test with no output at all */
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
         if (w < 0) {
             if (errno == EINTR) {
                 continue;
@@ -188,7 +192,10 @@ static void *proxy_thread(void *arg)
             for (size_t i = 0; i + 32 <= inject_len;) {
                 inject_buf[i + 2] = (unsigned char)(last_seq & 0xff);
                 inject_buf[i + 3] = (unsigned char)(last_seq >> 8);
-                uint32_t len = (uint32_t)inject_buf[i + 4] | ((uint32_t)inject_buf[i + 5] << 8);
+                uint32_t len = 0; /* only GenericEvents have a length (core events: time) */
+                if ((inject_buf[i] & 0x7f) == 35) {
+                    len = (uint32_t)inject_buf[i + 4] | ((uint32_t)inject_buf[i + 5] << 8);
+                }
                 i += 32 + 4u * len;
             }
             bool ok = write_all(pc->client, inject_buf, inject_len);
@@ -334,6 +341,32 @@ static void queue_touch(uint16_t evtype, uint32_t touch_id, uint16_t source, xcb
     pthread_mutex_unlock(&inject_lock);
 }
 
+/* xXIGesturePinchEvent: 100 bytes */
+static void queue_pinch(uint16_t evtype, xcb_window_t win, double scale)
+{
+    unsigned char e[100];
+    memset(e, 0, sizeof(e));
+    e[0] = 35; /* GenericEvent */
+    e[1] = xi_opcode;
+    put32(e + 4, (100 - 32) / 4);
+    put16(e + 8, evtype);
+    put16(e + 10, 2);  /* deviceid: master pointer */
+    put32(e + 16, 2);  /* detail: fingers */
+    put32(e + 20, root_win);
+    put32(e + 24, win);
+    put32(e + 40, 50u << 16); /* event_x */
+    put32(e + 44, 60u << 16); /* event_y */
+    put32(e + 64, (uint32_t)(int32_t)lround(scale * 65536.0));
+    put16(e + 72, 12); /* sourceid */
+    pthread_mutex_lock(&inject_lock);
+    if (inject_len + sizeof(e) <= INJECT_MAX) {
+        memcpy(inject_buf + inject_len, e, sizeof(e));
+        inject_len += sizeof(e);
+        atomic_store(&inject_pending, (int)inject_len);
+    }
+    pthread_mutex_unlock(&inject_lock);
+}
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -387,6 +420,7 @@ static void pump(event_log *log, int ms)
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             bool keep = (e.type >= SDL_EVENT_FINGER_DOWN && e.type <= SDL_EVENT_FINGER_CANCELED) ||
+                        (e.type >= SDL_EVENT_PINCH_BEGIN && e.type <= SDL_EVENT_PINCH_END) ||
                         ((e.type == SDL_EVENT_MOUSE_MOTION && e.motion.which == SDL_TOUCH_MOUSEID) ||
                          ((e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
                           e.button.which == SDL_TOUCH_MOUSEID));
@@ -409,7 +443,12 @@ static void flush_and_collect(event_log *log)
     while (atomic_load(&inject_pending) > 0 && SDL_GetTicks() < end) {
         pump(log, 2);
     }
-    pump(log, 80);
+    const int stuck = atomic_load(&inject_pending);
+    pump(log, 250); /* generous: sanitizer builds are slow */
+    if (stuck > 0) {
+        /* tells "never injected" from "injected, events late" in a flaky run */
+        fprintf(stderr, "note: %d injected byte(s) still unsent after 1s; collected %d event(s)\n", stuck, log->n);
+    }
 }
 
 static bool near(float a, float b)
@@ -575,6 +614,35 @@ int main(void)
               "FINGER_UP 5, pressure 0");
     }
     CHECK(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK), "mouse button state released");
+
+    /* XI 2.4 touchpad pinch (asked on a fresh connection: a connection
+     * announces its XI version once) */
+    xcb_connection_t *c24 = xcb_connect(NULL, NULL);
+    xcb_input_xi_query_version_reply_t *v24 =
+        xcb_connection_has_error(c24)
+            ? NULL
+            : xcb_input_xi_query_version_reply(c24, xcb_input_xi_query_version(c24, 2, 4), NULL);
+    const bool xi24 = v24 && (v24->major_version > 2 || v24->minor_version >= 4);
+    free(v24);
+    xcb_disconnect(c24);
+    if (xi24) {
+        queue_pinch(27, xid, 1.0);
+        queue_pinch(28, xid, 1.5);
+        queue_pinch(28, xid, 0.75);
+        queue_pinch(29, xid, 0.75);
+        flush_and_collect(&log);
+        CHECK(log.n == 4, "pinch: 4 events, got %d", log.n);
+        if (log.n == 4) {
+            const SDL_WindowID wid = SDL_GetWindowID(w);
+            CHECK(log.ev[0].type == SDL_EVENT_PINCH_BEGIN && log.ev[0].pinch.windowID == wid, "PINCH_BEGIN");
+            CHECK(log.ev[1].type == SDL_EVENT_PINCH_UPDATE && near(log.ev[1].pinch.scale, 1.5f), "PINCH_UPDATE 1.5");
+            CHECK(log.ev[2].type == SDL_EVENT_PINCH_UPDATE && near(log.ev[2].pinch.scale, 0.75f),
+                  "PINCH_UPDATE 0.75");
+            CHECK(log.ev[3].type == SDL_EVENT_PINCH_END && log.ev[3].pinch.windowID == wid, "PINCH_END");
+        }
+    } else {
+        printf("test_x11_touch: server has no XI 2.4, pinch part skipped\n");
+    }
 
     /* finger 6 is still down: destroying the window cancels it */
     SDL_DestroyWindow(w);

@@ -117,6 +117,11 @@ void SDLOP_SendClipboardUpdate(bool owner, char **mime_types, size_t num_mime_ty
     }
 }
 
+void SDLOP_CancelClipboardData(void)
+{
+    cancel_clipboard_data(0);
+}
+
 const char *const *SDLOP_GetClipboardOfferMimeTypes(size_t *count)
 {
     *count = num_clipboard_mime_types;

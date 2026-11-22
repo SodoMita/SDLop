@@ -265,11 +265,17 @@ bool SDL_GL_SetAttribute(SDL_GLAttr attr, int value)
     return true;
 }
 
+static bool query_realised_attribute(SDL_GLAttr attr, int *value);
+
 bool SDL_GL_GetAttribute(SDL_GLAttr attr, int *value)
 {
     init_glattrs();
     if (!value) {
         return SDL_SetError("NULL value pointer");
+    }
+    /* framebuffer properties come from the current context, as in stock */
+    if (query_realised_attribute(attr, value)) {
+        return true;
     }
     switch (attr) {
     case SDL_GL_RED_SIZE: *value = sdlop_glattrs.red_size; break;
@@ -452,6 +458,187 @@ static SDL_GLContext create_generic_offload_context(SDL_Window *window)
     return (SDL_GLContext)gctx;
 }
 #endif /* !__EMSCRIPTEN__ */
+
+/* Stock SDL3 answers the framebuffer attributes from the current context
+ * (glGetIntegerv, or glGetFramebufferAttachmentParameteriv on the default
+ * framebuffer for desktop GL 3+), so an application sees what it actually
+ * got rather than what it asked for. Same here for native GL contexts.
+ * Without a current context, or when the query fails, SDL_GL_GetAttribute
+ * keeps returning the requested value (stock reports 0 / an error then).
+ * The headless offload path already stores its realised sizes in
+ * sdlop_glattrs when it creates a context. */
+#define SDLOP_GL_VERSION_                               0x1F02
+#define SDLOP_GL_NO_ERROR_                              0
+#define SDLOP_GL_NONE_                                  0
+#define SDLOP_GL_FRONT_LEFT_                            0x0400
+#define SDLOP_GL_BACK_LEFT_                             0x0402
+#define SDLOP_GL_DOUBLEBUFFER_                          0x0C32
+#define SDLOP_GL_STEREO_                                0x0C33
+#define SDLOP_GL_RED_BITS_                              0x0D52
+#define SDLOP_GL_GREEN_BITS_                            0x0D53
+#define SDLOP_GL_BLUE_BITS_                             0x0D54
+#define SDLOP_GL_ALPHA_BITS_                            0x0D55
+#define SDLOP_GL_DEPTH_BITS_                            0x0D56
+#define SDLOP_GL_STENCIL_BITS_                          0x0D57
+#define SDLOP_GL_ACCUM_RED_BITS_                        0x0D58
+#define SDLOP_GL_ACCUM_GREEN_BITS_                      0x0D59
+#define SDLOP_GL_ACCUM_BLUE_BITS_                       0x0D5A
+#define SDLOP_GL_ACCUM_ALPHA_BITS_                      0x0D5B
+#define SDLOP_GL_DEPTH_                                 0x1801
+#define SDLOP_GL_STENCIL_                               0x1802
+#define SDLOP_GL_SAMPLE_BUFFERS_                        0x80A8
+#define SDLOP_GL_SAMPLES_                               0x80A9
+#define SDLOP_GL_FRAMEBUFFER_ATTACHMENT_RED_SIZE_       0x8212
+#define SDLOP_GL_FRAMEBUFFER_ATTACHMENT_GREEN_SIZE_     0x8213
+#define SDLOP_GL_FRAMEBUFFER_ATTACHMENT_BLUE_SIZE_      0x8214
+#define SDLOP_GL_FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE_     0x8215
+#define SDLOP_GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE_     0x8216
+#define SDLOP_GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE_   0x8217
+#define SDLOP_GL_DRAW_FRAMEBUFFER_BINDING_              0x8CA6
+#define SDLOP_GL_DRAW_FRAMEBUFFER_                      0x8CA9
+#define SDLOP_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_    0x8CD0
+#define SDLOP_GL_FRAMEBUFFER_                           0x8D40
+
+typedef const unsigned char *(SDLCALL *SDLOP_PFN_glGetString)(unsigned int);
+typedef void (SDLCALL *SDLOP_PFN_glGetIntegerv)(unsigned int, int *);
+typedef unsigned int (SDLCALL *SDLOP_PFN_glGetError)(void);
+typedef void (SDLCALL *SDLOP_PFN_glBindFramebuffer)(unsigned int, unsigned int);
+typedef void (SDLCALL *SDLOP_PFN_glGetFramebufferAttachmentParameteriv)(unsigned int, unsigned int, unsigned int,
+                                                                         int *);
+
+static bool query_realised_attribute(SDL_GLAttr attr, int *value)
+{
+    if (!current_context || !sdlop.video) {
+        return false;
+    }
+#ifndef __EMSCRIPTEN__
+    if (find_generic_ctx(current_context)) {
+        return false;
+    }
+#endif
+    unsigned int pname = 0, attachment = 0, attachment_pname = 0;
+    bool desktop_only = false;
+    switch (attr) {
+    case SDL_GL_RED_SIZE:
+        pname = SDLOP_GL_RED_BITS_;
+        attachment_pname = SDLOP_GL_FRAMEBUFFER_ATTACHMENT_RED_SIZE_;
+        break;
+    case SDL_GL_GREEN_SIZE:
+        pname = SDLOP_GL_GREEN_BITS_;
+        attachment_pname = SDLOP_GL_FRAMEBUFFER_ATTACHMENT_GREEN_SIZE_;
+        break;
+    case SDL_GL_BLUE_SIZE:
+        pname = SDLOP_GL_BLUE_BITS_;
+        attachment_pname = SDLOP_GL_FRAMEBUFFER_ATTACHMENT_BLUE_SIZE_;
+        break;
+    case SDL_GL_ALPHA_SIZE:
+        pname = SDLOP_GL_ALPHA_BITS_;
+        attachment_pname = SDLOP_GL_FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE_;
+        break;
+    case SDL_GL_DEPTH_SIZE:
+        pname = SDLOP_GL_DEPTH_BITS_;
+        attachment = SDLOP_GL_DEPTH_;
+        attachment_pname = SDLOP_GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE_;
+        break;
+    case SDL_GL_STENCIL_SIZE:
+        pname = SDLOP_GL_STENCIL_BITS_;
+        attachment = SDLOP_GL_STENCIL_;
+        attachment_pname = SDLOP_GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE_;
+        break;
+    case SDL_GL_BUFFER_SIZE:
+    {
+        /* no single GL query for this: the sum of the channels, as stock */
+        static const SDL_GLAttr channels[4] = { SDL_GL_RED_SIZE, SDL_GL_GREEN_SIZE, SDL_GL_BLUE_SIZE,
+                                                SDL_GL_ALPHA_SIZE };
+        int sum = 0;
+        for (int i = 0; i < 4; i++) {
+            int v = 0;
+            if (!query_realised_attribute(channels[i], &v)) {
+                return false;
+            }
+            sum += v;
+        }
+        *value = sum;
+        return true;
+    }
+    case SDL_GL_DOUBLEBUFFER: pname = SDLOP_GL_DOUBLEBUFFER_; desktop_only = true; break;
+    case SDL_GL_STEREO: pname = SDLOP_GL_STEREO_; desktop_only = true; break;
+    case SDL_GL_ACCUM_RED_SIZE: pname = SDLOP_GL_ACCUM_RED_BITS_; desktop_only = true; break;
+    case SDL_GL_ACCUM_GREEN_SIZE: pname = SDLOP_GL_ACCUM_GREEN_BITS_; desktop_only = true; break;
+    case SDL_GL_ACCUM_BLUE_SIZE: pname = SDLOP_GL_ACCUM_BLUE_BITS_; desktop_only = true; break;
+    case SDL_GL_ACCUM_ALPHA_SIZE: pname = SDLOP_GL_ACCUM_ALPHA_BITS_; desktop_only = true; break;
+    case SDL_GL_MULTISAMPLEBUFFERS: pname = SDLOP_GL_SAMPLE_BUFFERS_; break;
+    case SDL_GL_MULTISAMPLESAMPLES: pname = SDLOP_GL_SAMPLES_; break;
+    default:
+        return false;
+    }
+
+    SDLOP_PFN_glGetString get_string = (SDLOP_PFN_glGetString)SDL_GL_GetProcAddress("glGetString");
+    SDLOP_PFN_glGetIntegerv get_integerv = (SDLOP_PFN_glGetIntegerv)SDL_GL_GetProcAddress("glGetIntegerv");
+    SDLOP_PFN_glGetError get_error = (SDLOP_PFN_glGetError)SDL_GL_GetProcAddress("glGetError");
+    if (!get_string || !get_integerv || !get_error) {
+        SDL_ClearError();
+        return false;
+    }
+    const char *version = (const char *)get_string(SDLOP_GL_VERSION_);
+    if (!version) {
+        return false;
+    }
+    const bool es = strncmp(version, "OpenGL ES", 9) == 0;
+    if (es && desktop_only) {
+        return false; /* no such state in OpenGL ES: the request stands */
+    }
+    /* drop an error the application left pending, so a failing query below
+     * is recognised (stock leaves it there and reports it instead) */
+    (void)get_error();
+
+    int result = 0;
+    /* stock: desktop GL 3+ asks the default framebuffer's attachments (the
+     * *_BITS queries are gone from core profiles); ES and GL 1.x/2.x use
+     * glGetIntegerv */
+    if (attachment_pname && !es && atoi(version) >= 3) {
+        SDLOP_PFN_glGetFramebufferAttachmentParameteriv get_attachment =
+            (SDLOP_PFN_glGetFramebufferAttachmentParameteriv)SDL_GL_GetProcAddress(
+                "glGetFramebufferAttachmentParameteriv");
+        SDLOP_PFN_glBindFramebuffer bind_framebuffer =
+            (SDLOP_PFN_glBindFramebuffer)SDL_GL_GetProcAddress("glBindFramebuffer");
+        if (!get_attachment) {
+            SDL_ClearError();
+            return false;
+        }
+        int bound = 0;
+        if (bind_framebuffer) {
+            get_integerv(SDLOP_GL_DRAW_FRAMEBUFFER_BINDING_, &bound);
+            if (bound != 0) {
+                bind_framebuffer(SDLOP_GL_DRAW_FRAMEBUFFER_, 0);
+            }
+        }
+        if (!attachment) {
+            int doublebuffer = 1;
+            get_integerv(SDLOP_GL_DOUBLEBUFFER_, &doublebuffer);
+            attachment = doublebuffer ? SDLOP_GL_BACK_LEFT_ : SDLOP_GL_FRONT_LEFT_;
+        }
+        /* a default framebuffer without depth / stencil has object type
+         * GL_NONE there, and every other query on it is an error */
+        int type = -1;
+        if (attachment == SDLOP_GL_DEPTH_ || attachment == SDLOP_GL_STENCIL_) {
+            get_attachment(SDLOP_GL_FRAMEBUFFER_, attachment, SDLOP_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_, &type);
+        }
+        if (type != SDLOP_GL_NONE_) {
+            get_attachment(SDLOP_GL_FRAMEBUFFER_, attachment, attachment_pname, &result);
+        }
+        if (bind_framebuffer && bound != 0) {
+            bind_framebuffer(SDLOP_GL_DRAW_FRAMEBUFFER_, (unsigned int)bound);
+        }
+    } else {
+        get_integerv(pname, &result);
+    }
+    if (get_error() != SDLOP_GL_NO_ERROR_) {
+        return false;
+    }
+    *value = result;
+    return true;
+}
 
 SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc)
 {
@@ -751,11 +938,14 @@ bool SDL_GL_SwapWindow(SDL_Window *window)
                 return false;
             }
         }
-        if (!SDLOP_GLOffload_ReadToXRGB8888(gctx->offload_ctx, gw->surf,
+        /* an ARGB framebuffer (transparent window) gets GL's alpha */
+        const bool keep_alpha = (window->flags & SDL_WINDOW_TRANSPARENT) &&
+                                SDL_ISPIXELFORMAT_ALPHA(window->surface->format);
+        if (!SDLOP_GLOffload_ReadToARGB8888(gctx->offload_ctx, gw->surf,
                                             window->surface->pixels,
                                             window->surface->pitch,
                                             window->surface->w,
-                                            window->surface->h)) {
+                                            window->surface->h, keep_alpha)) {
             return false;
         }
         SDL_Rect rect = { 0, 0, window->surface->w, window->surface->h };

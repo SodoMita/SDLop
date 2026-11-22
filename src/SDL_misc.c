@@ -95,7 +95,7 @@ SDL_GUID SDL_StringToGUID(const char *pchGUID)
 #if !defined(__EMSCRIPTEN__) && !defined(_WIN32)
 /* is `prog` an executable in $PATH? (posix_spawnp would tell us too,
  * but glibc reports a missing program only through the exit status) */
-static bool program_in_path(const char *prog)
+bool SDLOP_ProgramInPath(const char *prog)
 {
     const char *path = getenv("PATH");
     if (!path || !*path) {
@@ -122,31 +122,43 @@ static bool program_in_path(const char *prog)
 }
 
 /* environment without LD_PRELOAD (stock: Steam's overlay breaks browsers) */
-static char **child_environment(const char *extra)
+static char **child_environment(const char *const *extra)
 {
-    size_t n = 0;
+    size_t n = 0, nextra = 0;
     while (environ && environ[n]) {
         n++;
     }
-    char **env = (char **)calloc(n + 2, sizeof(char *));
+    while (extra && extra[nextra]) {
+        nextra++;
+    }
+    char **env = (char **)calloc(n + nextra + 1, sizeof(char *));
     if (!env) {
         return NULL;
     }
     size_t k = 0;
     for (size_t i = 0; i < n; i++) {
-        if (strncmp(environ[i], "LD_PRELOAD=", 11) != 0) {
+        if (strncmp(environ[i], "LD_PRELOAD=", 11) == 0) {
+            continue;
+        }
+        bool overridden = false; /* extra "NAME=value" replaces NAME */
+        for (size_t j = 0; j < nextra && !overridden; j++) {
+            const char *eq = strchr(extra[j], '=');
+            const size_t len = eq ? (size_t)(eq - extra[j]) + 1 : 0;
+            overridden = len && strncmp(environ[i], extra[j], len) == 0;
+        }
+        if (!overridden) {
             env[k++] = environ[i];
         }
     }
-    if (extra) {
-        env[k++] = (char *)extra;
+    for (size_t j = 0; j < nextra; j++) {
+        env[k++] = (char *)extra[j];
     }
     return env;
 }
 
 /* run argv; with `output`, capture stdout (malloc'ed, NUL-terminated).
  * Returns the exit status (0-255), or -1 when it could not be run. */
-static int run_process(const char *const *argv, char **output, bool wait_for_exit)
+int SDLOP_RunProcess(const char *const *argv, const char *const *extra_env, char **output, bool wait_for_exit)
 {
     int pipefd[2] = { -1, -1 };
     posix_spawn_file_actions_t fa;
@@ -164,7 +176,7 @@ static int run_process(const char *const *argv, char **output, bool wait_for_exi
     }
     posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
 
-    char **env = child_environment(NULL);
+    char **env = child_environment(extra_env);
     pid_t pid = -1;
     int rc = posix_spawnp(&pid, argv[0], &fa, NULL, (char *const *)argv, env ? env : environ);
     free(env);
@@ -237,11 +249,11 @@ static int run_process(const char *const *argv, char **output, bool wait_for_exi
 static SDL_AtomicInt sdlop_messagebox_count; /* stock tracks open boxes too */
 
 #if !defined(__EMSCRIPTEN__) && !defined(_WIN32)
-static bool zenity_version(int *major, int *minor)
+bool SDLOP_ZenityVersion(int *major, int *minor)
 {
     const char *argv[] = { "zenity", "--version", NULL };
     char *out = NULL;
-    if (run_process(argv, &out, true) < 0 || !out) {
+    if (SDLOP_RunProcess(argv, NULL, &out, true) < 0 || !out) {
         free(out);
         return false;
     }
@@ -265,11 +277,11 @@ static bool zenity_show(const SDL_MessageBoxData *data, int *buttonID)
     if (data->numbuttons > SDLOP_MAX_MSGBOX_BUTTONS) {
         return SDL_SetError("Too many buttons (%d max allowed)", SDLOP_MAX_MSGBOX_BUTTONS);
     }
-    if (!program_in_path("zenity")) {
+    if (!SDLOP_ProgramInPath("zenity")) {
         return SDL_SetError("zenity is not installed");
     }
     int major = 0, minor = 0;
-    if (!zenity_version(&major, &minor)) {
+    if (!SDLOP_ZenityVersion(&major, &minor)) {
         return false;
     }
     const char *argv[5 + 2 + 2 + 2 + 2 * SDLOP_MAX_MSGBOX_BUTTONS + 1] = {
@@ -315,7 +327,7 @@ static bool zenity_show(const SDL_MessageBoxData *data, int *buttonID)
     argv[argc] = NULL;
 
     char *out = NULL;
-    int code = run_process(argv, &out, true);
+    int code = SDLOP_RunProcess(argv, NULL, &out, true);
     if (code >= 0 && code != 255 && out) {
         char *nl = strrchr(out, '\n'); /* it likes to add a newline */
         if (nl) {
@@ -519,7 +531,7 @@ bool SDL_OpenURL(const char *url)
     }
     return true;
 #else
-    if (!program_in_path("xdg-open")) {
+    if (!SDLOP_ProgramInPath("xdg-open")) {
         return SDL_SetError("xdg-open is not installed");
     }
     /* background process (stock: SDL_PROP_PROCESS_CREATE_BACKGROUND):
@@ -989,8 +1001,4 @@ void SDL_GDKSuspendComplete(void)
     SDL_Unsupported(); /* GDK only */
 }
 
-SDL_PenDeviceType SDL_GetPenDeviceType(SDL_PenID instance_id)
-{
-    (void)instance_id;
-    return SDL_PEN_DEVICE_TYPE_INVALID; /* SDLop reports no pens */
-}
+

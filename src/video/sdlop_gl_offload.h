@@ -113,12 +113,27 @@ void SDLOP_GLOffload_FlipCopyToXRGB8888(const uint8_t *src_bottom_up,
                                         void *dst_pixels, int dst_pitch,
                                         int dst_w, int dst_h);
 
+/* The same, keeping the source alpha when `keep_alpha` (ARGB8888 targets
+ * of SDL_WINDOW_TRANSPARENT windows); RGB888 sources are opaque. */
+void SDLOP_GLOffload_FlipCopyToARGB8888(const uint8_t *src_bottom_up,
+                                        int src_w, int src_h,
+                                        SDLOP_GLOffloadPixelFormat src_format,
+                                        void *dst_pixels, int dst_pitch,
+                                        int dst_w, int dst_h, bool keep_alpha);
+
 /* Read framebuffer 0 of `surf` on `ctx` and copy top-down XRGB8888 into
  * `dst_pixels` (`dst_pitch` bytes/row, `dst_w` x `dst_h`). */
 bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
                                     SDLOP_GLOffloadSurface *surf,
                                     void *dst_pixels, int dst_pitch,
                                     int dst_w, int dst_h);
+
+/* The same into ARGB8888, with the framebuffer's alpha when `keep_alpha`
+ * (a four-channel read format is used then). */
+bool SDLOP_GLOffload_ReadToARGB8888(SDLOP_GLOffloadContext *ctx,
+                                    SDLOP_GLOffloadSurface *surf,
+                                    void *dst_pixels, int dst_pitch,
+                                    int dst_w, int dst_h, bool keep_alpha);
 
 /* Release cached offload EGL / GBM resources and reset probe cache. */
 void SDLOP_GLOffload_Shutdown(void);

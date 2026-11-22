@@ -427,8 +427,13 @@ static void test_clipboard(void)
     SDL_free(t);
 
     CHECK(SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_CLIPBOARD_UPDATE, SDL_EVENT_CLIPBOARD_UPDATE) == 1, "update event");
-    CHECK(e.clipboard.owner && e.clipboard.num_mime_types == 1 && strcmp(e.clipboard.mime_types[0], "text/plain;charset=utf-8") == 0,
-          "update event content");
+    /* the text mime types are the driver's (stock: 1 generic, 5 on X11 and
+     * Wayland); text/plain;charset=utf-8 is always among them */
+    bool has_utf8_text = false;
+    for (int i = 0; i < e.clipboard.num_mime_types; i++) {
+        has_utf8_text = has_utf8_text || strcmp(e.clipboard.mime_types[i], "text/plain;charset=utf-8") == 0;
+    }
+    CHECK(e.clipboard.owner && e.clipboard.num_mime_types >= 1 && has_utf8_text, "update event content");
 
     CHECK(SDL_SetClipboardData(clip_cb, NULL, NULL, my_types, 2), "set data");
     size_t n = 0;

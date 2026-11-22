@@ -1,23 +1,12 @@
 cmake_minimum_required(VERSION 3.13)
 option(SDLOP_SANITIZERS "Build with ASan+UBSan and tune leak checks for GPU tests" OFF)
-option(SDLOP_TSAN "Build with ThreadSanitizer (mutually exclusive with SDLOP_SANITIZERS)" OFF)
 
 project(SDLop VERSION 0.2.0 LANGUAGES C)
-
-if (SDLOP_SANITIZERS AND SDLOP_TSAN)
-  message(FATAL_ERROR "SDLOP_SANITIZERS and SDLOP_TSAN are mutually exclusive (ASan and TSan cannot be combined)")
-endif()
 
 if (SDLOP_SANITIZERS)
   string(APPEND CMAKE_C_FLAGS " -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer")
   string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=address,undefined")
   string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=address,undefined")
-endif()
-
-if (SDLOP_TSAN)
-  string(APPEND CMAKE_C_FLAGS " -fsanitize=thread -fno-omit-frame-pointer")
-  string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=thread")
-  string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=thread")
 endif()
 
 set(CMAKE_C_STANDARD 11)
@@ -52,6 +41,7 @@ if(EMSCRIPTEN)
     src/SDL_events_desc.c
     src/SDL_events_categories.c
     src/SDL_clipboard.c
+    src/SDL_dropevents.c
     src/SDL_thread.c
     src/SDL_misc.c
     src/SDL_joystick.c
@@ -65,6 +55,7 @@ if(EMSCRIPTEN)
     src/SDL_keyboard_web.c
     src/SDL_keynames.c
     src/SDL_mouse.c
+    src/SDL_pen.c
     src/SDL_devices.c
     src/SDL_video.c
     src/SDL_surface.c
@@ -139,191 +130,235 @@ endif()
 # below.
 # ---------------------------------------------------------------------------
 if(NOT WIN32)
-  # Everything below needs pkg-config and POSIX system libraries; the
-  # Windows build links only Win32 system libraries (see further down).
+  # Everything in this block needs pkg-config and POSIX system libraries; the
+  # Windows build links only Win32 system libraries (see the WIN32 block below).
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
-  pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
-  pkg_check_modules(EGL REQUIRED egl)
-  pkg_check_modules(GBM REQUIRED gbm)
-  pkg_check_modules(LIBDRM REQUIRED libdrm)
-  option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
-  if(SDLOP_VIDEO_X11)
-    pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
-    if(NOT X11_XCB_FOUND)
-      message(STATUS "xcb headers not found - building without the X11 driver")
-      set(SDLOP_VIDEO_X11 OFF)
-    endif()
+pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
+pkg_check_modules(EGL REQUIRED egl)
+pkg_check_modules(GBM REQUIRED gbm)
+pkg_check_modules(LIBDRM REQUIRED libdrm)
+option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
+if(SDLOP_VIDEO_X11)
+  pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
+  if(NOT X11_XCB_FOUND)
+    message(STATUS "xcb headers not found - building without the X11 driver")
+    set(SDLOP_VIDEO_X11 OFF)
   endif()
-  # GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
-  pkg_check_modules(GLESV2 glesv2)
-  find_package(Vulkan QUIET)
-  pkg_check_modules(WAYLAND_SERVER wayland-server)
-
-  find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
-  pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
-  pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
-  pkg_get_variable(WAYLAND_CLIENT_DIR wayland-client pkgdatadir)
-
-  set(WL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
-  file(MAKE_DIRECTORY ${WL_GEN_DIR})
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/wayland-client-protocol.h ${WL_GEN_DIR}/wayland-client-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${WAYLAND_CLIENT_DIR}/wayland.xml
-            ${WL_GEN_DIR}/wayland-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} code
-            ${WAYLAND_CLIENT_DIR}/wayland.xml
-            ${WL_GEN_DIR}/wayland-client-protocol.c
-    DEPENDS ${WAYLAND_CLIENT_DIR}/wayland.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/xdg-shell-client-protocol.h ${WL_GEN_DIR}/xdg-shell-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-            ${WL_GEN_DIR}/xdg-shell-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-            ${WL_GEN_DIR}/xdg-shell-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/pointer-constraints-client-protocol.h ${WL_GEN_DIR}/pointer-constraints-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-            ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-            ${WL_GEN_DIR}/pointer-constraints-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/relative-pointer-client-protocol.h ${WL_GEN_DIR}/relative-pointer-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/relative-pointer-client-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/relative-pointer-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
-
-  # optional window-management protocols (bound when the compositor offers
-  # them): server-side decorations, idle inhibit, keyboard-shortcuts inhibit,
-  # activation/attention
-  set(SDLOP_WL_EXTRA_PROTOCOLS
-    "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
-    "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
-    "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
-    "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml"
-    "viewporter|stable/viewporter/viewporter.xml")
-  set(SDLOP_WL_EXTRA_OUTPUTS)
-  foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
-    string(REPLACE "|" ";" parts "${entry}")
-    list(GET parts 0 proto_name)
-    list(GET parts 1 proto_xml)
-    add_custom_command(
-      OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
-      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
-              ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
-              ${WL_GEN_DIR}/${proto_name}-client-protocol.h
-      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-              ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
-              ${WL_GEN_DIR}/${proto_name}-protocol.c
-      DEPENDS ${WAYLAND_PROTOCOLS_DIR}/${proto_xml})
-    list(APPEND SDLOP_WL_EXTRA_OUTPUTS
-      ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c)
-  endforeach()
-
-  # server-side codegen (used only by tests/test_pointer_lock's mini compositor)
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/xdg-shell-server-protocol.h ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
-            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-            ${WL_GEN_DIR}/xdg-shell-server-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
-            ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/viewporter-server-protocol.h ${WL_GEN_DIR}/viewporter-server-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
-            ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
-            ${WL_GEN_DIR}/viewporter-server-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
-            ${WL_GEN_DIR}/viewporter-server-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/pointer-constraints-server-protocol.h ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-            ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-            ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
-
-  add_custom_command(
-    OUTPUT ${WL_GEN_DIR}/relative-pointer-server-protocol.h ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/relative-pointer-server-protocol.h
-    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
-            ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
-            ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
-
-  # wlr virtual-pointer / zwp virtual-keyboard (vendored XMLs, not part of
-  # wayland-protocols): used only by test_virtual_input and the developer
-  # tools, generated on demand when one of them is built
-  set(SDLOP_WL_VIRTUAL_POINTER_XML ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml)
-  set(SDLOP_WL_VIRTUAL_KEYBOARD_XML ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
-  if (EXISTS ${SDLOP_WL_VIRTUAL_POINTER_XML} AND EXISTS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
-    set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS ON)
-    add_custom_command(
-      OUTPUT ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_POINTER_XML}
-              ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h
-      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_POINTER_XML}
-              ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-      DEPENDS ${SDLOP_WL_VIRTUAL_POINTER_XML})
-    add_custom_command(
-      OUTPUT ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h ${WL_GEN_DIR}/virtual-keyboard-protocol.c
-      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
-              ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h
-      COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
-              ${WL_GEN_DIR}/virtual-keyboard-protocol.c
-      DEPENDS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
-  else()
-    set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS OFF)
-  endif()
-
-  add_custom_target(sdlop_wayland_protocols
-    DEPENDS ${WL_GEN_DIR}/wayland-client-protocol.h
-            ${WL_GEN_DIR}/xdg-shell-client-protocol.h
-            ${WL_GEN_DIR}/xdg-shell-protocol.c
-            ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
-            ${WL_GEN_DIR}/pointer-constraints-protocol.c
-            ${WL_GEN_DIR}/relative-pointer-client-protocol.h
-            ${WL_GEN_DIR}/relative-pointer-protocol.c
-            ${WL_GEN_DIR}/xdg-shell-server-protocol.h
-            ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-            ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
-            ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-            ${WL_GEN_DIR}/relative-pointer-server-protocol.h
-            ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-            ${SDLOP_WL_EXTRA_OUTPUTS})
 endif()
+# GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
+pkg_check_modules(GLESV2 glesv2)
+find_package(Vulkan QUIET)
+pkg_check_modules(WAYLAND_SERVER wayland-server)
+
+find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
+pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
+pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+pkg_get_variable(WAYLAND_CLIENT_DIR wayland-client pkgdatadir)
+
+set(WL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
+file(MAKE_DIRECTORY ${WL_GEN_DIR})
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/wayland-client-protocol.h ${WL_GEN_DIR}/wayland-client-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+          ${WAYLAND_CLIENT_DIR}/wayland.xml
+          ${WL_GEN_DIR}/wayland-client-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} code
+          ${WAYLAND_CLIENT_DIR}/wayland.xml
+          ${WL_GEN_DIR}/wayland-client-protocol.c
+  DEPENDS ${WAYLAND_CLIENT_DIR}/wayland.xml)
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/xdg-shell-client-protocol.h ${WL_GEN_DIR}/xdg-shell-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+          ${WL_GEN_DIR}/xdg-shell-client-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+          ${WL_GEN_DIR}/xdg-shell-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/pointer-constraints-client-protocol.h ${WL_GEN_DIR}/pointer-constraints-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+          ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+          ${WL_GEN_DIR}/pointer-constraints-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/relative-pointer-client-protocol.h ${WL_GEN_DIR}/relative-pointer-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+          ${WL_GEN_DIR}/relative-pointer-client-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+          ${WL_GEN_DIR}/relative-pointer-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
+
+# optional window-management protocols (bound when the compositor offers
+# them): server-side decorations, idle inhibit, keyboard-shortcuts inhibit,
+# activation/attention
+set(SDLOP_WL_EXTRA_PROTOCOLS
+  "xdg-decoration|unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
+  "idle-inhibit|unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
+  "keyboard-shortcuts-inhibit|unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
+  "xdg-activation|staging/xdg-activation/xdg-activation-v1.xml"
+  "viewporter|stable/viewporter/viewporter.xml"
+  "primary-selection|unstable/primary-selection/primary-selection-unstable-v1.xml")
+set(SDLOP_WL_EXTRA_OUTPUTS)
+foreach(entry ${SDLOP_WL_EXTRA_PROTOCOLS})
+  string(REPLACE "|" ";" parts "${entry}")
+  list(GET parts 0 proto_name)
+  list(GET parts 1 proto_xml)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+            ${WL_GEN_DIR}/${proto_name}-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+            ${WAYLAND_PROTOCOLS_DIR}/${proto_xml}
+            ${WL_GEN_DIR}/${proto_name}-protocol.c
+    DEPENDS ${WAYLAND_PROTOCOLS_DIR}/${proto_xml})
+  list(APPEND SDLOP_WL_EXTRA_OUTPUTS
+    ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c)
+endforeach()
+
+# protocols newer than some distributions' wayland-protocols, vendored
+# like stock SDL3 does (src/video/wayland/protocols)
+set(SDLOP_WL_VENDORED_DIR ${CMAKE_SOURCE_DIR}/src/video/wayland/protocols)
+set(SDLOP_WL_VENDORED_PROTOCOLS
+  fractional-scale-v1
+  text-input-unstable-v3
+  tablet-v2
+  cursor-shape-v1
+  xdg-toplevel-icon-v1
+  xdg-dialog-v1
+  alpha-modifier-v1
+  pointer-warp-v1
+  pointer-gestures-unstable-v1
+  xdg-foreign-unstable-v2)
+foreach(proto_name ${SDLOP_WL_VENDORED_PROTOCOLS})
+  set(proto_xml ${SDLOP_WL_VENDORED_DIR}/${proto_name}.xml)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${proto_xml} ${WL_GEN_DIR}/${proto_name}-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${proto_xml} ${WL_GEN_DIR}/${proto_name}-protocol.c
+    DEPENDS ${proto_xml})
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/${proto_name}-server-protocol.h ${WL_GEN_DIR}/${proto_name}-server-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header ${proto_xml} ${WL_GEN_DIR}/${proto_name}-server-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${proto_xml} ${WL_GEN_DIR}/${proto_name}-server-protocol.c
+    DEPENDS ${proto_xml})
+  list(APPEND SDLOP_WL_EXTRA_OUTPUTS
+    ${WL_GEN_DIR}/${proto_name}-client-protocol.h ${WL_GEN_DIR}/${proto_name}-protocol.c
+    ${WL_GEN_DIR}/${proto_name}-server-protocol.h ${WL_GEN_DIR}/${proto_name}-server-protocol.c)
+endforeach()
+
+# server-side codegen (used only by tests/test_pointer_lock's mini compositor)
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/xdg-shell-server-protocol.h ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+          ${WL_GEN_DIR}/xdg-shell-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml
+          ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/viewporter-server-protocol.h ${WL_GEN_DIR}/viewporter-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+          ${WL_GEN_DIR}/viewporter-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml
+          ${WL_GEN_DIR}/viewporter-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml)
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/pointer-constraints-server-protocol.h ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+          ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+          ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml)
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/primary-selection-server-protocol.h ${WL_GEN_DIR}/primary-selection-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml
+          ${WL_GEN_DIR}/primary-selection-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml
+          ${WL_GEN_DIR}/primary-selection-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml)
+
+add_custom_command(
+  OUTPUT ${WL_GEN_DIR}/relative-pointer-server-protocol.h ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} server-header
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+          ${WL_GEN_DIR}/relative-pointer-server-protocol.h
+  COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+          ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml
+          ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+  DEPENDS ${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml)
+
+# wlr virtual-pointer / zwp virtual-keyboard (vendored XMLs, not part of
+# wayland-protocols): used only by test_virtual_input and the developer
+# tools, generated on demand when one of them is built
+set(SDLOP_WL_VIRTUAL_POINTER_XML ${CMAKE_SOURCE_DIR}/tests/protocols/wlr-virtual-pointer-unstable-v1.xml)
+set(SDLOP_WL_VIRTUAL_KEYBOARD_XML ${CMAKE_SOURCE_DIR}/tests/protocols/virtual-keyboard-unstable-v1.xml)
+if (EXISTS ${SDLOP_WL_VIRTUAL_POINTER_XML} AND EXISTS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
+  set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS ON)
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_POINTER_XML}
+            ${WL_GEN_DIR}/wlr-virtual-pointer-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_POINTER_XML}
+            ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+    DEPENDS ${SDLOP_WL_VIRTUAL_POINTER_XML})
+  add_custom_command(
+    OUTPUT ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
+            ${WL_GEN_DIR}/virtual-keyboard-client-protocol.h
+    COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${SDLOP_WL_VIRTUAL_KEYBOARD_XML}
+            ${WL_GEN_DIR}/virtual-keyboard-protocol.c
+    DEPENDS ${SDLOP_WL_VIRTUAL_KEYBOARD_XML})
+else()
+  set(SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS OFF)
+endif()
+
+add_custom_target(sdlop_wayland_protocols
+  DEPENDS ${WL_GEN_DIR}/wayland-client-protocol.h
+          ${WL_GEN_DIR}/xdg-shell-client-protocol.h
+          ${WL_GEN_DIR}/xdg-shell-protocol.c
+          ${WL_GEN_DIR}/pointer-constraints-client-protocol.h
+          ${WL_GEN_DIR}/pointer-constraints-protocol.c
+          ${WL_GEN_DIR}/relative-pointer-client-protocol.h
+          ${WL_GEN_DIR}/relative-pointer-protocol.c
+          ${WL_GEN_DIR}/xdg-shell-server-protocol.h
+          ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+          ${WL_GEN_DIR}/pointer-constraints-server-protocol.h
+          ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+          ${WL_GEN_DIR}/relative-pointer-server-protocol.h
+          ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+          ${WL_GEN_DIR}/primary-selection-server-protocol.h
+          ${WL_GEN_DIR}/primary-selection-server-protocol.c
+          ${SDLOP_WL_EXTRA_OUTPUTS})
 
 # ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
+endif()  # NOT WIN32: POSIX dependencies
+
 set(SDLop_SOURCES
   src/SDLop_core.c
-  src/internal/sdlop_platform.c
   src/SDL_stdlib.c
   src/SDL_error.c
   src/SDL_log.c
@@ -334,6 +369,7 @@ set(SDLop_SOURCES
   src/SDL_events_desc.c
   src/SDL_events_categories.c
   src/SDL_clipboard.c
+  src/SDL_dropevents.c
   src/SDL_thread.c
   src/SDL_misc.c
   src/SDL_joystick.c
@@ -347,8 +383,13 @@ set(SDLop_SOURCES
   src/SDL_keyboard.c
   src/SDL_keynames.c
   src/SDL_mouse.c
+  src/SDL_pen.c
   src/SDL_devices.c
   src/SDL_video.c
+  src/SDL_dbus.c
+  src/SDL_desktop.c
+  src/internal/sdlop_platform.c
+  src/SDL_dialog.c
   src/SDL_surface.c
   src/SDL_gl.c
   src/SDL_vulkan.c
@@ -358,6 +399,9 @@ set(SDLop_SOURCES
   src/video/sdlop_vk_offload.c
   src/video/sdlop_egl_dyn.c
   src/video/wayland/sdlop_wayland.c
+  src/video/wayland/sdlop_wayland_clipboard.c
+  src/video/wayland/sdlop_wayland_textinput.c
+  src/video/wayland/sdlop_wayland_tablet.c
   src/video/wayland/sdlop_wayland_dyn.c
   src/video/wayland/sdlop_wayland_gl.c
   src/video/wayland/sdlop_wayland_vulkan.c
@@ -372,10 +416,23 @@ set(SDLop_SOURCES
   src/video/dummy/sdlop_dummy.c
 )
 set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
+if(SDLOP_VIDEO_X11)
+  list(APPEND SDLop_SOURCES
+    src/video/x11/sdlop_x11.c
+    src/video/x11/sdlop_x11_dyn.c
+    src/video/x11/sdlop_x11_gl.c
+    src/video/x11/sdlop_x11_clipboard.c
+    src/video/x11/sdlop_x11_dnd.c
+    src/video/x11/sdlop_x11_xsettings.c
+    src/video/x11/sdlop_x11_pen.c
+    src/video/x11/sdlop_x11_xim.c
+    src/video/x11/sdlop_x11_vulkan.c)
+  list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+endif()
 
 if(WIN32)
-  # The Win32 driver, the POSIX-name shims it needs, and the VK -> SDL3
-  # keycode table. Everything above is POSIX-only and is filtered out below.
+  # The Win32 driver, the POSIX-name shims it needs, and the VK -> SDL3 keycode
+  # table. Everything above is POSIX-only and is removed here.
   list(APPEND SDLop_SOURCES
     src/internal/sdlop_win32_compat.c
     src/internal/sdlop_rawinput_win32.c
@@ -384,35 +441,41 @@ if(WIN32)
     src/video/windows/sdlop_windows_gl.c
     src/video/windows/sdlop_windows_vulkan.c
     src/video/sdlop_gl_offload_win32.c
-    src/video/sdlop_vk_offload_win32.c)
+    src/video/sdlop_vk_offload_win32.c
+    src/internal/sdlop_dbus_stub_win32.c)
   list(REMOVE_ITEM SDLop_SOURCES
     src/video/wayland/sdlop_wayland.c
     src/video/wayland/sdlop_wayland_dyn.c
     src/video/wayland/sdlop_wayland_protos.c
     src/video/wayland/sdlop_wayland_gl.c
     src/video/wayland/sdlop_wayland_vulkan.c
+    src/video/wayland/sdlop_wayland_clipboard.c
+    src/video/wayland/sdlop_wayland_tablet.c
+    src/video/wayland/sdlop_wayland_textinput.c
     src/video/kmsdrm/sdlop_kmsdrm.c
     src/video/kmsdrm/sdlop_kmsdrm_atomic.c
     src/video/kmsdrm/sdlop_kmsdrm_dyn.c
     src/video/kmsdrm/sdlop_kmsdrm_gl.c
     src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
     src/video/fbdev/sdlop_fbdev.c
+    src/video/x11/sdlop_x11.c
+    src/video/x11/sdlop_x11_dyn.c
+    src/video/x11/sdlop_x11_gl.c
+    src/video/x11/sdlop_x11_clipboard.c
+    src/video/x11/sdlop_x11_dnd.c
+    src/video/x11/sdlop_x11_xsettings.c
+    src/video/x11/sdlop_x11_pen.c
+    src/video/x11/sdlop_x11_xim.c
+    src/video/x11/sdlop_x11_vulkan.c
     src/video/sdlop_evdev.c
     src/video/sdlop_xcursor.c
     src/internal/sdlop_evdev.c
     src/sdlop_xkb_dyn.c
     src/video/sdlop_egl_dyn.c
     src/video/sdlop_gl_offload.c
-    src/video/sdlop_vk_offload.c)
+    src/video/sdlop_vk_offload.c
+    src/SDL_dbus.c)
   set(SDLop_VIDEO_DEFS SDLop_VIDEO_WINDOWS=1)
-endif()
-if(SDLOP_VIDEO_X11)
-  list(APPEND SDLop_SOURCES
-    src/video/x11/sdlop_x11.c
-    src/video/x11/sdlop_x11_dyn.c
-    src/video/x11/sdlop_x11_gl.c
-    src/video/x11/sdlop_x11_vulkan.c)
-  list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
 endif()
 
 # SDL3-style dynamic loading: wayland-client, xkbcommon and EGL are dlopen-ed
@@ -425,6 +488,7 @@ if(WIN32)
     user32
     gdi32
     opengl32
+    ws2_32
     shell32
     ole32
     uuid
@@ -510,8 +574,7 @@ endif()
 # Examples
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_EXAMPLES)
-  # wasd and raw_latency drive the Linux raw-input (evdev) API and clock_gettime,
-  # so they are built where that backend exists.
+  # raw_latency installs a SIGINT handler, which Win32 does not have
   if(WIN32)
     set(SDLOP_EXAMPLES window surface_plasma)
   else()
@@ -552,8 +615,8 @@ endif()
 if(SDLop_BUILD_TESTS)
   enable_testing()
   # Portable tests build and pass on every platform SDLop targets. The rest
-  # drive Linux-specific backends (evdev, fbdev, KMS, X11, Wayland, sysfs) or
-  # need pkg-config'd headers, and are registered in the !WIN32 branch below.
+  # drive POSIX-only backends (evdev, fbdev, KMS, X11, Wayland, D-Bus) and are
+  # registered further down.
   if(WIN32)
     set(SDLOP_PORTABLE_TESTS test_ring test_events test_layouts
         test_core test_main_callbacks test_threads test_iconv)
@@ -561,7 +624,7 @@ if(SDLop_BUILD_TESTS)
     set(SDLOP_PORTABLE_TESTS test_ring test_scancode test_events test_surface
         test_web test_keycodes test_layouts test_core test_main_callbacks
         test_misc test_threads test_vt_mask test_fbdev_device test_options
-        test_dropin_compat test_iconv)
+        test_dropin_compat test_iconv test_raw_translate test_dbus test_ime_txn)
   endif()
   foreach(t ${SDLOP_PORTABLE_TESTS})
     add_executable(${t} tests/${t}.c)
@@ -570,634 +633,636 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(${t} PRIVATE -UNDEBUG)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
-  # test_core exercises the clipboard, which is one global OS resource. Under a
-  # parallel ctest run it races the Windows clipboard test in both directions.
   set_tests_properties(test_core PROPERTIES RUN_SERIAL TRUE)
   if(NOT WIN32)
     target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
   endif()
 
   if(WIN32)
-    # The only Windows-specific test: the Win32 driver, WGL and the
-    # VK -> SDL3 keycode table all run through the portable set above.
+    # The Win32 driver, WGL, Vulkan and the VK -> SDL3 keycode table.
+    foreach(t test_win32_keycodes test_win32_scancodes test_win32_icc
+              test_win32_raw_keyboard test_win32_raw_input
+              test_win32_raw_input_events test_win32_raw_coexist
+              test_win32_raw_keyboard_once)
+      add_executable(${t} tests/${t}.c)
+      target_link_libraries(${t} PRIVATE sdlop)
+      target_include_directories(${t} PRIVATE src)
+      target_compile_options(${t} PRIVATE -UNDEBUG)
+      add_test(NAME ${t} COMMAND ${t})
+    endforeach()
+    set_tests_properties(test_win32_scancodes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+    # These inject input or drive global OS state (clipboard, foreground
+    # window, system-wide button mask), so they must not run beside anything.
+    foreach(t test_win32_cursor test_win32_hittest test_win32_shape
+              test_win32_raw_keyboard_e2e test_win32_raw_mouse_e2e
+              test_win32_gl test_win32_vulkan test_win32_clipboard)
+      add_executable(${t} tests/${t}.c)
+      target_link_libraries(${t} PRIVATE sdlop)
+      target_include_directories(${t} PRIVATE src)
+      target_compile_options(${t} PRIVATE -UNDEBUG)
+      add_test(NAME ${t} COMMAND ${t})
+      set_tests_properties(${t} PROPERTIES RUN_SERIAL TRUE)
+    endforeach()
+    target_link_libraries(test_win32_shape PRIVATE gdi32)
+    target_link_libraries(test_win32_gl PRIVATE opengl32)
+    set_tests_properties(test_win32_gl test_win32_vulkan PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+
+  if(NOT WIN32)  # POSIX-only tests: dummy+xcb/wayland/egl integrations
+    # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
+    # below, verified from a second xcb connection)
     add_executable(test_window_api tests/test_window_api.c)
     target_link_libraries(test_window_api PRIVATE sdlop)
     target_compile_options(test_window_api PRIVATE -UNDEBUG)
     add_test(NAME test_window_api COMMAND test_window_api dummy)
-    add_executable(test_win32_keycodes tests/test_win32_keycodes.c)
-    target_link_libraries(test_win32_keycodes PRIVATE sdlop)
-    target_include_directories(test_win32_keycodes PRIVATE src)
-    target_compile_options(test_win32_keycodes PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_keycodes COMMAND test_win32_keycodes)
-    # the scan code table must be stock SDL3's, not an identity cast
-    add_executable(test_win32_scancodes tests/test_win32_scancodes.c)
-    target_link_libraries(test_win32_scancodes PRIVATE sdlop)
-    target_include_directories(test_win32_scancodes PRIVATE src)
-    target_compile_options(test_win32_scancodes PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_scancodes COMMAND test_win32_scancodes)
-    set_tests_properties(test_win32_scancodes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
-    # cursors need a real window, so these run against the Windows driver
-    add_executable(test_win32_cursor tests/test_win32_cursor.c)
-    target_link_libraries(test_win32_cursor PRIVATE sdlop)
-    target_include_directories(test_win32_cursor PRIVATE src)
-    target_compile_options(test_win32_cursor PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_cursor COMMAND test_win32_cursor)
-    set_tests_properties(test_win32_cursor PROPERTIES RUN_SERIAL TRUE)
-    add_executable(test_win32_hittest tests/test_win32_hittest.c)
-    target_link_libraries(test_win32_hittest PRIVATE sdlop)
-    target_include_directories(test_win32_hittest PRIVATE src)
-    target_compile_options(test_win32_hittest PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_hittest COMMAND test_win32_hittest)
-    add_executable(test_win32_shape tests/test_win32_shape.c)
-    target_link_libraries(test_win32_shape PRIVATE sdlop gdi32)
-    target_include_directories(test_win32_shape PRIVATE src)
-    target_compile_options(test_win32_shape PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_shape COMMAND test_win32_shape)
-    add_executable(test_win32_icc tests/test_win32_icc.c)
-    target_link_libraries(test_win32_icc PRIVATE sdlop)
-    target_include_directories(test_win32_icc PRIVATE src)
-    target_compile_options(test_win32_icc PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_icc COMMAND test_win32_icc)
-    add_executable(test_win32_raw_keyboard tests/test_win32_raw_keyboard.c)
-    target_link_libraries(test_win32_raw_keyboard PRIVATE sdlop)
-    target_include_directories(test_win32_raw_keyboard PRIVATE src)
-    target_compile_options(test_win32_raw_keyboard PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_raw_keyboard COMMAND test_win32_raw_keyboard)
-    add_executable(test_win32_raw_input tests/test_win32_raw_input.c)
-    target_link_libraries(test_win32_raw_input PRIVATE sdlop)
-    target_include_directories(test_win32_raw_input PRIVATE src)
-    target_compile_options(test_win32_raw_input PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_raw_input COMMAND test_win32_raw_input)
-
-    add_executable(test_win32_raw_input_events tests/test_win32_raw_input_events.c)
-    target_link_libraries(test_win32_raw_input_events PRIVATE sdlop)
-    target_include_directories(test_win32_raw_input_events PRIVATE src)
-    target_compile_options(test_win32_raw_input_events PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_raw_input_events COMMAND test_win32_raw_input_events)
-
-    add_executable(test_win32_raw_coexist tests/test_win32_raw_coexist.c)
-    target_link_libraries(test_win32_raw_coexist PRIVATE sdlop)
-    target_include_directories(test_win32_raw_coexist PRIVATE src)
-    target_compile_options(test_win32_raw_coexist PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_raw_coexist COMMAND test_win32_raw_coexist)
-
-    add_executable(test_win32_raw_keyboard_e2e tests/test_win32_raw_keyboard_e2e.c)
-    target_link_libraries(test_win32_raw_keyboard_e2e PRIVATE sdlop)
-    target_include_directories(test_win32_raw_keyboard_e2e PRIVATE src)
-    target_compile_options(test_win32_raw_keyboard_e2e PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_raw_keyboard_e2e COMMAND test_win32_raw_keyboard_e2e)
-    set_tests_properties(test_win32_raw_keyboard_e2e PROPERTIES RUN_SERIAL TRUE)
-
-    add_executable(test_win32_raw_keyboard_once tests/test_win32_raw_keyboard_once.c)
-    target_link_libraries(test_win32_raw_keyboard_once PRIVATE sdlop)
-    target_include_directories(test_win32_raw_keyboard_once PRIVATE src)
-    target_compile_options(test_win32_raw_keyboard_once PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_raw_keyboard_once COMMAND test_win32_raw_keyboard_once)
-
-    add_executable(test_win32_clipboard tests/test_win32_clipboard.c)
-    target_link_libraries(test_win32_clipboard PRIVATE sdlop)
-    target_include_directories(test_win32_clipboard PRIVATE src)
-    target_compile_options(test_win32_clipboard PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_clipboard COMMAND test_win32_clipboard)
-    # The OS clipboard is one global resource: a parallel test that touches it
-    # corrupts this one and vice versa. Measured: test_core failed with
-    # "empty [!SDL_HasClipboardText()]" 4 runs out of 8 under -j3.
-    set_tests_properties(test_win32_clipboard PROPERTIES RUN_SERIAL TRUE)
-
-    add_executable(test_win32_raw_mouse_e2e tests/test_win32_raw_mouse_e2e.c)
-    target_link_libraries(test_win32_raw_mouse_e2e PRIVATE sdlop)
-    target_include_directories(test_win32_raw_mouse_e2e PRIVATE src)
-    target_compile_options(test_win32_raw_mouse_e2e PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_raw_mouse_e2e COMMAND test_win32_raw_mouse_e2e)
-    # Injected mouse events are global: pressing a button here would be seen by
-    # any test checking the system-wide button state at the same moment.
-    set_tests_properties(test_win32_raw_mouse_e2e PROPERTIES RUN_SERIAL TRUE)
-
-    add_executable(test_win32_gl tests/test_win32_gl.c)
-    target_link_libraries(test_win32_gl PRIVATE sdlop opengl32)
-    target_include_directories(test_win32_gl PRIVATE src)
-    target_compile_options(test_win32_gl PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_gl COMMAND test_win32_gl)
-    set_tests_properties(test_win32_gl PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
-
-    add_executable(test_win32_vulkan tests/test_win32_vulkan.c)
-    target_link_libraries(test_win32_vulkan PRIVATE sdlop)
-    target_include_directories(test_win32_vulkan PRIVATE src)
-    target_compile_options(test_win32_vulkan PRIVATE -UNDEBUG)
-    add_test(NAME test_win32_vulkan COMMAND test_win32_vulkan)
-    set_tests_properties(test_win32_vulkan PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
-    set_tests_properties(test_win32_raw_keyboard_once PROPERTIES RUN_SERIAL TRUE)
-  else()
-  # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
-  # below, verified from a second xcb connection)
-  add_executable(test_window_api tests/test_window_api.c)
-  target_link_libraries(test_window_api PRIVATE sdlop)
-  target_compile_options(test_window_api PRIVATE -UNDEBUG)
-  add_test(NAME test_window_api COMMAND test_window_api dummy)
-  # Wayland run: needs a compositor (WAYLAND_DISPLAY), skips otherwise
-  add_test(NAME test_window_api_wayland COMMAND test_window_api wayland)
-  # SDL_EGL_* / SDL_GL_ExtensionSupported against Mesa (skips without a
-  # display server; the X11 run is registered with the X11 tests)
-  add_executable(test_egl_api tests/test_egl_api.c)
-  target_link_libraries(test_egl_api PRIVATE sdlop)
-  target_compile_options(test_egl_api PRIVATE -UNDEBUG)
-  add_test(NAME test_egl_api_wayland COMMAND test_egl_api wayland)
-  # the generated headers must be valid C++ with C linkage
-  include(CheckLanguage)
-  check_language(CXX)
-  if(CMAKE_CXX_COMPILER)
-    enable_language(CXX)
-    add_executable(test_cxx_link tests/test_cxx_link.cpp)
-    target_link_libraries(test_cxx_link PRIVATE sdlop)
-    set_target_properties(test_cxx_link PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED ON)
-    target_compile_options(test_cxx_link PRIVATE -Wall -Wextra -pedantic -Werror -UNDEBUG)
-    add_test(NAME test_cxx_link COMMAND test_cxx_link)
-  endif()
-  # same keycode checks through the built-in US table (no libxkbcommon)
-  add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
-  set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
-
-  # integration tests that need real subsystems (auto-skip when unavailable)
-  add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
-  target_link_libraries(test_evdev_uinput PRIVATE sdlop)
-  target_include_directories(test_evdev_uinput PRIVATE src tests)
-  target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
-  add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
-
-  # Deterministic queue-pressure test through the real evdev worker. The
-  # process-local transport uses no input devices, root or display server.
-  add_executable(test_evdev_backpressure tests/test_evdev_backpressure.c bench/raw_pipe.c)
-  target_link_libraries(test_evdev_backpressure PRIVATE sdlop)
-  target_include_directories(test_evdev_backpressure PRIVATE src tests)
-  target_compile_options(test_evdev_backpressure PRIVATE -UNDEBUG)
-  target_link_options(test_evdev_backpressure PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
-  add_test(NAME test_evdev_backpressure COMMAND test_evdev_backpressure)
-  set_tests_properties(test_evdev_backpressure PROPERTIES TIMEOUT 15)
-
-  # Force the real worker's consumer-drains-mid-batch wakeup interleaving,
-  # and verify EVIOCSCLOCKID setup/fallback without kernel input devices.
-  add_executable(test_evdev_worker tests/test_evdev_worker.c)
-  target_link_libraries(test_evdev_worker PRIVATE sdlop)
-  target_include_directories(test_evdev_worker PRIVATE src tests)
-  target_compile_options(test_evdev_worker PRIVATE -UNDEBUG)
-  target_link_options(test_evdev_worker PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl
-    -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=__poll_chk -Wl,--wrap=epoll_wait)
-  foreach(mode wake busy monotonic negotiated-authoritative fallback-monotonic fallback-realtime)
-    add_test(NAME evdev_worker_${mode} COMMAND test_evdev_worker ${mode})
-    set_tests_properties(evdev_worker_${mode} PROPERTIES TIMEOUT 15)
-  endforeach()
-
-  # Callback snapshot lifetime, allocation failures and no-op updates.
-  add_executable(test_evdev_callbacks tests/test_evdev_callbacks.c bench/raw_pipe.c)
-  target_link_libraries(test_evdev_callbacks PRIVATE sdlop)
-  target_include_directories(test_evdev_callbacks PRIVATE tests)
-  target_compile_options(test_evdev_callbacks PRIVATE -UNDEBUG)
-  target_link_options(test_evdev_callbacks PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl
-    -Wl,--wrap=calloc -Wl,--wrap=free)
-  add_test(NAME test_evdev_callbacks COMMAND test_evdev_callbacks)
-  set_tests_properties(test_evdev_callbacks PROPERTIES TIMEOUT 15)
-
-  # Exact service/read boundaries and publication order in the real drain.
-  add_executable(test_evdev_dispatch tests/test_evdev_dispatch.c)
-  target_link_libraries(test_evdev_dispatch PRIVATE sdlop)
-  target_include_directories(test_evdev_dispatch PRIVATE src)
-  target_compile_options(test_evdev_dispatch PRIVATE -UNDEBUG)
-  target_link_options(test_evdev_dispatch PRIVATE -Wl,--wrap=read)
-  add_test(NAME test_evdev_dispatch COMMAND test_evdev_dispatch)
-  set_tests_properties(test_evdev_dispatch PROPERTIES TIMEOUT 15)
-
-  add_executable(test_wayland_scroll tests/test_wayland_scroll.c)
-  target_compile_options(test_wayland_scroll PRIVATE -UNDEBUG)
-  add_test(NAME test_wayland_scroll COMMAND test_wayland_scroll)
-
-  add_executable(test_evdev_absolute tests/test_evdev_absolute.c)
-  target_link_libraries(test_evdev_absolute PRIVATE sdlop)
-  target_include_directories(test_evdev_absolute PRIVATE src tests)
-  target_compile_options(test_evdev_absolute PRIVATE -UNDEBUG)
-  target_link_options(test_evdev_absolute PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
-  add_test(NAME test_evdev_absolute COMMAND test_evdev_absolute)
-  add_test(NAME test_evdev_text_repeat COMMAND test_evdev_absolute --repeat-only)
-  set_tests_properties(test_evdev_absolute test_evdev_text_repeat PROPERTIES TIMEOUT 30)
-
-  add_executable(test_evdev_syn_dropped tests/test_evdev_syn_dropped.c)
-  target_link_libraries(test_evdev_syn_dropped PRIVATE sdlop)
-  target_include_directories(test_evdev_syn_dropped PRIVATE tests)
-  target_compile_options(test_evdev_syn_dropped PRIVATE -UNDEBUG)
-  target_link_options(test_evdev_syn_dropped PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
-  add_test(NAME test_evdev_syn_dropped COMMAND test_evdev_syn_dropped)
-  set_tests_properties(test_evdev_syn_dropped PROPERTIES TIMEOUT 15)
-
-  add_executable(test_evdev_recovery tests/test_evdev_recovery.c)
-  target_link_libraries(test_evdev_recovery PRIVATE sdlop)
-  target_include_directories(test_evdev_recovery PRIVATE src tests)
-  target_compile_options(test_evdev_recovery PRIVATE -UNDEBUG)
-  target_link_options(test_evdev_recovery PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl
-    -Wl,--wrap=epoll_wait)
-  add_test(NAME test_evdev_recovery COMMAND test_evdev_recovery)
-  set_tests_properties(test_evdev_recovery PROPERTIES TIMEOUT 30)
-
-  add_executable(test_input_lifecycle tests/test_input_lifecycle.c)
-  target_link_libraries(test_input_lifecycle PRIVATE sdlop)
-  target_include_directories(test_input_lifecycle PRIVATE src tests)
-  target_compile_options(test_input_lifecycle PRIVATE -UNDEBUG)
-  target_link_options(test_input_lifecycle PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl -Wl,--wrap=read)
-  foreach(mode unplug repeat-grab wheel wheel-focus key-alias compose)
-    add_test(NAME input_lifecycle_${mode} COMMAND test_input_lifecycle ${mode})
-    set_tests_properties(input_lifecycle_${mode} PROPERTIES TIMEOUT 15)
-  endforeach()
-
-  add_executable(test_input_transport tests/test_input_transport.c)
-  target_include_directories(test_input_transport PRIVATE tests)
-  target_compile_options(test_input_transport PRIVATE -UNDEBUG)
-  target_link_options(test_input_transport PRIVATE
-    -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=__poll_chk -Wl,--wrap=clock_gettime)
-  add_test(NAME test_input_transport COMMAND test_input_transport)
-  set_tests_properties(test_input_transport PROPERTIES TIMEOUT 5)
-
-  # Benchmark accounting is testable without input devices or a display.
-  add_executable(test_raw_latency_bench tests/test_raw_latency_bench.c tests/uinput_synth.c)
-  target_link_libraries(test_raw_latency_bench PRIVATE sdlop)
-  target_include_directories(test_raw_latency_bench PRIVATE tests)
-  target_compile_options(test_raw_latency_bench PRIVATE -UNDEBUG)
-  add_test(NAME test_raw_latency_bench COMMAND test_raw_latency_bench)
-
-  add_executable(test_wayland tests/test_wayland.c)
-  target_link_libraries(test_wayland PRIVATE sdlop)
-  target_include_directories(test_wayland PRIVATE src)
-  target_compile_options(test_wayland PRIVATE -UNDEBUG)
-  add_test(NAME test_wayland COMMAND test_wayland)
-
-  # X11 driver integration test (needs a running X server, e.g. xvfb-run;
-  # skips without DISPLAY). Only the *test* links xcb/xcb-xtest - it drives
-  # input through XTest and verifies state from its own connection.
-  if(SDLOP_VIDEO_X11)
-    pkg_check_modules(X11_TEST_DEPS xcb xcb-xtest)
-    if(X11_TEST_DEPS_FOUND)
-      add_executable(test_x11 tests/test_x11.c)
-      target_link_libraries(test_x11 PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
-      target_include_directories(test_x11 PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
-      target_compile_options(test_x11 PRIVATE -UNDEBUG)
-      add_test(NAME test_x11 COMMAND test_x11)
-      target_compile_definitions(test_window_api PRIVATE SDLOP_TEST_HAVE_XCB=1)
-      target_link_libraries(test_window_api PRIVATE ${X11_TEST_DEPS_LIBRARIES})
-      target_include_directories(test_window_api PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
-      add_test(NAME test_window_api_x11 COMMAND test_window_api x11)
-      set_tests_properties(test_window_api_x11 PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-      add_test(NAME test_egl_api_x11 COMMAND test_egl_api x11)
-      # same suite through the xcb_put_image fallback (no MIT-SHM)
-      add_test(NAME test_x11_noshm COMMAND test_x11)
-      # and with only libxcb itself: no SHM / XKB / XInput2 / RandR, i.e.
-      # put_image, core keymap + timestamp repeat detection, warp-based
-      # relative mode and a single root-window display
-      add_test(NAME test_x11_minimal COMMAND test_x11)
-      set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-      # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
-      add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
-      target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
-      target_include_directories(test_x11_raw_source PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
-      target_compile_options(test_x11_raw_source PRIVATE -UNDEBUG)
-      add_test(NAME test_x11_raw_source COMMAND test_x11_raw_source)
-      set_tests_properties(test_x11_raw_source PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-      # desktop GL on X11 is GLX (GLEW & co. need glXGetCurrentDisplay);
-      # GLES / SDL_VIDEO_FORCE_EGL use EGL. libGL is dlopen-ed at run time.
-      add_executable(test_glx tests/test_glx.c)
-      target_link_libraries(test_glx PRIVATE sdlop ${CMAKE_DL_LIBS})
-      target_compile_options(test_glx PRIVATE -UNDEBUG)
-      add_test(NAME test_glx COMMAND test_glx)
-      set_tests_properties(test_glx PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-      set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
-      set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
-        "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none")
+    # Wayland run: needs a compositor (WAYLAND_DISPLAY), skips otherwise
+    add_test(NAME test_window_api_wayland COMMAND test_window_api wayland)
+    # SDL_EGL_* / SDL_GL_ExtensionSupported against Mesa (skips without a
+    # display server; the X11 run is registered with the X11 tests)
+    add_executable(test_egl_api tests/test_egl_api.c)
+    target_link_libraries(test_egl_api PRIVATE sdlop)
+    target_compile_options(test_egl_api PRIVATE -UNDEBUG)
+    add_test(NAME test_egl_api_wayland COMMAND test_egl_api wayland)
+    # the generated headers must be valid C++ with C linkage
+    include(CheckLanguage)
+    check_language(CXX)
+    if(CMAKE_CXX_COMPILER)
+      enable_language(CXX)
+      add_executable(test_cxx_link tests/test_cxx_link.cpp)
+      target_link_libraries(test_cxx_link PRIVATE sdlop)
+      set_target_properties(test_cxx_link PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED ON)
+      target_compile_options(test_cxx_link PRIVATE -Wall -Wextra -pedantic -Werror -UNDEBUG)
+      add_test(NAME test_cxx_link COMMAND test_cxx_link)
     endif()
-    # keyboard layouts end-to-end (setxkbmap + XKB group locking; the test
-    # restores the server layout). Skips where the keymap cannot be set.
-    pkg_check_modules(X11_LAYOUT_DEPS xcb xcb-xtest xcb-xkb)
-    if(X11_LAYOUT_DEPS_FOUND)
-      add_executable(test_x11_layout tests/test_x11_layout.c)
-      target_link_libraries(test_x11_layout PRIVATE sdlop ${X11_LAYOUT_DEPS_LIBRARIES})
-      target_include_directories(test_x11_layout PRIVATE ${X11_LAYOUT_DEPS_INCLUDE_DIRS})
-      target_compile_options(test_x11_layout PRIVATE -UNDEBUG)
-      add_test(NAME test_x11_layout COMMAND test_x11_layout)
-      set_tests_properties(test_x11_layout PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    # same keycode checks through the built-in US table (no libxkbcommon)
+    add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
+    set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
+
+    # integration tests that need real subsystems (auto-skip when unavailable)
+    add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
+    target_link_libraries(test_evdev_uinput PRIVATE sdlop)
+    target_include_directories(test_evdev_uinput PRIVATE src tests)
+    target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
+    add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
+
+    add_executable(test_wayland tests/test_wayland.c)
+    target_link_libraries(test_wayland PRIVATE sdlop)
+    target_include_directories(test_wayland PRIVATE src)
+    target_compile_options(test_wayland PRIVATE -UNDEBUG)
+    add_test(NAME test_wayland COMMAND test_wayland)
+
+    # X11 driver integration test (needs a running X server, e.g. xvfb-run;
+    # skips without DISPLAY). Only the *test* links xcb/xcb-xtest - it drives
+    # input through XTest and verifies state from its own connection.
+    if(SDLOP_VIDEO_X11)
+      pkg_check_modules(X11_TEST_DEPS xcb xcb-xtest)
+      if(X11_TEST_DEPS_FOUND)
+        add_executable(test_x11 tests/test_x11.c)
+        target_link_libraries(test_x11 PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_x11 PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11 PRIVATE -UNDEBUG)
+        add_test(NAME test_x11 COMMAND test_x11)
+        target_compile_definitions(test_window_api PRIVATE SDLOP_TEST_HAVE_XCB=1)
+        target_link_libraries(test_window_api PRIVATE ${X11_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_window_api PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        add_test(NAME test_window_api_x11 COMMAND test_window_api x11)
+        set_tests_properties(test_window_api_x11 PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        add_test(NAME test_egl_api_x11 COMMAND test_egl_api x11)
+        # same suite through the xcb_put_image fallback (no MIT-SHM)
+        add_test(NAME test_x11_noshm COMMAND test_x11)
+        # and with only libxcb itself: no SHM / XKB / XInput2 / RandR, i.e.
+        # put_image, core keymap + timestamp repeat detection, warp-based
+        # relative mode and a single root-window display
+        add_test(NAME test_x11_minimal COMMAND test_x11)
+        set_tests_properties(test_x11 test_x11_noshm test_x11_minimal PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        # system clipboard / primary selection against other X clients (raw
+        # xcb requestor + owner thread), with and without XFixes
+        add_executable(test_x11_clipboard tests/test_x11_clipboard.c)
+        target_link_libraries(test_x11_clipboard PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} pthread)
+        target_include_directories(test_x11_clipboard PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_clipboard PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_clipboard COMMAND test_x11_clipboard)
+        add_test(NAME test_x11_clipboard_noxfixes COMMAND test_x11_clipboard)
+        set_tests_properties(test_x11_clipboard test_x11_clipboard_noxfixes PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        set_tests_properties(test_x11_clipboard_noxfixes PROPERTIES ENVIRONMENT "SDLOP_LIB_XCB_XFIXES=none")
+        # SDL_SetWindowHitTest / SDL_ShowWindowSystemMenu: EWMH messages to the root
+        add_executable(test_x11_hittest tests/test_x11_hittest.c)
+        target_link_libraries(test_x11_hittest PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_x11_hittest PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_hittest PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_hittest COMMAND test_x11_hittest)
+        set_tests_properties(test_x11_hittest PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        # SDL_WINDOW_TRANSPARENT: ARGB visual, surface alpha read back
+        add_executable(test_x11_transparent tests/test_x11_transparent.c)
+        target_link_libraries(test_x11_transparent PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_x11_transparent PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_transparent PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_transparent COMMAND test_x11_transparent)
+        add_test(NAME test_x11_transparent_noshm COMMAND test_x11_transparent)
+        set_tests_properties(test_x11_transparent test_x11_transparent_noshm PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        set_tests_properties(test_x11_transparent_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
+        # SDL_SetWindowShape: XShape input shapes (the test itself needs xcb-shape)
+        pkg_check_modules(X11_SHAPE_TEST_DEPS xcb xcb-shape)
+        if(X11_SHAPE_TEST_DEPS_FOUND)
+          add_executable(test_x11_shape tests/test_x11_shape.c)
+          target_link_libraries(test_x11_shape PRIVATE sdlop ${X11_SHAPE_TEST_DEPS_LIBRARIES})
+          target_include_directories(test_x11_shape PRIVATE ${X11_SHAPE_TEST_DEPS_INCLUDE_DIRS})
+          target_compile_options(test_x11_shape PRIVATE -UNDEBUG)
+          add_test(NAME test_x11_shape COMMAND test_x11_shape)
+          add_test(NAME test_x11_shape_nomodule COMMAND test_x11_shape)
+          set_tests_properties(test_x11_shape test_x11_shape_nomodule PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+          set_tests_properties(test_x11_shape_nomodule PROPERTIES ENVIRONMENT "SDLOP_LIB_XCB_SHAPE=none")
+        else()
+          message(STATUS "xcb-shape not found: test_x11_shape not built")
+        endif()
+        # SDL_GetWindowICCProfile / SDL_EVENT_WINDOW_ICCPROF_CHANGED (_ICC_PROFILE)
+        add_executable(test_x11_icc tests/test_x11_icc.c)
+        target_link_libraries(test_x11_icc PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_x11_icc PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_icc PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_icc COMMAND test_x11_icc)
+        set_tests_properties(test_x11_icc PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        # SDL_SetWindowMouseRect via XFixes pointer barriers (+ warp-back fallback)
+        pkg_check_modules(X11_XFIXES_TEST xcb-xfixes)
+        if(X11_XFIXES_TEST_FOUND)
+          add_executable(test_x11_barriers tests/test_x11_barriers.c)
+          target_link_libraries(test_x11_barriers PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${X11_XFIXES_TEST_LIBRARIES})
+          target_include_directories(test_x11_barriers PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS} ${X11_XFIXES_TEST_INCLUDE_DIRS})
+          target_compile_options(test_x11_barriers PRIVATE -UNDEBUG)
+          add_test(NAME test_x11_barriers COMMAND test_x11_barriers)
+          add_test(NAME test_x11_barriers_nomodule COMMAND test_x11_barriers)
+          set_tests_properties(test_x11_barriers test_x11_barriers_nomodule PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+          set_tests_properties(test_x11_barriers_nomodule PROPERTIES ENVIRONMENT "SDLOP_LIB_XCB_XFIXES=none")
+        endif()
+        # exclusive fullscreen modes via XRandR (adds a user mode to Xvfb)
+        pkg_check_modules(X11_RANDR_TEST xcb-randr)
+        if(X11_RANDR_TEST_FOUND)
+          add_executable(test_x11_modes tests/test_x11_modes.c)
+          target_link_libraries(test_x11_modes PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${X11_RANDR_TEST_LIBRARIES})
+          target_include_directories(test_x11_modes PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS} ${X11_RANDR_TEST_INCLUDE_DIRS})
+          target_compile_options(test_x11_modes PRIVATE -UNDEBUG)
+          add_test(NAME test_x11_modes COMMAND test_x11_modes)
+          set_tests_properties(test_x11_modes PROPERTIES RUN_SERIAL TRUE TIMEOUT 90)
+        endif()
+        # XSETTINGS content scale against a raw xcb settings manager
+        add_executable(test_x11_xsettings tests/test_x11_xsettings.c)
+        target_link_libraries(test_x11_xsettings PRIVATE sdlop m ${X11_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_x11_xsettings PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_xsettings PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_xsettings COMMAND test_x11_xsettings)
+        add_test(NAME test_x11_xsettings_off COMMAND test_x11_xsettings)
+        set_tests_properties(test_x11_xsettings test_x11_xsettings_off PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        set_tests_properties(test_x11_xsettings_off PROPERTIES ENVIRONMENT "SDLOP_X11_NO_XSETTINGS=1")
+        # _NET_WM_SYNC_REQUEST resize sync (the test itself needs xcb-sync)
+        pkg_check_modules(X11_SYNC_TEST_DEPS xcb xcb-sync)
+        if(X11_SYNC_TEST_DEPS_FOUND)
+          add_executable(test_x11_sync tests/test_x11_sync.c)
+          target_link_libraries(test_x11_sync PRIVATE sdlop ${X11_SYNC_TEST_DEPS_LIBRARIES})
+          target_include_directories(test_x11_sync PRIVATE ${X11_SYNC_TEST_DEPS_INCLUDE_DIRS})
+          target_compile_options(test_x11_sync PRIVATE -UNDEBUG)
+          add_test(NAME test_x11_sync COMMAND test_x11_sync)
+          add_test(NAME test_x11_sync_nomodule COMMAND test_x11_sync)
+          set_tests_properties(test_x11_sync test_x11_sync_nomodule PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+          set_tests_properties(test_x11_sync_nomodule PROPERTIES ENVIRONMENT "SDLOP_LIB_XCB_SYNC=none")
+        else()
+          message(STATUS "xcb-sync not found: test_x11_sync not built")
+        endif()
+        # XDND drag-and-drop target against a raw xcb drag source
+        add_executable(test_x11_dnd tests/test_x11_dnd.c)
+        target_link_libraries(test_x11_dnd PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES})
+        target_include_directories(test_x11_dnd PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_dnd PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_dnd COMMAND test_x11_dnd)
+        set_tests_properties(test_x11_dnd PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        # XIM input method against a fake XIM server (xcb-imdkit, test only)
+        pkg_check_modules(XIM_TEST_DEPS xcb-imdkit)
+        if(XIM_TEST_DEPS_FOUND)
+          add_executable(test_x11_xim tests/test_x11_xim.c)
+          target_link_libraries(test_x11_xim PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${XIM_TEST_DEPS_LIBRARIES})
+          target_include_directories(test_x11_xim PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS} ${XIM_TEST_DEPS_INCLUDE_DIRS})
+          target_compile_options(test_x11_xim PRIVATE -UNDEBUG)
+          add_test(NAME test_x11_xim COMMAND test_x11_xim root)
+          add_test(NAME test_x11_xim_composition COMMAND test_x11_xim composition)
+          set_tests_properties(test_x11_xim test_x11_xim_composition PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        else()
+          message(STATUS "xcb-imdkit not found: test_x11_xim not built")
+        endif()
+        # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
+        add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
+        target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
+        target_include_directories(test_x11_raw_source PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_raw_source PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_raw_source COMMAND test_x11_raw_source)
+        set_tests_properties(test_x11_raw_source PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        # desktop GL on X11 is GLX (GLEW & co. need glXGetCurrentDisplay);
+        # GLES / SDL_VIDEO_FORCE_EGL use EGL. libGL is dlopen-ed at run time.
+        add_executable(test_glx tests/test_glx.c)
+        target_link_libraries(test_glx PRIVATE sdlop ${CMAKE_DL_LIBS})
+        target_compile_options(test_glx PRIVATE -UNDEBUG)
+        add_test(NAME test_glx COMMAND test_glx)
+        set_tests_properties(test_glx PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        set_tests_properties(test_x11_noshm PROPERTIES ENVIRONMENT "SDLOP_X11_NO_SHM=1")
+        set_tests_properties(test_x11_minimal PROPERTIES ENVIRONMENT
+          "SDLOP_LIB_XCB_SHM=none;SDLOP_LIB_XCB_XKB=none;SDLOP_LIB_XKBCOMMON_X11=none;SDLOP_LIB_XCB_XINPUT=none;SDLOP_LIB_XCB_RANDR=none;SDLOP_LIB_XCB_RENDER=none;SDLOP_LIB_XCB_XFIXES=none")
+      endif()
+      # keyboard layouts end-to-end (setxkbmap + XKB group locking; the test
+      # restores the server layout). Skips where the keymap cannot be set.
+      pkg_check_modules(X11_LAYOUT_DEPS xcb xcb-xtest xcb-xkb)
+      if(X11_LAYOUT_DEPS_FOUND)
+        add_executable(test_x11_layout tests/test_x11_layout.c)
+        target_link_libraries(test_x11_layout PRIVATE sdlop ${X11_LAYOUT_DEPS_LIBRARIES})
+        target_include_directories(test_x11_layout PRIVATE ${X11_LAYOUT_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_layout PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_layout COMMAND test_x11_layout)
+        set_tests_properties(test_x11_layout PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      endif()
+      # XI2.2 multitouch: an in-test X protocol proxy injects touch events
+      # (Xvfb has no touch devices)
+      pkg_check_modules(X11_TOUCH_DEPS xcb xcb-xinput)
+      if(X11_TOUCH_DEPS_FOUND)
+        add_executable(test_x11_touch tests/test_x11_touch.c)
+        target_link_libraries(test_x11_touch PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} pthread m)
+        target_include_directories(test_x11_touch PRIVATE ${X11_TOUCH_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_touch PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_touch COMMAND test_x11_touch)
+        set_tests_properties(test_x11_touch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        # XI2 pens: the same kind of proxy adds a fake tablet to XIQueryDevice
+        add_executable(test_x11_pen tests/test_x11_pen.c)
+        target_link_libraries(test_x11_pen PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} pthread m)
+        target_include_directories(test_x11_pen PRIVATE ${X11_TOUCH_DEPS_INCLUDE_DIRS})
+        target_compile_options(test_x11_pen PRIVATE -UNDEBUG)
+        add_test(NAME test_x11_pen COMMAND test_x11_pen on)
+        add_test(NAME test_x11_pen_off COMMAND test_x11_pen off)
+        set_tests_properties(test_x11_pen test_x11_pen_off PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      endif()
     endif()
-    # XI2.2 multitouch: an in-test X protocol proxy injects touch events
-    # (Xvfb has no touch devices)
-    pkg_check_modules(X11_TOUCH_DEPS xcb xcb-xinput)
-    if(X11_TOUCH_DEPS_FOUND)
-      add_executable(test_x11_touch tests/test_x11_touch.c)
-      target_link_libraries(test_x11_touch PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} pthread m)
-      target_include_directories(test_x11_touch PRIVATE ${X11_TOUCH_DEPS_INCLUDE_DIRS})
-      target_compile_options(test_x11_touch PRIVATE -UNDEBUG)
-      add_test(NAME test_x11_touch COMMAND test_x11_touch)
-      set_tests_properties(test_x11_touch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
+    # framebuffer (fbdev) driver: needs no device - SDLOP_FBDEV_DUMP makes the
+    # driver render into RAM and dump each presented frame as a PPM we check
+    add_executable(test_fbdev tests/test_fbdev.c)
+    target_link_libraries(test_fbdev PRIVATE sdlop)
+    target_include_directories(test_fbdev PRIVATE src)
+    target_compile_options(test_fbdev PRIVATE -UNDEBUG)
+    add_test(NAME test_fbdev COMMAND test_fbdev)
+    set_tests_properties(test_fbdev PROPERTIES
+      ENVIRONMENT "SDLOP_DISABLE_RAW_INPUT=1;SDLOP_TEST_STRICT=1;SDLOP_FBDEV_SIZE=320x240;SDLOP_FBDEV_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test_fbdev_frame.ppm"
+      TIMEOUT 60)
+
+    add_executable(test_kmsdrm tests/test_kmsdrm.c)
+    target_link_libraries(test_kmsdrm PRIVATE sdlop)
+    target_include_directories(test_kmsdrm PRIVATE src)
+    target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
+    add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
+
+    add_executable(test_gl_offload tests/test_gl_offload.c)
+    target_link_libraries(test_gl_offload PRIVATE sdlop)
+    target_include_directories(test_gl_offload PRIVATE src)
+    target_compile_options(test_gl_offload PRIVATE -UNDEBUG)
+    add_test(NAME test_gl_offload COMMAND test_gl_offload)
+
+    add_executable(test_vk_offload tests/test_vk_offload.c)
+    target_link_libraries(test_vk_offload PRIVATE sdlop)
+    target_include_directories(test_vk_offload PRIVATE src)
+    target_compile_options(test_vk_offload PRIVATE -UNDEBUG)
+    add_test(NAME test_vk_offload COMMAND test_vk_offload)
+
+    # KMS present-path benchmark (not a ctest gate; skips without KMS)
+    add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
+    target_link_libraries(bench_kmsdrm PRIVATE sdlop)
+    target_include_directories(bench_kmsdrm PRIVATE src)
+    target_compile_options(bench_kmsdrm PRIVATE -UNDEBUG)
+
+    if(GLESV2_FOUND)
+      add_executable(test_gl tests/test_gl.c)
+      target_link_libraries(test_gl PRIVATE sdlop ${GLESV2_LIBRARIES})
+      target_include_directories(test_gl PRIVATE src ${GLESV2_INCLUDE_DIRS})
+      target_compile_options(test_gl PRIVATE -UNDEBUG)
+      add_test(NAME test_gl COMMAND test_gl)
+    else()
+      message(STATUS "GLESv2 not found - skipping test_gl")
+    endif()
+
+    # pointer lock integration test (runs against tests/mini_compositor.c)
+    if(WAYLAND_SERVER_FOUND)
+      add_executable(mini_compositor tests/mini_compositor.c
+        ${WL_GEN_DIR}/xdg-shell-server-protocol.c
+        ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
+        ${WL_GEN_DIR}/relative-pointer-server-protocol.c
+        ${WL_GEN_DIR}/viewporter-server-protocol.c
+        ${WL_GEN_DIR}/primary-selection-server-protocol.c
+        ${WL_GEN_DIR}/fractional-scale-v1-server-protocol.c
+        ${WL_GEN_DIR}/text-input-unstable-v3-server-protocol.c
+        ${WL_GEN_DIR}/tablet-v2-server-protocol.c
+        ${WL_GEN_DIR}/cursor-shape-v1-server-protocol.c
+        ${WL_GEN_DIR}/xdg-toplevel-icon-v1-server-protocol.c
+        ${WL_GEN_DIR}/xdg-dialog-v1-server-protocol.c
+        ${WL_GEN_DIR}/alpha-modifier-v1-server-protocol.c
+        ${WL_GEN_DIR}/pointer-warp-v1-server-protocol.c
+        ${WL_GEN_DIR}/pointer-gestures-unstable-v1-server-protocol.c
+        ${WL_GEN_DIR}/xdg-foreign-unstable-v2-server-protocol.c)
+      add_dependencies(mini_compositor sdlop_wayland_protocols)
+      target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
+      target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
+
+      add_executable(test_pointer_lock tests/test_pointer_lock.c)
+      target_link_libraries(test_pointer_lock PRIVATE sdlop m)
+      target_include_directories(test_pointer_lock PRIVATE src)
+      target_compile_options(test_pointer_lock PRIVATE -UNDEBUG)
+      add_dependencies(test_pointer_lock mini_compositor)
+      add_test(NAME test_pointer_lock COMMAND test_pointer_lock $<TARGET_FILE:mini_compositor>)
+
+      add_executable(test_touch tests/test_touch.c)
+      target_link_libraries(test_touch PRIVATE sdlop m)
+      target_include_directories(test_touch PRIVATE src)
+      target_compile_options(test_touch PRIVATE -UNDEBUG)
+      add_dependencies(test_touch mini_compositor)
+      add_test(NAME test_touch COMMAND test_touch $<TARGET_FILE:mini_compositor>)
+
+      # wl_buffer release contract of software presentation
+      add_executable(test_wayland_buffers tests/test_wayland_buffers.c)
+      target_include_directories(test_wayland_buffers PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+      target_link_libraries(test_wayland_buffers PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
+      target_compile_options(test_wayland_buffers PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_buffers mini_compositor)
+      add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
+      add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
+
+      # clipboard + primary selection between two SDL processes
+      add_executable(test_wayland_clipboard tests/test_wayland_clipboard.c)
+      target_link_libraries(test_wayland_clipboard PRIVATE sdlop)
+      target_compile_options(test_wayland_clipboard PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_clipboard mini_compositor)
+      add_test(NAME test_wayland_clipboard COMMAND test_wayland_clipboard $<TARGET_FILE:mini_compositor>)
+      set_tests_properties(test_wayland_clipboard PROPERTIES TIMEOUT 60)
+
+      # drag-and-drop target (synthetic drags from the mini compositor)
+      add_executable(test_wayland_dnd tests/test_wayland_dnd.c)
+      target_link_libraries(test_wayland_dnd PRIVATE sdlop)
+      target_compile_options(test_wayland_dnd PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_dnd mini_compositor)
+      # HiDPI: fractional / preferred buffer / output scales
+      add_executable(test_wayland_cursor tests/test_wayland_cursor.c)
+      target_link_libraries(test_wayland_cursor PRIVATE sdlop)
+      target_compile_options(test_wayland_cursor PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_cursor mini_compositor)
+      foreach(cursor_mode shape noshape theme)
+        add_test(NAME test_wayland_cursor_${cursor_mode}
+                 COMMAND test_wayland_cursor $<TARGET_FILE:mini_compositor> ${cursor_mode})
+        set_tests_properties(test_wayland_cursor_${cursor_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+
+      add_executable(test_wayland_toplevel tests/test_wayland_toplevel.c)
+      target_link_libraries(test_wayland_toplevel PRIVATE sdlop)
+      target_compile_options(test_wayland_toplevel PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_toplevel mini_compositor)
+      foreach(toplevel_mode all none)
+        add_test(NAME test_wayland_toplevel_${toplevel_mode}
+                 COMMAND test_wayland_toplevel $<TARGET_FILE:mini_compositor> ${toplevel_mode})
+        set_tests_properties(test_wayland_toplevel_${toplevel_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+
+      add_executable(test_wayland_pen tests/test_wayland_pen.c)
+      target_link_libraries(test_wayland_pen PRIVATE sdlop m)
+      target_compile_options(test_wayland_pen PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_pen mini_compositor)
+      foreach(pen_mode on off)
+        add_test(NAME test_wayland_pen_${pen_mode} COMMAND test_wayland_pen $<TARGET_FILE:mini_compositor> ${pen_mode})
+        set_tests_properties(test_wayland_pen_${pen_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+
+      add_executable(test_wayland_wheel tests/test_wayland_wheel.c)
+      target_link_libraries(test_wayland_wheel PRIVATE sdlop m)
+      target_compile_options(test_wayland_wheel PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_wheel mini_compositor)
+      foreach(wheel_mode v9 v7 v4)
+        add_test(NAME test_wayland_wheel_${wheel_mode}
+                 COMMAND test_wayland_wheel $<TARGET_FILE:mini_compositor> ${wheel_mode})
+        set_tests_properties(test_wayland_wheel_${wheel_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+      add_executable(test_wayland_pinch tests/test_wayland_pinch.c)
+      target_link_libraries(test_wayland_pinch PRIVATE sdlop m)
+      target_compile_options(test_wayland_pinch PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_pinch mini_compositor)
+      foreach(pinch_mode v3 v1 off)
+        add_test(NAME test_wayland_pinch_${pinch_mode}
+                 COMMAND test_wayland_pinch $<TARGET_FILE:mini_compositor> ${pinch_mode})
+        set_tests_properties(test_wayland_pinch_${pinch_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+
+      add_executable(test_wayland_warp tests/test_wayland_warp.c)
+      target_link_libraries(test_wayland_warp PRIVATE sdlop)
+      target_compile_options(test_wayland_warp PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_warp mini_compositor)
+      foreach(warp_mode warp hint)
+        add_test(NAME test_wayland_warp_${warp_mode}
+                 COMMAND test_wayland_warp $<TARGET_FILE:mini_compositor> ${warp_mode})
+        set_tests_properties(test_wayland_warp_${warp_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+
+      add_executable(test_wayland_textinput tests/test_wayland_textinput.c)
+      target_link_libraries(test_wayland_textinput PRIVATE sdlop)
+      target_compile_options(test_wayland_textinput PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_textinput mini_compositor)
+      add_test(NAME test_wayland_textinput COMMAND test_wayland_textinput $<TARGET_FILE:mini_compositor>)
+      set_tests_properties(test_wayland_textinput PROPERTIES TIMEOUT 60)
+
+      add_executable(test_wayland_hidpi tests/test_wayland_hidpi.c)
+      target_link_libraries(test_wayland_hidpi PRIVATE sdlop)
+      target_compile_options(test_wayland_hidpi PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_hidpi mini_compositor)
+      foreach(hidpi_mode fractional lowdpi buffer output noviewport)
+        add_test(NAME test_wayland_hidpi_${hidpi_mode}
+                 COMMAND test_wayland_hidpi $<TARGET_FILE:mini_compositor> ${hidpi_mode})
+        set_tests_properties(test_wayland_hidpi_${hidpi_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+
+      foreach(dnd_mode files text bigtext refuse disabled)
+        add_test(NAME test_wayland_dnd_${dnd_mode} COMMAND test_wayland_dnd $<TARGET_FILE:mini_compositor> ${dnd_mode})
+        set_tests_properties(test_wayland_dnd_${dnd_mode} PROPERTIES TIMEOUT 60)
+      endforeach()
+    else()
+      message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch, test_wayland_buffers")
+    endif()
+
+    add_executable(smoke_relative_mode tests/smoke_relative_mode.c)
+    target_link_libraries(smoke_relative_mode PRIVATE sdlop)
+    add_test(NAME smoke_relative_mode COMMAND smoke_relative_mode)
+
+    if(GLESV2_FOUND)
+      add_executable(test_gl_matrix tests/test_gl_matrix.c)
+      target_link_libraries(test_gl_matrix PRIVATE sdlop ${GLESV2_LIBRARIES})
+      target_include_directories(test_gl_matrix PRIVATE src ${GLESV2_INCLUDE_DIRS})
+      target_compile_options(test_gl_matrix PRIVATE -UNDEBUG)
+      add_test(NAME test_gl_matrix COMMAND test_gl_matrix)
+    else()
+      message(STATUS "GLESv2 not found - skipping test_gl_matrix")
+    endif()
+
+    if(Vulkan_FOUND)
+      add_executable(test_vulkan tests/test_vulkan.c)
+      target_link_libraries(test_vulkan PRIVATE sdlop Vulkan::Vulkan)
+      target_include_directories(test_vulkan PRIVATE src)
+      target_compile_options(test_vulkan PRIVATE -UNDEBUG)
+      add_test(NAME test_vulkan COMMAND test_vulkan)
+
+      add_executable(test_vulkan_compute tests/test_vulkan_compute.c)
+      target_link_libraries(test_vulkan_compute PRIVATE sdlop Vulkan::Vulkan)
+      target_include_directories(test_vulkan_compute PRIVATE src tests)
+      target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
+      add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
+
+      add_executable(test_vk_offload_live tests/test_vk_offload_live.c)
+      target_link_libraries(test_vk_offload_live PRIVATE sdlop Vulkan::Vulkan)
+      target_include_directories(test_vk_offload_live PRIVATE src)
+      target_compile_options(test_vk_offload_live PRIVATE -UNDEBUG)
+      add_test(NAME test_vk_offload_live COMMAND test_vk_offload_live)
+    else()
+      message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute, test_vk_offload_live")
+    endif()
+
+    if(WAYLAND_CLIENT_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
+      add_executable(test_virtual_input tests/test_virtual_input.c
+        ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+        ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
+      target_link_libraries(test_virtual_input PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
+      target_include_directories(test_virtual_input PRIVATE src ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
+      target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
+      add_test(NAME test_virtual_input COMMAND test_virtual_input)
+    else()
+      message(STATUS "wayland-client or the virtual-input protocol XMLs not found - skipping test_virtual_input")
     endif()
   endif()
 
-  # framebuffer (fbdev) driver: needs no device - SDLOP_FBDEV_DUMP makes the
-  # driver render into RAM and dump each presented frame as a PPM we check
-  add_executable(test_fbdev tests/test_fbdev.c)
-  target_link_libraries(test_fbdev PRIVATE sdlop)
-  target_include_directories(test_fbdev PRIVATE src)
-  target_compile_options(test_fbdev PRIVATE -UNDEBUG)
-  add_test(NAME test_fbdev COMMAND test_fbdev)
-  set_tests_properties(test_fbdev PROPERTIES
-    ENVIRONMENT "SDLOP_DISABLE_RAW_INPUT=1;SDLOP_TEST_STRICT=1;SDLOP_FBDEV_SIZE=320x240;SDLOP_FBDEV_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test_fbdev_frame.ppm"
-    TIMEOUT 60)
-
-  add_executable(test_kmsdrm tests/test_kmsdrm.c)
-  target_link_libraries(test_kmsdrm PRIVATE sdlop)
-  target_include_directories(test_kmsdrm PRIVATE src)
-  target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
-  add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
-
-  add_executable(test_gl_offload tests/test_gl_offload.c)
-  target_link_libraries(test_gl_offload PRIVATE sdlop)
-  target_include_directories(test_gl_offload PRIVATE src)
-  target_compile_options(test_gl_offload PRIVATE -UNDEBUG)
-  add_test(NAME test_gl_offload COMMAND test_gl_offload)
-
-  add_executable(test_vk_offload tests/test_vk_offload.c)
-  target_link_libraries(test_vk_offload PRIVATE sdlop)
-  target_include_directories(test_vk_offload PRIVATE src)
-  target_compile_options(test_vk_offload PRIVATE -UNDEBUG)
-  add_test(NAME test_vk_offload COMMAND test_vk_offload)
-
-  # KMS present-path benchmark (not a ctest gate; skips without KMS)
-  add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
-  target_link_libraries(bench_kmsdrm PRIVATE sdlop)
-  target_include_directories(bench_kmsdrm PRIVATE src)
-  target_compile_options(bench_kmsdrm PRIVATE -UNDEBUG)
-
-  if(GLESV2_FOUND)
-    add_executable(test_gl tests/test_gl.c)
-    target_link_libraries(test_gl PRIVATE sdlop ${GLESV2_LIBRARIES})
-    target_include_directories(test_gl PRIVATE src ${GLESV2_INCLUDE_DIRS})
-    target_compile_options(test_gl PRIVATE -UNDEBUG)
-    add_test(NAME test_gl COMMAND test_gl)
-  else()
-    message(STATUS "GLESv2 not found - skipping test_gl")
-  endif()
-
-  # pointer lock integration test (runs against tests/mini_compositor.c)
-  if(WAYLAND_SERVER_FOUND)
-    add_executable(mini_compositor tests/mini_compositor.c
-      ${WL_GEN_DIR}/xdg-shell-server-protocol.c
-      ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
-      ${WL_GEN_DIR}/relative-pointer-server-protocol.c
-      ${WL_GEN_DIR}/viewporter-server-protocol.c)
-    add_dependencies(mini_compositor sdlop_wayland_protocols)
-    target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
-    target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})
-
-    add_executable(test_pointer_lock tests/test_pointer_lock.c)
-    target_link_libraries(test_pointer_lock PRIVATE sdlop m)
-    target_include_directories(test_pointer_lock PRIVATE src)
-    target_compile_options(test_pointer_lock PRIVATE -UNDEBUG)
-    add_dependencies(test_pointer_lock mini_compositor)
-    add_test(NAME test_pointer_lock COMMAND test_pointer_lock $<TARGET_FILE:mini_compositor>)
-
-    add_executable(test_wayland_keyboard tests/test_wayland_keyboard.c)
-    target_link_libraries(test_wayland_keyboard PRIVATE sdlop)
-    target_include_directories(test_wayland_keyboard PRIVATE src)
-    target_compile_options(test_wayland_keyboard PRIVATE -UNDEBUG)
-    add_dependencies(test_wayland_keyboard mini_compositor)
-    add_test(NAME wayland_keyboard_repeat_disabled COMMAND test_wayland_keyboard $<TARGET_FILE:mini_compositor>)
-    add_test(NAME wayland_keyboard_zero_delay COMMAND test_wayland_keyboard $<TARGET_FILE:mini_compositor> immediate)
-    set_tests_properties(wayland_keyboard_repeat_disabled wayland_keyboard_zero_delay PROPERTIES TIMEOUT 15)
-
-    add_executable(test_touch tests/test_touch.c)
-    target_link_libraries(test_touch PRIVATE sdlop m)
-    target_include_directories(test_touch PRIVATE src)
-    target_compile_options(test_touch PRIVATE -UNDEBUG)
-    add_dependencies(test_touch mini_compositor)
-    add_test(NAME test_touch COMMAND test_touch $<TARGET_FILE:mini_compositor>)
-
-    # wl_buffer release contract of software presentation
-    add_executable(test_wayland_buffers tests/test_wayland_buffers.c)
-    target_include_directories(test_wayland_buffers PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
-    target_link_libraries(test_wayland_buffers PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
-    target_compile_options(test_wayland_buffers PRIVATE -UNDEBUG)
-    add_dependencies(test_wayland_buffers mini_compositor)
-    add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
-    add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
-  else()
-    message(STATUS "wayland-server not found - skipping mini_compositor, test_pointer_lock, test_touch, test_wayland_buffers")
-  endif()
-
-  add_executable(smoke_relative_mode tests/smoke_relative_mode.c)
-  target_link_libraries(smoke_relative_mode PRIVATE sdlop)
-  add_test(NAME smoke_relative_mode COMMAND smoke_relative_mode)
-
-  if(GLESV2_FOUND)
-    add_executable(test_gl_matrix tests/test_gl_matrix.c)
-    target_link_libraries(test_gl_matrix PRIVATE sdlop ${GLESV2_LIBRARIES})
-    target_include_directories(test_gl_matrix PRIVATE src ${GLESV2_INCLUDE_DIRS})
-    target_compile_options(test_gl_matrix PRIVATE -UNDEBUG)
-    add_test(NAME test_gl_matrix COMMAND test_gl_matrix)
-  else()
-    message(STATUS "GLESv2 not found - skipping test_gl_matrix")
-  endif()
-
-  if(Vulkan_FOUND)
-    add_executable(test_vulkan tests/test_vulkan.c)
-    target_link_libraries(test_vulkan PRIVATE sdlop Vulkan::Vulkan)
-    target_include_directories(test_vulkan PRIVATE src)
-    target_compile_options(test_vulkan PRIVATE -UNDEBUG)
-    add_test(NAME test_vulkan COMMAND test_vulkan)
-
-    add_executable(test_vulkan_compute tests/test_vulkan_compute.c)
-    target_link_libraries(test_vulkan_compute PRIVATE sdlop Vulkan::Vulkan)
-    target_include_directories(test_vulkan_compute PRIVATE src tests)
-    target_compile_options(test_vulkan_compute PRIVATE -UNDEBUG)
-    add_test(NAME test_vulkan_compute COMMAND test_vulkan_compute)
-
-    add_executable(test_vk_offload_live tests/test_vk_offload_live.c)
-    target_link_libraries(test_vk_offload_live PRIVATE sdlop Vulkan::Vulkan)
-    target_include_directories(test_vk_offload_live PRIVATE src)
-    target_compile_options(test_vk_offload_live PRIVATE -UNDEBUG)
-    add_test(NAME test_vk_offload_live COMMAND test_vk_offload_live)
-  else()
-    message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute, test_vk_offload_live")
-  endif()
-
-  if(WAYLAND_CLIENT_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
-    add_executable(test_virtual_input tests/test_virtual_input.c
-      ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-      ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
-    target_link_libraries(test_virtual_input PRIVATE sdlop ${WAYLAND_CLIENT_LIBRARIES})
-    target_include_directories(test_virtual_input PRIVATE src ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
-    target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
-    add_test(NAME test_virtual_input COMMAND test_virtual_input)
-  else()
-    message(STATUS "wayland-client or the virtual-input protocol XMLs not found - skipping test_virtual_input")
-  endif()
-endif()
-  endif()  # else() of if(WIN32): Linux-only tests above
-
-
-# ---------------------------------------------------------------------------
-# Benchmarks (SDLop vs SDL3)
-# ---------------------------------------------------------------------------
-if(SDLop_BUILD_BENCHMARKS AND NOT WIN32)
-  # The benchmarks compare against a pkg-config'd stock SDL3 and poke the
-  # POSIX drivers, so they are built on the Linux/macOS side only.
-  pkg_check_modules(SDL3 sdl3)
-  add_executable(bench_events bench/bench_events.c)
-  target_link_libraries(bench_events PRIVATE sdlop)
-  if(SDL3_FOUND)
-    add_executable(bench_events_sdl3 bench/bench_events.c)
-    target_compile_definitions(bench_events_sdl3 PRIVATE SDLOP_BENCH_SDL3=1)
-    target_include_directories(bench_events_sdl3 PRIVATE ${SDL3_INCLUDE_DIRS})
-    target_link_directories(bench_events_sdl3 PRIVATE ${SDL3_LIBRARY_DIRS})
-    target_link_libraries(bench_events_sdl3 PRIVATE ${SDL3_LIBRARIES})
-  else()
-    message(STATUS "SDL3 not found - skipping comparison benchmark")
-  endif()
-  if(GLESV2_FOUND)
-    add_executable(bench_render bench/bench_render.c)
-    target_link_libraries(bench_render PRIVATE sdlop ${GLESV2_LIBRARIES})
-    target_include_directories(bench_render PRIVATE ${GLESV2_INCLUDE_DIRS})
-  else()
-    message(STATUS "GLESv2 not found - skipping bench_render")
-  endif()
-  # CPU-work proxy for the actual native dispatch loop, with fake full reads
-  # and immediate consumer reclamation. Not a device-latency benchmark.
-  add_executable(bench_raw_dispatch bench/bench_raw_dispatch.c)
-  target_link_libraries(bench_raw_dispatch PRIVATE sdlop)
-  target_include_directories(bench_raw_dispatch PRIVATE src)
-  target_compile_options(bench_raw_dispatch PRIVATE -UNDEBUG)
-  target_link_options(bench_raw_dispatch PRIVATE -Wl,--wrap=read)
-
-  add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
-  target_link_libraries(bench_raw_latency PRIVATE sdlop)
-  target_include_directories(bench_raw_latency PRIVATE src tests)
-
-  # Same real worker/API pipeline, with process-local pipe-backed evdev
-  # discovery. Needs neither root, /dev/input, uinput nor a display server.
-  add_executable(bench_raw_latency_pipe bench/bench_raw_latency.c bench/raw_pipe.c)
-  target_compile_definitions(bench_raw_latency_pipe PRIVATE SDLOP_BENCH_PIPE=1)
-  target_link_libraries(bench_raw_latency_pipe PRIVATE sdlop)
-  target_include_directories(bench_raw_latency_pipe PRIVATE tests)
-  target_link_options(bench_raw_latency_pipe PRIVATE
-    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl)
-  if(SDLop_BUILD_TESTS)
-    # Validate dispatch checksum/count/drop assertions, never a timing threshold.
-    add_test(NAME raw_dispatch_contract COMMAND bench_raw_dispatch)
-    set_tests_properties(raw_dispatch_contract PROPERTIES TIMEOUT 30)
-    add_test(NAME raw_latency_pipe_api COMMAND bench_raw_latency_pipe --api-overhead)
-    set_tests_properties(raw_latency_pipe_api PROPERTIES TIMEOUT 30
-      ENVIRONMENT "SDLOP_RAW_INPUT=1;SDLOP_DISABLE_RAW_INPUT=0")
-  endif()
-endif()
-
-# ABI parity gate: builds tools/abi_probe.c against these headers and against
-# stock SDL3 headers (-DSDL3_REFERENCE_INCLUDE=/path/to/SDL3/include) and
-# diffs every size/offset/enum value. Skipped when no reference is provided.
-if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
-  add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
-endif()
-
-# Developer tools (not CTests). SDLop_BUILD_TOOLS=OFF skips them; the
-# injectors are also skipped (with a message) when wayland-client,
-# libxkbcommon or the vendored virtual-input protocol XMLs are missing.
-if (SDLop_BUILD_TOOLS AND NOT EMSCRIPTEN)
-  # Manual, externally driven trace tool: waits for a compositor-side input
-  # script after READY-INPUT.
-  add_executable(behaviour_probe_wayland tools/behaviour_probe_wayland.c)
-  target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
-  target_include_directories(behaviour_probe_wayland PRIVATE src)
-
-  if (WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
-    # Reference compositor-side driver for the probe: injects the scripted
-    # pointer/key sequence once READY-INPUT appears.
-    add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c
-      ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
-      ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
-    add_dependencies(behaviour_probe_inject sdlop_wayland_protocols)
-    target_include_directories(behaviour_probe_inject PRIVATE
-      ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
-    target_link_libraries(behaviour_probe_inject PRIVATE
-      ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
-
-    # Wayland behaviour injector (virtual pointer + keyboard script driver);
-    # pairs with tests/run_behaviour_wayland.sh
-    add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
-    target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
-    target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
-  else()
-    message(STATUS "wayland-client, libxkbcommon or the virtual-input protocol XMLs not found - skipping wl_injector, behaviour_probe_inject")
-  endif()
-endif()
-
-# Options gate: SDLOP_* options are read through hints (settable from code)
-if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
-  add_test(NAME options_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/options_check.sh ${CMAKE_CURRENT_SOURCE_DIR})
-endif()
-
-# Export gate: every function declared in include/SDL3 is exported by the
-# shared library and nothing undeclared is exported.
-if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
-  add_test(NAME api_exports_check
-           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_exports_check.sh
-                   $<TARGET_FILE:sdlop_shared> ${CMAKE_CURRENT_SOURCE_DIR}/include)
-endif()
-
-# Surface differential test: tests/surface_diff.c hashes the result of every
-# blit / conversion / fill / transform case. Built against stock SDL3 as well
-# when both -DSDL3_REFERENCE_INCLUDE and -DSDL3_REFERENCE_LIB are given, the
-# outputs must match exactly; otherwise it runs as a smoke test.
-if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
-  add_executable(surface_diff tests/surface_diff.c)
-  target_link_libraries(surface_diff PRIVATE sdlop)
-  if (SDL3_REFERENCE_INCLUDE AND SDL3_REFERENCE_LIB)
-    add_executable(surface_diff_ref tests/surface_diff.c)
-    target_include_directories(surface_diff_ref BEFORE PRIVATE ${SDL3_REFERENCE_INCLUDE})
-    target_link_libraries(surface_diff_ref PRIVATE ${SDL3_REFERENCE_LIB})
-    get_filename_component(_sdl3_ref_dir ${SDL3_REFERENCE_LIB} DIRECTORY)
-    set_target_properties(surface_diff_ref PROPERTIES BUILD_RPATH ${_sdl3_ref_dir})
-    add_test(NAME surface_diff
-             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh
-                     $<TARGET_FILE:surface_diff> $<TARGET_FILE:surface_diff_ref>)
-  else()
-    add_test(NAME surface_diff
-             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh $<TARGET_FILE:surface_diff>)
-  endif()
-endif()
-
-# API subset gate: every SDL_* symbol exported by SDLop must also be exported
-# by stock SDL3 (strict-subset property). Skipped when no reference .so given.
-if (SDL3_REFERENCE_LIB AND NOT EMSCRIPTEN)
-  add_test(NAME api_subset_check
-           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_subset_check.sh
-                   $<TARGET_FILE:sdlop_shared> ${SDL3_REFERENCE_LIB})
-endif()
-
-if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
-  # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
-  # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
-  # only - every other test keeps full leak checking
-  foreach(t test_gl test_gl_matrix test_glx test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
-    if (TEST ${t})
-      set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+  # ---------------------------------------------------------------------------
+  # Benchmarks (SDLop vs SDL3)
+  # ---------------------------------------------------------------------------
+  if(SDLop_BUILD_BENCHMARKS AND NOT WIN32)  # benchmarks diff against system SDL3
+    pkg_check_modules(SDL3 sdl3)
+    add_executable(bench_events bench/bench_events.c)
+    target_link_libraries(bench_events PRIVATE sdlop)
+    if(SDL3_FOUND)
+      add_executable(bench_events_sdl3 bench/bench_events.c)
+      target_compile_definitions(bench_events_sdl3 PRIVATE SDLOP_BENCH_SDL3=1)
+      target_include_directories(bench_events_sdl3 PRIVATE ${SDL3_INCLUDE_DIRS})
+      target_link_directories(bench_events_sdl3 PRIVATE ${SDL3_LIBRARY_DIRS})
+      target_link_libraries(bench_events_sdl3 PRIVATE ${SDL3_LIBRARIES})
+    else()
+      message(STATUS "SDL3 not found - skipping comparison benchmark")
     endif()
-  endforeach()
-  # test_vulkan / test_vk_offload_live / test_gl_offload keep leak checking,
-  # minus allocations made inside Mesa / the Vulkan loader (tests/lsan_gpu.supp)
-  foreach(t test_vulkan test_vk_offload_live test_gl_offload)
-    if (TARGET ${t})
-      set_tests_properties(${t} PROPERTIES ENVIRONMENT
-        "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
+    if(GLESV2_FOUND)
+      add_executable(bench_render bench/bench_render.c)
+      target_link_libraries(bench_render PRIVATE sdlop ${GLESV2_LIBRARIES})
+      target_include_directories(bench_render PRIVATE ${GLESV2_INCLUDE_DIRS})
+    else()
+      message(STATUS "GLESv2 not found - skipping bench_render")
     endif()
-  endforeach()
-  # test_surface asserts the alloc-failure contract (CreateSurface must
-  # return NULL); ASan's allocator aborts on OOM unless allowed to return null
-  set_tests_properties(test_surface
-    PROPERTIES ENVIRONMENT "ASAN_OPTIONS=allocator_may_return_null=1")
+    add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
+    target_link_libraries(bench_raw_latency PRIVATE sdlop)
+    target_include_directories(bench_raw_latency PRIVATE src tests)
+  endif()
+
+  # ABI parity gate: builds tools/abi_probe.c against these headers and against
+  # stock SDL3 headers (-DSDL3_REFERENCE_INCLUDE=/path/to/SDL3/include) and
+  # diffs every size/offset/enum value. Skipped when no reference is provided.
+  if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
+    add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
+  endif()
+
+  # Developer tools (not CTests). SDLop_BUILD_TOOLS=OFF skips them; the
+  # injectors are also skipped (with a message) when wayland-client,
+  # libxkbcommon or the vendored virtual-input protocol XMLs are missing.
+  if (SDLop_BUILD_TOOLS AND NOT EMSCRIPTEN)
+    # Manual, externally driven trace tool: waits for a compositor-side input
+    # script after READY-INPUT.
+    add_executable(behaviour_probe_wayland tools/behaviour_probe_wayland.c)
+    target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
+    target_include_directories(behaviour_probe_wayland PRIVATE src)
+
+    if (WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
+      # Reference compositor-side driver for the probe: injects the scripted
+      # pointer/key sequence once READY-INPUT appears.
+      add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c
+        ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
+        ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
+      add_dependencies(behaviour_probe_inject sdlop_wayland_protocols)
+      target_include_directories(behaviour_probe_inject PRIVATE
+        ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+      target_link_libraries(behaviour_probe_inject PRIVATE
+        ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+
+      # Wayland behaviour injector (virtual pointer + keyboard script driver);
+      # pairs with tests/run_behaviour_wayland.sh
+      add_executable(wl_injector tools/wl_injector.c ${WL_GEN_DIR}/virtual-keyboard-protocol.c ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c)
+      target_include_directories(wl_injector PRIVATE ${WL_GEN_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS} ${XKBCOMMON_INCLUDE_DIRS})
+      target_link_libraries(wl_injector PRIVATE ${WAYLAND_CLIENT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+    else()
+      message(STATUS "wayland-client, libxkbcommon or the virtual-input protocol XMLs not found - skipping wl_injector, behaviour_probe_inject")
+    endif()
+  endif()
+
+  # Options gate: SDLOP_* options are read through hints (settable from code)
+  if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_test(NAME options_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/options_check.sh ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
+
+  # Export gate: every function declared in include/SDL3 is exported by the
+  # shared library and nothing undeclared is exported.
+  if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_test(NAME api_exports_check
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_exports_check.sh
+                     $<TARGET_FILE:sdlop_shared> ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
+
+  # Surface differential test: tests/surface_diff.c hashes the result of every
+  # blit / conversion / fill / transform case. Built against stock SDL3 as well
+  # when both -DSDL3_REFERENCE_INCLUDE and -DSDL3_REFERENCE_LIB are given, the
+  # outputs must match exactly; otherwise it runs as a smoke test.
+  if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+    add_executable(surface_diff tests/surface_diff.c)
+    target_link_libraries(surface_diff PRIVATE sdlop)
+    if (SDL3_REFERENCE_INCLUDE AND SDL3_REFERENCE_LIB)
+      add_executable(surface_diff_ref tests/surface_diff.c)
+      target_include_directories(surface_diff_ref BEFORE PRIVATE ${SDL3_REFERENCE_INCLUDE})
+      target_link_libraries(surface_diff_ref PRIVATE ${SDL3_REFERENCE_LIB})
+      get_filename_component(_sdl3_ref_dir ${SDL3_REFERENCE_LIB} DIRECTORY)
+      set_target_properties(surface_diff_ref PROPERTIES BUILD_RPATH ${_sdl3_ref_dir})
+      add_test(NAME surface_diff
+               COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh
+                       $<TARGET_FILE:surface_diff> $<TARGET_FILE:surface_diff_ref>)
+    else()
+      add_test(NAME surface_diff
+               COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_surface_diff.sh $<TARGET_FILE:surface_diff>)
+    endif()
+  endif()
+
+  # API subset gate: every SDL_* symbol exported by SDLop must also be exported
+  # by stock SDL3 (strict-subset property). Skipped when no reference .so given.
+  if (SDL3_REFERENCE_LIB AND NOT EMSCRIPTEN)
+    add_test(NAME api_subset_check
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_subset_check.sh
+                     $<TARGET_FILE:sdlop_shared> ${SDL3_REFERENCE_LIB})
+  endif()
+
+  if (SDLOP_SANITIZERS AND NOT EMSCRIPTEN)
+    # llvmpipe/lavapipe leak inside libLLVM under LSan (verified: leak frames are
+    # entirely Mesa/LLVM internals); disable leak detection for the GPU tests
+    # only - every other test keeps full leak checking
+    foreach(t test_gl test_gl_matrix test_glx test_vulkan_compute test_egl_api_x11 test_egl_api_wayland)
+      if (TEST ${t})
+        set_tests_properties(${t} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+      endif()
+    endforeach()
+    # test_vulkan / test_vk_offload_live / test_gl_offload keep leak checking,
+    # minus allocations made inside Mesa / the Vulkan loader (tests/lsan_gpu.supp)
+    foreach(t test_vulkan test_vk_offload_live test_gl_offload)
+      if (TARGET ${t})
+        set_tests_properties(${t} PROPERTIES ENVIRONMENT
+          "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/lsan_gpu.supp:print_suppressions=0")
+      endif()
+    endforeach()
+    # test_surface asserts the alloc-failure contract (CreateSurface must
+    # return NULL); ASan's allocator aborts on OOM unless allowed to return null
+    set_tests_properties(test_surface
+      PROPERTIES ENVIRONMENT "ASAN_OPTIONS=allocator_may_return_null=1")
+  endif()  # NOT WIN32
 endif()

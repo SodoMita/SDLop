@@ -77,25 +77,41 @@ void SDLOP_FreeTemporaryMemory(void)
     free_temp_list(list);
 }
 
-/* unlink the pushing thread's entry for the event's pointer, if any */
-static TempMem *claim_event_memory(const SDL_Event *event)
+static TempMem *claim_pointer(const void *ptr, TempMem *list)
 {
-    const void *ptr = NULL;
-    if (event->type == SDL_EVENT_CLIPBOARD_UPDATE) {
-        ptr = event->clipboard.mime_types;
-    }
     if (!ptr) {
-        return NULL;
+        return list;
     }
     for (TempMem **link = &thread_temp; *link; link = &(*link)->next) {
         if ((*link)->memory == ptr) {
             TempMem *e = *link;
             *link = e->next;
-            e->next = NULL;
+            e->next = list;
             return e;
         }
     }
-    return NULL;
+    return list;
+}
+
+/* unlink the pushing thread's entries for the event's pointers, if any */
+static TempMem *claim_event_memory(const SDL_Event *event)
+{
+    switch (event->type) {
+    case SDL_EVENT_CLIPBOARD_UPDATE:
+        return claim_pointer(event->clipboard.mime_types, NULL);
+    case SDL_EVENT_DROP_FILE:
+    case SDL_EVENT_DROP_TEXT:
+    case SDL_EVENT_DROP_BEGIN:
+    case SDL_EVENT_DROP_COMPLETE:
+    case SDL_EVENT_DROP_POSITION:
+        return claim_pointer(event->drop.data, claim_pointer(event->drop.source, NULL));
+    case SDL_EVENT_TEXT_EDITING:
+        return claim_pointer(event->edit.text, NULL);
+    case SDL_EVENT_TEXT_EDITING_CANDIDATES:
+        return claim_pointer(event->edit_candidates.candidates, NULL);
+    default:
+        return NULL;
+    }
 }
 
 static void give_memory_to_thread(TempMem *list)
@@ -480,6 +496,9 @@ void SDL_SetEventEnabled(Uint32 type, bool enabled)
     if (type == SDL_EVENT_TEXT_INPUT || type == SDL_EVENT_TEXT_EDITING) {
         /* nothing else to toggle: SDLop has no IME to switch off */
     }
+    if (type == SDL_EVENT_DROP_FILE || type == SDL_EVENT_DROP_TEXT) {
+        SDLOP_ToggleDragAndDropSupport();
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -534,6 +553,26 @@ bool SDL_PushEvent(SDL_Event *event)
     return push_any_thread(event, 0, false);
 }
 
+/* stock SDL_ShouldMinimizeOnFocusLoss: "auto" minimizes a window that
+ * switched the display mode, so the desktop mode comes back */
+static bool should_minimize_on_focus_loss(SDL_Window *window)
+{
+    if (!(window->flags & SDL_WINDOW_FULLSCREEN) || window->is_destroying || SDLOP_DisplayModeSwitchPending()) {
+        return false;
+    }
+    const char *hint = SDL_GetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS);
+    if (!hint || !*hint || SDL_strcasecmp(hint, "auto") == 0) {
+        for (int i = 0; i < sdlop.num_displays; i++) {
+            const SDLop_Display *d = &sdlop.displays[i];
+            if (d->fullscreen_window == window && d->current_mode.w > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return SDL_GetHintBoolean(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, false);
+}
+
 void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1, Sint32 data2)
 {
     SDL_Event event;
@@ -556,6 +595,23 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
         SDLOP_OnWindowMoved(window);
     } else if (window && type == SDL_EVENT_WINDOW_RESIZED) {
         SDLOP_GL_NotifyWindowResized(window);
+        /* SDL_OnWindowResized: the shape follows the window size */
+        if ((window->flags & SDL_WINDOW_TRANSPARENT) && sdlop.video && sdlop.video->UpdateWindowShape) {
+            SDL_Surface *shape =
+                (SDL_Surface *)SDL_GetPointerProperty(window->props, SDL_PROP_WINDOW_SHAPE_POINTER, NULL);
+            if (shape) {
+                sdlop.video->UpdateWindowShape(sdlop.video, window, shape);
+            }
+        }
+    }
+    /* SDL_OnWindowMinimized / Restored: an exclusive mode only holds while
+     * the window is shown */
+    if (window && type == SDL_EVENT_WINDOW_MINIMIZED && (window->flags & SDL_WINDOW_FULLSCREEN)) {
+        SDLOP_UpdateFullscreenMode(window, false);
+    } else if (window && type == SDL_EVENT_WINDOW_RESTORED && (window->flags & SDL_WINDOW_FULLSCREEN)) {
+        SDLOP_UpdateFullscreenMode(window, true);
+    } else if (window && type == SDL_EVENT_WINDOW_FOCUS_LOST && should_minimize_on_focus_loss(window)) {
+        SDL_MinimizeWindow(window);
     }
     /* SDL_OnWindowFocusGained/Lost: grabs only hold while focused */
     if (window && (type == SDL_EVENT_WINDOW_FOCUS_GAINED || type == SDL_EVENT_WINDOW_FOCUS_LOST) &&
@@ -740,6 +796,7 @@ void SDL_PumpEvents(void)
      * worker on Linux and by the Raw Input worker on Windows (both opt-in
      * there); with neither running this is a no-op. */
     SDLOP_RawInputPump();
+    SDLOP_DBus_Pump(); /* session bus signals (theme changes, portal replies) */
 
     /* 2. drain window system (non-blocking) */
     if (sdlop.video) {
@@ -917,7 +974,8 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         (void)video_fd;
         SDL_Delay((Uint32)wait_ms);
 #else
-        struct pollfd pfds[2];
+        const int dbus_fd = SDLOP_DBus_GetFD(); /* theme changes, portal replies */
+        struct pollfd pfds[3];
         int nfds = 0;
         if (sdlop.wake_fd >= 0) {
             pfds[nfds].fd = sdlop.wake_fd;
@@ -926,6 +984,11 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         }
         if (video_fd >= 0) {
             pfds[nfds].fd = video_fd;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+        if (dbus_fd >= 0) {
+            pfds[nfds].fd = dbus_fd;
             pfds[nfds].events = POLLIN;
             nfds++;
         }
