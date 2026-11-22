@@ -5,7 +5,10 @@
  *   move <dx> <dy>          relative pointer motion
  *   button <name> <down|up>
  *   click <name>
- *   wheel <amount>          vertical axis, positive = down
+ *   wheel <detents>         mouse wheel, positive = down: whole detents are
+ *                           sent like a real wheel (axis_discrete, 15 units
+ *                           each - the compositor turns that into value120)
+ *   scroll <value>          touchpad-style continuous vertical axis
  *   key <name> <down|up>    virtual keyboard, evdev code
  *   tap <name>
  *   flush                   roundtrip
@@ -146,10 +149,17 @@ int main(int argc, char **argv)
             nanosleep(&ts, NULL);
             zwlr_virtual_pointer_v1_button(vptr, now_ms(), button_code(*a1 ? a1 : "left"), WL_POINTER_BUTTON_STATE_RELEASED);
             zwlr_virtual_pointer_v1_frame(vptr);
-        } else if (!strcmp(cmd, "wheel")) {
+        } else if (!strcmp(cmd, "wheel") && atof(a1) == (double)atoi(a1)) {
+            const int detents = atoi(a1);
+            zwlr_virtual_pointer_v1_axis_source(vptr, WL_POINTER_AXIS_SOURCE_WHEEL);
+            zwlr_virtual_pointer_v1_axis_discrete(vptr, now_ms(), WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                                  wl_fixed_from_double(detents * 15.0), detents);
+            zwlr_virtual_pointer_v1_frame(vptr);
+        } else if (!strcmp(cmd, "wheel") || !strcmp(cmd, "scroll")) {
+            zwlr_virtual_pointer_v1_axis_source(vptr, !strcmp(cmd, "wheel") ? WL_POINTER_AXIS_SOURCE_WHEEL
+                                                                             : WL_POINTER_AXIS_SOURCE_FINGER);
             zwlr_virtual_pointer_v1_axis(vptr, now_ms(),
                 WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(atof(a1)));
-            zwlr_virtual_pointer_v1_axis_source(vptr, WL_POINTER_AXIS_SOURCE_WHEEL);
             zwlr_virtual_pointer_v1_frame(vptr);
         } else if (!strcmp(cmd, "key")) {
             zwp_virtual_keyboard_v1_key(vkb, now_ms(), key_code(a1),

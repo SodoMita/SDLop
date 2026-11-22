@@ -159,7 +159,12 @@ typedef struct WaylandDeviceData
 
     SDL_Window *pointer_focus;
     SDL_Window *touch_focus;
+    /* wheel, per pointer frame (stock SDL3's model): a frame's value120
+     * (seat v8+) or discrete (v5-7) steps win over its continuous value,
+     * which counts 10 units per detent */
     float axis_x_acc, axis_y_acc;
+    Uint8 axis_x_type, axis_y_type; /* AXIS_CONTINUOUS / AXIS_DISCRETE / AXIS_VALUE120 */
+    SDL_MouseWheelDirection axis_direction;
 
     /* relative mouse mode (pointer lock) */
     struct zwp_pointer_constraints_v1 *pointer_constraints;
@@ -1783,19 +1788,65 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     }
 }
 
-static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value)
+enum
 {
-    WaylandDeviceData *d = (WaylandDeviceData *)data;
-    (void)pointer;
-    (void)time;
+    AXIS_CONTINUOUS = 0,
+    AXIS_DISCRETE,
+    AXIS_VALUE120
+};
+
+/* one axis contribution; vertical is negated (Wayland: positive = down,
+ * SDL: positive = away from the user) */
+static void pointer_axis_common(WaylandDeviceData *d, Uint8 type, uint32_t axis, double value)
+{
     if (SDLOP_RawInputIsSource()) {
         return;
     }
-    float v = (float)wl_fixed_to_double(value) / 10.0f; /* weston: 10 units per detent */
-    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        d->axis_y_acc -= v;
-    } else {
-        d->axis_x_acc += v;
+    const bool vertical = axis == WL_POINTER_AXIS_VERTICAL_SCROLL;
+    if (!vertical && axis != WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        return;
+    }
+    float *acc = vertical ? &d->axis_y_acc : &d->axis_x_acc;
+    Uint8 *kind = vertical ? &d->axis_y_type : &d->axis_x_type;
+    const float v = (float)(vertical ? -value : value);
+    switch (type) {
+    case AXIS_VALUE120: /* may come several times per frame: accumulate */
+        if (*kind != AXIS_VALUE120) {
+            *kind = AXIS_VALUE120;
+            *acc = 0.0f;
+        }
+        *acc += v;
+        break;
+    case AXIS_DISCRETE:
+        if (*kind != AXIS_DISCRETE) {
+            *kind = AXIS_DISCRETE;
+            *acc = v;
+        }
+        break;
+    default: /* only without steps in this frame */
+        if (*kind == AXIS_CONTINUOUS) {
+            *acc = v;
+        }
+        break;
+    }
+}
+
+static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value)
+{
+    (void)pointer;
+    (void)time;
+    pointer_axis_common((WaylandDeviceData *)data, AXIS_CONTINUOUS, axis, wl_fixed_to_double(value));
+}
+
+static float axis_units(float acc, Uint8 type)
+{
+    switch (type) {
+    case AXIS_VALUE120:
+        return acc / 120.0f;
+    case AXIS_DISCRETE:
+        return acc;
+    default:
+        return acc / 10.0f; /* weston/sway/libinput: 10 units per detent-ish */
     }
 }
 
@@ -1804,9 +1855,12 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
     if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) { /* accumulators stay empty under raw input */
-        SDLOP_SendMouseWheel(d->axis_x_acc, d->axis_y_acc, SDLOP_MonotonicNS());
-        d->axis_x_acc = d->axis_y_acc = 0.0f;
+        SDLOP_SendMouseWheelDirection(axis_units(d->axis_x_acc, d->axis_x_type), axis_units(d->axis_y_acc, d->axis_y_type),
+                                      d->axis_direction, SDLOP_MonotonicNS());
     }
+    d->axis_x_acc = d->axis_y_acc = 0.0f;
+    d->axis_x_type = d->axis_y_type = AXIS_CONTINUOUS;
+    d->axis_direction = SDL_MOUSEWHEEL_NORMAL;
     /* relative mouse mode: flush accumulated relative-pointer motion
      * (skipped when the raw evdev worker owns the mouse) */
     if (d->relative_pointer && (d->rel_x_acc != 0.0f || d->rel_y_acc != 0.0f)) {
@@ -1834,33 +1888,23 @@ static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t t
 
 static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete)
 {
-    (void)data;
     (void)pointer;
-    (void)axis;
-    (void)discrete;
+    pointer_axis_common((WaylandDeviceData *)data, AXIS_DISCRETE, axis, (double)discrete);
 }
 
 static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120)
 {
-    WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
-    if (SDLOP_RawInputIsSource()) {
-        return;
-    }
-    float v = (float)value120 / 120.0f;
-    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        d->axis_y_acc += v;
-    } else {
-        d->axis_x_acc += v;
-    }
+    pointer_axis_common((WaylandDeviceData *)data, AXIS_VALUE120, axis, (double)value120);
 }
 
 static void pointer_axis_relative_direction(void *data, struct wl_pointer *pointer, uint32_t axis, uint32_t direction)
 {
-    (void)data;
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)pointer;
     (void)axis;
-    (void)direction;
+    d->axis_direction =
+        direction == WL_POINTER_AXIS_RELATIVE_DIRECTION_INVERTED ? SDL_MOUSEWHEEL_FLIPPED : SDL_MOUSEWHEEL_NORMAL;
 }
 
 static const struct wl_pointer_listener pointer_listener = {

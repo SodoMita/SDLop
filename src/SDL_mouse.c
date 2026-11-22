@@ -344,6 +344,13 @@ void SDLOP_SendPinch(Uint32 type, Uint64 timestamp_ns, SDL_Window *window, float
 
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
 {
+    SDLOP_SendMouseWheelDirection(x, y, SDL_MOUSEWHEEL_NORMAL, timestamp_ns);
+}
+
+/* FLIPPED: natural scrolling; like stock the values are not negated, the
+ * application multiplies by -1 if it wants the physical direction */
+void SDLOP_SendMouseWheelDirection(float x, float y, SDL_MouseWheelDirection direction, Uint64 timestamp_ns)
+{
     if (x == 0.0f && y == 0.0f) {
         return;
     }
@@ -355,7 +362,7 @@ void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
     event.wheel.which = 0;
     event.wheel.x = x;
     event.wheel.y = y;
-    event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+    event.wheel.direction = direction;
     event.wheel.mouse_x = sdlop.mouse_x;
     event.wheel.mouse_y = sdlop.mouse_y;
     SDLOP_PushEventInternal(&event);

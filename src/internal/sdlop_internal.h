@@ -437,6 +437,7 @@ void SDLOP_RemoveTouch(SDL_TouchID id);
 void SDLOP_TrackTouch(Uint32 type, SDL_TouchID touchID, SDL_FingerID fingerID, float x, float y, float pressure);
 void SDLOP_DevicesQuit(void);
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns);
+void SDLOP_SendMouseWheelDirection(float x, float y, SDL_MouseWheelDirection direction, Uint64 timestamp_ns);
 
 /* Timestamp helpers */
 Uint64 SDLOP_MonotonicNS(void);

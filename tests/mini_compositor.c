@@ -49,7 +49,12 @@
   "menu X,Y serial=ok|bad" (ok: the serial of the latest button press).
   MINI_POINTER_CMD=<file>: on SIGUSR2 the lines of <file> are run as
   pointer input on the window - "motion X Y", "press BTN", "release BTN"
-  (linux button codes), each followed by a frame.
+  (linux button codes), "wheel AXIS STEPS120" (a mouse wheel: source,
+  value120 for wl_pointer v8+ or discrete for v5-7, axis = 15 units per
+  detent), "natural AXIS STEPS120" (the same with relative direction
+  inverted), "finger AXIS VALUE" (touchpad: continuous only), each
+  followed by a frame. AXIS: 0 vertical, 1 horizontal.
+  MINI_SEAT_VERSION=<n> caps the wl_seat global's version.
   MINI_TABLET=1 for tests/test_wayland_pen.c: offers zwp_tablet_manager_v2
   with one tablet and two tools (a pen with pressure+tilt, an eraser);
   MINI_POINTER_CMD lines then also drive the current tool: "tsel pen|eraser",
@@ -2091,7 +2096,36 @@ static int P_signal_cb(int signal_number, void *data)
         if (!M.pointer) {
             break;
         }
-        if (sscanf(line, "motion %lf %lf", &x, &y) == 2) {
+        int axis, steps;
+        double value;
+        const int pv = wl_resource_get_version(M.pointer);
+        if (sscanf(line, "wheel %d %d", &axis, &steps) == 2) {
+            /* a mouse wheel like libinput reports it: steps in 1/120ths of
+             * a detent, 15 units of continuous value per detent */
+            if (pv >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION) {
+                wl_pointer_send_axis_source(M.pointer, WL_POINTER_AXIS_SOURCE_WHEEL);
+            }
+            if (pv >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
+                wl_pointer_send_axis_value120(M.pointer, (uint32_t)axis, steps);
+            } else if (pv >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && steps % 120 == 0) {
+                wl_pointer_send_axis_discrete(M.pointer, (uint32_t)axis, steps / 120);
+            }
+            wl_pointer_send_axis(M.pointer, 1000, (uint32_t)axis, wl_fixed_from_double(steps / 120.0 * 15.0));
+        } else if (sscanf(line, "natural %d %d", &axis, &steps) == 2) { /* wheel, inverted relative direction */
+            if (pv >= WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION) {
+                wl_pointer_send_axis_relative_direction(M.pointer, (uint32_t)axis,
+                                                        WL_POINTER_AXIS_RELATIVE_DIRECTION_INVERTED);
+            }
+            if (pv >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
+                wl_pointer_send_axis_value120(M.pointer, (uint32_t)axis, steps);
+            }
+            wl_pointer_send_axis(M.pointer, 1000, (uint32_t)axis, wl_fixed_from_double(steps / 120.0 * 15.0));
+        } else if (sscanf(line, "finger %d %lf", &axis, &value) == 2) { /* touchpad: continuous only */
+            if (pv >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION) {
+                wl_pointer_send_axis_source(M.pointer, WL_POINTER_AXIS_SOURCE_FINGER);
+            }
+            wl_pointer_send_axis(M.pointer, 1000, (uint32_t)axis, wl_fixed_from_double(value));
+        } else if (sscanf(line, "motion %lf %lf", &x, &y) == 2) {
             wl_pointer_send_motion(M.pointer, 1000, wl_fixed_from_double(x), wl_fixed_from_double(y));
         } else if (sscanf(line, "press %u", &btn) == 1) {
             P_button_serial = wl_display_next_serial(M.display);
@@ -2471,9 +2505,12 @@ int main(void)
     wl_global_create(M.display, &wl_compositor_interface, compositor_version, NULL, compositor_bind);
     wl_global_create(M.display, &wl_shm_interface, 1, NULL, shm_bind);
     /* v9 needs libwayland >= 1.22; clamp to what the library implements */
-    wl_global_create(M.display, &wl_seat_interface,
-                     wl_seat_interface.version < 9 ? wl_seat_interface.version : 9,
-                     NULL, seat_bind);
+    int seat_version = wl_seat_interface.version < 9 ? wl_seat_interface.version : 9;
+    if (getenv("MINI_SEAT_VERSION")) {
+        const int want = atoi(getenv("MINI_SEAT_VERSION"));
+        seat_version = want >= 1 && want < seat_version ? want : seat_version;
+    }
+    wl_global_create(M.display, &wl_seat_interface, seat_version, NULL, seat_bind);
     wl_global_create(M.display, &xdg_wm_base_interface, 2, NULL, wm_base_bind);
     wl_global_create(M.display, &zwp_pointer_constraints_v1_interface, 1, NULL, pc_bind);
     wl_global_create(M.display, &zwp_relative_pointer_manager_v1_interface, 1, NULL, rpm_bind);
