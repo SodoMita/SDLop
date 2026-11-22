@@ -78,7 +78,9 @@ typedef struct SDLop_Display
     float content_scale;
     SDL_DisplayOrientation natural_orientation;
     SDL_DisplayOrientation current_orientation;
-    SDL_DisplayMode desktop_mode;   /* sdlop reports desktop mode == current mode */
+    SDL_DisplayMode desktop_mode;   /* the mode outside exclusive fullscreen */
+    SDL_DisplayMode current_mode;   /* set by an exclusive fullscreen mode switch; w == 0: desktop mode */
+    SDL_Window *fullscreen_window;  /* window whose exclusive mode the display is in */
     SDL_DisplayMode *fullscreen_modes;   /* sorted largest first; desktop mode always present */
     int num_fullscreen_modes;
     SDL_PropertiesID props;              /* display properties group (0 until first access) */
@@ -184,6 +186,10 @@ struct SDLop_VideoDevice
     bool (*SetWindowFocusable)(SDLop_VideoDevice *device, SDL_Window *window, bool focusable);
     bool (*SetWindowHitTest)(SDLop_VideoDevice *device, SDL_Window *window, bool enabled);
     bool (*UpdateWindowShape)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *shape);
+    /* real mode switch for exclusive fullscreen (stock SetDisplayMode); `mode` is one of the
+     * display's fullscreen modes, or its desktop mode to restore. Optional: without it
+     * exclusive modes are emulated (the window just covers the display). */
+    bool (*SetDisplayMode)(SDLop_VideoDevice *device, SDLop_Display *display, const SDL_DisplayMode *mode);
     bool (*SuspendScreenSaver)(SDLop_VideoDevice *device);
     void *(*GetWindowICCProfile)(SDLop_VideoDevice *device, SDL_Window *window, size_t *size);
     bool (*SetWindowFramebufferVSync)(SDLop_VideoDevice *device, SDL_Window *window, int vsync);
@@ -453,6 +459,14 @@ bool SDLOP_GetDisplayBoundsById(SDL_DisplayID displayID, SDL_Rect *rect);
 int SDLOP_GetDisplayIndexById(SDL_DisplayID displayID); /* -1 when absent */
 SDL_DisplayID SDLOP_GetDisplayIdAtIndex(int index);      /* 0 when absent */
 bool SDLOP_AddFullscreenDisplayMode(SDL_DisplayID displayID, const SDL_DisplayMode *mode);
+/* drivers: the display is now in `mode` (NULL = its desktop mode); sends
+ * SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED on a change */
+void SDLOP_SetCurrentDisplayMode(SDL_DisplayID displayID, const SDL_DisplayMode *mode);
+/* exclusive fullscreen: apply (enter) or give back (leave) the window's
+ * fullscreen mode on its display (stock SDL_UpdateFullscreenMode) */
+void SDLOP_UpdateFullscreenMode(SDL_Window *window, bool enter);
+/* true shortly after a real mode switch, while focus churn from it is expected */
+bool SDLOP_DisplayModeSwitchPending(void);
 void SDLOP_UpdateWindowDisplay(SDL_Window *window);      /* re-resolves window->displayID */
 
 /* GL attributes (SDL_gl.c) */

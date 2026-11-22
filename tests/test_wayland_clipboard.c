@@ -307,7 +307,17 @@ int main(int argc, char *argv[])
     char *t = SDL_GetClipboardText();
     CHECK(t && strcmp(t, "from B") == 0, "SDL_GetClipboardText (B) = '%s'", t ? t : "(null)");
     SDL_free(t);
-    char *p = SDL_GetPrimarySelectionText();
+    /* the primary selection comes through its own device: its offer can
+     * land a dispatch after the clipboard one */
+    char *p = NULL;
+    for (Uint64 until = SDL_GetTicks() + 2000;; SDL_Delay(5)) {
+        SDL_PumpEvents();
+        SDL_free(p);
+        p = SDL_GetPrimarySelectionText();
+        if ((p && strcmp(p, "B primary") == 0) || SDL_GetTicks() >= until) {
+            break;
+        }
+    }
     CHECK(p && strcmp(p, "B primary") == 0, "SDL_GetPrimarySelectionText (B) = '%s'", p ? p : "(null)");
     SDL_free(p);
     send_token('4');

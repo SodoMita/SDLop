@@ -531,6 +531,26 @@ bool SDL_PushEvent(SDL_Event *event)
     return push_any_thread(event);
 }
 
+/* stock SDL_ShouldMinimizeOnFocusLoss: "auto" minimizes a window that
+ * switched the display mode, so the desktop mode comes back */
+static bool should_minimize_on_focus_loss(SDL_Window *window)
+{
+    if (!(window->flags & SDL_WINDOW_FULLSCREEN) || window->is_destroying || SDLOP_DisplayModeSwitchPending()) {
+        return false;
+    }
+    const char *hint = SDL_GetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS);
+    if (!hint || !*hint || SDL_strcasecmp(hint, "auto") == 0) {
+        for (int i = 0; i < sdlop.num_displays; i++) {
+            const SDLop_Display *d = &sdlop.displays[i];
+            if (d->fullscreen_window == window && d->current_mode.w > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return SDL_GetHintBoolean(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, false);
+}
+
 void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1, Sint32 data2)
 {
     SDL_Event event;
@@ -561,6 +581,15 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
                 sdlop.video->UpdateWindowShape(sdlop.video, window, shape);
             }
         }
+    }
+    /* SDL_OnWindowMinimized / Restored: an exclusive mode only holds while
+     * the window is shown */
+    if (window && type == SDL_EVENT_WINDOW_MINIMIZED && (window->flags & SDL_WINDOW_FULLSCREEN)) {
+        SDLOP_UpdateFullscreenMode(window, false);
+    } else if (window && type == SDL_EVENT_WINDOW_RESTORED && (window->flags & SDL_WINDOW_FULLSCREEN)) {
+        SDLOP_UpdateFullscreenMode(window, true);
+    } else if (window && type == SDL_EVENT_WINDOW_FOCUS_LOST && should_minimize_on_focus_loss(window)) {
+        SDL_MinimizeWindow(window);
     }
     /* SDL_OnWindowFocusGained/Lost: grabs only hold while focused */
     if (window && (type == SDL_EVENT_WINDOW_FOCUS_GAINED || type == SDL_EVENT_WINDOW_FOCUS_LOST) &&

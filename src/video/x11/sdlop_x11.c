@@ -23,6 +23,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
@@ -187,8 +188,17 @@ typedef struct X11Monitor
     bool primary;
     int num_modes;
     SDL_DisplayMode modes[48];
+    xcb_randr_mode_t mode_ids[48]; /* RandR mode behind modes[i] */
+    xcb_randr_output_t output;     /* the output modes came from (0: no RandR) */
     SDL_DisplayID display_id;
 } X11Monitor;
+
+/* a display switched away from its desktop mode (exclusive fullscreen) */
+typedef struct X11ModeSave
+{
+    SDL_DisplayID display_id;
+    xcb_randr_mode_t desktop_mode;
+} X11ModeSave;
 
 typedef struct X11DeviceData
 {
@@ -226,6 +236,8 @@ typedef struct X11DeviceData
     } fingers[16];
     bool has_randr;
     uint8_t randr_event_base;
+    X11ModeSave mode_saves[SDLOP_MAX_DISPLAYS];
+    int num_mode_saves;
     bool randr_monitors;          /* RandR >= 1.5 */
     bool displays_dirty;
 
@@ -1669,6 +1681,7 @@ static void fill_output_modes(X11Monitor *mon, xcb_randr_get_screen_resources_cu
         if (!m || (m->mode_flags & XCB_RANDR_MODE_FLAG_INTERLACE)) {
             continue;
         }
+        mon->mode_ids[mon->num_modes] = m->id;
         SDL_DisplayMode *dm = &mon->modes[mon->num_modes++];
         memset(dm, 0, sizeof(*dm));
         dm->format = SDL_PIXELFORMAT_ARGB8888;
@@ -1722,7 +1735,8 @@ static int enumerate_monitors(X11Monitor *out, int max)
                     snprintf(mon->name, sizeof(mon->name), "x11-%d", count + 1);
                 }
                 if (res && X11_xcb_randr_monitor_info_outputs_length(mi) > 0) {
-                    fill_output_modes(mon, res, X11_xcb_randr_monitor_info_outputs(mi)[0]);
+                    mon->output = X11_xcb_randr_monitor_info_outputs(mi)[0];
+                    fill_output_modes(mon, res, mon->output);
                 }
                 count++;
             }
@@ -1761,6 +1775,16 @@ static void apply_monitor_to_display(const X11Monitor *mon)
     sdlop.displays[idx].content_scale = x11.content_scale;
 }
 
+static X11ModeSave *x11_mode_save(SDL_DisplayID id)
+{
+    for (int i = 0; i < x11.num_mode_saves; i++) {
+        if (x11.mode_saves[i].display_id == id) {
+            return &x11.mode_saves[i];
+        }
+    }
+    return NULL;
+}
+
 static void x11_update_displays(bool send_events)
 {
     X11Monitor fresh[SDLOP_MAX_DISPLAYS];
@@ -1795,7 +1819,14 @@ static void x11_update_displays(bool send_events)
                 SDLOP_SendDisplayEvent(nm->display_id, SDL_EVENT_DISPLAY_MOVED, 0, 0);
             }
         }
-        if (nm->rect.w != old->rect.w || nm->rect.h != old->rect.h || nm->refresh_mhz != old->refresh_mhz) {
+        /* while switched (exclusive fullscreen) the monitor shows the
+         * fullscreen mode, not the desktop one */
+        const int desk_mhz = d->desktop_mode.refresh_rate_denominator
+                                 ? (int)((Sint64)d->desktop_mode.refresh_rate_numerator * 1000 /
+                                         d->desktop_mode.refresh_rate_denominator)
+                                 : 0;
+        if (!x11_mode_save(nm->display_id) &&
+            (nm->rect.w != d->desktop_mode.w || nm->rect.h != d->desktop_mode.h || nm->refresh_mhz != desk_mhz)) {
             d->desktop_mode.w = nm->rect.w;
             d->desktop_mode.h = nm->rect.h;
             d->desktop_mode.refresh_rate = nm->refresh_mhz / 1000.0f;
@@ -1841,6 +1872,152 @@ static void x11_update_displays(bool send_events)
         }
         SDLOP_UpdateWindowDisplay(w);
     }
+}
+
+/* stock X11_SetDisplayMode, minus its single-monitor screen size: the
+ * screen becomes the bounding box of every lit crtc with this one resized */
+static bool x11_SetDisplayMode(SDLop_VideoDevice *device, SDLop_Display *display, const SDL_DisplayMode *mode)
+{
+    (void)device;
+    const SDL_DisplayID id = display->id;
+    X11Monitor *mon = NULL;
+    for (int i = 0; i < x11.num_monitors; i++) {
+        if (x11.monitors[i].display_id == id) {
+            mon = &x11.monitors[i];
+        }
+    }
+    if (!x11.has_randr || !mon || !mon->output) {
+        return SDL_SetError("XRandR mode switching unavailable on this display");
+    }
+    X11ModeSave *save = x11_mode_save(id);
+    const bool to_desktop = mode->w == display->desktop_mode.w && mode->h == display->desktop_mode.h &&
+                            fabsf(mode->refresh_rate - display->desktop_mode.refresh_rate) < 0.01f;
+    xcb_randr_mode_t want = XCB_NONE;
+    if (to_desktop) {
+        if (!save) {
+            return true; /* never left it */
+        }
+        want = save->desktop_mode;
+    } else {
+        for (int i = 0; i < mon->num_modes && want == XCB_NONE; i++) {
+            const SDL_DisplayMode *m = &mon->modes[i];
+            if (m->w == mode->w && m->h == mode->h && fabsf(m->refresh_rate - mode->refresh_rate) < 0.01f) {
+                want = mon->mode_ids[i];
+            }
+        }
+        if (want == XCB_NONE) {
+            return SDL_SetError("Display mode %dx%d@%g not offered by XRandR", mode->w, mode->h,
+                                (double)mode->refresh_rate);
+        }
+    }
+
+    xcb_randr_get_screen_resources_current_reply_t *res = X11_xcb_randr_get_screen_resources_current_reply(
+        x11.conn, X11_xcb_randr_get_screen_resources_current(x11.conn, x11.root), NULL);
+    if (!res) {
+        return SDL_SetError("Couldn't get XRandR screen resources");
+    }
+    bool ok = false;
+    xcb_randr_get_output_info_reply_t *oi = X11_xcb_randr_get_output_info_reply(
+        x11.conn, X11_xcb_randr_get_output_info(x11.conn, mon->output, res->config_timestamp), NULL);
+    xcb_randr_get_crtc_info_reply_t *ci = NULL;
+    if (oi && oi->crtc != XCB_NONE) {
+        ci = X11_xcb_randr_get_crtc_info_reply(
+            x11.conn, X11_xcb_randr_get_crtc_info(x11.conn, oi->crtc, res->config_timestamp), NULL);
+    }
+    const xcb_randr_mode_info_t *mi = find_mode(res, want);
+    if (!ci || !mi) {
+        SDL_SetError("Couldn't get XRandR output/crtc info");
+        goto done;
+    }
+    if (ci->mode == want) {
+        ok = true;
+        goto done;
+    }
+    const xcb_randr_crtc_t crtc = oi->crtc;
+    const bool sideways = (ci->rotation & (XCB_RANDR_ROTATION_ROTATE_90 | XCB_RANDR_ROTATION_ROTATE_270)) != 0;
+    int screen_w = ci->x + (sideways ? mi->height : mi->width);
+    int screen_h = ci->y + (sideways ? mi->width : mi->height);
+    xcb_randr_crtc_t *crtcs = X11_xcb_randr_get_screen_resources_current_crtcs(res);
+    for (int i = 0; i < X11_xcb_randr_get_screen_resources_current_crtcs_length(res); i++) {
+        if (crtcs[i] == crtc) {
+            continue;
+        }
+        xcb_randr_get_crtc_info_reply_t *o = X11_xcb_randr_get_crtc_info_reply(
+            x11.conn, X11_xcb_randr_get_crtc_info(x11.conn, crtcs[i], res->config_timestamp), NULL);
+        if (o) {
+            if (o->mode != XCB_NONE) {
+                screen_w = SDL_max(screen_w, o->x + o->width);
+                screen_h = SDL_max(screen_h, o->y + o->height);
+            }
+            free(o);
+        }
+    }
+    /* keep the physical size ratio the server started with */
+    const int mm_w = x11.screen->width_in_pixels
+                         ? (int)((Sint64)screen_w * x11.screen->width_in_millimeters / x11.screen->width_in_pixels)
+                         : 0;
+    const int mm_h = x11.screen->height_in_pixels
+                         ? (int)((Sint64)screen_h * x11.screen->height_in_millimeters / x11.screen->height_in_pixels)
+                         : 0;
+    const xcb_randr_mode_t was = ci->mode;
+
+    X11_xcb_grab_server(x11.conn);
+    xcb_randr_set_crtc_config_reply_t *r = X11_xcb_randr_set_crtc_config_reply(
+        x11.conn,
+        X11_xcb_randr_set_crtc_config(x11.conn, crtc, XCB_CURRENT_TIME, res->config_timestamp, 0, 0, XCB_NONE,
+                                      ci->rotation, 0, NULL),
+        NULL);
+    const bool disabled = r && r->status == XCB_RANDR_SET_CONFIG_SUCCESS;
+    xcb_timestamp_t cfg = res->config_timestamp;
+    free(r);
+    if (disabled) {
+        /* BadMatch/BadValue here are known and harmless (stock SDL #4561, #4840) */
+        free(X11_xcb_request_check(x11.conn, X11_xcb_randr_set_screen_size_checked(
+                                                 x11.conn, x11.root, (uint16_t)screen_w, (uint16_t)screen_h,
+                                                 (uint32_t)SDL_max(mm_w, 1), (uint32_t)SDL_max(mm_h, 1))));
+        xcb_randr_output_t out = mon->output;
+        r = X11_xcb_randr_set_crtc_config_reply(
+            x11.conn,
+            X11_xcb_randr_set_crtc_config(x11.conn, crtc, XCB_CURRENT_TIME, cfg, ci->x, ci->y, want, ci->rotation,
+                                          1, &out),
+            NULL);
+        ok = r && r->status == XCB_RANDR_SET_CONFIG_SUCCESS;
+        if (!ok) {
+            /* light the crtc up again the way it was */
+            free(r);
+            r = X11_xcb_randr_set_crtc_config_reply(
+                x11.conn,
+                X11_xcb_randr_set_crtc_config(x11.conn, crtc, XCB_CURRENT_TIME, cfg, ci->x, ci->y, was,
+                                              ci->rotation, 1, &out),
+                NULL);
+        }
+        free(r);
+    }
+    X11_xcb_ungrab_server(x11.conn);
+    x11_flush();
+    if (!ok) {
+        SDL_SetError("XRandR refused the mode switch");
+        goto done;
+    }
+    if (to_desktop) {
+        *save = x11.mode_saves[--x11.num_mode_saves];
+    } else if (!save && x11.num_mode_saves < (int)SDL_arraysize(x11.mode_saves)) {
+        x11.mode_saves[x11.num_mode_saves].display_id = id;
+        x11.mode_saves[x11.num_mode_saves].desktop_mode = was;
+        x11.num_mode_saves++;
+    }
+
+done:
+    free(ci);
+    free(oi);
+    free(res);
+    if (ok) {
+        /* bounds follow now (fullscreen windows are fitted to them), not
+         * when the RandR notify comes round */
+        x11_update_displays(true);
+        x11.displays_dirty = false;
+    }
+    return ok;
 }
 
 static void x11_init_randr(void)
@@ -4122,6 +4299,7 @@ SDLop_VideoDevice SDLop_x11_device = {
     .ShowWindowSystemMenu = x11_ShowWindowSystemMenu,
     .UpdateWindowShape = x11_UpdateWindowShape,
     .GetWindowICCProfile = x11_GetWindowICCProfile,
+    .SetDisplayMode = x11_SetDisplayMode,
     .SetWindowModal = x11_SetWindowModal,
     .SetWindowBordered = x11_SetWindowBordered,
     .SetWindowResizable = x11_SetWindowResizable,

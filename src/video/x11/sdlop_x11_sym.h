@@ -169,6 +169,11 @@ SDLOP_X11_SYM(RANDR, xcb_randr_get_output_info_modes_length)
 SDLOP_X11_SYM(RANDR, xcb_randr_get_crtc_info)
 SDLOP_X11_SYM(RANDR, xcb_randr_get_crtc_info_reply)
 SDLOP_X11_SYM(RANDR, xcb_randr_select_input)
+SDLOP_X11_SYM(RANDR, xcb_randr_get_screen_resources_current_crtcs)
+SDLOP_X11_SYM(RANDR, xcb_randr_get_screen_resources_current_crtcs_length)
+SDLOP_X11_SYM(RANDR, xcb_randr_set_crtc_config)
+SDLOP_X11_SYM(RANDR, xcb_randr_set_crtc_config_reply)
+SDLOP_X11_SYM(RANDR, xcb_randr_set_screen_size_checked)
 
 /* ------------------------------------------------------------- RENDER */
 SDLOP_X11_MODULE(RENDER)
