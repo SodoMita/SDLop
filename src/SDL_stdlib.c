@@ -36,7 +36,12 @@
 #undef SDL_memmove
 #undef SDL_memset
 
+#ifndef _WIN32
+/* MinGW defines `environ` as a macro over its CRT's __imp_environ, so
+ * declaring it here trips clang's -Winconsistent-dllimport. The Win32
+ * environment is read through the CRT instead (see SDLOP_EnvironmentQuit). */
 extern char **environ;
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Memory                                                              */
@@ -1237,6 +1242,7 @@ typedef enum SDLOP_IconvKind
     SDLOP_ICONV_UTF32LE,
     SDLOP_ICONV_UTF32BE,
     SDLOP_ICONV_UCS2,
+    SDLOP_ICONV_8859_1,  /* ASCII / ISO-8859-1: byte == code point */
     SDLOP_ICONV_ACP,     /* "" or "ANSI" */
     SDLOP_ICONV_UNSUPPORTED
 } SDLOP_IconvKind;
@@ -1262,14 +1268,29 @@ static SDLOP_IconvKind iconv_kind(const char *name)
     if (SDL_strcasecmp(name, "UTF-16BE") == 0 || SDL_strcasecmp(name, "UNICODEBIG") == 0) {
         return SDLOP_ICONV_UTF16BE;
     }
-    if (SDL_strcasecmp(name, "UTF-32") == 0 || SDL_strcasecmp(name, "UTF-32LE") == 0) {
+    if (SDL_strcasecmp(name, "UTF-32") == 0 || SDL_strcasecmp(name, "UTF-32LE") == 0 ||
+        SDL_strcasecmp(name, "UCS-4") == 0 || SDL_strcasecmp(name, "UCS-4LE") == 0 ||
+        SDL_strcasecmp(name, "UCS4") == 0) {
+        /* stock maps UCS-4 to UTF-32; SDL_iconv_utf8_ucs4() needs this name */
         return SDLOP_ICONV_UTF32LE;
     }
-    if (SDL_strcasecmp(name, "UTF-32BE") == 0) {
+    if (SDL_strcasecmp(name, "UTF-32BE") == 0 || SDL_strcasecmp(name, "UCS-4BE") == 0) {
         return SDLOP_ICONV_UTF32BE;
     }
     if (SDL_strcasecmp(name, "UCS-2") == 0) {
         return SDLOP_ICONV_UCS2;
+    }
+    if (SDL_strcasecmp(name, "UCS-2LE") == 0) {
+        return SDLOP_ICONV_UTF16LE; /* a fixed 16-bit little-endian encoding */
+    }
+    if (SDL_strcasecmp(name, "UTF8") == 0) {
+        return SDLOP_ICONV_UTF8;    /* glibc accepts the dashless spelling */
+    }
+    if (SDL_strcasecmp(name, "ASCII") == 0 || SDL_strcasecmp(name, "US-ASCII") == 0 ||
+        SDL_strcasecmp(name, "ISO-8859-1") == 0 || SDL_strcasecmp(name, "LATIN1") == 0) {
+        /* single-byte, and every byte is a code point: the ANSI path is only
+         * right when the ANSI code page is 1252, so handle these directly */
+        return SDLOP_ICONV_8859_1;
     }
     /* the Windows ANSI code page: SDL3 spells it "ACP", and an empty or
      * "ANSI" name means the same in the Win32 iconv world */
@@ -1312,6 +1333,14 @@ static bool iconv_next(const SDLOP_IconvKind from, const char **in, size_t *left
 {
     const unsigned char *p = (const unsigned char *)*in;
     switch (from) {
+    case SDLOP_ICONV_8859_1:
+        if (*left < 1) {
+            return false;
+        }
+        *cp = p[0];
+        *in += 1;
+        *left -= 1;
+        return true;
     case SDLOP_ICONV_UTF8:
         if (*left < 1) {
             return false;
@@ -1510,6 +1539,12 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
                 enc[n++] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
                 enc[n++] = (unsigned char)(0x80 | (cp & 0x3F));
             }
+            break;
+        case SDLOP_ICONV_8859_1:
+            if (cp > 0xFF) {
+                return SDL_ICONV_EILSEQ; /* not representable, like iconv */
+            }
+            enc[n++] = (unsigned char)cp;
             break;
         case SDLOP_ICONV_UTF16LE:
         case SDLOP_ICONV_UCS2:

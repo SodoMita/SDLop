@@ -865,9 +865,16 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         return 0;
 
     case WM_DESTROY:
+        /* Only drop the focus this window actually holds: a child destroyed
+         * through its parent raises WM_DESTROY too, and clearing blindly would
+         * take the focus away from an unrelated window. */
         if (window) {
-            sdlop.keyboard_focus = NULL;
-            sdlop.mouse_focus = NULL;
+            if (sdlop.keyboard_focus == window) {
+                sdlop.keyboard_focus = NULL;
+            }
+            if (sdlop.mouse_focus == window) {
+                sdlop.mouse_focus = NULL;
+            }
         }
         SetPropW(hwnd, L"SDLopWindow", NULL);
         return 0;
@@ -1550,10 +1557,18 @@ static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *win
     }
     const bool go_fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
     if (go_fullscreen) {
-        /* remember what to restore to */
-        GetWindowRect(data->hwnd, &data->windowed_rect);
-        data->windowed_style = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_STYLE);
-        data->windowed_exstyle = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_EXSTYLE);
+        /* Remember what to restore to - but only on the windowed -> fullscreen
+         * transition. SDL_SetWindowFullscreenMode() on a window that is
+         * already fullscreen calls the driver again, and by then GetWindowRect
+         * is the monitor rect and the style is WS_POPUP, so saving here every
+         * time would record fullscreen as the windowed state and leaving
+         * fullscreen would produce a borderless monitor-sized window. */
+        if (!data->is_fullscreen) {
+            GetWindowRect(data->hwnd, &data->windowed_rect);
+            data->windowed_style = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_STYLE);
+            data->windowed_exstyle = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_EXSTYLE);
+            data->is_fullscreen = true;
+        }
         MONITORINFO mi;
         SDL_zero(mi);
         mi.cbSize = sizeof(mi);
@@ -1567,6 +1582,7 @@ static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *win
         }
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_ENTER_FULLSCREEN, 0, 0);
     } else {
+        data->is_fullscreen = false;
         SetWindowLongPtrW(data->hwnd, GWL_STYLE, (LONG_PTR)data->windowed_style);
         SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, (LONG_PTR)data->windowed_exstyle);
         SetWindowPos(data->hwnd, (data->windowed_exstyle & WS_EX_TOPMOST) ? HWND_TOPMOST : HWND_NOTOPMOST,
@@ -1606,15 +1622,24 @@ static bool win32_SetWindowRelativeMouseMode(SDLop_VideoDevice *device, SDL_Wind
     (void)device;
     SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
     sdlop_win32.want_relative_mouse = enabled;
-    /* Raw input gives unaccelerated deltas and no cursor clamping; when the
-     * mode is off, position events come from WM_MOUSEMOVE again. */
-    RAWINPUTDEVICE rid;
-    SDL_zero(rid);
-    rid.usUsagePage = 0x01;
-    rid.usUsage = 0x02;
-    rid.dwFlags = enabled ? 0 : RIDEV_REMOVE;
-    rid.hwndTarget = NULL;
-    RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    /* Windows keeps ONE raw-input registration per usage per process, so this
+     * must not fight the worker for it. win32_register_raw_keyboard() has the
+     * same rule for the keyboard. When the worker is the source it owns both
+     * registrations (RIDEV_INPUTSINK on its own hidden window) and already
+     * delivers unaccelerated deltas, so leave them alone entirely: registering
+     * here with hwndTarget=NULL would replace the worker's mouse registration
+     * and RIDEV_REMOVE on the way out would delete it, after which
+     * WM_MOUSEMOVE and the button messages are suppressed by
+     * SDLOP_RawInputIsSource() and the pointer goes dead until restart. */
+    if (!SDLOP_RawInputIsSource()) {
+        RAWINPUTDEVICE rid;
+        SDL_zero(rid);
+        rid.usUsagePage = 0x01;
+        rid.usUsage = 0x02;
+        rid.dwFlags = enabled ? 0 : RIDEV_REMOVE;
+        rid.hwndTarget = NULL;
+        RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    }
     if (enabled) {
         if (data && data->hwnd) {
             RECT rc;
@@ -2824,21 +2849,21 @@ static UINT win32_clipboard_format_png(void)
 static bool win32_set_clipboard_text(const char *mime_type)
 {
     size_t size = 0;
-    void *utf8 = SDLOP_GetInternalClipboardData(mime_type, &size);
     wchar_t *wide;
     HGLOBAL memory;
     int length;
     bool result = false;
 
-    (void)utf8;
-    SDL_free(utf8);
-    if (!size) {
+    /* One fetch: SDLOP_GetInternalClipboardData runs the application's data
+     * callback, and asking twice for the size and then the bytes called it
+     * twice for a single copy. */
+    void *utf8 = SDLOP_GetInternalClipboardData(mime_type, &size);
+    if (!utf8) {
         return true; /* the app offered no text under this type */
     }
-
-    utf8 = SDLOP_GetInternalClipboardData(mime_type, &size);
-    if (!utf8) {
-        return SDL_SetError("Couldn't get clipboard data from the application");
+    if (!size) {
+        SDL_free(utf8);
+        return true;
     }
 
     length = MultiByteToWideChar(CP_UTF8, 0, (const char *)utf8, (int)size, NULL, 0);
@@ -2901,7 +2926,6 @@ static bool win32_set_clipboard_html(const char *mime_type)
     const size_t open_len = sizeof(open_marker) - 1;
     const size_t close_len = sizeof(close_marker) - 1;
     const size_t fragment_start = header_len + open_len;
-    const size_t fragment_end = fragment_start + size; /* set below */
     size_t total;
     UINT format;
     bool result = false;
@@ -2927,11 +2951,14 @@ static bool win32_set_clipboard_html(const char *mime_type)
     SDL_memcpy(buffer + fragment_start + size, close_marker, close_len);
     SDL_free(html);
 
-    win32_patch_offset(buffer, "StartHTML:", 0); /* the header starts at 0 */
+    /* StartHTML is the offset of the HTML *context*, not of the "Version:"
+     * header: the spec starts it at "<html>" (or at the fragment when that is
+     * omitted, as here), and readers that take 0 literally try to parse the
+     * Version/StartHTML lines as markup. */
+    win32_patch_offset(buffer, "StartHTML:", fragment_start);
     win32_patch_offset(buffer, "EndHTML:", total);
     win32_patch_offset(buffer, "StartFragment:", fragment_start);
     win32_patch_offset(buffer, "EndFragment:", fragment_start + size);
-    (void)fragment_end;
 
     memory = GlobalAlloc(GMEM_MOVEABLE, total);
     if (memory) {
@@ -2942,9 +2969,10 @@ static bool win32_set_clipboard_html(const char *mime_type)
             format = RegisterClipboardFormatW(L"HTML Format");
             if (format && SetClipboardData(format, memory)) {
                 result = true;
-            } else {
-                GlobalFree(memory);
+                SDL_free(buffer);
+                return result;
             }
+            GlobalFree(memory);
         } else {
             GlobalFree(memory);
         }
@@ -2952,6 +2980,11 @@ static bool win32_set_clipboard_html(const char *mime_type)
         SDL_SetError("Out of memory");
     }
     SDL_free(buffer);
+    if (!result) {
+        /* A FALSE return with no error set leaves callers with a stale
+         * SDL_GetError() from something unrelated. */
+        SDL_SetError("Couldn't set clipboard data");
+    }
     return result;
 }
 

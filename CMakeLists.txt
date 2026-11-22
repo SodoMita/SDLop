@@ -546,6 +546,21 @@ if(NOT WIN32)
   add_dependencies(sdlop_shared sdlop_wayland_protocols)
 endif()
 set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
+if(WIN32)
+  # Make the DLL export list a property of the code, not of the linker.
+  # Without this SDL_DECLSPEC is empty on Windows and the exports come from
+  # auto-export, which not every linker pairs with tools/sdlop.sym: GNU ld
+  # applies the version script to PE and lld ignores it silently, so the same
+  # tree could export 318 internal SDLOP_* symbols or not depending on who
+  # linked it. With DLL_EXPORT every exported function says so itself.
+  target_compile_definitions(sdlop_shared PRIVATE DLL_EXPORT)
+  # The two SDL_SetLinuxThreadPriority* functions exist in the Windows DLL as
+  # "only available on Linux" stubs, so they need a dllexport declaration to
+  # define against. This macro only adds those two declarations; it does not
+  # make them visible to applications, which is why it is private here and is
+  # not part of the installed/public header set.
+  target_compile_definitions(sdlop_shared PRIVATE SDLOP_EXPORT_LINUX_API)
+endif()
 target_include_directories(sdlop_shared PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_include_directories(sdlop_shared PRIVATE
@@ -1252,7 +1267,8 @@ if(SDLop_BUILD_TESTS)
   # blit / conversion / fill / transform case. Built against stock SDL3 as well
   # when both -DSDL3_REFERENCE_INCLUDE and -DSDL3_REFERENCE_LIB are given, the
   # outputs must match exactly; otherwise it runs as a smoke test.
-  if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
+  # (Windows has no run_surface_diff.sh: sh scripts are POSIX-only here.)
+  if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT WIN32)
     add_executable(surface_diff tests/surface_diff.c)
     target_link_libraries(surface_diff PRIVATE sdlop)
     if (SDL3_REFERENCE_INCLUDE AND SDL3_REFERENCE_LIB)

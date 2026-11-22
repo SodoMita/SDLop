@@ -346,6 +346,7 @@ typedef struct SDLop_Globals
 
     /* event queue wakeup (raw input worker -> main thread) */
     int wake_fd;                /* eventfd, read to reset */
+    void *wake_handle;          /* Win32: auto-reset event, waited on and set */
 
     /* KMSDRM VT-switch signals owned by the driver's signalfd; helper
      * threads (raw evdev worker) block these so the signals are always

@@ -67,11 +67,10 @@ typedef struct SDLOP_RawDevice
     float hi_res_x, hi_res_y;
     SDL_Window *wheel_focus; /* owner of a partial SDL wheel frame */
     bool removal_done; /* main-thread state release completed */
-    int abs_value[2], abs_min[2], abs_max[2];
+    int abs_min[2], abs_max[2];
     int abs_range[2]; /* abs_max - abs_min, kept for the abs_motion scaling */
     bool touch_is_left; /* BTN_TOUCH with no BTN_LEFT is this device's left button */
-    float abs_last[2]; /* normalized relative-mode baseline */
-    bool abs_dirty, abs_valid, abs_recovered;
+    bool abs_recovered;
     bool syncing, wait_report, requested;
     Uint64 retry_ns;
     unsigned int sync_code;
@@ -238,7 +237,6 @@ static int open_input_devices(void)
                     dev->abs_min[axis] = info->minimum;
                     dev->abs_max[axis] = info->maximum;
                     dev->abs_range[axis] = info->maximum - info->minimum;
-                    dev->abs_value[axis] = info->value;
                 }
                 dev->has_abs = valid;
                 dev->is_pointer |= valid;
@@ -804,7 +802,6 @@ void SDLOP_RawInputResetPointerFrame(void)
 {
     for (int i = 0; i < raw.num_devices; i++) {
         raw.devices[i].hi_res_x = raw.devices[i].hi_res_y = 0;
-        raw.devices[i].abs_valid = raw.devices[i].abs_dirty = false;
     }
 }
 
@@ -1148,7 +1145,7 @@ static void begin_sync(SDLOP_RawDevice *dev, bool wait_report)
     dev->sync_code = 0;
     dev->retry_ns = 0;
     dev->hi_res_x = dev->hi_res_y = 0.0f; /* damaged partial wheel frame */
-    dev->abs_dirty = dev->abs_valid = dev->abs_recovered = false;
+    dev->abs_recovered = false;
     raw.have_sync = true;
     sdlop.repeat_active = false; /* don't repeat uncertain key state */
 }
@@ -1180,7 +1177,9 @@ static void pump_recovery(void)
         if ((raw.fallback_pending || atomic_load_explicit(&dev->disconnected, memory_order_acquire)) &&
             !dev->removal_done) {
             dev->hi_res_x = dev->hi_res_y = 0;
-            dev->abs_dirty = dev->abs_valid = false;
+            /* a slot being reused must not keep the old device's absolute
+             * baseline, or the first sample of the new one makes a delta */
+            SDL_zero(abs_state[dev->index]);
             for (unsigned code = 0; code <= KEY_MAX; code++) {
                 if (!test_bit(dev->keys, code)) { continue; }
                 SDLop_RawEvent up = { .device = dev->index, .type = EV_KEY, .code = (Uint16)code };
@@ -1204,13 +1203,20 @@ static void pump_recovery(void)
                 dev->sync_code = 0;
             } else if (!dev->wait_report && (int64_t)(tail - dev->snapshot_boundary) >= 0) {
                 if (dev->has_abs && !dev->abs_recovered) {
+                    /* Restore the position the device actually has, in the
+                     * model abs_motion reads (#10's abs_state), and drop the
+                     * motion baseline: the deltas lost while SYN_DROPPED are
+                     * unknown, so the next sample re-anchors rather than
+                     * manufacturing one jump across the gap. */
+                    SDLOP_AbsState *st = &abs_state[dev->index];
                     for (int axis = 0; axis < 2; axis++) {
-                        dev->abs_value[axis] = dev->snapshot_abs[axis].value;
                         dev->abs_min[axis] = dev->snapshot_abs[axis].minimum;
                         dev->abs_max[axis] = dev->snapshot_abs[axis].maximum;
+                        st->cur[axis] = dev->snapshot_abs[axis].value;
+                        st->has_cur[axis] = true;
                     }
-                    dev->abs_dirty = true;
-                    dev->abs_valid = false; /* never invent lost relative history */
+                    st->has_last = false;
+                    st->dirty = true;
                     abs_motion(dev, 0, raw.winsys);
                     dev->abs_recovered = true;
                 }

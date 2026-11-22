@@ -17,6 +17,12 @@
 #define SDL_MAIN_NOIMPL
 
 #include "internal/sdlop_internal.h"
+/* SDL_RegisterApp / SDL_UnregisterApp / SDL_GDKSuspendComplete are declared
+ * under #if defined(SDL_PLATFORM_WINDOWS) in SDL_main.h, and without this
+ * include their definitions here compile without a dllexport prototype, so
+ * they drop out of the DLL's export list as soon as the build stops relying
+ * on auto-export. SDL_MAIN_NOIMPL above keeps the header from emitting main. */
+#include <SDL3/SDL_main.h>
 
 #include <errno.h>
 #include <stdio.h>

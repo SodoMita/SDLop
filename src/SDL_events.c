@@ -240,6 +240,11 @@ static void wake_main_thread(void)
         uint64_t one = 1;
         (void)!write(sdlop.wake_fd, &one, sizeof(one));
     }
+#ifdef _WIN32
+    if (sdlop.wake_handle) {
+        SetEvent((HANDLE)sdlop.wake_handle);
+    }
+#endif
 }
 
 static bool side_push(const SDL_Event *event)
@@ -973,10 +978,18 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
 
         int video_fd = sdlop.video ? sdlop.video->GetEventFD(sdlop.video) : -1;
 #ifdef _WIN32
-        /* No file descriptors to poll: the Win32 driver pumps inside
-         * SDL_PumpEvents(), so waiting is a plain sleep between pumps. */
+        /* Win32 has no pollable fds, but it does have waitable objects: block
+         * on the wake event and on this thread's input queue. Sleep()ing here
+         * instead would wake 64-100 times a second while idle and pick input
+         * up a whole tick late. MWMO_INPUTAVAILABLE returns for messages
+         * already in the queue that PeekMessage would find, so this cannot
+         * miss input that arrived before the wait. A cross-thread
+         * SDL_PushEvent signals the same event, so it wakes the waiter
+         * immediately instead of after the sleep. */
         (void)video_fd;
-        SDL_Delay((Uint32)wait_ms);
+        const HANDLE wake_handle = (HANDLE)sdlop.wake_handle;
+        MsgWaitForMultipleObjectsEx(wake_handle ? 1 : 0, &wake_handle, (DWORD)wait_ms,
+                                    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 #else
         const int dbus_fd = SDLOP_DBus_GetFD(); /* theme changes, portal replies */
         /* Device fds plus the evdev backend's inotify hotplug fd. */

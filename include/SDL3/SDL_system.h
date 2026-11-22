@@ -122,7 +122,11 @@ typedef bool (SDLCALL *SDL_X11EventHook)(void *userdata, XEvent *xevent);
 
 
 /* Platform specific functions for Linux*/
-#ifdef SDL_PLATFORM_LINUX
+/* SDLop: the Windows build also exports these two (as the honest "only
+ * available on Linux" error) because tools/api_exports_check.sh compares the
+ * declared header set against the DLL and cannot evaluate this #ifdef. They
+ * are still NOT declared to Windows applications, like stock SDL3. */
+#if defined(SDL_PLATFORM_LINUX) || (defined(SDL_PLATFORM_WINDOWS) && defined(SDLOP_EXPORT_LINUX_API))
 
 /**
  * Sets the UNIX nice value for a thread.

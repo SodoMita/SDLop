@@ -31,6 +31,7 @@ typedef struct SDLop_Win32WindowData
     Uint32 dpi;
 
     /* fullscreen bookkeeping */
+    bool is_fullscreen;   /* windowed_* below only describe a windowed window */
     RECT windowed_rect;
     DWORD windowed_style;
     DWORD windowed_exstyle;

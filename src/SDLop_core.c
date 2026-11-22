@@ -254,8 +254,12 @@ bool SDL_Init(SDL_InitFlags flags)
         sdlop.repeat_delay_ms = 500;
         sdlop.repeat_interval_ms = 33;
 #if defined(__EMSCRIPTEN__) || defined(_WIN32)
-        /* no fd to wake on the web; Windows events have their own mechanism */
+        /* No fd to wake on the web; Windows waits on an auto-reset event
+         * instead, so SDL_WaitEvent can block rather than poll. */
         sdlop.wake_fd = -1;
+#if defined(_WIN32)
+        sdlop.wake_handle = CreateEventW(NULL, FALSE, FALSE, NULL);
+#endif
 #else
         sdlop.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (sdlop.wake_fd < 0) {
@@ -321,6 +325,12 @@ void SDL_Quit(void)
         close(sdlop.wake_fd);
         sdlop.wake_fd = -1;
     }
+#if defined(_WIN32)
+    if (sdlop.wake_handle) {
+        CloseHandle((HANDLE)sdlop.wake_handle);
+        sdlop.wake_handle = NULL;
+    }
+#endif
     SDLOP_EnvironmentQuit();
     SDLOP_ThreadsQuit();
     memset(&sdlop, 0, sizeof(sdlop));

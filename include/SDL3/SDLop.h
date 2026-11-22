@@ -331,7 +331,7 @@ typedef struct SDLop_RawInputStats
  * \param stats output storage, must not be NULL.
  * \returns true on success, false for a NULL pointer (SDL error set).
  */
-extern bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats);
+extern SDL_DECLSPEC bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats);
 
 /**
  * Set the background color a window is presented with.

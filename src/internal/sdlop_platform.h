@@ -68,13 +68,40 @@ typedef pthread_mutex_t SDLOP_MUTEX_T;
 #define SDLOP_MUTEX_INIT_RECURSIVE(m) SDLOP_MUTEX_INIT_ONCE(m)
 
 /* A mutex with static storage duration. Both platforms spell this the same
- * way at the call site; only the expansion differs. */
+ * way at the call site; only the expansion differs.
+ *
+ * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP is a glibc extension, and the plain
+ * PTHREAD_MUTEX_INITIALIZER it would replace is NOT recursive. Win32's
+ * CRITICAL_SECTION always is, so static-initialising POSIX mutexes the plain
+ * way made the two platforms differ in exactly the property SDL3 code relies
+ * on: SDL_OpenHapticFromJoystick() holds the joystick lock and calls
+ * SDL_IsJoystickHaptic(), which takes it again. On Linux that nested lock
+ * would deadlock. Hence the GNU initialiser where it exists, and the same
+ * once-initialised fallback everywhere else. */
 typedef struct SDLOP_StaticMutex
 {
     pthread_mutex_t id;
 } SDLOP_StaticMutex;
 
-#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER }
+#if defined(__GLIBC__) || defined(__ANDROID__)
+#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP }
+#else
+#define SDLOP_STATIC_MUTEX(name)                                       \
+    SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER };            \
+    static bool name##_inited;                                         \
+    static void name##_init(void)                                      \
+    {                                                                  \
+        SDLOP_MUTEX_INIT_RECURSIVE(&(name).id);                        \
+    }                                                                  \
+    static void name##_ensure(void)                                    \
+    {                                                                  \
+        static SDLOP_ONCE_T once = SDLOP_ONCE_INIT;                    \
+        if (!name##_inited) {                                          \
+            SDLOP_ONCE(&once, name##_init);                            \
+            name##_inited = true;                                      \
+        }                                                              \
+    }
+#endif
 #define SDLOP_SM(m)              (&(m)->id)
 
 /* --- once -------------------------------------------------------- */
@@ -285,21 +312,20 @@ bool SDLOP_SemWaitUntil(SDLOP_SEM_T *sem, const struct timespec *deadline);
 
 /* --- sleep / yield ----------------------------------------------- */
 
-/* Sleeps are millisecond-granular on Windows unless a high-resolution timer
- * is in play; SDL_DelayPrecise spins the last fraction of a millisecond, so
- * the coarse Sleep is enough here. */
-#define SDLOP_SLEEP_NS(ns) do {                                          \
-        const Uint64 _ms = ((ns) + 999999ull) / 1000000ull;              \
-        if (_ms) {                                                       \
-            Sleep((DWORD)(_ms > 0x7fffffffull ? 0x7fffffffull : _ms));   \
-        }                                                                \
-    } while (0)
+/* Sleep() is millisecond-granular and, at the default timer resolution,
+ * rounds up to the 15.6 ms tick: SDL_Delay(1) sleeps 15.6 ms and any frame
+ * limiter built on it runs at ~64 Hz. Stock SDL3 sleeps on a high-resolution
+ * waitable timer, so do the same, with Sleep() as the fallback for systems
+ * without CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+ has it).
+ * SDLOP_SleepNS() owns the timer; see sdlop_platform.c. */
+#define SDLOP_SLEEP_NS(ns) SDLOP_SleepNS((Sint64)(ns))
 
 /* Absolute CLOCK_MONOTONIC deadline: sleep the difference, leave the last
  * 200 us to the caller's spin loop. */
 #define SDLOP_SLEEP_UNTIL_NS(abs_ns) SDLOP_SleepUntilNS((Sint64)(abs_ns))
 
 void SDLOP_SleepUntilNS(Sint64 abs_ns);
+void SDLOP_SleepNS(Sint64 ns);
 
 #define SDLOP_YIELD() SwitchToThread()
 
