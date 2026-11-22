@@ -158,6 +158,7 @@ int main(void)
     tracking = false;
     assert(!freed); /* old reader snapshots reclaimed only after worker join */
     SDL_Quit();
+    assert(SDLop_GetRawEventCount() == 502); /* held reader + 501 persistent deliveries */
     /* Reinitialization must not carry a dangling ownership chain forward. */
     for (int cycle = 0; cycle < 3; cycle++) {
         assert(SDL_Init(SDL_INIT_VIDEO) && SDLop_RawInputAvailable());

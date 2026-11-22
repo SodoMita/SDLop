@@ -7,6 +7,7 @@
 
 #define TEST_FD (-123)
 #define SDLOP_MAX_EVENTS_PER_SERVICE (SDLOP_MAX_READS_PER_DEVICE * SDLOP_MAX_EVENTS_PER_READ)
+_Static_assert(SDLOP_MAX_EVENTS_PER_SERVICE == 2048, "preserve the existing service bound");
 enum Mode { FULL, SHORT, INTERRUPT, FINITE, SCANS, END, ERROR };
 static enum Mode mode;
 static unsigned calls, native_count, callbacks;

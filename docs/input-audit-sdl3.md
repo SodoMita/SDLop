@@ -11,6 +11,10 @@ removes the single-writer counter RMW, caches conservative SPSC index limits,
 and fixes fortified-poll test interception. It improves some high-load results
 but retains an uncleared overall gate and reports saturation throughput costs.
 The historical measurements below remain specific to the audit stage.
+A later [regression/allocation follow-up](input-regression-followup.md) adds
+TSan and broader queue tests, fixes no-op callback allocations and post-join
+snapshot leaks, and rejects two additional native-path candidates that failed
+the timing gate.
 
 ## Audit findings and fixes
 
@@ -127,7 +131,9 @@ do not erase it. All trials: [audit load log](benchmarks/2026-11-21-audit-load.t
   Callback code must itself remain nonblocking; budgets cannot preempt user code.
 - **Callback registration lifetime:** pre-existing snapshot replacement retains
   prior callback allocations. The max active callback count does not bound
-  churn allocations. Unregister is not a worker quiescence barrier. Public docs
+  churn allocations. The subsequent [allocation fix](input-regression-followup.md)
+  avoids absent-unregister churn and frees retained versions after join; active
+  lifetime churn can still retain memory. Unregister is not a worker quiescence barrier. Public docs
   now warn against freeing userdata until worker stop/join; no per-event
   reclamation mechanism/lock was introduced. Init/quit must not race API use;
   never quit from the worker callback (self-join).

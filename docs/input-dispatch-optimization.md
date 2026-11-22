@@ -8,6 +8,9 @@ PR #11's initial commit **0e60878**, not against an older small-ring build.
 regressed in this sample. Keep the PR draft; do not call this universally faster.**
 No new runtime dependency, syscall, allocation, callback batching/filtering, or
 lock was added to the per-native-event path.
+The later [regression/allocation follow-up](input-regression-followup.md) adds
+TSan coverage, fixes snapshot reclamation, and records additional rejected
+native-path candidates. This report's measurements remain stage-specific.
 
 ## Verified work and changes
 

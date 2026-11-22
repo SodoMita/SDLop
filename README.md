@@ -284,6 +284,9 @@ The [dispatch optimization follow-up](docs/input-dispatch-optimization.md)
 measures single-writer counter publication and SPSC index caching, with retained
 counter-only experiments, a rootless CPU-work proxy (`bench_raw_dispatch`) and
 explicit latency/throughput tradeoffs. The full callback gate remains uncleared.
+The [regression follow-up](docs/input-regression-followup.md) adds TSan and queue
+boundary coverage, removes absent-unregister allocations, reclaims callback
+snapshots after worker join, and records rejected native-path experiments.
 
 ## API surface (SDL3-compatible)
 

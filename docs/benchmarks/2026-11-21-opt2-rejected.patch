@@ -1,0 +1,55 @@
+--- a/bench/bench_raw_dispatch.c
++++ b/bench/bench_raw_dispatch.c
+@@ -21,0 +22,4 @@
++/* Permit identical-source comparisons with the preceding read-count-only cap. */
++#ifndef SDLOP_MAX_EVENTS_PER_SERVICE
++#define SDLOP_MAX_EVENTS_PER_SERVICE (SDLOP_MAX_READS_PER_DEVICE * SDLOP_MAX_EVENTS_PER_READ)
++#endif
+@@ -72 +76 @@
+-    const Uint64 per_block = PASSES * SDLOP_MAX_READS_PER_DEVICE * SDLOP_MAX_EVENTS_PER_READ;
++    const Uint64 per_block = PASSES * SDLOP_MAX_EVENTS_PER_SERVICE;
+--- a/src/internal/sdlop_evdev.c
++++ b/src/internal/sdlop_evdev.c
+@@ -45,2 +45,3 @@
+-#define SDLOP_MAX_EVENTS_PER_READ 64
+-#define SDLOP_MAX_READS_PER_DEVICE 32 /* bound wakeup/control starvation */
++#define SDLOP_MAX_EVENTS_PER_READ 256
++#define SDLOP_MAX_READS_PER_DEVICE 32 /* also bound interrupted/short reads */
++#define SDLOP_MAX_EVENTS_PER_SERVICE 2048 /* preserve wakeup/control fairness */
+@@ -246,2 +247,7 @@
+-    for (int reads = 0; reads < SDLOP_MAX_READS_PER_DEVICE; reads++) {
+-        ssize_t got = read(dev->fd, batch, SDLOP_MAX_EVENTS_PER_READ * sizeof(*batch));
++    int remaining = SDLOP_MAX_EVENTS_PER_SERVICE;
++    for (int reads = 0; reads < SDLOP_MAX_READS_PER_DEVICE && remaining > 0; reads++) {
++        /* Read what's already queued, never wait to fill a batch. Larger
++         * reads amortize syscall cost at high load; the independent record
++         * cap preserves the former 32 * 64 maximum work before notification. */
++        int limit = remaining < SDLOP_MAX_EVENTS_PER_READ ? remaining : SDLOP_MAX_EVENTS_PER_READ;
++        ssize_t got = read(dev->fd, batch, (size_t)limit * sizeof(*batch));
+@@ -254,0 +261 @@
++        remaining -= count;
+--- a/src/internal/sdlop_ring.h
++++ b/src/internal/sdlop_ring.h
+@@ -93,0 +94,3 @@
++    if (!max_elems) {
++        return 0;
++    }
+@@ -95,4 +98,10 @@
+-    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+-    /* Single and bulk pops may be mixed by the one consumer. Keep its cache
+-     * at least as new as the batch, including zero-length calls. */
+-    ring->cached_head = head;
++    uint64_t head = ring->cached_head;
++    if (head - tail < max_elems) {
++        /* Reuse an acquired limit only if it can satisfy the entire request.
++         * Otherwise refresh: don't return a short batch from a stale cache. */
++        head = atomic_load_explicit(&ring->head, memory_order_acquire);
++        if (head == tail) {
++            return 0; /* no cache write on the common idle path */
++        }
++        ring->cached_head = head;
++    }
+@@ -101,3 +109,0 @@
+-    if (!count) {
+-        return 0;
+-    }
