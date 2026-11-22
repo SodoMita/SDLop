@@ -95,12 +95,16 @@ struct SDL_Gamepad
     struct SDL_Gamepad *next;
 };
 
+/* Maximum fds exposed to SDL_WaitEventTimeout(): evdev devices plus one
+ * inotify descriptor used for hotplug notification. */
+#define SDLOP_JOYSTICK_MAX_WAIT_FDS 65
+
 /* Lifecycle (called from SDLop_core.c / SDL_PumpEvents()). */
 bool SDLOP_InitJoysticks(void);
 void SDLOP_QuitJoysticks(void);
 bool SDLOP_JoysticksInitialized(void);
 void SDLOP_JoystickPump(void);        /* called from SDL_PumpEvents() */
-int SDLOP_JoystickGetEventFDs(int *fds, int max_fds); /* for SDL_WaitEvent */
+int SDLOP_JoystickGetEventFDs(int *fds, int max_fds); /* devices + hotplug fd */
 
 /* Backend -> core. */
 SDL_Joystick *SDLOP_JoystickAddDevice(const SDLop_JoystickDeviceDesc *desc, void *driverdata);

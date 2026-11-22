@@ -23,6 +23,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -33,7 +34,9 @@
 #define SDLOP_MAX_AXES 16
 #define SDLOP_MAX_BUTTONS 64
 #define SDLOP_MAX_HATS 4
-#define SDLOP_RESCAN_NS (250ull * 1000000ull)
+/* SDL3's fallback detection interval. Inotify normally makes this irrelevant;
+ * it is a safety net for missed notifications. */
+#define SDLOP_RESCAN_NS (3000ull * 1000000ull)
 
 typedef struct SDLOP_EvdevJoystick
 {
@@ -50,10 +53,12 @@ typedef struct SDLOP_EvdevJoystick
 static SDLOP_EvdevJoystick *devices;
 static bool initialized;
 static Uint64 last_scan_ns;
+static time_t last_input_dir_mtime;
+static int inotify_fd = -1;
 
 /* Non-joystick event nodes are expensive to probe: on this system opening and
  * closing all of the keyboard/mouse nodes takes ~140 ms. Remember devices that
- * failed the joystick probe so later 250 ms rescans only stat() them. The
+ * failed the joystick probe so periodic rescans only stat() them. The
  * inode/ctime test makes a recreated node with the same event number get
  * probed again. */
 typedef struct SDLOP_RejectedDevice
@@ -345,6 +350,32 @@ static void clear_rejected_devices(void)
     }
 }
 
+static void forget_rejected_device(const char *path)
+{
+    for (SDLOP_RejectedDevice **link = &rejected; *link;) {
+        SDLOP_RejectedDevice *r = *link;
+        if (strcmp(r->path, path) == 0) {
+            *link = r->next;
+            SDL_free(r);
+        } else {
+            link = &r->next;
+        }
+    }
+}
+
+static bool is_event_node(const char *name)
+{
+    if (!name || strncmp(name, "event", 5) != 0 || name[5] < '0' || name[5] > '9') {
+        return false;
+    }
+    for (const char *p = name + 5; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void remove_device(SDLOP_EvdevJoystick *dev)
 {
     SDL_LockJoysticks();
@@ -367,6 +398,16 @@ static void remove_device(SDLOP_EvdevJoystick *dev)
     SDL_free(dev);
     if (joystick) {
         SDLOP_JoystickRemoveDevice(joystick);
+    }
+}
+
+static void remove_device_by_path(const char *path)
+{
+    for (SDLOP_EvdevJoystick *d = devices; d; d = d->next) {
+        if (strcmp(d->path, path) == 0) {
+            remove_device(d);
+            return;
+        }
     }
 }
 
@@ -440,6 +481,14 @@ static void add_device(const char *path)
 
 static void scan_devices(void)
 {
+    struct stat dir_st;
+    bool have_dir_st = (stat("/dev/input", &dir_st) == 0);
+
+    last_scan_ns = SDL_GetTicksNS();
+    if (have_dir_st) {
+        last_input_dir_mtime = dir_st.st_mtime;
+    }
+
     /* Drop cached negative probes for nodes that vanished or were recreated. */
     prune_rejected_devices();
 
@@ -459,16 +508,103 @@ static void scan_devices(void)
     }
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        const char *n = entry->d_name;
-        if (strncmp(n, "event", 5) != 0 || n[5] < '0' || n[5] > '9') {
+        if (!is_event_node(entry->d_name)) {
             continue;
         }
         char path[PATH_MAX];
-        SDL_snprintf(path, sizeof(path), "/dev/input/%s", n);
+        SDL_snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
         add_device(path);
     }
     closedir(dir);
-    last_scan_ns = SDL_GetTicksNS();
+}
+
+/* SDL3's fallback: only walk /dev/input again when the directory changed, and
+ * never more often than the detection interval. Inotify makes this a safety
+ * net rather than the primary hotplug mechanism. */
+static void maybe_scan_devices(void)
+{
+    Uint64 now = SDL_GetTicksNS();
+    if (now - last_scan_ns < SDLOP_RESCAN_NS) {
+        return;
+    }
+    struct stat st;
+    if (stat("/dev/input", &st) == 0 && st.st_mtime == last_input_dir_mtime) {
+        last_scan_ns = now;
+        return;
+    }
+    scan_devices();
+}
+
+static void init_inotify(void)
+{
+    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (inotify_fd < 0) {
+        return;
+    }
+    /* SDL3 also watches IN_ATTRIB: udev may change permissions after node
+     * creation, which is exactly when a previously unreadable node becomes
+     * openable. */
+    if (inotify_add_watch(inotify_fd, "/dev/input",
+                          IN_CREATE | IN_DELETE | IN_MOVE | IN_ATTRIB) < 0) {
+        close(inotify_fd);
+        inotify_fd = -1;
+    }
+}
+
+static void quit_inotify(void)
+{
+    if (inotify_fd >= 0) {
+        close(inotify_fd);
+        inotify_fd = -1;
+    }
+}
+
+static void drain_inotify(void)
+{
+    if (inotify_fd < 0) {
+        return;
+    }
+
+    union
+    {
+        struct inotify_event event;
+        char storage[4096];
+    } buf;
+    bool overflow = false;
+
+    for (;;) {
+        ssize_t bytes = read(inotify_fd, &buf, sizeof(buf));
+        if (bytes <= 0) {
+            break;
+        }
+        size_t remain = (size_t)bytes;
+        char *p = buf.storage;
+        while (remain >= sizeof(struct inotify_event)) {
+            struct inotify_event *ev = (struct inotify_event *)p;
+            size_t len = sizeof(struct inotify_event) + ev->len;
+            if (len > remain) {
+                break;
+            }
+            if (ev->mask & IN_Q_OVERFLOW) {
+                overflow = true;
+            } else if (ev->len > 0 && is_event_node(ev->name)) {
+                char path[PATH_MAX];
+                SDL_snprintf(path, sizeof(path), "/dev/input/%s", ev->name);
+                if (ev->mask & (IN_CREATE | IN_MOVED_TO | IN_ATTRIB)) {
+                    forget_rejected_device(path);
+                    add_device(path);
+                } else if (ev->mask & (IN_DELETE | IN_MOVED_FROM)) {
+                    forget_rejected_device(path);
+                    remove_device_by_path(path);
+                }
+            }
+            p += len;
+            remain -= len;
+        }
+    }
+    if (overflow) {
+        scan_devices();
+    }
 }
 
 static bool read_events(SDLOP_EvdevJoystick *dev)
@@ -522,6 +658,7 @@ bool SDLOP_InitJoysticks(void)
     }
     initialized = true;
     last_scan_ns = 0;
+    init_inotify();
     scan_devices();
     return true;
 }
@@ -535,6 +672,7 @@ void SDLOP_QuitJoysticks(void)
         remove_device(devices);
     }
     clear_rejected_devices();
+    quit_inotify();
     SDLOP_JoystickQuitAllDevices();
     initialized = false;
 }
@@ -547,6 +685,9 @@ bool SDLOP_JoysticksInitialized(void)
 int SDLOP_JoystickGetEventFDs(int *fds, int max_fds)
 {
     int count = 0;
+    if (inotify_fd >= 0 && max_fds > 0) {
+        fds[count++] = inotify_fd;
+    }
     for (SDLOP_EvdevJoystick *d = devices; d && count < max_fds; d = d->next) {
         fds[count++] = d->fd;
     }
@@ -558,10 +699,8 @@ void SDLOP_JoystickPump(void)
     if (!initialized) {
         return;
     }
-    Uint64 now = SDL_GetTicksNS();
-    if (now - last_scan_ns > SDLOP_RESCAN_NS) {
-        scan_devices();
-    }
+    drain_inotify();
+    maybe_scan_devices();
 
     struct pollfd pfds[SDLOP_MAX_EVDEV_JOYSTICKS];
     SDLOP_EvdevJoystick *devs[SDLOP_MAX_EVDEV_JOYSTICKS];

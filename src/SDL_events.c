@@ -915,11 +915,10 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         }
 
         int video_fd = sdlop.video ? sdlop.video->GetEventFD(sdlop.video) : -1;
-        /* Match the evdev backend's device cap so no controller is left out
-         * of the wake-up poll set. */
-        int joy_fds[64];
+        /* Device fds plus the evdev backend's inotify hotplug fd. */
+        int joy_fds[SDLOP_JOYSTICK_MAX_WAIT_FDS];
         int num_joy = SDLOP_JoystickGetEventFDs(joy_fds, (int)SDL_arraysize(joy_fds));
-        struct pollfd pfds[66]; /* wake fd + video fd + joystick fds */
+        struct pollfd pfds[SDLOP_JOYSTICK_MAX_WAIT_FDS + 2]; /* wake + video + joystick/hotplug fds */
         int nfds = 0;
         int wake_index = -1;
         if (sdlop.wake_fd >= 0) {
