@@ -316,7 +316,6 @@ static void enumerate(void)
         free(err);
         return;
     }
-    int parsed = 0;
     for (int i = 0; i < xp.num_pens; i++) {
         xp.pens[i]->seen = false;
     }
@@ -342,16 +341,9 @@ static void enumerate(void)
             break;
         }
         consider_device(info, q);
-        parsed++;
         p = q;
     }
-    const int num_infos = r->num_infos;
     free(r);
-    int removed = 0;
-    for (int i = 0; i < xp.num_pens; i++) {
-        removed += !xp.pens[i]->seen;
-    }
-    SDL_SetError("x11 pen enumerate: %d/%d infos, %d pens, %d gone", parsed, num_infos, xp.num_pens, removed);
     for (int i = xp.num_pens - 1; i >= 0; i--) {
         if (!xp.pens[i]->seen) {
             remove_pen_at(i, false); /* the device is gone: nothing to deselect */

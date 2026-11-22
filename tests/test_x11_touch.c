@@ -188,7 +188,10 @@ static void *proxy_thread(void *arg)
             for (size_t i = 0; i + 32 <= inject_len;) {
                 inject_buf[i + 2] = (unsigned char)(last_seq & 0xff);
                 inject_buf[i + 3] = (unsigned char)(last_seq >> 8);
-                uint32_t len = (uint32_t)inject_buf[i + 4] | ((uint32_t)inject_buf[i + 5] << 8);
+                uint32_t len = 0; /* only GenericEvents have a length (core events: time) */
+                if ((inject_buf[i] & 0x7f) == 35) {
+                    len = (uint32_t)inject_buf[i + 4] | ((uint32_t)inject_buf[i + 5] << 8);
+                }
                 i += 32 + 4u * len;
             }
             bool ok = write_all(pc->client, inject_buf, inject_len);

@@ -301,7 +301,15 @@ static void *proxy_thread(void *arg)
             for (size_t i = 0; i + 32 <= inject_len;) {
                 inject_buf[i + 2] = (unsigned char)(last_seq & 0xff);
                 inject_buf[i + 3] = (unsigned char)(last_seq >> 8);
-                uint32_t len = (uint32_t)inject_buf[i + 4] | ((uint32_t)inject_buf[i + 5] << 8);
+                /* only GenericEvents have a length (in core events bytes
+                 * 4..7 are the time): a misparse leaves later events with a
+                 * stale sequence, which xcb widens past its pending
+                 * requests and then fails their replies */
+                uint32_t len = 0;
+                if ((inject_buf[i] & 0x7f) == 35) {
+                    len = (uint32_t)inject_buf[i + 4] | ((uint32_t)inject_buf[i + 5] << 8) |
+                          ((uint32_t)inject_buf[i + 6] << 16) | ((uint32_t)inject_buf[i + 7] << 24);
+                }
                 i += 32 + 4u * len;
             }
             bool ok = write_all(pc->client, inject_buf, inject_len);
@@ -840,17 +848,10 @@ int main(int argc, char *argv[])
     atomic_store(&fake_present, false);
     queue_hierarchy(XCB_INPUT_HIERARCHY_MASK_SLAVE_REMOVED);
     flush_and_collect(&log);
-    int late_pen = -1;
-    if (SDL_GetPenDeviceType(stylus) != SDL_PEN_DEVICE_TYPE_INVALID) {
-        event_log late;
-        memset(&late, 0, sizeof(late));
-        pump(&late, 1500);
-        late_pen = count_pen(&late);
-    }
     char diag[512];
-    snprintf(diag, sizeof(diag), "queries %d->%d replies %d->%d rewrites %d->%d injections %d->%d late %d types %d %d [%s]",
+    snprintf(diag, sizeof(diag), "queries %d->%d replies %d->%d rewrites %d->%d injections %d->%d types %d %d [%s]",
              q0, atomic_load(&stat_queries), r0, atomic_load(&stat_query_replies), w0, atomic_load(&stat_rewrites), j0,
-             atomic_load(&stat_injections), late_pen, (int)SDL_GetPenDeviceType(stylus),
+             atomic_load(&stat_injections), (int)SDL_GetPenDeviceType(stylus),
              (int)SDL_GetPenDeviceType(eraser), SDL_GetError());
     int outs = 0;
     for (i = 0; i < log.n; i++) {
