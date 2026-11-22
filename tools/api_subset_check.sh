@@ -13,9 +13,17 @@ SDLOP_SO=${1:?usage: api_subset_check.sh <libSDLop.so> <libSDL3.so>}
 SDL3_SO=${2:?usage: api_subset_check.sh <libSDLop.so> <libSDL3.so>}
 
 extract() {
-    nm -D --defined-only "$1" \
-        | awk '$2=="T" || $2=="i" {sub(/@.*/,"",$3); print $3}' \
-        | grep -E '^SDL_' | sort -u
+    # PE (.dll) has no ELF dynamic symbol table; ask objdump for the export
+    # directory, the same way api_exports_check.sh does. Without this branch
+    # nm reports "no symbols" and the comparison below passes vacuously.
+    if file -b "$1" | grep -qi 'PE32'; then
+        objdump -p "$1" | awk '/^\[Ordinal\/Name Pointer\] Table/ {t=1; next}
+                                t && /^$/ {exit}
+                                t {print $NF}'
+    else
+        nm -D --defined-only "$1" \
+            | awk '$2=="T" || $2=="i" {sub(/@.*/,"",$3); print $3}'
+    fi | grep -E '^SDL_' | sort -u
 }
 
 sdlop_syms=$(extract "$SDLOP_SO")
