@@ -1175,8 +1175,10 @@ static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32
 {
     (void)data;
     (void)keyboard;
+    /* rate 0: the compositor turned key repeat off */
+    sdlop.repeat_disabled = rate <= 0;
     if (rate > 0 && delay > 0) {
-        SDLOP_RawInputSetRepeatInfo((Uint32)delay, (Uint32)(1000 / rate));
+        SDLOP_RawInputSetRepeatInfo((Uint32)delay, (Uint32)SDL_max(1000 / rate, 1));
     }
 }
 

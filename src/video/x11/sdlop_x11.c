@@ -1180,6 +1180,7 @@ static void x11_sync_repeat_info(void)
     xcb_xkb_get_controls_reply_t *c = X11_xcb_xkb_get_controls_reply(
         x11.conn, X11_xcb_xkb_get_controls(x11.conn, (xcb_xkb_device_spec_t)x11.xkb_device_id), NULL);
     if (c) {
+        sdlop.repeat_disabled = !(c->enabledControls & XCB_XKB_BOOL_CTRL_REPEAT_KEYS); /* xset r off */
         if (c->repeatDelay > 0 && c->repeatInterval > 0) {
             SDLOP_RawInputSetRepeatInfo(c->repeatDelay, c->repeatInterval);
         }

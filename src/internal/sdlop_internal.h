@@ -328,6 +328,7 @@ typedef struct SDLop_Globals
     Uint64 repeat_next_ns;      /* absolute CLOCK_MONOTONIC deadline */
     Uint32 repeat_delay_ms;
     Uint32 repeat_interval_ms;
+    bool repeat_disabled;       /* the window system turned key repeat off */
 
     /* xkb (set by the wayland driver, else defaults) */
     void *xkb_context;          /* struct xkb_context* */
@@ -486,6 +487,9 @@ void SDLOP_RawInputAttachConsole(int console_fd);
 void SDLOP_RawInputDetachConsole(void);
 void SDLOP_RawInputPump(void);      /* drain raw ring -> SDL events (main thread) */
 void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms);
+void SDLOP_RawInputTestFeed(const SDLop_RawEvent *ev, bool winsys); /* tests only */
+int SDLOP_RawInputTestAddDevice(bool keyboard, bool pointer, bool absolute, int min_x, int max_x, int min_y, int max_y,
+                                bool touch_is_left); /* tests only */
 
 /* Video core helpers (SDL_video.c) */
 bool SDLOP_VideoInit(void);
