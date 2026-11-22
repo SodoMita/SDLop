@@ -34,6 +34,7 @@
 #include "alpha-modifier-v1-client-protocol.h"
 #include "pointer-warp-v1-client-protocol.h"
 #include "pointer-gestures-unstable-v1-client-protocol.h"
+#include "xdg-foreign-unstable-v2-client-protocol.h"
 #include "../kmsdrm/sdlop_xcursor.h"
 
 #include <errno.h>
@@ -109,7 +110,10 @@ typedef struct WaylandWindowData
     struct xdg_dialog_v1 *dialog;      /* SDL_WINDOW_MODAL (xdg_wm_dialog_v1) */
     int hit_test_result;               /* SDL_HitTestResult under the pointer */
     struct wp_alpha_modifier_surface_v1 *alpha; /* SDL_SetWindowOpacity, created on first use */
+    bool transparent;    /* SDL_WINDOW_TRANSPARENT: ARGB8888 buffers, no opaque region */
+    bool clear_explicit; /* SDLop_SetWindowClearColor called: an opaque clear even when transparent */
     struct xdg_toplevel_icon_v1 *icon; /* SDL_SetWindowIcon, kept for re-shown toplevels */
+    struct zxdg_exported_v2 *exported; /* xdg-foreign handle of the toplevel (portal dialog parent) */
     struct wl_buffer **icon_buffers;   /* must outlive the icon */
     int num_icon_buffers;
 
@@ -171,6 +175,7 @@ typedef struct WaylandDeviceData
     struct zwp_relative_pointer_manager_v1 *relative_manager;
     struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
     struct xdg_toplevel_icon_manager_v1 *toplevel_icon_manager;
+    struct zxdg_exporter_v2 *exporter; /* xdg-foreign: toplevel handles for other clients */
     struct xdg_wm_dialog_v1 *wm_dialog;
     struct wp_alpha_modifier_v1 *alpha_modifier;
     struct wp_pointer_warp_v1 *pointer_warp;
@@ -259,9 +264,31 @@ static void rect_add(SDL_Rect *acc, const SDL_Rect *r)
     acc->h = y1 - y0;
 }
 
+/* the clear colour as a buffer pixel: transparent windows start fully
+ * transparent unless a colour was set (as on X11) */
 static uint32_t window_clear_xrgb(SDL_Window *window)
 {
-    return ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
+    const WaylandWindowData *wd = (const WaylandWindowData *)window->driverdata;
+    const uint32_t rgb = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
+    if (wd && wd->transparent) {
+        return wd->clear_explicit ? (rgb | 0xff000000u) : 0;
+    }
+    return rgb;
+}
+
+/* the opaque region lets the compositor skip blending (stock: every
+ * window but transparent or translucent ones). Parts outside the surface
+ * are ignored by the compositor, so it needn't follow the size. */
+static void window_update_opaque_region(SDL_Window *window, WaylandWindowData *wd)
+{
+    if (!wd->transparent && window->opacity >= 1.0f) {
+        struct wl_region *region = wl_compositor_create_region(wl_data.compositor);
+        wl_region_add(region, 0, 0, INT32_MAX, INT32_MAX);
+        wl_surface_set_opaque_region(wd->surface, region);
+        wl_region_destroy(region);
+    } else {
+        wl_surface_set_opaque_region(wd->surface, NULL);
+    }
 }
 
 static void fill_xrgb(void *pixels, size_t npix, uint32_t color)
@@ -276,9 +303,11 @@ static void fill_xrgb(void *pixels, size_t npix, uint32_t color)
     }
 }
 
-/* memfd-backed XRGB8888 wl_buffer; the pool and fd are not kept (the
- * buffer keeps the memory alive, the compositor has its own mapping) */
-static struct wl_buffer *shm_create_wl_buffer(int w, int h, bool populate, void **map_out, size_t *size_out)
+/* memfd-backed XRGB8888 (ARGB8888 for transparent windows) wl_buffer; the
+ * pool and fd are not kept (the buffer keeps the memory alive, the
+ * compositor has its own mapping) */
+static struct wl_buffer *shm_create_wl_buffer(int w, int h, bool alpha, bool populate, void **map_out,
+                                              size_t *size_out)
 {
     const size_t stride = (size_t)w * 4;
     const size_t size = stride * (size_t)h;
@@ -301,7 +330,8 @@ static struct wl_buffer *shm_create_wl_buffer(int w, int h, bool populate, void 
         return NULL;
     }
     struct wl_shm_pool *pool = wl_shm_create_pool(wl_data.shm, fd, (int32_t)size);
-    struct wl_buffer *buffer = pool ? wl_shm_pool_create_buffer(pool, 0, w, h, (int32_t)stride, WL_SHM_FORMAT_XRGB8888)
+    struct wl_buffer *buffer = pool ? wl_shm_pool_create_buffer(pool, 0, w, h, (int32_t)stride,
+                                                                     alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888)
                                     : NULL;
     if (pool) {
         wl_shm_pool_destroy(pool);
@@ -344,7 +374,7 @@ static void shm_set_size(WaylandWindowData *wd, int w, int h)
 static WaylandShmBuffer *shm_add_buffer(WaylandWindowData *wd)
 {
     WaylandShmBuffer *b = &wd->shm[wd->num_shm];
-    b->buffer = shm_create_wl_buffer(wd->buffer_w, wd->buffer_h, true, &b->map, &b->size);
+    b->buffer = shm_create_wl_buffer(wd->buffer_w, wd->buffer_h, wd->transparent, true, &b->map, &b->size);
     if (!b->buffer) {
         return NULL;
     }
@@ -557,7 +587,7 @@ static bool window_attach_clear(SDL_Window *window, WaylandWindowData *wd)
             }
             void *map = NULL;
             size_t size = 0;
-            wd->clear_buffer = shm_create_wl_buffer(1, 1, false, &map, &size);
+            wd->clear_buffer = shm_create_wl_buffer(1, 1, wd->transparent, false, &map, &size);
             if (!wd->clear_buffer) {
                 return false;
             }
@@ -764,7 +794,10 @@ static bool wayland_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
         wd->shm[i].stale.w = w;
         wd->shm[i].stale.h = h;
     }
-    SDL_Surface *s = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_XRGB8888, wd->shadow, w * 4);
+    /* transparent windows: ARGB8888 (wl_shm's is premultiplied, as stock
+     * hands it to the app) */
+    SDL_Surface *s = SDL_CreateSurfaceFrom(w, h, wd->transparent ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_XRGB8888,
+                                           wd->shadow, w * 4);
     if (!s) {
         return false;
     }
@@ -2406,6 +2439,8 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, xdg_toplevel_icon_manager_v1_interface.name) == 0 && !d->toplevel_icon_manager) {
         /* icon_size preferences are ignored (stock) */
         d->toplevel_icon_manager = wl_registry_bind(registry, name, &xdg_toplevel_icon_manager_v1_interface, 1);
+    } else if (strcmp(interface, zxdg_exporter_v2_interface.name) == 0 && !d->exporter) {
+        d->exporter = wl_registry_bind(registry, name, &zxdg_exporter_v2_interface, 1);
     } else if (strcmp(interface, wp_pointer_warp_v1_interface.name) == 0 && !d->pointer_warp) {
         d->pointer_warp = wl_registry_bind(registry, name, &wp_pointer_warp_v1_interface, 1);
     } else if (strcmp(interface, zwp_pointer_gestures_v1_interface.name) == 0 && !d->pointer_gestures &&
@@ -2598,6 +2633,9 @@ static void wayland_Quit(SDLop_VideoDevice *device)
     }
     if (wl_data.toplevel_icon_manager) {
         xdg_toplevel_icon_manager_v1_destroy(wl_data.toplevel_icon_manager);
+    }
+    if (wl_data.exporter) {
+        zxdg_exporter_v2_destroy(wl_data.exporter);
     }
     if (wl_data.wm_dialog) {
         xdg_wm_dialog_v1_destroy(wl_data.wm_dialog);
@@ -2837,6 +2875,8 @@ static bool wayland_SetWindowOpacity(SDLop_VideoDevice *device, SDL_Window *wind
         wd->alpha = wp_alpha_modifier_v1_get_surface(wl_data.alpha_modifier, wd->surface);
     }
     wp_alpha_modifier_surface_v1_set_multiplier(wd->alpha, (uint32_t)((double)UINT32_MAX * (double)opacity));
+    window->opacity = opacity; /* the region follows it now */
+    window_update_opaque_region(window, wd);
     if (wd->configured) {
         if (wd->gl_active && !wd->gl_offload_active) {
             wl_surface_commit(wd->surface);
@@ -2848,8 +2888,32 @@ static bool wayland_SetWindowOpacity(SDLop_VideoDevice *device, SDL_Window *wind
     return true;
 }
 
+/* xdg-foreign (stock): SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING
+ * names the toplevel to other clients, e.g. the file chooser portal
+ * ("wayland:<handle>" parent) */
+static void exported_handle(void *data, struct zxdg_exported_v2 *exported, const char *handle)
+{
+    (void)exported;
+    SDL_Window *window = (SDL_Window *)data;
+    if (!window->props) { /* still being created: SDL_GetWindowProperties() refuses it */
+        window->props = SDL_CreateProperties();
+    }
+    if (window->props) {
+        SDL_SetStringProperty(window->props, SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING, handle);
+    }
+}
+
+static const struct zxdg_exported_v2_listener exported_listener = { exported_handle };
+
 static void destroy_role_objects(WaylandWindowData *wd)
 {
+    if (wd->exported) {
+        zxdg_exported_v2_destroy(wd->exported);
+        wd->exported = NULL;
+        if (wd->window && wd->window->props) {
+            SDL_SetStringProperty(wd->window->props, SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING, NULL);
+        }
+    }
     if (wd->dialog) {
         xdg_dialog_v1_destroy(wd->dialog); /* before its toplevel */
         wd->dialog = NULL;
@@ -2984,6 +3048,10 @@ static bool wayland_create_role_objects_raw(SDL_Window *window)
                                                                  ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
                                                                  : ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
+    if (wl_data.exporter) {
+        wd->exported = zxdg_exporter_v2_export_toplevel(wl_data.exporter, wd->surface);
+        zxdg_exported_v2_add_listener(wd->exported, &exported_listener, window);
+    }
     apply_size_limits(window);
     if (window->parent && window->parent->driverdata &&
         ((WaylandWindowData *)window->parent->driverdata)->toplevel) {
@@ -3026,6 +3094,12 @@ static bool wayland_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     wl_surface_add_listener(wd->surface, &surface_listener, window);
     wd->window = window;
     wd->dest_w = wd->dest_h = -1;
+    wd->transparent = (window->flags & SDL_WINDOW_TRANSPARENT) != 0;
+    window->driverdata = wd; /* window_clear_xrgb() needs it from here on */
+    window_update_opaque_region(window, wd);
+    if (wd->transparent && sdlop_glattrs.alpha_size == 0) {
+        sdlop_glattrs.alpha_size = 8; /* an EGL config with alpha (stock) */
+    }
     if (wl_data.viewporter) {
         wd->viewport = wp_viewporter_get_viewport(wl_data.viewporter, wd->surface);
     }
@@ -3315,6 +3389,9 @@ static void wayland_SetWindowClearColor(SDLop_VideoDevice *device, SDL_Window *w
 {
     (void)device;
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (wd) {
+        wd->clear_explicit = true;
+    }
     if (!wd || !wd->configured || (wd->gl_active && !wd->gl_offload_active)) {
         return;
     }

@@ -9,9 +9,9 @@
   - zenity --file-selection otherwise, on a thread (as stock)
   - SDL_HINT_FILE_DIALOG_DRIVER = "portal" | "zenity" picks one
 
-  Parent windows: X11 windows by XID ("x11:<hex>" for the portal,
-  --attach for zenity); Wayland toplevels are not exported yet
-  (xdg-foreign), so portal dialogs there are not modal to the window.
+  Parent windows (as stock): the portal gets "wayland:<handle>" for
+  Wayland toplevels exported with xdg-foreign (when the compositor has it)
+  or "x11:<hex>" for X11 windows; zenity gets --attach for X11 windows.
 
   Based on src/dialog/{SDL_dialog.c, SDL_dialog_utils.c,
   unix/SDL_portaldialog.c, unix/SDL_zenitydialog.c} (zlib license).
@@ -306,11 +306,14 @@ static bool portal_show(SDL_FileDialogType type, SDL_DialogFileCallback callback
     if (!m) {
         goto fail_nomem;
     }
-    char parent[64] = "";
+    char parent[320] = "";
     if (window) {
-        const Sint64 xid =
-            SDL_GetNumberProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
-        if (xid) {
+        const SDL_PropertiesID wprops = SDL_GetWindowProperties(window);
+        const char *handle = SDL_GetStringProperty(wprops, SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING, NULL);
+        const Sint64 xid = SDL_GetNumberProperty(wprops, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+        if (handle && *handle) {
+            snprintf(parent, sizeof(parent), "wayland:%s", handle);
+        } else if (xid) {
             snprintf(parent, sizeof(parent), "x11:%llx", (unsigned long long)xid);
         }
     }

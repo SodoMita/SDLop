@@ -71,7 +71,7 @@ static double progress_value;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 /* file chooser */
 static atomic_int fc_calls;
-static char fc_method[32], fc_title[128], fc_token[64], fc_folder[256], fc_glob[128], fc_parent[64];
+static char fc_method[32], fc_title[128], fc_token[64], fc_folder[256], fc_glob[128], fc_parent[128];
 static int fc_nfilters;
 static bool fc_multiple, fc_directory, fc_modal, fc_match_first;
 static atomic_int fc_mode; /* 0: answer with files, 1: cancel, 2: no portal */
@@ -456,6 +456,17 @@ int main(void)
         changed += e.type == SDL_EVENT_SYSTEM_THEME_CHANGED;
     }
     CHECK(changed == 0, "unchanged value: no event (%d)", changed);
+    /* a change while blocked in SDL_WaitEvent wakes it (the bus fd is polled) */
+    atomic_store(&send_changed, 1);
+    {
+        const Uint64 t0 = SDL_GetTicks();
+        bool got = false;
+        while (!got && SDL_GetTicks() - t0 < 2000 && SDL_WaitEventTimeout(&e, 2000)) {
+            got = e.type == SDL_EVENT_SYSTEM_THEME_CHANGED;
+        }
+        CHECK(got, "SDL_WaitEventTimeout returns the theme change");
+        CHECK(SDL_GetSystemTheme() == SDL_SYSTEM_THEME_DARK, "theme dark again");
+    }
 
     SDL_Window *w = SDL_CreateWindow("dbus", 64, 64, 0);
     CHECK(w != NULL, "window");
@@ -520,12 +531,21 @@ int main(void)
     CHECK(dlg.filter == 1, "chosen filter index (%d)", dlg.filter);
 
     atomic_store(&fc_mode, 1);
+    /* a parent window exported over xdg-foreign (set by hand on the dummy
+     * driver's window): "wayland:<handle>" (stock) */
+    SDL_Window *pw = SDL_CreateWindow("parent", 32, 32, 0);
+    CHECK(pw && SDL_SetStringProperty(SDL_GetWindowProperties(pw),
+                                      SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING, "abc-123"),
+          "parent window with an export handle");
     SDL_PropertiesID dp = SDL_CreateProperties();
     SDL_SetStringProperty(dp, SDL_PROP_FILE_DIALOG_TITLE_STRING, "Pick a folder");
+    SDL_SetPointerProperty(dp, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, pw);
     SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_OPENFOLDER, dialog_cb, NULL, dp);
     SDL_DestroyProperties(dp);
     CHECK(wait_for(&dlg.called, 2, 3000), "folder dialog: callback");
     CHECK(fc_directory && strcmp(fc_title, "Pick a folder") == 0, "folder: directory option, title '%s'", fc_title);
+    CHECK(fc_modal && strcmp(fc_parent, "wayland:abc-123") == 0, "folder: modal to 'wayland:abc-123' ('%s')", fc_parent);
+    SDL_DestroyWindow(pw);
     CHECK(!dlg.null_list && dlg.n == 0, "cancel: empty list (null %d, n %d)", (int)dlg.null_list, dlg.n);
 
     atomic_store(&fc_mode, 2);

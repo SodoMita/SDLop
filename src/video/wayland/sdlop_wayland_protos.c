@@ -33,3 +33,4 @@
 #include "alpha-modifier-v1-protocol.c"
 #include "pointer-warp-v1-protocol.c"
 #include "pointer-gestures-unstable-v1-protocol.c"
+#include "xdg-foreign-unstable-v2-protocol.c"

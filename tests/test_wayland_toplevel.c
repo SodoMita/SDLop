@@ -11,20 +11,28 @@
     - modal windows (SDL_WINDOW_MODAL, SDL_SetWindowModal) get an
       xdg_dialog_v1 with set_modal / unset_modal, a fresh one when re-shown
     - SDL_SetWindowOpacity: wp_alpha_modifier_surface_v1 multiplier,
-      committed right away
+      committed right away; the opaque region is dropped while translucent
+    - SDL_WINDOW_TRANSPARENT: ARGB8888 surface and shm buffers, no opaque
+      region, cleared fully transparent until SDLop_SetWindowClearColor,
+      SDL_GL_ALPHA_SIZE 8 when it was 0; opaque windows keep XRGB8888 and
+      an opaque region
     - SDL_SetWindowHitTest: a left press on a draggable / resize area
       starts xdg_toplevel move / resize with the press serial and is not
       passed on, resize areas show resize cursors (cursor-shape), normal
       areas behave normally (pointer input via MINI_POINTER_CMD)
     - SDL_ShowWindowSystemMenu: xdg_toplevel show_window_menu
+    - xdg-foreign: toplevels are exported, the handle is
+      SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING, dropped
+      when hidden, a new one when shown again
     - without the protocols SDL_SetWindowIcon / SDL_SetWindowOpacity fail
-      cleanly and SDL_SetWindowModal still succeeds
+      cleanly, SDL_SetWindowModal still succeeds and there is no handle
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).
 */
 
 #include <SDL3/SDL.h>
+#include <SDL3/SDLop.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +120,24 @@ static bool wait_last_in(const char *path, const char *prefix, const char *want)
 static bool wait_last(const char *prefix, const char *want)
 {
     return wait_last_in(logpath, prefix, want);
+}
+
+/* pump until the window's xdg-foreign export handle is want (NULL: none) */
+static bool wait_handle(SDL_Window *w, const char *want)
+{
+    const Uint64 end = SDL_GetTicks() + 2000;
+    const char *h = NULL;
+    while (SDL_GetTicks() < end) {
+        SDL_PumpEvents();
+        h = SDL_GetStringProperty(SDL_GetWindowProperties(w), SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING,
+                                  NULL);
+        if (want ? (h && strcmp(h, want) == 0) : !h) {
+            return true;
+        }
+        SDL_Delay(5);
+    }
+    fprintf(stderr, "  export handle '%s', want '%s'\n", h ? h : "(null)", want ? want : "(null)");
+    return false;
 }
 
 static void pump_for(Uint32 ms)
@@ -222,10 +248,18 @@ int main(int argc, char *argv[])
     }
     SDL_Surface *s = SDL_GetWindowSurface(w);
     if (s) {
+        CHECK(s->format == SDL_PIXELFORMAT_XRGB8888, "opaque window surface: %s", SDL_GetPixelFormatName(s->format));
         SDL_FillSurfaceRect(s, NULL, 0xff000000);
         SDL_UpdateWindowSurface(w);
     }
     pump_for(100);
+    CHECK(wait_handle(w, icons ? "mini-1" : NULL), "main window export handle");
+    if (icons) {
+        char last[640];
+        CHECK(wait_last("opaque=", "opaque=set"), "opaque window: opaque region");
+        CHECK(count_lines("attach ", last, sizeof(last)) > 0 && strncmp(last, "attach XRGB ", 12) == 0,
+              "opaque window: XRGB8888 buffers ('%s')", last);
+    }
 
     /* 32x16 half-transparent red, 2x green, a too-small blue (skipped) */
     SDL_Surface *icon = solid(32, 16, 0x80ff0000);
@@ -267,7 +301,9 @@ int main(int argc, char *argv[])
     if (icons) {
         CHECK(op, "SDL_SetWindowOpacity: %s", SDL_GetError());
         CHECK(wait_last("alpha=", "alpha=2147483647"), "half opacity committed");
+        CHECK(wait_last("opaque=", "opaque=none"), "translucent: no opaque region");
         CHECK(SDL_SetWindowOpacity(w, 1.0f) && wait_last("alpha=", "alpha=4294967295"), "full opacity");
+        CHECK(wait_last("opaque=", "opaque=set"), "opaque again: opaque region");
         CHECK(SDL_GetWindowOpacity(w) == 1.0f, "opacity reads back");
     } else {
         CHECK(!op, "SDL_SetWindowOpacity fails without wp_alpha_modifier_v1");
@@ -357,6 +393,60 @@ int main(int argc, char *argv[])
         SDL_DestroyWindow(dlg);
         if (icons) {
             CHECK(wait_count("dialog destroyed", 2, NULL, 0), "destroyed with the window");
+        }
+    }
+
+    /* SDL_WINDOW_TRANSPARENT */
+    {
+        int alpha = -1;
+        SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
+        SDL_Window *t = SDL_CreateWindow("transparent", 64, 48, SDL_WINDOW_TRANSPARENT);
+        CHECK(t != NULL, "transparent window: %s", SDL_GetError());
+        CHECK(t && (SDL_GetWindowFlags(t) & SDL_WINDOW_TRANSPARENT), "SDL_WINDOW_TRANSPARENT kept");
+        CHECK(SDL_GL_GetAttribute(SDL_GL_ALPHA_SIZE, &alpha) && alpha == 8, "GL alpha size %d", alpha);
+        if (icons && t) {
+            CHECK(wait_last("opaque=", "opaque=none"), "transparent: no opaque region");
+            CHECK(wait_last("attach ", "attach ARGB pixel=00000000"), "transparent: cleared to transparent");
+        }
+        SDL_Surface *ts = t ? SDL_GetWindowSurface(t) : NULL;
+        CHECK(ts && ts->format == SDL_PIXELFORMAT_ARGB8888, "transparent surface: %s",
+              ts ? SDL_GetPixelFormatName(ts->format) : SDL_GetError());
+        if (ts) {
+            SDL_FillSurfaceRect(ts, NULL, 0x80402010);
+            CHECK(SDL_UpdateWindowSurface(t), "update transparent: %s", SDL_GetError());
+            if (icons) {
+                CHECK(wait_last("attach ", "attach ARGB pixel=80402010"), "transparent: alpha reaches the compositor");
+            }
+            SDLop_SetWindowClearColor(t, 1, 2, 3);
+            if (icons) {
+                CHECK(wait_last("attach ", "attach ARGB pixel=ff010203"), "explicit clear colour is opaque");
+            }
+        }
+        if (t && icons) {
+            const int before = count_lines("opaque=", NULL, 0);
+            CHECK(SDL_SetWindowOpacity(t, 0.5f) && wait_last("alpha=", "alpha=2147483647"), "transparent opacity");
+            CHECK(SDL_SetWindowOpacity(t, 1.0f) && wait_last("alpha=", "alpha=4294967295"), "transparent opacity 1");
+            CHECK(wait_count("opaque=", before + 2, NULL, 0) && wait_last("opaque=", "opaque=none"),
+                  "transparent: still no opaque region at full opacity");
+        }
+        if (t && icons) {
+            /* a hidden window's toplevel goes, and its handle with it */
+            char last[640];
+            CHECK(count_lines("export ", last, sizeof(last)) > 0, "transparent window exported");
+            CHECK(wait_handle(t, last + 7), "transparent window handle '%s'", last + 7);
+            SDL_HideWindow(t);
+            CHECK(wait_handle(t, NULL), "hidden: no export handle");
+            char unexported[640];
+            snprintf(unexported, sizeof(unexported), "unexport %s", last + 7);
+            CHECK(wait_last("unexport ", unexported), "hidden: export destroyed");
+            SDL_ShowWindow(t);
+            const int n = atoi(last + 12);
+            char want[32];
+            snprintf(want, sizeof(want), "mini-%d", n + 1);
+            CHECK(wait_handle(t, want), "re-shown: a new handle");
+        }
+        if (t) {
+            SDL_DestroyWindow(t);
         }
     }
 

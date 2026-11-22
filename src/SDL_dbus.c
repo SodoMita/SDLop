@@ -1318,6 +1318,11 @@ static void compact_handlers(void)
     db.nhandlers = o;
 }
 
+int SDLOP_DBus_GetFD(void)
+{
+    return db.fd;
+}
+
 void SDLOP_DBus_Pump(void)
 {
     if (db.fd < 0 && db.nqueue == 0) {

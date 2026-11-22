@@ -935,7 +935,8 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         }
 
         int video_fd = sdlop.video ? sdlop.video->GetEventFD(sdlop.video) : -1;
-        struct pollfd pfds[2];
+        const int dbus_fd = SDLOP_DBus_GetFD(); /* theme changes, portal replies */
+        struct pollfd pfds[3];
         int nfds = 0;
         if (sdlop.wake_fd >= 0) {
             pfds[nfds].fd = sdlop.wake_fd;
@@ -944,6 +945,11 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         }
         if (video_fd >= 0) {
             pfds[nfds].fd = video_fd;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+        if (dbus_fd >= 0) {
+            pfds[nfds].fd = dbus_fd;
             pfds[nfds].events = POLLIN;
             nfds++;
         }

@@ -236,7 +236,8 @@ set(SDLOP_WL_VENDORED_PROTOCOLS
   xdg-dialog-v1
   alpha-modifier-v1
   pointer-warp-v1
-  pointer-gestures-unstable-v1)
+  pointer-gestures-unstable-v1
+  xdg-foreign-unstable-v2)
 foreach(proto_name ${SDLOP_WL_VENDORED_PROTOCOLS})
   set(proto_xml ${SDLOP_WL_VENDORED_DIR}/${proto_name}.xml)
   add_custom_command(
@@ -825,7 +826,8 @@ if(SDLop_BUILD_TESTS)
       ${WL_GEN_DIR}/xdg-dialog-v1-server-protocol.c
       ${WL_GEN_DIR}/alpha-modifier-v1-server-protocol.c
       ${WL_GEN_DIR}/pointer-warp-v1-server-protocol.c
-      ${WL_GEN_DIR}/pointer-gestures-unstable-v1-server-protocol.c)
+      ${WL_GEN_DIR}/pointer-gestures-unstable-v1-server-protocol.c
+      ${WL_GEN_DIR}/xdg-foreign-unstable-v2-server-protocol.c)
     add_dependencies(mini_compositor sdlop_wayland_protocols)
     target_include_directories(mini_compositor PRIVATE ${WL_GEN_DIR} ${WAYLAND_SERVER_INCLUDE_DIRS})
     target_link_libraries(mini_compositor PRIVATE ${WAYLAND_SERVER_LIBRARIES})

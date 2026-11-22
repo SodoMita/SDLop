@@ -43,7 +43,11 @@
   set_icon as "icon=null" or "icon SIZExSIZE@SCALE:CENTER/CORNER ..."
   (pixels as 8-digit hex), and "dialog", "modal=1|0", "dialog destroyed".
   It also offers wp_alpha_modifier_v1: "alpha=FACTOR" is logged when a
-  multiplier is committed.
+  multiplier is committed, and zxdg_exporter_v2: toplevels get handles
+  "mini-N", logged as "export mini-N" and "unexport mini-N". For the newest xdg surface it logs its opaque
+  region ("opaque=set|none", also when it becomes the newest) and every
+  attached shm buffer ("attach FORMAT pixel=AARRGGBB", the first pixel;
+  FORMAT is XRGB or ARGB).
   With MINI_TOPLEVEL_LOG, xdg_toplevel move / resize / show_window_menu
   log "move serial=ok|bad", "resize edge=E serial=ok|bad" and
   "menu X,Y serial=ok|bad" (ok: the serial of the latest button press).
@@ -94,6 +98,7 @@
 #include "xdg-toplevel-icon-v1-server-protocol.h"
 #include "xdg-dialog-v1-server-protocol.h"
 #include "alpha-modifier-v1-server-protocol.h"
+#include "xdg-foreign-unstable-v2-server-protocol.h"
 #include "pointer-warp-v1-server-protocol.h"
 #include "tablet-v2-server-protocol.h"
 #include "pointer-gestures-unstable-v1-server-protocol.h"
@@ -163,6 +168,7 @@ typedef struct
 {
     mini_pool *pool;
     int32_t offset, w, h, stride;
+    uint32_t format;
     bool held;
     bool current;
     uint64_t sum;
@@ -422,6 +428,7 @@ static void pool_create_buffer(struct wl_client *client, struct wl_resource *res
         b->w = width;
         b->h = height;
         b->stride = stride;
+        b->format = format;
     }
     wl_resource_set_implementation(buf, &buffer_impl, b, buffer_res_destroy);
 }
@@ -472,6 +479,53 @@ static const struct wl_shm_interface shm_impl = { shm_create_pool, NULL /* relea
 
 /* ---------------- wl_surface ---------------- */
 
+static void TL_logs(const char *line);
+
+/* opaque region per surface (MINI_TOPLEVEL_LOG) */
+static struct
+{
+    struct wl_resource *surface;
+    bool opaque;
+} TL_opaque[64];
+
+#define TL_NUM_OPAQUE (int)(sizeof(TL_opaque) / sizeof(TL_opaque[0]))
+
+/* slot of surface (or a new one with create), -1 if none */
+static int TL_opaque_slot(struct wl_resource *surface, bool create)
+{
+    for (int i = 0; i < TL_NUM_OPAQUE; i++) {
+        if (TL_opaque[i].surface == surface) {
+            return i;
+        }
+    }
+    for (int i = 0; create && i < TL_NUM_OPAQUE; i++) {
+        if (!TL_opaque[i].surface) {
+            TL_opaque[i].surface = surface;
+            TL_opaque[i].opaque = false;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void TL_log_opaque(struct wl_resource *surface)
+{
+    const int i = TL_opaque_slot(surface, false);
+    TL_logs(i >= 0 && TL_opaque[i].opaque ? "opaque=set" : "opaque=none");
+}
+
+static void surface_set_opaque_region(struct wl_client *client, struct wl_resource *res, struct wl_resource *region)
+{
+    (void)client;
+    const int i = TL_log ? TL_opaque_slot(res, true) : -1;
+    if (i >= 0) {
+        TL_opaque[i].opaque = region != NULL;
+        if (res == M.surface_res) {
+            TL_log_opaque(res);
+        }
+    }
+}
+
 static void surface_attach(struct wl_client *client, struct wl_resource *res,
                            struct wl_resource *buffer, int32_t sx, int32_t sy)
 {
@@ -483,6 +537,20 @@ static void surface_attach(struct wl_client *client, struct wl_resource *res,
         return; /* cursor etc.: not checked */
     }
     M.buffer_attached = (buffer != NULL);
+    if (TL_log && res == M.surface_res && buffer) {
+        mini_buffer *tb = wl_resource_get_user_data(buffer);
+        if (tb && tb->pool && tb->pool->map && (size_t)tb->offset + 4 <= tb->pool->size) {
+            uint32_t px;
+            memcpy(&px, (const uint8_t *)tb->pool->map + tb->offset, 4);
+            char line[64];
+            snprintf(line, sizeof(line), "attach %s pixel=%08x",
+                     tb->format == WL_SHM_FORMAT_ARGB8888 ? "ARGB"
+                     : tb->format == WL_SHM_FORMAT_XRGB8888 ? "XRGB"
+                                                            : "other",
+                     px);
+            TL_logs(line);
+        }
+    }
     if (H_mode && res == M.surface_res) {
         mini_buffer *hb = buffer ? wl_resource_get_user_data(buffer) : NULL;
         H_pending_w = hb ? hb->w : 0;
@@ -677,6 +745,10 @@ static void surface_frame(struct wl_client *client, struct wl_resource *res, uin
 static void surface_destroy(struct wl_client *client, struct wl_resource *res)
 {
     (void)client;
+    const int i = TL_opaque_slot(res, false);
+    if (i >= 0) {
+        TL_opaque[i].surface = NULL;
+    }
     wl_resource_destroy(res);
 }
 
@@ -685,7 +757,7 @@ static const struct wl_surface_interface surface_impl = {
     .attach = surface_attach,
     .damage = (void *)noop,
     .frame = surface_frame,
-    .set_opaque_region = (void *)noop,
+    .set_opaque_region = surface_set_opaque_region,
     .set_input_region = (void *)noop,
     .commit = surface_commit,
     .set_buffer_transform = surface_set_buffer_transform,
@@ -800,6 +872,9 @@ static void wm_base_get_xdg_surface(struct wl_client *client, struct wl_resource
     st->resource = xs;
     wl_resource_set_implementation(xs, &xdg_surface_impl, st, xdg_surface_res_destroy);
     M.surface_res = surface;
+    if (TL_log) {
+        TL_log_opaque(surface);
+    }
     if (H_mode && strcmp(H_source, "buffer") == 0) {
         H_send(H_value);
     }
@@ -1411,6 +1486,47 @@ static void TL_alpha_mgr_bind(struct wl_client *client, void *data, uint32_t ver
     (void)data;
     struct wl_resource *r = wl_resource_create(client, &wp_alpha_modifier_v1_interface, version, id);
     wl_resource_set_implementation(r, &TL_alpha_mgr_impl, NULL, NULL);
+}
+
+/* zxdg_exporter_v2 (MINI_TOPLEVEL_LOG): handles "mini-N", logged as
+ * "export mini-N" / "unexport mini-N" */
+static int TL_nexports;
+
+static const struct zxdg_exported_v2_interface TL_exported_impl = {
+    .destroy = res_destroy,
+};
+
+static void TL_exported_destroyed(struct wl_resource *res)
+{
+    char line[48];
+    snprintf(line, sizeof(line), "unexport mini-%d", (int)(intptr_t)wl_resource_get_user_data(res));
+    TL_logs(line);
+}
+
+static void TL_export_toplevel(struct wl_client *client, struct wl_resource *res, uint32_t id,
+                               struct wl_resource *surface)
+{
+    (void)surface;
+    struct wl_resource *r = wl_resource_create(client, &zxdg_exported_v2_interface, wl_resource_get_version(res), id);
+    const int n = ++TL_nexports;
+    wl_resource_set_implementation(r, &TL_exported_impl, (void *)(intptr_t)n, TL_exported_destroyed);
+    char handle[32], line[48];
+    snprintf(handle, sizeof(handle), "mini-%d", n);
+    snprintf(line, sizeof(line), "export %s", handle);
+    TL_logs(line);
+    zxdg_exported_v2_send_handle(r, handle);
+}
+
+static const struct zxdg_exporter_v2_interface TL_exporter_impl = {
+    .destroy = res_destroy,
+    .export_toplevel = TL_export_toplevel,
+};
+
+static void TL_exporter_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *r = wl_resource_create(client, &zxdg_exporter_v2_interface, version, id);
+    wl_resource_set_implementation(r, &TL_exporter_impl, NULL, NULL);
 }
 
 static const struct wl_keyboard_interface keyboard_impl = {
@@ -2542,6 +2658,7 @@ int main(void)
         wl_global_create(M.display, &xdg_toplevel_icon_manager_v1_interface, 1, NULL, TL_icon_mgr_bind);
         wl_global_create(M.display, &xdg_wm_dialog_v1_interface, 1, NULL, TL_dialog_mgr_bind);
         wl_global_create(M.display, &wp_alpha_modifier_v1_interface, 1, NULL, TL_alpha_mgr_bind);
+        wl_global_create(M.display, &zxdg_exporter_v2_interface, 1, NULL, TL_exporter_bind);
     }
     T_log = getenv("MINI_TEXT_INPUT");
     if (T_log) {

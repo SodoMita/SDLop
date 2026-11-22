@@ -625,6 +625,7 @@ bool SDLOP_DBus_Connect(void);
 bool SDLOP_DBus_IsConnected(void);
 const char *SDLOP_DBus_UniqueName(void);
 void SDLOP_DBus_Pump(void); /* from SDL_PumpEvents: dispatches signals */
+int SDLOP_DBus_GetFD(void); /* the session bus socket, -1 if not connected (SDL_WaitEvent polls it) */
 void SDLOP_DBus_Quit(void);
 SDLop_DBusMsg *SDLOP_DBus_Call(SDLop_DBusMsg *m, int timeout_ms); /* reply or NULL (error set) */
 bool SDLOP_DBus_Send(SDLop_DBusMsg *m);                             /* no reply wanted */
