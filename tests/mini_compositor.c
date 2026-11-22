@@ -646,6 +646,16 @@ static void D_maybe_start(void);
 static void H_commit(void);
 static void H_send(int value);
 
+
+/* wl_pointer.frame exists since v5: older pointers get none (each event
+ * stands alone), like a real v4 compositor */
+static void mini_pointer_frame(void)
+{
+    if (M.pointer && wl_resource_get_version(M.pointer) >= WL_POINTER_FRAME_SINCE_VERSION) {
+        wl_pointer_send_frame(M.pointer);
+    }
+}
+
 static void surface_commit(struct wl_client *client, struct wl_resource *res)
 {
     (void)client;
@@ -683,7 +693,7 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         W_enter_serial = serial;
         wl_pointer_send_enter(M.pointer, serial, M.surface_res,
                               wl_fixed_from_double(100.0), wl_fixed_from_double(100.0));
-        wl_pointer_send_frame(M.pointer);
+        mini_pointer_frame();
         printf("mini: sent pointer enter\n");
         fflush(stdout);
         if (M.touch) {
@@ -910,7 +920,7 @@ static int rel_timer_cb(void *data)
         fflush(stdout);
     }
     if (M.pointer) {
-        wl_pointer_send_frame(M.pointer);
+        mini_pointer_frame();
     }
     return 1; /* one shot */
 }
@@ -921,7 +931,7 @@ static int abs_timer_cb(void *data)
     if (M.pointer && M.surface_res) {
         wl_pointer_send_motion(M.pointer, 999,
                                wl_fixed_from_double(600.0), wl_fixed_from_double(450.0));
-        wl_pointer_send_frame(M.pointer);
+        mini_pointer_frame();
         printf("mini: sent absolute motion(600, 450) after unlock\n");
         fflush(stdout);
     }
@@ -2293,7 +2303,7 @@ static int P_signal_cb(int signal_number, void *data)
         } else {
             continue;
         }
-        wl_pointer_send_frame(M.pointer);
+        mini_pointer_frame();
     }
     fclose(f);
     wl_display_flush_clients(M.display);

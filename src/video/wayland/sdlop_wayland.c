@@ -1866,11 +1866,18 @@ static void pointer_axis_common(WaylandDeviceData *d, Uint8 type, uint32_t axis,
     }
 }
 
+static void flush_pointer_frame(WaylandDeviceData *d);
+static bool pointer_has_frames(const WaylandDeviceData *d);
+
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value)
 {
     (void)pointer;
     (void)time;
-    pointer_axis_common((WaylandDeviceData *)data, AXIS_CONTINUOUS, axis, wl_fixed_to_double(value));
+    WaylandDeviceData *d = (WaylandDeviceData *)data;
+    pointer_axis_common(d, AXIS_CONTINUOUS, axis, wl_fixed_to_double(value));
+    if (!pointer_has_frames(d)) {
+        flush_pointer_frame(d);
+    }
 }
 
 static float axis_units(float acc, Uint8 type)
@@ -1885,10 +1892,9 @@ static float axis_units(float acc, Uint8 type)
     }
 }
 
-static void pointer_frame(void *data, struct wl_pointer *pointer)
+/* deliver what a wl_pointer frame accumulated */
+static void flush_pointer_frame(WaylandDeviceData *d)
 {
-    WaylandDeviceData *d = (WaylandDeviceData *)data;
-    (void)pointer;
     if (d->axis_x_acc != 0.0f || d->axis_y_acc != 0.0f) { /* accumulators stay empty under raw input */
         SDLOP_SendMouseWheelDirection(axis_units(d->axis_x_acc, d->axis_x_type), axis_units(d->axis_y_acc, d->axis_y_type),
                                       d->axis_direction, SDLOP_MonotonicNS());
@@ -1904,6 +1910,18 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
         }
         d->rel_x_acc = d->rel_y_acc = 0.0f;
     }
+}
+
+static void pointer_frame(void *data, struct wl_pointer *pointer)
+{
+    (void)pointer;
+    flush_pointer_frame((WaylandDeviceData *)data);
+}
+
+/* wl_pointer before v5 has no frame event: every event is a frame */
+static bool pointer_has_frames(const WaylandDeviceData *d)
+{
+    return d->pointer && wl_pointer_get_version(d->pointer) >= WL_POINTER_FRAME_SINCE_VERSION;
 }
 
 static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t axis_source)
@@ -3682,6 +3700,9 @@ static void relative_pointer_motion(void *data, struct zwp_relative_pointer_v1 *
      * deltas match SDL3's wayland behavior */
     wl_data.rel_x_acc += (float)wl_fixed_to_double(dx_unaccel);
     wl_data.rel_y_acc += (float)wl_fixed_to_double(dy_unaccel);
+    if (!pointer_has_frames(&wl_data)) {
+        flush_pointer_frame(&wl_data); /* no frame will follow */
+    }
 }
 
 static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
