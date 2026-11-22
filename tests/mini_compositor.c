@@ -1657,9 +1657,34 @@ static void compositor_create_surface(struct wl_client *client, struct wl_resour
     }
 }
 
+/* regions (opaque / input): accepted, contents not tracked */
+static void region_rect(struct wl_client *client, struct wl_resource *res, int32_t x, int32_t y, int32_t w,
+                        int32_t h)
+{
+    (void)client;
+    (void)res;
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+}
+
+static const struct wl_region_interface region_impl = {
+    .destroy = res_destroy,
+    .add = region_rect,
+    .subtract = region_rect,
+};
+
+static void compositor_create_region(struct wl_client *client, struct wl_resource *res, uint32_t id)
+{
+    (void)res;
+    struct wl_resource *r = wl_resource_create(client, &wl_region_interface, 1, id);
+    wl_resource_set_implementation(r, &region_impl, NULL, NULL);
+}
+
 static const struct wl_compositor_interface compositor_impl = {
     .create_surface = compositor_create_surface,
-    .create_region = NULL,
+    .create_region = compositor_create_region,
 };
 
 static void compositor_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
