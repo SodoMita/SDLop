@@ -257,6 +257,11 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     }
 }
 
+void SDLOP_KeyboardClearComposition(void)
+{
+    /* DOM owns composition on the web. */
+}
+
 void SDLOP_KeyboardProcessRepeats(void)
 {
     if (!sdlop.repeat_active) {
@@ -369,6 +374,10 @@ bool SDLOP_RawInputInit(void)
 }
 
 void SDLOP_RawInputQuit(void)
+{
+}
+
+void SDLOP_RawInputResetPointerFrame(void)
 {
 }
 

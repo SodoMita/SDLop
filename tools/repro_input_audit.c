@@ -7,7 +7,22 @@
 #include "internal/sdlop_internal.h"
 #include <assert.h>
 #include <stdatomic.h>
+#define __wrap_ioctl pipe_ioctl
 #include "../bench/raw_pipe.c"
+#undef __wrap_ioctl
+static bool highres;
+int __wrap_ioctl(int fd, unsigned long request, ...)
+{
+    va_list args;
+    va_start(args, request);
+    void *arg = va_arg(args, void *);
+    va_end(args);
+    int result = pipe_ioctl(fd, request, arg);
+    if (result >= 0 && highres && synthetic_fd(fd) && _IOC_NR(request) == 0x20 + EV_REL) {
+        set_bit(arg, _IOC_SIZE(request), REL_WHEEL_HI_RES);
+    }
+    return result;
+}
 
 static atomic_bool removed;
 static atomic_uint dead_reads;
@@ -61,6 +76,7 @@ int main(int argc, char **argv)
         return 2;
     }
     bool compose = !strcmp(argv[1], "compose");
+    highres = !strcmp(argv[1], "wheel") || !strcmp(argv[1], "wheel-focus");
     setenv("SDL_VIDEODRIVER", "dummy", 1);
     setenv("SDLOP_RAW_INPUT", "1", 1);
     setenv("SDLOP_DISABLE_RAW_INPUT", "0", 1);

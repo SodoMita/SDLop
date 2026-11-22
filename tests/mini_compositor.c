@@ -46,6 +46,7 @@ struct mini
     struct wl_resource *xdg_surface;
     struct wl_resource *xdg_toplevel;
     struct wl_resource *pointer;
+    struct wl_resource *keyboard;
     struct wl_resource *touch;
     struct wl_resource *locked;
     struct wl_resource *relpointer;
@@ -495,6 +496,13 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         wl_pointer_send_enter(M.pointer, serial, M.surface_res,
                               wl_fixed_from_double(100.0), wl_fixed_from_double(100.0));
         wl_pointer_send_frame(M.pointer);
+        if (getenv("SDLOP_TEST_KEYBOARD") && M.keyboard) {
+            uint32_t held[] = { 42, 48 }; /* held Shift and B: only restore modifier */
+            struct wl_array keys = { sizeof(held), sizeof(held), held };
+            wl_keyboard_send_enter(M.keyboard, serial, M.surface_res, &keys);
+            wl_keyboard_send_modifiers(M.keyboard, serial, 1, 0, 0, 0);
+            wl_keyboard_send_key(M.keyboard, serial, 1, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
+        }
         if (getenv("SDLOP_TEST_SCROLL")) {
             wl_pointer_send_axis(M.pointer, 1, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(-1));
             if (wl_resource_get_version(M.pointer) >= 8) {
@@ -817,6 +825,19 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
     struct wl_resource *k = wl_resource_create(client, &wl_keyboard_interface,
                                                wl_resource_get_version(res), id);
     wl_resource_set_implementation(k, &keyboard_impl, NULL, NULL);
+    M.keyboard = k;
+    if (getenv("SDLOP_TEST_KEYBOARD")) {
+        static const char map[] =
+            "xkb_keymap { xkb_keycodes { include \"evdev+aliases(qwerty)\" }; "
+            "xkb_types { include \"complete\" }; xkb_compat { include \"complete\" }; "
+            "xkb_symbols { include \"pc+us\" }; };";
+        int fd = memfd_create("mini-keymap", MFD_CLOEXEC);
+        if (fd < 0 || write(fd, map, sizeof(map)) != sizeof(map)) { abort(); }
+        wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, sizeof(map));
+        close(fd);
+        bool immediate = getenv("SDLOP_TEST_KEYBOARD_IMMEDIATE") != NULL;
+        wl_keyboard_send_repeat_info(k, immediate ? 20 : 0, immediate ? 0 : 500);
+    }
 }
 
 static const struct wl_seat_interface seat_impl = {

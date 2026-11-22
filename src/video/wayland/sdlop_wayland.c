@@ -931,7 +931,6 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys)
 {
     (void)keyboard;
-    (void)keys;
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     (void)d;
     SDL_Window *window = NULL;
@@ -951,6 +950,28 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
         sdlop.keyboard_focus = window;
         window->flags |= SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
+        /* Restore only held modifiers, never action keys/text/repeats, and
+         * never mix seat keyboard events into a running raw source. */
+        if (!SDLOP_RawInputIsSource()) {
+            uint32_t *key;
+            wl_array_for_each(key, keys) {
+                if (*key > SDLOP_EVDEV_KEY_MAX) { continue; }
+                SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[*key];
+                switch (sc) {
+                case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT:
+                case SDL_SCANCODE_LCTRL: case SDL_SCANCODE_RCTRL:
+                case SDL_SCANCODE_LALT: case SDL_SCANCODE_RALT:
+                case SDL_SCANCODE_LGUI: case SDL_SCANCODE_RGUI:
+                case SDL_SCANCODE_MODE:
+                    if (!sdlop.keystate[sc]) {
+                        SDLOP_SendKeyboardKey(true, false, sc, (Uint16)*key, 0);
+                    }
+                    break;
+                default: break;
+                }
+            }
+            sdlop.repeat_active = false;
+        }
     }
 }
 
@@ -1003,8 +1024,8 @@ static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32
 {
     (void)data;
     (void)keyboard;
-    if (rate > 0 && delay > 0) {
-        SDLOP_RawInputSetRepeatInfo((Uint32)delay, (Uint32)(1000 / rate));
+    if (rate >= 0 && delay >= 0) {
+        SDLOP_RawInputSetRepeatInfo((Uint32)delay, rate ? (Uint32)(1000 / SDL_min(rate, 1000)) : 0);
     }
 }
 
@@ -1293,6 +1314,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     (void)surface;
     SDL_Window *window = d->pointer_focus;
     d->pointer_focus = NULL;
+    SDLOP_RawInputResetPointerFrame();
     d->scroll = (SDLOP_WaylandScroll){ 0 };
     sdlop.mouse_has_position = false;
     if (sdlop.mouse_focus == window) {

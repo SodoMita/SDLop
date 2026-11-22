@@ -301,7 +301,7 @@ static void compose_init(void)
     }
 }
 
-static void compose_reset(void)
+void SDLOP_KeyboardClearComposition(void)
 {
     if (compose_st) {
         SDLOP_XKB_xkb_compose_state_reset(compose_st);
@@ -337,7 +337,7 @@ static bool set_keymap(struct xkb_keymap *new_keymap)
     /* the state sync that follows a new keymap is part of setting it */
     suppress_layout_event = true;
     compose_init();
-    compose_reset();
+    SDLOP_KeyboardClearComposition();
     if (replacing) {
         SDL_Event event;
         SDL_zero(event);
@@ -713,7 +713,8 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
 
     /* text: from the live state (modifiers, active layout), through
      * compose for dead keys / the Compose key */
-    if (key_event && text_utf8 && text_size) {
+    if (key_event && text_utf8 && text_size && sdlop.keyboard_focus &&
+        sdlop.keyboard_focus->text_input_active) {
         if (compose_key(xk, text_utf8, text_size)) {
             return key;
         }
@@ -824,7 +825,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
 
     /* key repeat management (raw path has no server-generated repeats) */
     if (down && !repeat) {
-        if (key_repeats) {
+        if (key_repeats && !sdlop.repeat_disabled) {
             sdlop.repeat_scancode = scancode;
             sdlop.repeat_rawcode = rawcode;
             sdlop.repeat_active = true;
@@ -839,6 +840,11 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
 void SDLOP_KeyboardProcessRepeats(void)
 {
     if (!sdlop.repeat_active) {
+        return;
+    }
+    if (sdlop.repeat_disabled || !sdlop.keyboard_focus || sdlop.keyboard_grabbed_elsewhere ||
+        !SDLOP_RawInputKeyboardAllowed()) {
+        sdlop.repeat_active = false; /* cancel, never replay a grab/VT backlog */
         return;
     }
     Uint64 now = SDLOP_MonotonicNS();
@@ -871,7 +877,7 @@ void SDL_ResetKeyboard(void)
         }
     }
     sdlop.repeat_active = false;
-    compose_reset(); /* focus loss abandons a pending dead key */
+    SDLOP_KeyboardClearComposition(); /* focus loss abandons a pending dead key */
 }
 
 SDL_Keymod SDL_GetModState(void)

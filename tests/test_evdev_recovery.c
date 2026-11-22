@@ -382,8 +382,46 @@ int main(void)
     assert(SDL_Init(SDL_INIT_VIDEO));
     assert(SDLop_RawInputAvailable() && SDLop_GetRawInputStats(&final));
     assert(!final.events_seen && !final.sdl_ring_dropped && !final.poll_ring_dropped);
-    SDL_Quit();
     puts("PASS: counters survive quit and reset on worker reinitialization");
+
+    assert(SDL_CreateWindow("removal", 320, 200, 0));
+    SDLOP_RawInputQuit();
+    sdlop.video->window_system_input = true;
+    assert(SDLOP_RawInputInit());
+    sent = 0;
+    atomic_store(&callbacks, 0); atomic_store(&idle_records, 0);
+    assert(SDLop_RegisterRawEventCallback(on_raw, NULL));
+    SDL_FlushEvents(0, SDL_EVENT_LAST);
+    send_event(0, EV_KEY, KEY_A, 1); send_event(1, EV_KEY, KEY_A, 1);
+    send_event(0, EV_KEY, KEY_B, 1); send_event(0, EV_KEY, BTN_LEFT, 1);
+    wait_idle(); collect();
+    assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A] && SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B]);
+    filler.type = SDL_EVENT_USER;
+    while (SDL_PushEvent(&filler)) { }
+    close(first->write_fd); first->write_fd = -1; /* real pipe EOF/HUP */
+    SDL_Delay(20);
+    SDL_PumpEvents(); /* a full queue must postpone, not lose, release state */
+    assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B]);
+    SDL_FlushEvents(0, SDL_EVENT_LAST);
+    Uint64 deadline = SDL_GetTicks() + 3000;
+    while (SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] && SDL_GetTicks() < deadline) {
+        SDL_PumpEvents(); SDL_Delay(1);
+    }
+    seen = collect();
+    assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]); /* surviving device owns it */
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] && seen.keyup[SDL_SCANCODE_B] == 1);
+    assert(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) && seen.up == 1);
+    assert(SDLOP_RawInputIsSource()); /* other combo still covers both classes */
+    assert(SDLop_GetRawEventCount() == (Uint64)sent && atomic_load(&callbacks) == sent);
+    send_event(1, EV_KEY, KEY_A, 0); send_event(1, EV_KEY, KEY_C, 1); wait_idle(); collect();
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A] && SDL_GetKeyboardState(NULL)[SDL_SCANCODE_C]);
+    close(second.write_fd); second.write_fd = -1;
+    deadline = SDL_GetTicks() + 3000;
+    while (SDLOP_RawInputIsSource() && SDL_GetTicks() < deadline) { SDL_PumpEvents(); SDL_Delay(1); }
+    assert(!SDLOP_RawInputIsSource() && !SDL_GetKeyboardState(NULL)[SDL_SCANCODE_C]);
+    assert(SDLop_GetRawEventCount() == (Uint64)sent && atomic_load(&callbacks) == sent);
+    puts("PASS: terminal EOF retires devices, queue-safe releases preserve union; last removal enables seat fallback without synthetic raw callbacks");
+    SDL_Quit();
     close(second.read_fd); close(second.write_fd); second.read_fd = -1;
     unlink(path); uinput_synth_destroy(first);
     puts("test_evdev_recovery: PASS");

@@ -43,6 +43,9 @@ bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID props
             return false;
         }
     }
+    if (!window->text_input_active && sdlop.keyboard_focus == window) {
+        SDLOP_KeyboardClearComposition();
+    }
     window->text_input_active = true;
     return true;
 }
@@ -56,6 +59,7 @@ bool SDL_StopTextInput(SDL_Window *window)
 {
     CHECK_WINDOW(window, false);
     window->text_input_active = false;
+    if (sdlop.keyboard_focus == window) { SDLOP_KeyboardClearComposition(); }
     return true;
 }
 
@@ -96,8 +100,7 @@ bool SDL_GetTextInputArea(SDL_Window *window, SDL_Rect *rect, int *cursor)
 bool SDL_ClearComposition(SDL_Window *window)
 {
     CHECK_WINDOW(window, false);
-    /* compose sequences are resolved per key press; nothing is pending
-     * across calls that an application could clear (no IME) */
+    if (sdlop.keyboard_focus == window) { SDLOP_KeyboardClearComposition(); }
     return true;
 }
 

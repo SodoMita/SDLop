@@ -58,10 +58,15 @@ typedef struct SDLOP_RawDevice
     bool is_pointer;
     bool clock_monotonic; /* EVIOCSCLOCKID succeeded for this fd */
     bool has_abs;
+    bool wheel_highres_x, wheel_highres_y; /* immutable capabilities */
+    bool dead_fd; /* worker only; fd kept open until join */
+    atomic_bool disconnected; /* worker release -> main acquire */
 
     /* Main-thread SDL adapter state (never touched by the worker). */
     unsigned long keys[SDLOP_KEY_WORDS];
     float hi_res_x, hi_res_y;
+    SDL_Window *wheel_focus; /* owner of a partial SDL wheel frame */
+    bool removal_done; /* main-thread state release completed */
     int abs_value[2], abs_min[2], abs_max[2];
     float abs_last[2]; /* normalized relative-mode baseline */
     bool abs_dirty, abs_valid, abs_recovered;
@@ -102,6 +107,9 @@ static struct
     int num_devices;
     bool have_keyboard;
     bool have_pointer;
+    bool fallback_pending, source_lost; /* main-thread only, all-or-nothing */
+    Uint16 alias_head[SDL_SCANCODE_COUNT], alias_next[SDLOP_EVDEV_KEY_MAX + 1];
+    Uint16 delivered_code[SDL_SCANCODE_COUNT]; /* native code owning logical down */
     bool winsys; /* started for X11/Wayland: the only SDL input source there */
 
     /* rings: single producer (worker), single consumer (main thread) */
@@ -196,6 +204,8 @@ static int open_input_devices(void)
         if (test_bit(evbits, EV_REL)) {
             unsigned long relbits[REL_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
             if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relbits)), relbits) >= 0) {
+                dev->wheel_highres_x = test_bit(relbits, REL_HWHEEL_HI_RES);
+                dev->wheel_highres_y = test_bit(relbits, REL_WHEEL_HI_RES);
                 if (test_bit(relbits, REL_X) && test_bit(relbits, REL_Y)) {
                     dev->is_pointer = true;
                 }
@@ -265,6 +275,16 @@ static void dispatch_callbacks(const SDLop_RawEvent *event)
     }
 }
 
+/* Cold error path only: never change native publication/callback behavior.
+ * Keep descriptors alive until join, so the main thread never races close/reuse. */
+static void retire_device(SDLOP_RawDevice *dev)
+{
+    if (dev->fd < 0 || dev->dead_fd) { return; }
+    (void)epoll_ctl(raw.epoll_fd, EPOLL_CTL_DEL, dev->fd, NULL);
+    dev->dead_fd = true;
+    atomic_store_explicit(&dev->disconnected, true, memory_order_release);
+}
+
 /* Drain only on the worker. Recovery reuses the same publication/callback
  * path before querying kernel state; queries never run in the event loop. */
 static bool drain_device_events(SDLOP_RawDevice *dev, struct input_event *batch,
@@ -288,7 +308,9 @@ static bool drain_device_events(SDLOP_RawDevice *dev, struct input_event *batch,
             continue;
         }
         if (got <= 0) {
-            return got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+            bool empty = got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+            if (!empty) { retire_device(dev); }
+            return empty;
         }
         int count = (int)(got / (ssize_t)sizeof(struct input_event));
         for (int j = 0; j < count; j++) {
@@ -364,7 +386,7 @@ static void *worker_main(void *arg)
          * detects a successful push even if the consumer empties the ring
          * mid-batch. No extra operations on the per-event publication path. */
         uint64_t sdl_head_before = atomic_load_explicit(&raw.sdl_ring.head, memory_order_relaxed);
-        bool quit_requested = false;
+        bool quit_requested = false, recovered = false;
         Uint64 mono_now = SDLOP_MonotonicNS();
         for (int i = 0; i < n; i++) {
             if (evs[i].data.u32 == 0xFFFFFFFFu) {
@@ -380,9 +402,12 @@ static void *worker_main(void *arg)
                 continue;
             }
             SDLOP_RawDevice *dev = &raw.devices[evs[i].data.u32];
-            (void)drain_device_events(dev, batch, mono_now, rt_offset_ns);
+            if (!dev->dead_fd) {
+                bool drained = drain_device_events(dev, batch, mono_now, rt_offset_ns);
+                if (drained && (evs[i].events & (EPOLLHUP | EPOLLERR))) { retire_device(dev); }
+                recovered |= dev->dead_fd; /* wake even when no native record arrived */
+            }
         }
-        bool recovered = false;
         unsigned int requests = atomic_load_explicit(&raw.resync_requests, memory_order_acquire);
         if (requests && !quit_requested && raw.running) {
             requests = atomic_exchange_explicit(&raw.resync_requests, 0, memory_order_acquire);
@@ -391,7 +416,9 @@ static void *worker_main(void *arg)
                     continue;
                 }
                 SDLOP_RawDevice *dev = &raw.devices[i];
+                if (dev->dead_fd) { continue; } /* main handles terminal state */
                 bool drained = drain_device_events(dev, batch, SDLOP_MonotonicNS(), rt_offset_ns);
+                if (dev->dead_fd) { recovered = true; continue; }
                 memset(dev->snapshot_keys, 0, sizeof(dev->snapshot_keys));
                 int result = -1;
                 if (drained) {
@@ -492,6 +519,13 @@ bool SDLOP_RawInputInit(void)
     }
     memset(&raw, 0, sizeof(raw));
     raw.winsys = winsys;
+    for (unsigned code = 0; code <= SDLOP_EVDEV_KEY_MAX; code++) {
+        SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[code];
+        if (sc != SDL_SCANCODE_UNKNOWN) {
+            raw.alias_next[code] = raw.alias_head[sc];
+            raw.alias_head[sc] = (Uint16)(code + 1);
+        }
+    }
     pthread_mutex_init(&raw.cb_mutex, NULL);
     atomic_store(&raw.event_count, 0);
 
@@ -650,7 +684,7 @@ bool SDLOP_RawInputHasKeyboard(void)
 bool SDLOP_RawInputIsSource(void)
 {
     /* only ever set with both a keyboard and a pointer (see Init) */
-    return raw.running && raw.winsys;
+    return raw.running && raw.winsys && !raw.source_lost;
 }
 
 /* ------------------------------------------------------------------ */
@@ -748,6 +782,19 @@ static bool winsys_pointer_focus(void)
 static bool winsys_keyboard_focus(void)
 {
     return sdlop.keyboard_focus && !sdlop.keyboard_grabbed_elsewhere;
+}
+
+void SDLOP_RawInputResetPointerFrame(void)
+{
+    for (int i = 0; i < raw.num_devices; i++) {
+        raw.devices[i].hi_res_x = raw.devices[i].hi_res_y = 0;
+        raw.devices[i].abs_valid = raw.devices[i].abs_dirty = false;
+    }
+}
+
+bool SDLOP_RawInputKeyboardAllowed(void)
+{
+    return !raw.running || raw.source_lost || (raw.winsys ? (!raw.fallback_pending && winsys_keyboard_focus()) : raw_console_foreground());
 }
 
 /* Translate single-contact ABS_X/Y devices in window coordinates. Cache
@@ -849,15 +896,25 @@ static void pump_event(const SDLop_RawEvent *ev, bool recovering)
             break;
         }
         case SDLop_REL_WHEEL:
+            if (dev->wheel_highres_y) { break; }
             SDLOP_SendMouseWheel(0.0f, (float)ev->value, ev->timestamp_ns);
             break;
         case SDLop_REL_HWHEEL:
+            if (dev->wheel_highres_x) { break; }
             SDLOP_SendMouseWheel((float)ev->value, 0.0f, ev->timestamp_ns);
             break;
         case SDLop_REL_WHEEL_HI_RES:
+            if (dev->wheel_focus != (sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.relative_mode_window)) {
+                dev->hi_res_x = dev->hi_res_y = 0;
+            }
+            dev->wheel_focus = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.relative_mode_window;
             dev->hi_res_y += (float)ev->value / 120.0f;
             break;
         case SDLop_REL_HWHEEL_HI_RES:
+            if (dev->wheel_focus != (sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.relative_mode_window)) {
+                dev->hi_res_x = dev->hi_res_y = 0;
+            }
+            dev->wheel_focus = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.relative_mode_window;
             dev->hi_res_x += (float)ev->value / 120.0f;
             break;
         default:
@@ -874,7 +931,10 @@ static void pump_event(const SDLop_RawEvent *ev, bool recovering)
     case SDLop_EV_SYN:
         if (ev->code == SDLop_SYN_REPORT) { pump_absolute(dev, ev->timestamp_ns); }
         if (ev->code == SDLop_SYN_REPORT && (dev->hi_res_x != 0.0f || dev->hi_res_y != 0.0f)) {
-            SDLOP_SendMouseWheel(dev->hi_res_x, dev->hi_res_y, ev->timestamp_ns);
+            SDL_Window *focus = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.relative_mode_window;
+            if (!winsys || (winsys_pointer_focus() && focus == dev->wheel_focus)) {
+                SDLOP_SendMouseWheel(dev->hi_res_x, dev->hi_res_y, ev->timestamp_ns);
+            }
             dev->hi_res_x = dev->hi_res_y = 0.0f;
         }
         break;
@@ -909,11 +969,23 @@ static void pump_key(const SDLop_RawEvent *ev, bool recovering)
     } else {
         dev->keys[word] &= ~mask;
     }
+    SDL_Scancode sc = ev->code <= SDLOP_EVDEV_KEY_MAX ?
+        (SDL_Scancode)sdlop_evdev_to_scancode[ev->code] : SDL_SCANCODE_UNKNOWN;
+    Uint16 head = sc != SDL_SCANCODE_UNKNOWN ? raw.alias_head[sc] : 0;
+    bool aliases = head && raw.alias_next[head - 1];
     for (int i = 0; i < raw.num_devices; i++) {
         bool held = (Uint32)i != ev->device && test_bit(raw.devices[i].keys, ev->code);
         if (mouse_button_from_btn(ev->code) == SDL_BUTTON_LEFT) {
             held |= (ev->code != BTN_LEFT || (Uint32)i != ev->device) && test_bit(raw.devices[i].keys, BTN_LEFT);
             held |= (ev->code != BTN_TOUCH || (Uint32)i != ev->device) && test_bit(raw.devices[i].keys, BTN_TOUCH);
+        }
+        if (aliases) {
+            for (Uint16 link = head; link; link = raw.alias_next[link - 1]) {
+                unsigned code = link - 1;
+                if ((Uint32)i != ev->device || code != ev->code) {
+                    held |= test_bit(raw.devices[i].keys, code);
+                }
+            }
         }
         if (held) {
             /* A prior physical press may have been focus-filtered. Do not
@@ -927,7 +999,14 @@ static void pump_key(const SDLop_RawEvent *ev, bool recovering)
             }
         }
     }
-    pump_event(ev, recovering);
+    if (aliases && !mouse_button_from_btn(ev->code)) {
+        SDLop_RawEvent logical = *ev;
+        if (down && !sdlop.keystate[sc]) { raw.delivered_code[sc] = ev->code; }
+        if (!down) { logical.code = raw.delivered_code[sc]; }
+        pump_event(&logical, recovering);
+    } else {
+        pump_event(ev, recovering);
+    }
 }
 
 static void begin_sync(SDLOP_RawDevice *dev, bool wait_report)
@@ -967,7 +1046,20 @@ static bool pump_recovery(void)
     uint64_t tail = atomic_load_explicit(&raw.sdl_ring.tail, memory_order_relaxed);
     for (int i = 0; i < raw.num_devices; i++) {
         SDLOP_RawDevice *dev = &raw.devices[i];
-        if (!dev->syncing) {
+        if ((raw.fallback_pending || atomic_load_explicit(&dev->disconnected, memory_order_acquire)) &&
+            !dev->removal_done) {
+            dev->hi_res_x = dev->hi_res_y = 0;
+            dev->abs_dirty = dev->abs_valid = false;
+            for (unsigned code = 0; code <= KEY_MAX; code++) {
+                if (!test_bit(dev->keys, code)) { continue; }
+                if (SDLOP_EventQueueFree() < 3) { return false; }
+                SDLop_RawEvent up = { .device = dev->index, .type = EV_KEY, .code = (Uint16)code };
+                pump_key(&up, true);
+            }
+            dev->removal_done = true;
+            dev->syncing = dev->requested = false;
+        }
+        if (!dev->syncing || dev->removal_done) {
             continue;
         }
         if (dev->requested && atomic_load_explicit(&dev->snapshot_ready, memory_order_acquire)) {
@@ -1019,6 +1111,14 @@ static bool pump_recovery(void)
         }
     }
     raw.have_sync = any;
+    if (raw.fallback_pending) {
+        bool done = true;
+        for (int i = 0; i < raw.num_devices; i++) { done &= raw.devices[i].removal_done; }
+        if (done) {
+            sdlop.repeat_active = false;
+            raw.source_lost = true; /* enable seat keyboard+mouse only after ALL raw releases */
+        }
+    }
     return true;
 }
 
@@ -1026,6 +1126,22 @@ void SDLOP_RawInputPump(void)
 {
     if (!raw.running) {
         return;
+    }
+    if (!raw.source_lost) {
+        bool keyboard = false, pointer = false, removed = false;
+        for (int i = 0; i < raw.num_devices; i++) {
+            SDLOP_RawDevice *dev = &raw.devices[i];
+            bool dead = atomic_load_explicit(&dev->disconnected, memory_order_acquire);
+            removed |= dead && !dev->removal_done;
+            keyboard |= !dead && dev->is_keyboard;
+            pointer |= !dead && dev->is_pointer;
+        }
+        raw.have_keyboard = keyboard;
+        raw.have_pointer = pointer;
+        if (removed) {
+            raw.have_sync = true;
+            raw.fallback_pending |= raw.winsys && !(keyboard && pointer);
+        }
     }
     uint64_t dropped = atomic_load_explicit(&raw.sdl_dropped, memory_order_acquire);
     if (dropped != raw.observed_dropped) {
@@ -1055,7 +1171,9 @@ void SDLOP_RawInputPump(void)
             break;
         }
         SDLOP_RawDevice *dev = &raw.devices[ev.device];
-        if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
+        if (raw.fallback_pending || dev->removal_done) {
+            /* Native callbacks/poll ring stay global; no SDL source mixing. */
+        } else if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
             begin_sync(dev, true);
         } else if (dev->syncing) {
             if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
@@ -1171,10 +1289,14 @@ bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
 
 void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms)
 {
-    if (delay_ms) {
-        sdlop.repeat_delay_ms = delay_ms;
-    }
-    if (interval_ms) {
+    sdlop.repeat_delay_ms = delay_ms; /* zero is a legal immediate start */
+    sdlop.repeat_disabled = interval_ms == 0;
+    if (!interval_ms) {
+        sdlop.repeat_active = false;
+    } else {
         sdlop.repeat_interval_ms = interval_ms;
+        if (sdlop.repeat_active) {
+            sdlop.repeat_next_ns = SDLOP_MonotonicNS() + (Uint64)delay_ms * 1000000ull;
+        }
     }
 }

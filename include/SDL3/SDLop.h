@@ -277,8 +277,11 @@ extern int SDLop_PollRawEvents(SDLop_RawEvent *events, int max_events);
  *
  * When false (e.g. /dev/input is not readable, or on X11/Wayland without
  * SDLOP_RAW_INPUT=1), SDLop transparently uses window-system input instead.
- * On X11/Wayland a true result means evdev is the only SDL keyboard and
- * mouse source.
+ * On X11/Wayland evdev initially replaces both SDL keyboard and mouse.
+ * If device removal loses either required class, SDL input falls back to the
+ * window system after releasing held raw state. The worker can remain running
+ * for native callbacks/polling on surviving devices, so this query remains
+ * true in that case. Reinitialize video to rescan newly connected devices.
  */
 extern bool SDLop_RawInputAvailable(void);
 
