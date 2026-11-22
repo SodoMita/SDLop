@@ -634,7 +634,12 @@ static void flush_and_collect(event_log *log)
     while (atomic_load(&inject_pending) > 0 && SDL_GetTicks() < end) {
         pump(log, 2);
     }
+    const int stuck = atomic_load(&inject_pending);
     pump(log, 300); /* generous: sanitizer builds are slow */
+    if (stuck > 0) {
+        /* tells "never injected" from "injected, events late" in a flaky run */
+        fprintf(stderr, "note: %d injected byte(s) still unsent after 1s; collected %d event(s)\n", stuck, log->n);
+    }
 }
 
 static int find(const event_log *log, Uint32 type, int from)
