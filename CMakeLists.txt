@@ -668,6 +668,13 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_win32_gl PRIVATE -UNDEBUG)
     add_test(NAME test_win32_gl COMMAND test_win32_gl)
     set_tests_properties(test_win32_gl PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+    add_executable(test_win32_vulkan tests/test_win32_vulkan.c)
+    target_link_libraries(test_win32_vulkan PRIVATE sdlop)
+    target_include_directories(test_win32_vulkan PRIVATE src)
+    target_compile_options(test_win32_vulkan PRIVATE -UNDEBUG)
+    add_test(NAME test_win32_vulkan COMMAND test_win32_vulkan)
+    set_tests_properties(test_win32_vulkan PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
     set_tests_properties(test_win32_raw_keyboard_once PROPERTIES RUN_SERIAL TRUE)
   else()
   # SDL 3.4 window/cursor/grab/device API on the dummy driver (and on X11
