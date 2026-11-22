@@ -10,6 +10,8 @@
     - preedit -> SDL_EVENT_TEXT_EDITING with the cursor in characters
     - commit_string -> SDL_EVENT_TEXT_INPUT, split into <= 63-byte events
       at UTF-8 boundaries, followed by an empty TEXT_EDITING
+    - a transaction with preedit_string before commit_string on the wire:
+      TEXT_INPUT first, then the new TEXT_EDITING (applied at done)
     - SDL_StopTextInput disables it
 
   This software is provided 'as-is', without any express or implied
@@ -175,11 +177,16 @@ int main(int argc, char *argv[])
     char text[512] = "";
     int edits = 0, inputs = 0;
     bool got_preedit = false, cleared = false;
+    char tail[256] = ""; /* events after the first commit was cleared */
     deadline = SDL_GetTicks() + 2000;
-    while (SDL_GetTicks() < deadline && !(cleared && strcmp(text, COMMIT) == 0)) {
+    while (SDL_GetTicks() < deadline && !(cleared && strstr(tail, "E:nx|"))) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_EVENT_TEXT_EDITING) {
+            if (cleared && (e.type == SDL_EVENT_TEXT_EDITING || e.type == SDL_EVENT_TEXT_INPUT)) {
+                SDL_strlcat(tail, e.type == SDL_EVENT_TEXT_INPUT ? "T:" : "E:", sizeof(tail));
+                SDL_strlcat(tail, e.type == SDL_EVENT_TEXT_INPUT ? e.text.text : e.edit.text, sizeof(tail));
+                SDL_strlcat(tail, "|", sizeof(tail));
+            } else if (e.type == SDL_EVENT_TEXT_EDITING) {
                 edits++;
                 CHECK(e.edit.windowID == SDL_GetWindowID(w), "editing windowID");
                 if (strcmp(e.edit.text, PREEDIT) == 0) {
@@ -206,6 +213,8 @@ int main(int argc, char *argv[])
     CHECK(strcmp(text, COMMIT) == 0, "committed text '%s' (want '%s')", text, COMMIT);
     CHECK(inputs >= 2, "long commit split into several TEXT_INPUT events (%d)", inputs);
     CHECK(cleared, "empty TEXT_EDITING after the commit");
+    /* text-input-v3 applies a transaction at done: commit, then preedit */
+    CHECK(strcmp(tail, "T:Y|E:nx|") == 0, "preedit+commit transaction applied in order ('%s')", tail);
 
     /* moving the cursor: x clamped to the area's right edge */
     const SDL_Rect area2 = { 50, 60, 80, 20 };

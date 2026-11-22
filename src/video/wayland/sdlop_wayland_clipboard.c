@@ -210,8 +210,19 @@ static void *offer_receive(Offer *o, const char *mime, size_t *length)
         return NULL;
     }
     int fds[2];
-    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) {
+    /* the write end goes to the source client, and FD passing keeps its
+     * file status flags: it must stay blocking (a source with a plain write
+     * loop would hit EAGAIN and truncate). The ends are separate open file
+     * descriptions, so only our read end becomes nonblocking. */
+    if (pipe2(fds, O_CLOEXEC) < 0) {
         SDL_SetError("Clipboard pipe: %s", strerror(errno));
+        return NULL;
+    }
+    const int rflags = fcntl(fds[0], F_GETFL);
+    if (rflags < 0 || fcntl(fds[0], F_SETFL, rflags | O_NONBLOCK) < 0) {
+        SDL_SetError("Clipboard pipe: %s", strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
         return NULL;
     }
     if (o->primary) {

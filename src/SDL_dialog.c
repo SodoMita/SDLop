@@ -111,7 +111,7 @@ static PortalRequest *portal_requests;
     "type='signal',sender='org.freedesktop.portal.Desktop',interface='org.freedesktop.portal.Request',member=" \
     "'Response',path='%s'"
 
-static void portal_free(PortalRequest *req)
+static void portal_unlink(PortalRequest *req)
 {
     for (PortalRequest **pp = &portal_requests; *pp; pp = &(*pp)->next) {
         if (*pp == req) {
@@ -119,6 +119,12 @@ static void portal_free(PortalRequest *req)
             break;
         }
     }
+    req->next = NULL;
+}
+
+static void portal_free(PortalRequest *req)
+{
+    portal_unlink(req);
     for (int i = 0; i < req->nfilters; i++) {
         free(req->filter_names[i]);
     }
@@ -187,6 +193,9 @@ static bool portal_response(SDLop_DBusMsg *msg, void *userdata)
     }
     SDLOP_DBus_RemoveMatch(req->rule);
     SDLOP_DBus_RemoveHandler(portal_response, req);
+    /* this frame owns req from here on: the callback may shut video down,
+     * and SDLOP_Dialog_Quit() must not free it underneath us */
+    portal_unlink(req);
     if (response == 1 || response == 2) {
         /* cancelled (1) or ended otherwise (2): an empty list (stock) */
         const char *none[] = { NULL };

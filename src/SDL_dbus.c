@@ -1369,6 +1369,8 @@ void SDLOP_DBus_Quit(void)
     free(db.queue);
     free(db.rbuf);
     free(db.unique_name);
+    const int dispatching = db.dispatching; /* quit from inside a handler */
     memset(&db, 0, sizeof(db));
     db.fd = -1;
+    db.dispatching = dispatching;
 }

@@ -383,6 +383,18 @@ static void SDLCALL dialog_cb(void *userdata, const char *const *list, int filte
     atomic_fetch_add(&dlg.called, 1);
 }
 
+static atomic_int quit_cb_called;
+static void SDLCALL dialog_quit_cb(void *userdata, const char *const *list, int filter)
+{
+    (void)userdata;
+    (void)list;
+    (void)filter;
+    /* the application shuts video down from inside the dialog callback:
+     * SDLOP_Dialog_Quit() + SDLOP_DBus_Quit() run under the dispatcher */
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    atomic_fetch_add(&quit_cb_called, 1);
+}
+
 static bool wait_for(atomic_int *v, int want, int ms)
 {
     for (int i = 0; i < ms / 5 && atomic_load(v) < want; i++) {
@@ -604,6 +616,13 @@ int main(void)
     free(saved_path);
     CHECK(atomic_load(&dlg.called) == 6 && dlg.null_list && strstr(dlg.error, "Invalid dialog file filters"),
           "invalid pattern rejected ('%s')", dlg.error);
+    /* a callback that quits video while the portal response is dispatched
+     * (the request must already be detached: no use-after-free under ASan) */
+    atomic_store(&fc_mode, 1);
+    SDL_SetHint(SDL_HINT_FILE_DIALOG_DRIVER, "portal");
+    SDL_ShowOpenFileDialog(dialog_quit_cb, NULL, NULL, NULL, 0, NULL, false);
+    CHECK(wait_for(&quit_cb_called, 1, 3000), "callback that quits video: called once");
+    CHECK(!SDL_WasInit(SDL_INIT_VIDEO), "video shut down from the callback");
     SDL_ResetHint(SDL_HINT_FILE_DIALOG_DRIVER);
     SDL_Quit();
     CHECK(wait_for(&conn_closed, 4, 2000), "connection 4 closed");

@@ -20,6 +20,8 @@
   set_actions -> action(copy) and drop. The run fails (exit 6) unless the
   client read the data and called wl_data_offer.finish - or, with
   MINI_DND_REFUSE=1, unless it accepted nothing and read nothing.
+  MINI_DND_REPEAT=<n> writes <data> n times plus a newline, with blocking
+  writes (a source larger than the pipe capacity).
   MINI_SCALE=<source>:<value> gives the client's window a preferred scale
   for tests/test_wayland_hidpi.c - fractional:<n/120> (offers
   wp_fractional_scale_manager_v1), buffer:<n> (wl_compositor v6
@@ -2052,6 +2054,7 @@ static void S_prim_mgr_bind(struct wl_client *client, void *data, uint32_t versi
 /* ---------------- synthetic drag (MINI_DND) ---------------- */
 
 static const char *D_data;
+static int D_repeat = 1; /* MINI_DND_REPEAT: D_data repeated, then "\n" */
 static bool D_refuse_expected;
 static bool D_started, D_dropped, D_finished, D_accepted;
 static int D_received;
@@ -2072,14 +2075,27 @@ static void D_offer_receive(struct wl_client *client, struct wl_resource *res, c
 {
     (void)client;
     (void)res;
-    size_t len = strlen(D_data), off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, D_data + off, len - off);
-        if (n <= 0) {
+    /* a plain blocking writer, like most sources: a short write or EAGAIN
+     * (a receiver that made the pipe nonblocking) truncates the transfer */
+    size_t len = strlen(D_data), off = 0, total = 0;
+    for (int r = 0; r < D_repeat; r++) {
+        off = 0;
+        while (off < len) {
+            ssize_t n = write(fd, D_data + off, len - off);
+            if (n <= 0) {
+                break;
+            }
+            off += (size_t)n;
+        }
+        total += off;
+        if (off < len) {
             break;
         }
-        off += (size_t)n;
     }
+    if (D_repeat > 1 && off == len && write(fd, "\n", 1) == 1) {
+        total++;
+    }
+    off = total;
     close(fd);
     D_received++;
     printf("mini: dnd receive %s (%zu bytes)\n", mime, off);
@@ -2489,6 +2505,11 @@ static void T_commit(struct wl_client *client, struct wl_resource *res)
         zwp_text_input_v3_send_done(res, T_commits);
         zwp_text_input_v3_send_commit_string(res, commit);
         zwp_text_input_v3_send_done(res, T_commits);
+        /* one transaction carrying both strings, the preedit first on the
+         * wire: done must apply the commit before the new preedit */
+        zwp_text_input_v3_send_preedit_string(res, "nx", 2, 2);
+        zwp_text_input_v3_send_commit_string(res, "Y");
+        zwp_text_input_v3_send_done(res, T_commits);
     }
 }
 
@@ -2661,6 +2682,9 @@ int main(void)
     }
 
     D_data = getenv("MINI_DND");
+    if (getenv("MINI_DND_REPEAT") && atoi(getenv("MINI_DND_REPEAT")) > 1) {
+        D_repeat = atoi(getenv("MINI_DND_REPEAT"));
+    }
     D_refuse_expected = getenv("MINI_DND_REFUSE") && atoi(getenv("MINI_DND_REFUSE"));
     if (D_data) {
         D_timer = wl_event_loop_add_timer(M.loop, D_timer_cb, NULL);

@@ -8,9 +8,10 @@
     - content type from SDL_PROP_TEXTINPUT_* (type, capitalization,
       autocorrect, multiline), cursor rectangle from SDL_SetTextInputArea
       (x clamped to the area as in stock)
-    - preedit_string -> SDL_EVENT_TEXT_EDITING (cursor bytes converted to
-      characters), commit_string -> SDL_EVENT_TEXT_INPUT, done without a
-      preedit -> empty SDL_EVENT_TEXT_EDITING
+    - preedit_string / commit_string are double-buffered and applied at
+      done (sdlop_wayland_ime_txn.h): old preedit cleared, commit ->
+      SDL_EVENT_TEXT_INPUT, then the new preedit -> SDL_EVENT_TEXT_EDITING
+      (cursor bytes converted to characters), or an empty one
   Keys the IME does not consume still arrive as wl_keyboard keys and produce
   text locally (stock). Beyond stock, SDL_ClearComposition re-enables the
   text input, which resets the IME's composition.
@@ -23,6 +24,7 @@
 #include "sdlop_wayland_internal.h"
 #include "sdlop_wayland_dyn.h"
 #include "text-input-unstable-v3-client-protocol.h"
+#include "sdlop_wayland_ime_txn.h"
 
 #include <string.h>
 
@@ -32,7 +34,7 @@ static struct
     struct wl_seat *seat;
     struct zwp_text_input_v3 *ti;
     bool enabled;
-    bool has_preedit;
+    SDLOP_IMETxn txn; /* double-buffered until done */
     SDL_Window *enabled_window;
     SDL_Rect rect; /* last cursor rectangle sent */
     int cursor;
@@ -57,30 +59,14 @@ static void ti_preedit_string(void *data, struct zwp_text_input_v3 *t, const cha
 {
     (void)data;
     (void)t;
-    ti.has_preedit = true;
-    if (!text) {
-        SDLOP_SendEditingText("", 0, 0);
-        return;
-    }
-    const size_t len = strlen(text);
-    const int begin = cursor_begin >= 0 ? (int)SDL_utf8strnlen(text, (size_t)cursor_begin < len ? (size_t)cursor_begin : len) : -1;
-    const int end = cursor_end >= 0 ? (int)SDL_utf8strnlen(text, (size_t)cursor_end < len ? (size_t)cursor_end : len) : -1;
-    int size;
-    if (end >= 0) {
-        size = begin >= 0 ? end - begin : end;
-    } else {
-        size = -1;
-    }
-    SDLOP_SendEditingText(text, begin, size);
+    SDLOP_IMETxnSetPreedit(&ti.txn, text, cursor_begin, cursor_end);
 }
 
 static void ti_commit_string(void *data, struct zwp_text_input_v3 *t, const char *text)
 {
     (void)data;
     (void)t;
-    if (text) {
-        SDLOP_SendKeyboardText(text, 0);
-    }
+    SDLOP_IMETxnSetCommit(&ti.txn, text);
 }
 
 static void ti_delete_surrounding_text(void *data, struct zwp_text_input_v3 *t, uint32_t before, uint32_t after)
@@ -92,15 +78,17 @@ static void ti_delete_surrounding_text(void *data, struct zwp_text_input_v3 *t, 
     (void)after;
 }
 
+static void send_text(const char *text)
+{
+    SDLOP_SendKeyboardText(text, 0);
+}
+
 static void ti_done(void *data, struct zwp_text_input_v3 *t, uint32_t serial)
 {
     (void)data;
     (void)t;
     (void)serial;
-    if (!ti.has_preedit) {
-        SDLOP_SendEditingText("", 0, 0);
-    }
-    ti.has_preedit = false;
+    SDLOP_IMETxnDone(&ti.txn, SDLOP_SendEditingText, send_text);
 }
 
 static const struct zwp_text_input_v3_listener ti_listener = {
@@ -228,6 +216,7 @@ static void do_enable(SDL_Window *window)
     ti.cursor = 0;
     send_cursor_rect(window);
     zwp_text_input_v3_commit(ti.ti);
+    SDLOP_IMETxnReset(&ti.txn); /* enable resets the input method state */
     ti.enabled = true;
     ti.enabled_window = window;
 }
@@ -238,7 +227,7 @@ static void do_disable(void)
     zwp_text_input_v3_commit(ti.ti);
     ti.enabled = false;
     ti.enabled_window = NULL;
-    ti.has_preedit = false;
+    SDLOP_IMETxnReset(&ti.txn);
     SDL_zero(ti.rect);
     ti.cursor = 0;
 }
@@ -325,5 +314,6 @@ void SDLOP_Wayland_TextInput_Quit(void)
     if (ti.manager) {
         zwp_text_input_manager_v3_destroy(ti.manager);
     }
+    SDLOP_IMETxnReset(&ti.txn);
     memset(&ti, 0, sizeof(ti));
 }

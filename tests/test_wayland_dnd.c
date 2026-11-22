@@ -7,6 +7,8 @@
                URI -> BEGIN, POSITION(10.5,20.25), POSITION(30,40),
                FILE x2, COMPLETE; the compositor checks finish
     text     - text/plain;charset=utf-8 -> TEXT per line
+    bigtext  - one 1 MiB line from a blocking-write source (larger than
+               the pipe): our read end only is nonblocking -> intact TEXT
     refuse   - only image/png offered: nothing accepted, no events
     disabled - SDL_EVENT_DROP_FILE/TEXT disabled: nothing accepted
 
@@ -42,8 +44,11 @@ int main(int argc, char *argv[])
     }
     const char *mode = argc > 2 ? argv[2] : "files";
     const bool files = strcmp(mode, "files") == 0;
+    const bool bigtext = strcmp(mode, "bigtext") == 0;
     const bool text = strcmp(mode, "text") == 0;
-    const bool expect_drop = files || text;
+    const bool expect_drop = files || text || bigtext;
+    enum { BIG_REPEAT = 65536 }; /* x 16 bytes = 1 MiB */
+    size_t big_len = 0;
 
     char xdg[] = "/tmp/sdlop-mini-dnd-XXXXXX";
     if (!mkdtemp(xdg)) {
@@ -65,6 +70,10 @@ int main(int argc, char *argv[])
                    "file://elsewhere.invalid/tmp/remote.txt\r\nhttp://example.com/x\r\n",
                    1);
             setenv("MINI_DND_MIMES", "text/plain,text/uri-list", 1);
+        } else if (bigtext) {
+            setenv("MINI_DND", "0123456789abcdef", 1);
+            setenv("MINI_DND_REPEAT", "65536", 1);
+            setenv("MINI_DND_MIMES", "text/plain;charset=utf-8", 1);
         } else if (text) {
             setenv("MINI_DND", "hello\nworld \xc3\xa9\n", 1);
             setenv("MINI_DND_MIMES", "text/plain;charset=utf-8", 1);
@@ -109,7 +118,7 @@ int main(int argc, char *argv[])
     float px[4] = { 0 }, py[4] = { 0 };
     char *file[4] = { 0 }, *txt[4] = { 0 };
     bool order_ok = true;
-    Uint64 deadline = SDL_GetTicks() + (expect_drop ? 3000 : 1500);
+    Uint64 deadline = SDL_GetTicks() + (bigtext ? 10000 : expect_drop ? 3000 : 1500);
     while (SDL_GetTicks() < deadline && completes == 0) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -141,7 +150,12 @@ int main(int argc, char *argv[])
                 break;
             case SDL_EVENT_DROP_TEXT:
                 order_ok = order_ok && begins == 1;
-                if (ntexts < 4) {
+                if (bigtext) {
+                    big_len = strlen(e.drop.data);
+                    for (size_t i = 0; i < big_len && order_ok; i += 16) {
+                        order_ok = big_len - i >= 16 && memcmp(e.drop.data + i, "0123456789abcdef", 16) == 0;
+                    }
+                } else if (ntexts < 4) {
                     txt[ntexts] = SDL_strdup(e.drop.data);
                 }
                 ntexts++;
@@ -167,6 +181,9 @@ int main(int argc, char *argv[])
         CHECK(nfiles == 2 && ntexts == 0, "2 local files (got %d files, %d texts)", nfiles, ntexts);
         CHECK(file[0] && strcmp(file[0], "/tmp/a b.txt") == 0, "file 1 = '%s'", file[0] ? file[0] : "(null)");
         CHECK(file[1] && strcmp(file[1], "/tmp/c.txt") == 0, "file 2 = '%s'", file[1] ? file[1] : "(null)");
+    } else if (bigtext) {
+        CHECK(ntexts == 1 && nfiles == 0, "1 big text line (got %d texts, %d files)", ntexts, nfiles);
+        CHECK(big_len == (size_t)BIG_REPEAT * 16, "big text intact: %zu of %zu bytes", big_len, (size_t)BIG_REPEAT * 16);
     } else if (text) {
         CHECK(ntexts == 2 && nfiles == 0, "2 text lines (got %d texts, %d files)", ntexts, nfiles);
         CHECK(txt[0] && strcmp(txt[0], "hello") == 0, "text 1 = '%s'", txt[0] ? txt[0] : "(null)");
