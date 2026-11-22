@@ -238,7 +238,8 @@ typedef void (*SDLop_RawEventCallback)(const SDLop_RawEvent *event, void *userda
  *
  * \param cb the callback, invoked on the worker thread for each raw event.
  * \param userdata a pointer passed through to the callback.
- * \returns true on success or false if too many callbacks are registered.
+ * \returns true on success, false for a NULL callback, a full callback list,
+ *          or an allocation failure (SDL error set).
  */
 extern bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata);
 
@@ -248,6 +249,9 @@ extern bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *user
  * This publishes a new callback list; it is not a worker synchronization
  * barrier. A callback from the previous list may still be in flight. Keep its
  * userdata alive until the worker has stopped (SDL_Quit joins the worker).
+ * Absent callbacks cause no allocation. Replaced lists remain alive until
+ * worker join and are then freed; repeated list changes can retain memory
+ * during the worker lifetime, not across a completed shutdown.
  * Register/unregister must not race with input initialization or shutdown;
  * never call SDL_Quit from the worker callback itself.
  */

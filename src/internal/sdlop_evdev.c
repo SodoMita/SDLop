@@ -82,6 +82,9 @@ typedef struct SDLOP_CallbackSet
         SDLop_RawEventCallback cb;
         void *userdata;
     } entries[SDLOP_MAX_CALLBACKS];
+    /* Immutable ownership chain. The worker never traverses it; reclaim all
+     * published versions only after it has joined, without per-event epochs. */
+    struct SDLOP_CallbackSet *previous;
 } SDLOP_CallbackSet;
 
 static struct
@@ -553,7 +556,12 @@ void SDLOP_RawInputQuit(void)
     }
     raw.num_devices = 0;
     raw.winsys = false;
-    free((void *)raw.callbacks);
+    SDLOP_CallbackSet *set = raw.callbacks;
+    while (set) {
+        SDLOP_CallbackSet *previous = set->previous;
+        free(set);
+        set = previous;
+    }
     raw.callbacks = NULL;
     pthread_mutex_destroy(&raw.cb_mutex);
 }
@@ -987,12 +995,10 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
     set->entries[count].cb = cb;
     set->entries[count].userdata = userdata;
     set->count = count + 1;
+    set->previous = old;
     atomic_store_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, set, memory_order_release);
     pthread_mutex_unlock(&raw.cb_mutex);
-    /* Previous set intentionally not freed: worker thread may still read it.
-     * One retained allocation per list replacement; the callback-count limit
-     * does not bound repeated registration/unregistration churn. */
-    (void)old;
+    /* Old versions remain alive for in-flight worker readers until join. */
     return true;
 }
 
@@ -1000,9 +1006,16 @@ void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
 {
     pthread_mutex_lock(&raw.cb_mutex);
     SDLOP_CallbackSet *old = raw.callbacks;
-    if (!old) {
+    bool found = false;
+    for (int i = 0; old && i < old->count; i++) {
+        if (old->entries[i].cb == cb) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
         pthread_mutex_unlock(&raw.cb_mutex);
-        return;
+        return; /* no change: no allocation, publication or retained snapshot */
     }
     SDLOP_CallbackSet *set = (SDLOP_CallbackSet *)calloc(1, sizeof(*set));
     if (!set) {
@@ -1015,6 +1028,7 @@ void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
             set->entries[set->count++] = old->entries[i];
         }
     }
+    set->previous = old;
     atomic_store_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, set, memory_order_release);
     pthread_mutex_unlock(&raw.cb_mutex);
 }

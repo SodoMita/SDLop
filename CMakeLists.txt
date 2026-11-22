@@ -542,6 +542,26 @@ if(SDLop_BUILD_TESTS)
     set_tests_properties(evdev_worker_${mode} PROPERTIES TIMEOUT 15)
   endforeach()
 
+  # Callback snapshot lifetime, allocation failures and no-op updates.
+  add_executable(test_evdev_callbacks tests/test_evdev_callbacks.c bench/raw_pipe.c)
+  target_link_libraries(test_evdev_callbacks PRIVATE sdlop)
+  target_include_directories(test_evdev_callbacks PRIVATE tests)
+  target_compile_options(test_evdev_callbacks PRIVATE -UNDEBUG)
+  target_link_options(test_evdev_callbacks PRIVATE
+    -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl
+    -Wl,--wrap=calloc -Wl,--wrap=free)
+  add_test(NAME test_evdev_callbacks COMMAND test_evdev_callbacks)
+  set_tests_properties(test_evdev_callbacks PROPERTIES TIMEOUT 15)
+
+  # Exact service/read boundaries and publication order in the real drain.
+  add_executable(test_evdev_dispatch tests/test_evdev_dispatch.c)
+  target_link_libraries(test_evdev_dispatch PRIVATE sdlop)
+  target_include_directories(test_evdev_dispatch PRIVATE src)
+  target_compile_options(test_evdev_dispatch PRIVATE -UNDEBUG)
+  target_link_options(test_evdev_dispatch PRIVATE -Wl,--wrap=read)
+  add_test(NAME test_evdev_dispatch COMMAND test_evdev_dispatch)
+  set_tests_properties(test_evdev_dispatch PROPERTIES TIMEOUT 15)
+
   add_executable(test_evdev_syn_dropped tests/test_evdev_syn_dropped.c)
   target_link_libraries(test_evdev_syn_dropped PRIVATE sdlop)
   target_include_directories(test_evdev_syn_dropped PRIVATE tests)
