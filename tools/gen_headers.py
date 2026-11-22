@@ -43,6 +43,7 @@ HEADERS = [
     "SDL_blendmode.h", "SDL_surface.h", "SDL_video.h", "SDL_events.h",
     "SDL_keyboard.h", "SDL_keycode.h", "SDL_scancode.h", "SDL_mouse.h",
     "SDL_touch.h", "SDL_clipboard.h", "SDL_misc.h", "SDL_messagebox.h",
+    "SDL_dialog.h",
     "SDL_vulkan.h", "SDL_main.h", "SDL_main_impl.h",
     "SDL_atomic.h", "SDL_thread.h", "SDL_filesystem.h",
     # no-device stubs (SDL_joystick.c): enumeration is empty, opening fails

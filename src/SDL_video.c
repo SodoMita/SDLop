@@ -114,6 +114,7 @@ void SDLOP_VideoQuit(void)
     }
     SDLOP_RemoveAllPens();
     SDLOP_Desktop_Quit();
+    SDLOP_Dialog_Quit();
     SDLOP_DBus_Quit();
     /* drivers are responsible for DelDisplay at Quit; make sure nothing leaks */
     for (int i = 0; i < sdlop.num_displays; i++) {

@@ -382,6 +382,7 @@ set(SDLop_SOURCES
   src/SDL_video.c
   src/SDL_dbus.c
   src/SDL_desktop.c
+  src/SDL_dialog.c
   src/SDL_surface.c
   src/SDL_gl.c
   src/SDL_vulkan.c

@@ -680,5 +680,13 @@ void SDLOP_Desktop_Init(void); /* async theme lookup + change subscription */
 SDL_SystemTheme SDLOP_Desktop_GetSystemTheme(void);
 void SDLOP_Desktop_UpdateProgress(SDL_Window *window);
 void SDLOP_Desktop_Quit(void);
+void SDLOP_Dialog_Quit(void); /* SDL_dialog.c: drops pending portal requests */
+
+/* child processes (SDL_misc.c; not on Emscripten) */
+bool SDLOP_ProgramInPath(const char *prog);
+/* run argv (extra_env: NULL-terminated "NAME=value" overrides); with
+ * output, capture stdout (malloc'ed). Exit status, or -1 */
+int SDLOP_RunProcess(const char *const *argv, const char *const *extra_env, char **output, bool wait_for_exit);
+bool SDLOP_ZenityVersion(int *major, int *minor);
 
 #endif /* sdlop_internal_h_ */

@@ -1,6 +1,6 @@
 /*
   SDLop test: the built-in session bus client (SDL_dbus.c) and the desktop
-  integration on top of it (SDL_desktop.c), against a fake bus: a thread
+  integration on top of it (SDL_desktop.c, SDL_dialog.c), against a fake bus: a thread
   serving a unix socket with the real wire protocol (SASL EXTERNAL, Hello,
   AddMatch, the settings portal, signals). Dummy video driver.
 
@@ -13,6 +13,15 @@
                 Wayland / X11 init) and its reply (v(u): light) arrives
                 through SDL_PumpEvents, so SDL_GetSystemTheme() doesn't wait
   connection 3: no portal (error reply): unknown, no error left behind
+  connection 4: file dialogs through the portal FileChooser: options
+                (handle_token, multiple, directory, filters as
+                case-insensitive globs, current_folder, modal), the match
+                on the predicted request path added before the call, the
+                Response (file URIs -> paths, current_filter -> index),
+                cancel -> empty list; driver "portal" without a portal and
+                "zenity" without zenity -> NULL + error; a fake zenity
+                script (arguments, filters, exit-code environment,
+                paths from its output, callback from its thread)
   SDLOP_NO_DBUS=1: no connection at all
 
   This software is provided 'as-is', without any express or implied
@@ -29,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -59,6 +69,12 @@ static char progress_path[256], progress_uri[256];
 static atomic_bool progress_visible;
 static double progress_value;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+/* file chooser */
+static atomic_int fc_calls;
+static char fc_method[32], fc_title[128], fc_token[64], fc_folder[256], fc_glob[128], fc_parent[64];
+static int fc_nfilters;
+static bool fc_multiple, fc_directory, fc_modal, fc_match_first;
+static atomic_int fc_mode; /* 0: answer with files, 1: cancel, 2: no portal */
 static Uint32 server_serial = 1000;
 
 static bool send_msg(int fd, SDLop_DBusMsg *m)
@@ -128,6 +144,99 @@ static void handle(int fd, int conn, SDLop_DBusMsg *m)
             SDLOP_DBus_PutU32(r, 2);
             send_msg(fd, r);
         }
+    } else if (type == SDLOP_DBUS_METHOD_CALL && strcmp(iface, "org.freedesktop.portal.FileChooser") == 0) {
+        const int mode = atomic_load(&fc_mode);
+        if (mode == 2) {
+            send_msg(fd, SDLOP_DBus_NewError(m, "org.freedesktop.DBus.Error.ServiceUnknown", "no portal"));
+            return;
+        }
+        const char *parent = "", *title = "", *key;
+        SDLop_DBusIter arr, ent, var, sub, f, g;
+        pthread_mutex_lock(&lock);
+        snprintf(fc_method, sizeof(fc_method), "%s", member);
+        fc_nfilters = 0;
+        fc_multiple = fc_directory = fc_modal = false;
+        fc_folder[0] = fc_glob[0] = fc_token[0] = '\0';
+        SDLOP_DBus_IterInit(m, &it);
+        SDLOP_DBus_IterGetString(&it, &parent);
+        SDLOP_DBus_IterNext(&it);
+        SDLOP_DBus_IterGetString(&it, &title);
+        snprintf(fc_parent, sizeof(fc_parent), "%s", parent);
+        snprintf(fc_title, sizeof(fc_title), "%s", title);
+        SDLOP_DBus_IterNext(&it);
+        if (SDLOP_DBus_IterRecurse(&it, &arr)) {
+            while (SDLOP_DBus_IterType(&arr)) {
+                if (SDLOP_DBus_IterRecurse(&arr, &ent) && SDLOP_DBus_IterGetString(&ent, &key) &&
+                    SDLOP_DBus_IterNext(&ent) && SDLOP_DBus_IterRecurse(&ent, &var)) {
+                    const char *str;
+                    if (strcmp(key, "handle_token") == 0 && SDLOP_DBus_IterGetString(&var, &str)) {
+                        snprintf(fc_token, sizeof(fc_token), "%s", str);
+                    } else if (strcmp(key, "multiple") == 0) {
+                        SDLOP_DBus_IterGetBool(&var, &fc_multiple);
+                    } else if (strcmp(key, "directory") == 0) {
+                        SDLOP_DBus_IterGetBool(&var, &fc_directory);
+                    } else if (strcmp(key, "modal") == 0) {
+                        SDLOP_DBus_IterGetBool(&var, &fc_modal);
+                    } else if (strcmp(key, "current_folder") == 0 && SDLOP_DBus_IterRecurse(&var, &sub)) {
+                        size_t n = 0;
+                        Uint8 b;
+                        while (SDLOP_DBus_IterGetByte(&sub, &b) && n + 1 < sizeof(fc_folder)) {
+                            fc_folder[n++] = (char)b;
+                            if (!SDLOP_DBus_IterNext(&sub)) {
+                                break;
+                            }
+                        }
+                        fc_folder[n] = '\0';
+                    } else if (strcmp(key, "filters") == 0 && SDLOP_DBus_IterRecurse(&var, &sub)) {
+                        while (SDLOP_DBus_IterType(&sub)) {
+                            fc_nfilters++;
+                            const char *glob;
+                            if (fc_nfilters == 2 && SDLOP_DBus_IterRecurse(&sub, &f) && SDLOP_DBus_IterNext(&f) &&
+                                SDLOP_DBus_IterRecurse(&f, &g) && SDLOP_DBus_IterRecurse(&g, &f) &&
+                                SDLOP_DBus_IterNext(&f) && SDLOP_DBus_IterGetString(&f, &glob)) {
+                                snprintf(fc_glob, sizeof(fc_glob), "%s", glob); /* filter 2, glob 1 */
+                            }
+                            if (!SDLOP_DBus_IterNext(&sub)) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!SDLOP_DBus_IterNext(&arr)) {
+                    break;
+                }
+            }
+        }
+        char path[256];
+        snprintf(path, sizeof(path), "/org/freedesktop/portal/desktop/request/1_42/%s", fc_token);
+        fc_match_first = strstr(match_rule, path) != NULL;
+        pthread_mutex_unlock(&lock);
+        SDLop_DBusMsg *r = SDLOP_DBus_NewReply(m, "o");
+        SDLOP_DBus_PutString(r, path);
+        send_msg(fd, r);
+        /* the user picks */
+        SDLop_DBusMsg *sig = SDLOP_DBus_NewSignal(path, "org.freedesktop.portal.Request", "Response", "ua{sv}");
+        SDLOP_DBus_SetDestination(sig, ":1.42");
+        SDLOP_DBus_PutU32(sig, mode == 1 ? 1 : 0);
+        SDLop_DBusArray a = SDLOP_DBus_OpenArray(sig, '{');
+        if (mode == 0) {
+            SDLOP_DBus_PutDictVariantKey(sig, "uris", "as");
+            SDLop_DBusArray u = SDLOP_DBus_OpenArray(sig, 's');
+            SDLOP_DBus_PutString(sig, "file:///tmp/a%20b.txt");
+            SDLOP_DBus_PutString(sig, "file:///tmp/c.png");
+            SDLOP_DBus_CloseArray(sig, &u);
+            SDLOP_DBus_PutDictVariantKey(sig, "current_filter", "(sa(us))");
+            SDLOP_DBus_OpenStruct(sig);
+            SDLOP_DBus_PutString(sig, "Images");
+            SDLop_DBusArray gl = SDLOP_DBus_OpenArray(sig, '(');
+            SDLOP_DBus_OpenStruct(sig);
+            SDLOP_DBus_PutU32(sig, 0);
+            SDLOP_DBus_PutString(sig, "*.[pP][nN][gG]");
+            SDLOP_DBus_CloseArray(sig, &gl);
+        }
+        SDLOP_DBus_CloseArray(sig, &a);
+        send_msg(fd, sig);
+        atomic_fetch_add(&fc_calls, 1);
     } else if (type == SDLOP_DBUS_SIGNAL && strcmp(iface, "com.canonical.Unity.LauncherEntry") == 0 &&
                strcmp(member, "Update") == 0) {
         const char *uri = "", *key = "";
@@ -252,6 +361,28 @@ static void *bus_thread(void *arg)
 
 /* ---- test -------------------------------------------------------------- */
 
+static struct
+{
+    atomic_int called;
+    bool null_list;
+    int n, filter;
+    char files[4][256];
+    char error[256];
+} dlg;
+
+static void SDLCALL dialog_cb(void *userdata, const char *const *list, int filter)
+{
+    (void)userdata;
+    dlg.null_list = list == NULL;
+    dlg.n = 0;
+    for (int i = 0; list && list[i] && i < 4; i++) {
+        snprintf(dlg.files[dlg.n++], sizeof(dlg.files[0]), "%s", list[i]);
+    }
+    dlg.filter = filter;
+    snprintf(dlg.error, sizeof(dlg.error), "%s", list ? "" : SDL_GetError());
+    atomic_fetch_add(&dlg.called, 1);
+}
+
 static bool wait_for(atomic_int *v, int want, int ms)
 {
     for (int i = 0; i < ms / 5 && atomic_load(v) < want; i++) {
@@ -370,6 +501,93 @@ int main(void)
     SDL_Quit();
     CHECK(wait_for(&conn_closed, 3, 2000), "connection 3 closed");
 
+    /* --- 4: file dialogs ------------------------------------------------- */
+    CHECK(SDL_Init(SDL_INIT_VIDEO), "SDL_Init dialogs");
+    const SDL_DialogFileFilter filters[] = { { "Text", "txt;md" }, { "Images", "png;JPG" }, { "All", "*" } };
+    SDL_ShowOpenFileDialog(dialog_cb, NULL, NULL, filters, 3, "/tmp", true);
+    CHECK(wait_for(&dlg.called, 1, 3000), "open dialog: callback");
+    pthread_mutex_lock(&lock);
+    CHECK(strcmp(fc_method, "OpenFile") == 0 && strcmp(fc_title, "Open File") == 0, "OpenFile '%s' '%s'", fc_method,
+          fc_title);
+    CHECK(fc_match_first, "Response match on the request path added before the call");
+    CHECK(fc_multiple && !fc_directory && !fc_modal && fc_parent[0] == '\0', "options: multiple, no parent");
+    CHECK(fc_nfilters == 3 && strcmp(fc_glob, "*.[pP][nN][gG]") == 0, "filters (%d, '%s')", fc_nfilters, fc_glob);
+    CHECK(strcmp(fc_folder, "/tmp") == 0, "current_folder '%s'", fc_folder);
+    pthread_mutex_unlock(&lock);
+    CHECK(!dlg.null_list && dlg.n == 2 && strcmp(dlg.files[0], "/tmp/a b.txt") == 0 &&
+              strcmp(dlg.files[1], "/tmp/c.png") == 0,
+          "files (%d: '%s' '%s')", dlg.n, dlg.files[0], dlg.files[1]);
+    CHECK(dlg.filter == 1, "chosen filter index (%d)", dlg.filter);
+
+    atomic_store(&fc_mode, 1);
+    SDL_PropertiesID dp = SDL_CreateProperties();
+    SDL_SetStringProperty(dp, SDL_PROP_FILE_DIALOG_TITLE_STRING, "Pick a folder");
+    SDL_ShowFileDialogWithProperties(SDL_FILEDIALOG_OPENFOLDER, dialog_cb, NULL, dp);
+    SDL_DestroyProperties(dp);
+    CHECK(wait_for(&dlg.called, 2, 3000), "folder dialog: callback");
+    CHECK(fc_directory && strcmp(fc_title, "Pick a folder") == 0, "folder: directory option, title '%s'", fc_title);
+    CHECK(!dlg.null_list && dlg.n == 0, "cancel: empty list (null %d, n %d)", (int)dlg.null_list, dlg.n);
+
+    atomic_store(&fc_mode, 2);
+    SDL_SetHint(SDL_HINT_FILE_DIALOG_DRIVER, "portal");
+    SDL_ShowSaveFileDialog(dialog_cb, NULL, NULL, NULL, 0, NULL);
+    CHECK(atomic_load(&dlg.called) == 3 && dlg.null_list && strstr(dlg.error, "unsupported"),
+          "portal driver without portal: NULL + error ('%s')", dlg.error);
+    const char *old_path = getenv("PATH");
+    char *saved_path = old_path ? strdup(old_path) : NULL;
+    setenv("PATH", "/nonexistent", 1);
+    SDL_SetHint(SDL_HINT_FILE_DIALOG_DRIVER, "zenity");
+    SDL_ShowSaveFileDialog(dialog_cb, NULL, NULL, NULL, 0, NULL);
+    CHECK(atomic_load(&dlg.called) == 4 && dlg.null_list, "zenity driver without zenity: NULL");
+    /* a fake zenity: records its arguments, picks two files */
+    char zdir[300], zscript[340], zargs[340];
+    snprintf(zdir, sizeof(zdir), "%s/zbin", dir);
+    snprintf(zscript, sizeof(zscript), "%s/zenity", zdir);
+    snprintf(zargs, sizeof(zargs), "%s/args", dir);
+    mkdir(zdir, 0700);
+    FILE *zf = fopen(zscript, "w");
+    if (zf) {
+        fprintf(zf,
+                "#!/bin/sh\n"
+                "if [ \"$1\" = --version ]; then echo 4.0.1; exit 0; fi\n"
+                "printf '%%s\\n' \"$@\" \"OK=$ZENITY_OK\" > '%s'\n"
+                "printf '/tmp/x y\\n/tmp/z\\n'\n",
+                zargs);
+        fclose(zf);
+        chmod(zscript, 0700);
+    }
+    setenv("PATH", zdir, 1);
+    SDL_ShowOpenFileDialog(dialog_cb, NULL, NULL, filters, 3, "/tmp/", true);
+    CHECK(wait_for(&dlg.called, 5, 5000), "zenity: callback (from its thread)");
+    CHECK(!dlg.null_list && dlg.n == 2 && strcmp(dlg.files[0], "/tmp/x y") == 0 && strcmp(dlg.files[1], "/tmp/z") == 0,
+          "zenity: files (%d '%s' '%s', error '%s')", dlg.n, dlg.files[0], dlg.files[1], dlg.error);
+    char zout[2048] = "";
+    zf = fopen(zargs, "r");
+    if (zf) {
+        size_t zn = fread(zout, 1, sizeof(zout) - 1, zf);
+        zout[zn] = '\0';
+        fclose(zf);
+    }
+    CHECK(strstr(zout, "--file-selection\n") && strstr(zout, "--multiple\n") && strstr(zout, "--filename\n/tmp/\n") &&
+              strstr(zout, "--file-filter=Images | *.[pP][nN][gG] *.[jJ][pP][gG]\n") &&
+              strstr(zout, "--file-filter=All | *\n") && strstr(zout, "OK=0"),
+          "zenity arguments:\n%s", zout);
+    unlink(zscript);
+    unlink(zargs);
+    rmdir(zdir);
+    if (saved_path) {
+        setenv("PATH", saved_path, 1);
+    }
+
+    const SDL_DialogFileFilter bad[] = { { "Bad", "*.png" } };
+    SDL_ShowOpenFileDialog(dialog_cb, NULL, NULL, bad, 1, NULL, false);
+    free(saved_path);
+    CHECK(atomic_load(&dlg.called) == 6 && dlg.null_list && strstr(dlg.error, "Invalid dialog file filters"),
+          "invalid pattern rejected ('%s')", dlg.error);
+    SDL_ResetHint(SDL_HINT_FILE_DIALOG_DRIVER);
+    SDL_Quit();
+    CHECK(wait_for(&conn_closed, 4, 2000), "connection 4 closed");
+
     /* --- SDLOP_NO_DBUS ----------------------------------------------------- */
     setenv("SDLOP_NO_DBUS", "1", 1);
     CHECK(SDL_Init(SDL_INIT_VIDEO), "SDL_Init 4");
@@ -377,7 +595,7 @@ int main(void)
     w = SDL_CreateWindow("dbus", 64, 64, 0);
     SDL_SetWindowProgressValue(w, 0.25f);
     SDL_Delay(50);
-    CHECK(t == SDL_SYSTEM_THEME_UNKNOWN && atomic_load(&connections) == 3, "SDLOP_NO_DBUS: no connection (%d)",
+    CHECK(t == SDL_SYSTEM_THEME_UNKNOWN && atomic_load(&connections) == 4, "SDLOP_NO_DBUS: no connection (%d)",
           atomic_load(&connections));
     SDL_DestroyWindow(w);
     SDL_Quit();
