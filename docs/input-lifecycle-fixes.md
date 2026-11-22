@@ -8,7 +8,7 @@ runtime dependencies, ordinary-input compositor rerouting or synthetic focus.
 
 | Audit finding | Implementation | Verification |
 |---|---|---|
-| Terminal raw-device errors | `sdlop_evdev.c:retire_device` removes the fd from epoll on EOF/terminal read error. Worker release-publishes removal and wakes the main thread; fd stays open until join to avoid close/reuse races. Main-thread recovery releases only that device's physical state under the usual queue reserve and logical union rules. | `input_lifecycle_unplug`: one ENODEV read, no spin or held A/button. `test_evdev_recovery`: actual pipe EOF, full SDL queue, surviving keyboard holds A while removed B/button release exactly once. Raw callbacks/counters contain no synthetic releases. |
+| Terminal raw-device errors | `sdlop_evdev.c:retire_device` removes the fd from epoll on EOF/terminal read error. Worker release-publishes removal and wakes the main thread; fd stays open until join to avoid close/reuse races. Main-thread recovery releases only that device's physical state under the logical union rules. With a full SDL queue, the state release still completes while its notification may be dropped. | `input_lifecycle_unplug`: one ENODEV read, no spin or held A/button. `test_evdev_recovery`: pipe EOF, full SDL queue, surviving keyboard keeps A while removed B/button state releases immediately; no stale notification replay. Raw callbacks/counters contain no synthetic releases. |
 | Repeats during external keyboard grabs | The common native repeat generator cancels repeats without focus, during an external grab, when disabled, or when raw console/adapter ownership is lost. X11's external-grab transition cancels immediately as well. | `input_lifecycle_repeat-grab`: real raw A press, modeled X11 grab state, due repeat produces zero key/text events. Existing clock, recovery and repeat-text tests pass. |
 | Composition crossing text sessions | Native compose reset is shared with start/stop/clear for the focused text session. Inactive text input no longer feeds compose. Clearing another window does not reset the focused window's composition. Web receives the required internal no-op hook; DOM still owns its composition. | `input_lifecycle_compose`: a real German acute+E control first verifies data, then disabled/start, stop/start and explicit clear all produce fresh `e`, not `é`. Existing layout/dead-key/compose suite passes. |
 | Wayland repeat_info semantics | Explicit disabled state represents interval=0; delay=0 is legal. The listener accepts nonnegative values and clamps positive rate to 1000 Hz before conversion. Disabling cancels a running repeat; changing an active timer rebases its deadline. | Actual listener diagnostics and new mini-compositor tests for disabled repeat and rate20/delay0; key/text counts checked. |
@@ -21,9 +21,11 @@ runtime dependencies, ordinary-input compositor rerouting or synthetic focus.
 
 On X11/Wayland, if removal loses the keyboard or pointer class, the SDL adapter
 releases **all** remaining raw-held state before enabling window-system keyboard
-**and** mouse. While that release is queue-blocked, compositor input remains
-suppressed. The worker may keep serving native callbacks/polling on surviving
-fds, but no subsequent native records enter the SDL adapter after fallback.
+**and** mouse. The release is state-first even under queue pressure; notifications
+that cannot fit are dropped, and compositor input remains suppressed until all
+raw state is cleared. The worker may keep serving native callbacks/polling on
+surviving fds, but no subsequent native records enter the SDL adapter after
+fallback.
 `SDLop_RawInputAvailable` still reports whether that observer worker is running;
 its public documentation now explains the fallback exception to source selection.
 

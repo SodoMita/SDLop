@@ -208,6 +208,11 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
         return;
     }
 
+    /* Match the native three-slot policy for a possible key/text sequence. */
+    bool previous_suppression = sdlop.suppress_input_events;
+    if (SDLOP_IsMainThread() && SDLOP_EventQueueFree() < 3) {
+        sdlop.suppress_input_events = true;
+    }
     SDL_Keymod mod = sdlop.modstate;
     SDL_Keymod modbit = modifier_bit_for(scancode);
 
@@ -239,9 +244,9 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     event.key.raw = rawcode;
     event.key.down = down;
     event.key.repeat = repeat;
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 
-    if (down && text[0]) {
+    if (down && text[0] && sdlop.keyboard_focus && sdlop.keyboard_focus->text_input_active) {
         SDLOP_SendKeyboardText(text, timestamp_ns);
     }
 
@@ -255,6 +260,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     } else if (!down && scancode == sdlop.repeat_scancode) {
         sdlop.repeat_active = false;
     }
+    sdlop.suppress_input_events = previous_suppression;
 }
 
 void SDLOP_KeyboardClearComposition(void)
@@ -268,10 +274,20 @@ void SDLOP_KeyboardProcessRepeats(void)
         return;
     }
     Uint64 now = SDLOP_MonotonicNS();
-    while (sdlop.repeat_active && (Sint64)(now - sdlop.repeat_next_ns) >= 0) {
-        SDLOP_SendKeyboardKey(true, true, sdlop.repeat_scancode, sdlop.repeat_rawcode, sdlop.repeat_next_ns);
-        sdlop.repeat_next_ns += (Uint64)sdlop.repeat_interval_ms * 1000000ull;
+    Uint64 interval_ns = (Uint64)sdlop.repeat_interval_ms * 1000000ull;
+    if (!interval_ns) {
+        sdlop.repeat_active = false;
+        return;
     }
+    if ((Sint64)(now - sdlop.repeat_next_ns) < 0) {
+        return;
+    }
+    /* Coalesce missed deadlines instead of replaying an unbounded burst. */
+    sdlop.repeat_next_ns = now + interval_ns;
+    if (SDLOP_EventQueueFree() < 3) {
+        return;
+    }
+    SDLOP_SendKeyboardKey(true, true, sdlop.repeat_scancode, sdlop.repeat_rawcode, now);
 }
 
 /* ------------------------------------------------------------------ */
@@ -421,5 +437,7 @@ bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
         return SDL_InvalidParamError("stats");
     }
     SDL_zero(*stats);
+    stats->version = SDLOP_RAW_INPUT_STATS_VERSION;
+    stats->size = (Uint32)sizeof(*stats);
     return true;
 }

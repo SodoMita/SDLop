@@ -118,7 +118,10 @@ static void on_raw(const SDLop_RawEvent *event, void *userdata)
 {
     (void)userdata;
     SDLop_RawInputStats stats;
-    if (!SDLop_GetRawInputStats(&stats)) { atomic_fetch_add(&callback_stats_errors, 1); }
+    if (!SDLop_GetRawInputStats(&stats) ||
+        stats.version != SDLOP_RAW_INPUT_STATS_VERSION || stats.size != sizeof(stats)) {
+        atomic_fetch_add(&callback_stats_errors, 1);
+    }
     if (event->type == EV_SYN && event->code == SYN_DROPPED) { atomic_fetch_add(&raw_markers, 1); }
     atomic_fetch_add(&callbacks, 1);
 }
@@ -203,6 +206,7 @@ int main(void)
     setenv("SDLOP_LIB_XKB", "none", 1);
     SDLop_RawInputStats initial;
     assert(SDLop_GetRawInputStats(&initial));
+    assert(initial.version == SDLOP_RAW_INPUT_STATS_VERSION && initial.size == sizeof(initial));
     assert(!initial.events_seen && !initial.sdl_ring_dropped && !initial.poll_ring_dropped);
     assert(!SDLop_GetRawInputStats(NULL) && *SDL_GetError());
     SDL_ClearError();
@@ -294,7 +298,9 @@ int main(void)
     recover_to(4); seen = collect(); assert(seen.keyup[SDL_SCANCODE_A] == 1);
     puts("PASS: failed query preserves state and retries on later pumps");
 
-    /* Resync may require more events than the queue has room for. */
+    /* State recovery must finish even with no queue capacity. The state query
+     * reflects the snapshot immediately; its SDL transition notifications may
+     * be dropped rather than replayed later as a stale backlog. */
     key_state(0, KEY_A, true); key_state(0, KEY_W, true); key_state(0, BTN_LEFT, true);
     send_event(0, EV_KEY, KEY_A, 1); send_event(0, EV_KEY, KEY_W, 1);
     send_event(0, EV_KEY, BTN_LEFT, 1); wait_idle(); collect();
@@ -305,20 +311,26 @@ int main(void)
     assert(filled > 3 && filled < 100000); SDL_ClearError();
     key_state(0, KEY_A, false); key_state(0, KEY_W, false);
     key_state(0, BTN_LEFT, false); key_state(0, KEY_D, true);
-    dropped(0); SDL_PumpEvents(); assert(atomic_load(&queries) == 4);
-    SDL_Event removed[3];
-    assert(SDL_PeepEvents(removed, 3, SDL_GETEVENT, user, user) == 3);
-    recover_to(5); /* applies first release, retains remaining diff */
-    assert(SDLOP_EventQueueFree() == 2);
-    SDL_Event sentinels[113]; int n, total = 3;
+    int queries_before = atomic_load(&queries);
+    dropped(0);
+    SDL_PumpEvents(); /* process damage while the event queue is full */
+    recover_to(queries_before + 1);
+    assert(SDLOP_EventQueueFree() == 0);
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]);
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_W]);
+    assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_D]);
+    assert(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK));
+    SDL_Event sentinels[113]; int n, total = 0;
     while ((n = SDL_PeepEvents(sentinels, 113, SDL_GETEVENT, user, user)) > 0) { total += n; }
     assert(total == filled);
     SDL_PumpEvents(); seen = collect();
-    assert(seen.keyup[SDL_SCANCODE_A] == 1 && seen.keyup[SDL_SCANCODE_W] == 1);
-    assert(seen.keydown[SDL_SCANCODE_D] == 1 && seen.up == 1);
+    assert(!seen.keyup[SDL_SCANCODE_A] && !seen.keyup[SDL_SCANCODE_W]);
+    assert(!seen.keydown[SDL_SCANCODE_D] && !seen.up);
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A] &&
+           !SDL_GetKeyboardState(NULL)[SDL_SCANCODE_W] && SDL_GetKeyboardState(NULL)[SDL_SCANCODE_D]);
     key_state(0, KEY_D, false); send_event(0, EV_KEY, KEY_D, 0); wait_idle(); collect();
     drain_raw();
-    puts("PASS: full SDL queue and incremental snapshot application retain every transition");
+    puts("PASS: full SDL queue never freezes key/button state or replays dropped transitions");
 
     /* Lose final release records in both full rings, then recover without any
      * further native input (control eventfd must not shut the worker down). */
@@ -400,23 +412,21 @@ int main(void)
     while (SDL_PushEvent(&filler)) { }
     close(first->write_fd); first->write_fd = -1; /* real pipe EOF/HUP */
     SDL_Delay(20);
-    SDL_PumpEvents(); /* a full queue must postpone, not lose, release state */
-    assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B]);
+    SDL_PumpEvents(); /* state releases complete even though notifications cannot fit */
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B]);
+    assert(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK));
     SDL_FlushEvents(0, SDL_EVENT_LAST);
-    Uint64 deadline = SDL_GetTicks() + 3000;
-    while (SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] && SDL_GetTicks() < deadline) {
-        SDL_PumpEvents(); SDL_Delay(1);
-    }
+    SDL_PumpEvents();
     seen = collect();
     assert(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A]); /* surviving device owns it */
-    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] && seen.keyup[SDL_SCANCODE_B] == 1);
-    assert(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) && seen.up == 1);
+    assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_B] && !seen.keyup[SDL_SCANCODE_B]);
+    assert(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) && !seen.up);
     assert(SDLOP_RawInputIsSource()); /* other combo still covers both classes */
     assert(SDLop_GetRawEventCount() == (Uint64)sent && atomic_load(&callbacks) == sent);
     send_event(1, EV_KEY, KEY_A, 0); send_event(1, EV_KEY, KEY_C, 1); wait_idle(); collect();
     assert(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A] && SDL_GetKeyboardState(NULL)[SDL_SCANCODE_C]);
     close(second.write_fd); second.write_fd = -1;
-    deadline = SDL_GetTicks() + 3000;
+    Uint64 deadline = SDL_GetTicks() + 3000;
     while (SDLOP_RawInputIsSource() && SDL_GetTicks() < deadline) { SDL_PumpEvents(); SDL_Delay(1); }
     assert(!SDLOP_RawInputIsSource() && !SDL_GetKeyboardState(NULL)[SDL_SCANCODE_C]);
     assert(SDLop_GetRawEventCount() == (Uint64)sent && atomic_load(&callbacks) == sent);

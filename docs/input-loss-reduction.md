@@ -4,21 +4,27 @@
 No new dependencies, no motion coalescing, no changed raw callback filtering.
 This report describes the loss-reduction stage before the subsequent
 [worker wakeup/clock changes](input-worker-wakeup-clock.md); measurements below
-are retained for that stage, not relabeled as current-build results.
+are retained for that stage, not relabeled as current-build results. The
+queue-gated state behavior in those original measurements was later corrected:
+the current adapter advances SDL state while full and drops input notifications
+that cannot be queued. See the current pressure tests below.
 
 ## Verified loss sites and changes
 
-- `src/internal/sdlop_evdev.c:SDLOP_RawInputPump` previously popped up to
-  2,048 native records per pump, irrespective of room in the 512-slot SDL queue
-  in `src/SDL_events.c:queue_add_with_memory`. It could update mouse/key state
-  while the corresponding SDL events were rejected. Now it checks main-thread
-  queue headroom **before popping**, reserving three slots for the largest
-  current translation (layout change + key + text). Pending records remain in
-  the raw SDL ring until the application drains the SDL queue.
-- `src/SDL_keyboard.c:SDLOP_KeyboardProcessRepeats` previously advanced overdue
-  repeats even when their generated events could not fit. It now keeps them
-  pending until the same headroom is available. Other backend event producers
-  still use their existing overflow behavior.
+- `src/internal/sdlop_evdev.c:SDLOP_RawInputPump` originally deferred raw
+  records until there were three free slots in the SDL queue. Under sustained
+  pressure that also froze key/button/mouse state queries. The current pump
+  always translates records and applies state. `SDLOP_PushInputEvent` preserves
+  event-watch/filter behavior and drops a notification quietly if no slot is
+  available. Keyboard delivery preflights three slots for a possible
+  keymap/key/text sequence; key-only input is also dropped if fewer than three
+  slots remain. This keeps state current without an unbounded event backlog; it
+  intentionally does not reconstruct dropped edges or motion events.
+- `src/SDL_keyboard.c:SDLOP_KeyboardProcessRepeats` at this stage retained due
+  repeats while the queue was full. The current generator instead cancels that
+  deadline, schedules a fresh interval, and emits at most one repeat per pump;
+  it cannot replay a pressure-sized backlog after the queue drains. The web
+  generator follows the same bounded policy.
 - `src/internal/sdlop_evdev.c:worker_main` publishes independently to two bounded
   rings. Their old capacities, 2,048 SDL-input and 1,024 raw-poll records, held
   only 10.7ms / 5.3ms at 192,000 native records/s. Both are now 32,768 records:
@@ -41,17 +47,23 @@ still affect measured latency; unchanged dispatch is not proof of a timing gate.
 
 ### Memory and semantics
 
-On this x86-64 build, `nm -S` reports raw state growing from 74,624 to 1,573,760
-bytes and the SDL event queue from 102,400 to 1,638,400 bytes: **2,964 KiB extra
-static storage** in total (about 2.9 MiB). No additional runtime event-storage allocation.
-Applications that do not drain input indefinitely still overflow the rings.
-Event filters/watches retain their existing semantics; a reentrant watcher that
-itself fills the queue can consume the reserved headroom.
+At the loss-reduction-stage x86-64 revision (not the current branch), `nm -S`
+reported fixed raw state/rings at 1,573,760 bytes and the 8,192-slot SDL event
+queue at 1,638,400 bytes: 3,212,160 bytes (about 3.06 MiB) of bounded static
+storage, **2,964 KiB more** than that stage's earlier 74,624-byte raw state plus
+512-slot queue. These are historical stage figures, not a current-branch BSS
+measurement; later recovery/lifecycle work enlarged raw state. The arrays keep
+event storage allocation-free on the hot path; raw storage is cleared at worker
+initialization. Applications that never drain input can still overflow the raw
+rings. Event filters/watches retain their semantics; a reentrant watcher can
+itself consume queue headroom.
 
-Backpressure delays SDL state changes along with their events when the queue is
-full. It does not block the worker, recover old history, synthesize motion, or
-prioritize releases over preceding motion. Increased buffering can exchange
-loss for latency. The conservative three-slot reserve can leave two slots unused.
+The previous queue gate delayed state changes with event delivery; the current
+implementation keeps state current and drops notifications when they cannot fit.
+Keyboard layout/key/text sequences require three slots; standalone mouse events
+can use any remaining slot. It does not block the worker, recover old history,
+synthesize missing motion, or prioritize releases over earlier records. Larger
+buffers still exchange loss for latency.
 
 ## Before/after high-load comparison
 
@@ -121,28 +133,23 @@ preserved without dropping unfavorable results in
 
 ## Tests
 
-- `test_evdev_backpressure`: real worker plus pipe-backed discovery. Pauses SDL
-  consumption for 600 two-axis reports with button down/up, then verifies native
-  counts, SDL motion/button FIFO order and no stuck button. Repeats with the SDL
-  queue filled to its **actual capacity**, pumps four times while full, verifies
-  SDL relative state has not advanced, removes existing sentinels, and checks
-  every pending event. Thus the test exercises backpressure even with larger
-  buffers. Original build: 1,024/1,804 raw records, 512/1,200 SDL motions in the
-  first burst; 0/1,200 SDL motions in the full-queue case. Modified: all records
-  and button pairs in both cases.
+- `test_evdev_backpressure`: the first pipe-backed burst checks native counts,
+  SDL motion/button FIFO order, and no stuck button. The pressure phase fills
+  the SDL queue to its **actual capacity**, waits for worker callbacks without
+  pumping, then pumps while full. It verifies current relative/key/button state,
+  intact raw callbacks/poll records, preservation of existing sentinels, and no
+  replay of the deliberately dropped SDL notifications after draining. These
+  assertions replace the older expectation that state remained deferred.
 - `test_ring`: original 4M single-pop concurrent stress plus 4M bulk-pop stress,
   and empty/zero-limit/oversized-limit/wrap/FIFO/overflow cases.
-- `test_events`: adds full-queue overdue-repeat deferral and subsequent delivery.
-- Modified library built from 37 real dummy/fbdev translation units. Eighteen
-  rootless executables passed: ring, backpressure, events, scancode, surface,
-  web-native shim, no-XKB keycodes, core, main callbacks, misc, threads, VT mask,
-  synthetic fbdev, options, drop-in compatibility, dummy window API, benchmark
-  accounting, and real RAM/PPM fbdev path. X11 portions skipped without DISPLAY;
-  runtime XKB/layout-specific coverage unavailable here.
-- ASan+UBSan real-library builds passed ring, events, backpressure, and 100k
-  reports/mode at 64kHz with complete delivery and no sanitizer diagnostics.
-- CMake is unavailable in this image, so the registered CTest target was not
-  exercised through CMake. Manual builds linked the real library, not stubs.
+- `test_events`: verifies full-queue repeat cancellation, no immediate replay
+  after draining, and resumption on a fresh interval.
+- The archived optimized and ASan+UBSan suites passed the original test set.
+  Those captured logs predate the current queue-state contract; they are not
+  evidence that this later change has passed those suites. See the evidence
+  [index](benchmarks/README.md) for dated snapshots and their scope.
+- CMake availability and full-project integration coverage are environment
+  dependent; see the current turn's test results rather than reusing old logs.
 
 ## Genuine uinput attempt and remaining limits
 

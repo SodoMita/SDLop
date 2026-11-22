@@ -18,6 +18,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDLop.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef __EMSCRIPTEN__
@@ -160,8 +161,17 @@ static void test_browser_driver(void)
         &cw, &ch);
     CHECK(cw == 320 && ch == 240, "canvas sized to window (%dx%d)", cw, ch);
 
-    /* stock SDL3: TEXT_INPUT only flows after an explicit opt-in */
+    /* stock SDL3: TEXT_INPUT only flows after an explicit opt-in. Key state
+     * events still work before text input is started. */
     CHECK(!SDL_TextInputActive(w), "text input inactive by default");
+    dispatch_js("window.dispatchEvent(new KeyboardEvent('keydown', {code:'KeyW', key:'w', bubbles:true, cancelable:true}))");
+    SDL_PumpEvents();
+    const char *inactive_text = NULL;
+    CHECK(poll_key(SDL_SCANCODE_W, true, &inactive_text), "KEY_DOWN W before text input starts");
+    CHECK(!inactive_text, "no TEXT_INPUT before StartTextInput (got %s)", inactive_text ? inactive_text : "none");
+    dispatch_js("window.dispatchEvent(new KeyboardEvent('keyup', {code:'KeyW', key:'w', bubbles:true}))");
+    SDL_PumpEvents();
+    CHECK(poll_key(SDL_SCANCODE_W, false, NULL), "KEY_UP W before text input starts");
     CHECK(SDL_StartTextInput(w), "StartTextInput: %s", SDL_GetError());
     CHECK(SDL_TextInputActive(w), "text input active after StartTextInput");
 
@@ -191,6 +201,16 @@ static void test_browser_driver(void)
     SDL_PumpEvents();
     CHECK(poll_key(SDL_SCANCODE_W, false, NULL), "KEY_UP W");
     CHECK(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_LSHIFT], "shift released in keystate");
+
+    CHECK(SDL_StopTextInput(w), "StopTextInput: %s", SDL_GetError());
+    dispatch_js("window.dispatchEvent(new KeyboardEvent('keydown', {code:'KeyW', key:'w', bubbles:true, cancelable:true}))");
+    SDL_PumpEvents();
+    const char *stopped_text = NULL;
+    CHECK(poll_key(SDL_SCANCODE_W, true, &stopped_text), "KEY_DOWN W after text input stops");
+    CHECK(!stopped_text, "no TEXT_INPUT after StopTextInput (got %s)", stopped_text ? stopped_text : "none");
+    dispatch_js("window.dispatchEvent(new KeyboardEvent('keyup', {code:'KeyW', key:'w', bubbles:true}))");
+    SDL_PumpEvents();
+    CHECK(poll_key(SDL_SCANCODE_W, false, NULL), "KEY_UP W after text input stops");
 
     /* mouse: synthetic events on #canvas */
     dispatch_js("const c = document.getElementById('canvas');"
@@ -272,6 +292,8 @@ int main(void)
 {
     SDLop_RawInputStats stats;
     CHECK(SDLop_GetRawInputStats(&stats), "raw stats available without input init");
+    CHECK(stats.version == SDLOP_RAW_INPUT_STATS_VERSION && stats.size == sizeof(stats),
+          "raw stats report the frozen v1 layout");
     CHECK(!stats.events_seen && !stats.sdl_ring_dropped && !stats.poll_ring_dropped,
           "raw counters initially zero (web always zero)");
     CHECK(!SDLop_GetRawInputStats(NULL), "NULL stats output rejected");

@@ -121,7 +121,7 @@ void SDLOP_SendMouseMotion(float x, float y, float xrel, float yrel, Uint64 time
     event.motion.y = sdlop.mouse_y;
     event.motion.xrel = xrel;
     event.motion.yrel = yrel;
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 }
 
 void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 timestamp_ns)
@@ -158,7 +158,7 @@ void SDLOP_SendMouseButton(bool down, Uint8 button, float x, float y, Uint64 tim
     event.button.clicks = 1;
     event.button.x = sdlop.mouse_x;
     event.button.y = sdlop.mouse_y;
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 }
 
 /* ---- synthetic mouse events from touch (SDL3 SDL_HINT_TOUCH_MOUSE_EVENTS,
@@ -222,7 +222,7 @@ static void touch_mouse_event(Uint32 type, SDL_Window *window, float x, float y,
         event.motion.y = fy;
         event.motion.xrel = xrel;
         event.motion.yrel = yrel;
-        SDLOP_PushEventInternal(&event);
+        SDLOP_PushInputEvent(&event);
     }
     if (type == SDL_EVENT_MOUSE_MOTION) {
         return;
@@ -243,7 +243,7 @@ static void touch_mouse_event(Uint32 type, SDL_Window *window, float x, float y,
     event.button.clicks = 1;
     event.button.x = fx;
     event.button.y = fy;
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 }
 
 static void touch_to_mouse(Uint32 type, SDL_TouchID touchID, SDL_FingerID fingerID, float x, float y,
@@ -314,7 +314,7 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
     event.tfinger.dy = dy;
     event.tfinger.pressure = pressure;
     event.tfinger.windowID = windowID;
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 }
 
 
@@ -334,7 +334,7 @@ void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
     event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
     event.wheel.mouse_x = sdlop.mouse_x;
     event.wheel.mouse_y = sdlop.mouse_y;
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 }
 
 SDL_Window *SDL_GetMouseFocus(void)

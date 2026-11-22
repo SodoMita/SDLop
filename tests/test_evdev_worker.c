@@ -19,6 +19,15 @@
 #include "../bench/raw_pipe.c"
 #undef __wrap_ioctl
 
+int __wrap_ioctl(int fd, unsigned long request, ...);
+int __wrap_epoll_wait(int fd, struct epoll_event *events, int count, int timeout);
+ssize_t __wrap_read(int fd, void *buffer, size_t size);
+ssize_t __wrap_write(int fd, const void *buffer, size_t size);
+int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout);
+#ifdef __GLIBC__
+int __wrap___poll_chk(struct pollfd *fds, nfds_t count, int timeout, size_t bytes);
+#endif
+
 static bool accept_clock;
 static int clock_requests;
 static atomic_int records;

@@ -7,6 +7,7 @@
 */
 #include <SDL3/SDL.h>
 #include <SDL3/SDLop.h>
+#include "internal/sdlop_internal.h"
 #include "uinput_synth.h"
 
 #include <linux/input-event-codes.h>
@@ -113,6 +114,27 @@ static void drain_and_check(void)
     CHECK(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK), "no stuck mouse button");
 }
 
+static void drain_pressure_raw(int expected_records)
+{
+    SDLop_RawEvent raw[127];
+    int total = 0, key_down = 0, key_up = 0, button_down = 0, button_up = 0;
+    int n;
+    while ((n = SDLop_PollRawEvents(raw, 127)) > 0) {
+        total += n;
+        for (int i = 0; i < n; i++) {
+            if (raw[i].type != SDLop_EV_KEY) { continue; }
+            if (raw[i].code == KEY_A) {
+                if (raw[i].value) { key_down++; } else { key_up++; }
+            } else if (raw[i].code == BTN_LEFT) {
+                if (raw[i].value) { button_down++; } else { button_up++; }
+            }
+        }
+    }
+    CHECK(total == expected_records, "pressure records remain available in the raw polling ring");
+    CHECK(key_down == 1 && key_up == 1, "raw key transitions remain intact during SDL pressure");
+    CHECK(button_down == 2 && button_up == 2, "raw button transitions remain intact during SDL pressure");
+}
+
 int main(void)
 {
     setenv("SDL_VIDEODRIVER", "dummy", 1);
@@ -126,8 +148,18 @@ int main(void)
         return 1;
     }
     SDL_Window *window = SDL_CreateWindow("pressure", 320, 200, 0);
-    if (!window || !SDLop_RegisterRawEventCallback(on_raw, NULL)) {
-        fprintf(stderr, "window/callback setup failed: %s\n", SDL_GetError());
+    if (!window) {
+        fprintf(stderr, "window setup failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        uinput_synth_destroy(device);
+        return 1;
+    }
+    /* Model a window-system source on the dummy driver so the test can assert
+     * keyboard state without claiming a real console VT. */
+    SDLOP_RawInputQuit();
+    sdlop.video->window_system_input = true;
+    if (!SDLOP_RawInputInit() || !SDLop_RegisterRawEventCallback(on_raw, NULL)) {
+        fprintf(stderr, "raw source/callback setup failed: %s\n", SDL_GetError());
         SDL_Quit();
         uinput_synth_destroy(device);
         return 1;
@@ -143,8 +175,8 @@ int main(void)
     float dx, dy;
     SDL_GetRelativeMouseState(&dx, &dy); /* clear both accumulated axes */
 
-    /* Fill the public queue, then pump repeatedly: input must remain pending,
-     * not disappear while state changes without matching deliverable events. */
+    /* Fill the public queue and pump without consuming it. Raw records must
+     * still advance SDL state; only their SDL notifications are dropped. */
     Uint32 user_type = SDL_RegisterEvents(1);
     CHECK(user_type != 0, "register sentinel event type");
     SDL_Event sentinel;
@@ -155,19 +187,40 @@ int main(void)
     CHECK(sentinels > 0 && sentinels < 100000, "bounded SDL queue filled");
     SDL_ClearError();
     burst(device);
-    CHECK(wait_for_callbacks(NATIVE_RECORDS * 2), "callbacks continue while SDL queue is full");
+    uinput_synth_key(device, KEY_A, 1);
+    uinput_synth_syn(device);
+    uinput_synth_key(device, BTN_LEFT, 1);
+    uinput_synth_syn(device);
+    CHECK(wait_for_callbacks(NATIVE_RECORDS * 2 + 4), "callbacks continue while SDL queue is full");
     for (int i = 0; i < 4; i++) { SDL_PumpEvents(); }
     SDL_GetRelativeMouseState(&dx, &dy);
-    CHECK(dx == 0 && dy == 0, "full queue defers raw translation and SDL state changes");
+    CHECK(dx == 180300.0f && dy == -600.0f, "full-queue pump still updates relative mouse state");
+    CHECK(SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A], "full-queue pump still updates keyboard state");
+    CHECK(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK, "full-queue pump still updates held button state");
+    CHECK(!*SDL_GetError(), "input event drops under pressure do not set a queue-full error");
+
+    /* A later release is observed too, while the event queue remains full. */
+    uinput_synth_key(device, KEY_A, 0);
+    uinput_synth_syn(device);
+    uinput_synth_key(device, BTN_LEFT, 0);
+    uinput_synth_syn(device);
+    CHECK(wait_for_callbacks(NATIVE_RECORDS * 2 + 8), "callbacks continue for pressure releases");
+    for (int i = 0; i < 4; i++) { SDL_PumpEvents(); }
+    CHECK(!SDL_GetKeyboardState(NULL)[SDL_SCANCODE_A], "full-queue pump applies key release state");
+    CHECK(!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK), "full-queue pump applies button release state");
+
     int removed = 0;
     SDL_Event events[113];
     int n;
     while ((n = SDL_PeepEvents(events, 113, SDL_GETEVENT, user_type, user_type)) > 0) { removed += n; }
     CHECK(removed == sentinels, "existing SDL events survive pressure");
-    drain_and_check();
+    drain_pressure_raw(NATIVE_RECORDS + 8);
+    int replayed = 0;
+    while (SDL_PollEvent(&sentinel)) { replayed++; }
+    CHECK(replayed == 0, "dropped SDL notifications are not replayed after the queue drains");
 
     SDL_Quit(); /* join before reading final worker-owned callback state */
-    CHECK(atomic_load(&callbacks) == NATIVE_RECORDS * 2, "callbacks see every native record");
+    CHECK(atomic_load(&callbacks) == NATIVE_RECORDS * 2 + 8, "callbacks see every native record");
     uinput_synth_destroy(device);
     printf("test_evdev_backpressure: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

@@ -296,6 +296,7 @@ typedef struct SDLop_Globals
     Uint16 repeat_rawcode;
     bool repeat_active;
     bool repeat_disabled;
+    bool suppress_input_events; /* main-thread-only compound key delivery */
     Uint64 repeat_next_ns;      /* absolute CLOCK_MONOTONIC deadline */
     Uint32 repeat_delay_ms;
     Uint32 repeat_interval_ms;
@@ -325,7 +326,9 @@ extern SDLop_Globals sdlop;
 
 /* Push an event into the SDL event queue (main thread only). */
 bool SDLOP_PushEventInternal(SDL_Event *event);
-/* Main-thread-only queue headroom, for input translation backpressure. */
+/* Input event: caller has updated state; drop quietly if it cannot be queued. */
+bool SDLOP_PushInputEvent(SDL_Event *event);
+/* Main-thread-only queue headroom for input event delivery. */
 Uint32 SDLOP_EventQueueFree(void);
 
 /* Post a window event (RESIZED, FOCUS_*, CLOSE_REQUESTED, ...). */

@@ -272,7 +272,7 @@ static void check_layout_change(void)
         SDL_zero(event);
         event.type = SDL_EVENT_KEYMAP_CHANGED;
         event.common.timestamp = SDL_GetTicksNS();
-        SDLOP_PushEventInternal(&event);
+        SDLOP_PushInputEvent(&event);
     }
 }
 
@@ -343,7 +343,7 @@ static bool set_keymap(struct xkb_keymap *new_keymap)
         SDL_zero(event);
         event.type = SDL_EVENT_KEYMAP_CHANGED; /* app event: common layout */
         event.common.timestamp = SDL_GetTicksNS();
-        SDLOP_PushEventInternal(&event);
+        SDLOP_PushInputEvent(&event);
     }
     return true;
 }
@@ -771,6 +771,13 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
         return;
     }
 
+    /* Translation can emit a layout-change, key, and text event. Preflight
+     * that maximum sequence so ordinary queue pressure drops it together. */
+    bool previous_suppression = sdlop.suppress_input_events;
+    if (SDLOP_IsMainThread() && SDLOP_EventQueueFree() < 3) {
+        sdlop.suppress_input_events = true;
+    }
+
     Uint16 xkb_raw = rawcode ? rawcode : evdev_from_scancode(scancode);
     SDL_Keymod mod = sdlop.modstate;
     SDL_Keymod modbit = modifier_bit_for(scancode);
@@ -817,7 +824,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     event.key.raw = rawcode;
     event.key.down = down;
     event.key.repeat = repeat;
-    SDLOP_PushEventInternal(&event);
+    SDLOP_PushInputEvent(&event);
 
     if (down && text[0]) {
         SDLOP_SendKeyboardText(text, timestamp_ns);
@@ -834,6 +841,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     } else if (!down && scancode == sdlop.repeat_scancode) {
         sdlop.repeat_active = false;
     }
+    sdlop.suppress_input_events = previous_suppression;
 }
 
 /* Generate due repeats. Called from PumpEvents. */
@@ -848,13 +856,22 @@ void SDLOP_KeyboardProcessRepeats(void)
         return;
     }
     Uint64 now = SDLOP_MonotonicNS();
-    /* Keep overdue repeats pending when input/event traffic fills the queue.
-     * A key can emit a layout change, key event and text event. */
-    while (sdlop.repeat_active && SDLOP_EventQueueFree() >= 3 &&
-           (Sint64)(now - sdlop.repeat_next_ns) >= 0) {
-        SDLOP_SendKeyboardKey(true, true, sdlop.repeat_scancode, sdlop.repeat_rawcode, sdlop.repeat_next_ns);
-        sdlop.repeat_next_ns += (Uint64)sdlop.repeat_interval_ms * 1000000ull;
+    Uint64 interval_ns = (Uint64)sdlop.repeat_interval_ms * 1000000ull;
+    if (!interval_ns) {
+        sdlop.repeat_active = false;
+        return;
     }
+    if ((Sint64)(now - sdlop.repeat_next_ns) < 0) {
+        return;
+    }
+    /* Never accumulate a repeat backlog. If input traffic filled the queue,
+     * skip this deadline and start a fresh interval; otherwise emit at most
+     * one repeat per pump, timestamped when it is actually delivered. */
+    sdlop.repeat_next_ns = now + interval_ns;
+    if (SDLOP_EventQueueFree() < 3) {
+        return;
+    }
+    SDLOP_SendKeyboardKey(true, true, sdlop.repeat_scancode, sdlop.repeat_rawcode, now);
 }
 
 /* ------------------------------------------------------------------ */

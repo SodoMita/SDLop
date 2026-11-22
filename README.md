@@ -118,7 +118,10 @@ either all from evdev (`/dev/input`) or all from the window system.
   expose global device events, including keys, regardless of window/VT focus.
   Applications using this API must implement their own focus/security policy;
   do not treat it as a focus-filtered SDL event queue. `SDLop_RawInputAvailable`
-  reports the worker; on X11/Wayland true also means evdev is the SDL source.
+  reports worker availability, not current SDL source ownership: X11/Wayland
+  initially use evdev for both keyboard and mouse, but can fall back to the
+  window system after a required device class is lost while the worker remains
+  available for callbacks/polling on surviving devices.
 - **Timestamp provenance follows the source.** Raw-derived SDL events convert
   kernel times to SDL's tick epoch; window-system events use the native
   handler's receipt time. The raw-input benchmark below measures the evdev path.
@@ -286,14 +289,17 @@ limitations, and the **currently uncleared callback performance gate**.
 The [self-audit and pinned SDL3 comparison](docs/input-audit-sdl3.md) documents
 reentrant-pump and continuous-device fixes, checked benchmark transport,
 identical-source rootless measurements, and deferred gaps (including wheel
-selection, frame aggregation, hotplug and focus/VT snapshots).
+selection, frame aggregation, hot-add/reopen discovery and focus/VT snapshots).
 The [dispatch optimization follow-up](docs/input-dispatch-optimization.md)
 measures single-writer counter publication and SPSC index caching, with retained
 counter-only experiments, a rootless CPU-work proxy (`bench_raw_dispatch`) and
 explicit latency/throughput tradeoffs. The full callback gate remains uncleared.
 The [regression follow-up](docs/input-regression-followup.md) adds TSan and queue
 boundary coverage, removes absent-unregister allocations, reclaims callback
-snapshots after worker join, and records rejected native-path experiments.
+snapshots after worker join, and records rejected native-path experiments. The
+retained raw trial, test, and sanitizer logs are indexed in
+[docs/benchmarks/README.md](docs/benchmarks/README.md); their historical results
+do not clear the current callback performance gate.
 
 ## API surface (SDL3-compatible)
 
@@ -343,7 +349,7 @@ SDLop_RegisterRawEventCallback(on_raw, NULL);  /* like ni_register_callback */
 SDLop_RawEvent raws[64];
 int n = SDLop_PollRawEvents(raws, 64);         /* like ni_poll */
 
-SDLop_RawInputAvailable();     /* is the evdev worker running? */
+SDLop_RawInputAvailable();     /* raw callback/poll worker is running? */
 SDLop_GetRawEventCount();
 SDLop_SetWindowClearColor(w, 0x30, 0xA0, 0x40);  /* no renderer needed */
 ```
@@ -580,10 +586,12 @@ Highlights:
   non-Latin layouts (ru, el, ...) keep the US-QWERTY letter keycodes, and
   AZERTY keeps `SDLK_1`... on the number row while
   `SDL_GetKeyFromScancode(..., false)` reports the layout's symbol
-  (`й`, `&`, `é`...). Dead keys and the Compose key are composed into text via
-  xkbcommon's compose tables (locale from `LC_ALL`, `LC_CTYPE`, `LANG`, else
-  `C`; needs libxkbcommon >= 0.5 and the X11 Compose data, otherwise text is
-  emitted uncomposed). No IME (XIM / text-input-v3) yet.
+  (`й`, `&`, `é`...). Call `SDL_StartTextInput(window)` to receive text: text
+  delivery and dead-key/Compose processing are inactive by default, and stopping
+  text input ends that compose session. Composition uses xkbcommon's compose
+  tables (locale from `LC_ALL`, `LC_CTYPE`, `LANG`, else `C`; needs
+  libxkbcommon >= 0.5 and the X11 Compose data, otherwise text is emitted
+  uncomposed). No IME (XIM / text-input-v3) yet.
 - Touch: `wl_touch` on Wayland and XInput 2.2 multitouch on X11 deliver
   `SDL_EVENT_FINGER_*` (x/y/dx/dy normalized to the window, pressure 1 while
   down; on X11 touchID = source device, fingerID = touch id). Like SDL3, the

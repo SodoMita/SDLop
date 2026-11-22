@@ -14,14 +14,19 @@
 
 static void *allocations[16384];
 static size_t allocated, freed;
-static bool tracking, fail_next;
+static atomic_bool tracking;
+static bool fail_next;
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
 static bool entered, released;
 static atomic_int delivered;
+static atomic_int self_unregistered;
 
 extern void *__real_calloc(size_t, size_t);
 extern void __real_free(void *);
+void *__wrap_calloc(size_t n, size_t size);
+void __wrap_free(void *p);
+
 void *__wrap_calloc(size_t n, size_t size)
 {
     if (tracking && fail_next) { fail_next = false; errno = ENOMEM; return NULL; }
@@ -61,6 +66,13 @@ static void on_raw(const SDLop_RawEvent *event, void *userdata)
 {
     (void)event; (void)userdata;
     atomic_fetch_add(&delivered, 1);
+}
+
+static void unregister_self(const SDLop_RawEvent *event, void *userdata)
+{
+    (void)event; (void)userdata;
+    atomic_fetch_add_explicit(&self_unregistered, 1, memory_order_relaxed);
+    SDLop_UnregisterRawEventCallback(unregister_self);
 }
 
 static void absent(const SDLop_RawEvent *event, void *userdata)
@@ -157,8 +169,32 @@ int main(void)
     size_t empty_allocations = allocated - before;
     tracking = false;
     assert(!freed); /* old reader snapshots reclaimed only after worker join */
+    until = SDL_GetTicksNS() + 3000000000ull;
+    while (SDLop_GetRawEventCount() < 502) {
+        assert(SDL_GetTicksNS() < until);
+        SDL_Delay(1);
+    }
+
+    /* A worker callback may remove itself: dispatch holds no writer lock. */
+    Uint64 before_self = SDLop_GetRawEventCount();
+    assert(before_self == 502);
+    assert(SDLop_RegisterRawEventCallback(unregister_self, NULL));
+    assert(uinput_synth_rel(device, SDLop_REL_X, 502));
+    until = SDL_GetTicksNS() + 3000000000ull;
+    while (SDLop_GetRawEventCount() < before_self + 1) {
+        assert(SDL_GetTicksNS() < until);
+        SDL_Delay(1);
+    }
+    assert(atomic_load_explicit(&self_unregistered, memory_order_relaxed) == 1);
+    assert(uinput_synth_rel(device, SDLop_REL_X, 503));
+    until = SDL_GetTicksNS() + 3000000000ull;
+    while (SDLop_GetRawEventCount() < before_self + 2) {
+        assert(SDL_GetTicksNS() < until);
+        SDL_Delay(1);
+    }
+    assert(atomic_load_explicit(&self_unregistered, memory_order_relaxed) == 1);
     SDL_Quit();
-    assert(SDLop_GetRawEventCount() == 502); /* held reader + 501 persistent deliveries */
+    assert(SDLop_GetRawEventCount() == before_self + 2);
     /* Reinitialization must not carry a dangling ownership chain forward. */
     for (int cycle = 0; cycle < 3; cycle++) {
         assert(SDL_Init(SDL_INIT_VIDEO) && SDLop_RawInputAvailable());
@@ -175,6 +211,6 @@ int main(void)
     printf("callback snapshots: allocated=%zu freed_after_join=%zu; empty_unregister_allocations=%zu; native delivery=501/501\n",
            allocated, freed, empty_allocations);
     bool ok = !unnecessary && !empty_allocations && allocated == freed;
-    printf("test_evdev_callbacks: %s (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)\n", ok ? "PASS" : "FAIL");
+    printf("test_evdev_callbacks: %s (no-op allocation, held reader, churn, max count, OOM, self-unregister, shutdown reclamation)\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

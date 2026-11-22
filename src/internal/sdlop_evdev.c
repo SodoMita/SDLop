@@ -127,7 +127,7 @@ static struct
     bool have_sync; /* main-thread slow path active */
 
     /* callbacks (RCU-style snapshot pointer swap) */
-    _Alignas(SDLOP_CACHELINE) SDLOP_CallbackSet *callbacks;
+    _Alignas(SDLOP_CACHELINE) _Atomic(SDLOP_CallbackSet *) callbacks;
     pthread_mutex_t cb_mutex;
 } raw;
 
@@ -185,6 +185,8 @@ static int open_input_devices(void)
 
         SDLOP_RawDevice *dev = &raw.devices[raw.num_devices];
         memset(dev, 0, sizeof(*dev)); /* a previous rejected fd may have used this slot */
+        atomic_init(&dev->disconnected, false);
+        atomic_init(&dev->snapshot_ready, false);
         dev->fd = fd;
         dev->index = (Uint32)raw.num_devices;
         dev->clock_monotonic = clock_monotonic;
@@ -266,7 +268,7 @@ static int open_input_devices(void)
 
 static void dispatch_callbacks(const SDLop_RawEvent *event)
 {
-    SDLOP_CallbackSet *set = atomic_load_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, memory_order_acquire);
+    SDLOP_CallbackSet *set = atomic_load_explicit(&raw.callbacks, memory_order_acquire);
     if (!set || set->count == 0) {
         return;
     }
@@ -518,6 +520,12 @@ bool SDLOP_RawInputInit(void)
         return false;
     }
     memset(&raw, 0, sizeof(raw));
+    atomic_init(&raw.running, false);
+    atomic_init(&raw.callbacks, NULL);
+    atomic_init(&raw.event_count, 0);
+    atomic_init(&raw.sdl_dropped, 0);
+    atomic_init(&raw.poll_dropped, 0);
+    atomic_init(&raw.resync_requests, 0);
     raw.winsys = winsys;
     for (unsigned code = 0; code <= SDLOP_EVDEV_KEY_MAX; code++) {
         SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[code];
@@ -527,7 +535,6 @@ bool SDLOP_RawInputInit(void)
         }
     }
     pthread_mutex_init(&raw.cb_mutex, NULL);
-    atomic_store(&raw.event_count, 0);
 
     SDLOP_RingInit(&raw.sdl_ring, raw.sdl_ring_storage, SDLOP_SDL_RING_SIZE, sizeof(SDLop_RawEvent));
     SDLOP_RingInit(&raw.poll_ring, raw.poll_ring_storage, SDLOP_POLL_RING_SIZE, sizeof(SDLop_RawEvent));
@@ -637,13 +644,13 @@ void SDLOP_RawInputQuit(void)
     }
     raw.num_devices = 0;
     raw.winsys = false;
-    SDLOP_CallbackSet *set = raw.callbacks;
+    SDLOP_CallbackSet *set = atomic_load_explicit(&raw.callbacks, memory_order_relaxed);
     while (set) {
         SDLOP_CallbackSet *previous = set->previous;
         free(set);
         set = previous;
     }
-    raw.callbacks = NULL;
+    atomic_store_explicit(&raw.callbacks, NULL, memory_order_relaxed);
     pthread_mutex_destroy(&raw.cb_mutex);
 }
 
@@ -1038,9 +1045,9 @@ static void request_snapshot(SDLOP_RawDevice *dev)
 
 /* Main-thread recovery slow path. The snapshot is immutable until the next
  * request. Consume all ring records preceding its publication boundary before
- * diffing it; do not replay stale queued key transitions after the diff.
- * Returns false when the SDL queue needs draining before recovery can finish. */
-static bool pump_recovery(void)
+ * diffing it; do not replay stale queued key transitions after the diff. SDL
+ * state recovery always completes; event delivery may be dropped under pressure. */
+static void pump_recovery(void)
 {
     bool any = false;
     uint64_t tail = atomic_load_explicit(&raw.sdl_ring.tail, memory_order_relaxed);
@@ -1052,7 +1059,6 @@ static bool pump_recovery(void)
             dev->abs_dirty = dev->abs_valid = false;
             for (unsigned code = 0; code <= KEY_MAX; code++) {
                 if (!test_bit(dev->keys, code)) { continue; }
-                if (SDLOP_EventQueueFree() < 3) { return false; }
                 SDLop_RawEvent up = { .device = dev->index, .type = EV_KEY, .code = (Uint16)code };
                 pump_key(&up, true);
             }
@@ -1074,7 +1080,6 @@ static bool pump_recovery(void)
                 dev->sync_code = 0;
             } else if (!dev->wait_report && (int64_t)(tail - dev->snapshot_boundary) >= 0) {
                 if (dev->has_abs && !dev->abs_recovered) {
-                    if (SDLOP_EventQueueFree() < 3) { return false; }
                     for (int axis = 0; axis < 2; axis++) {
                         dev->abs_value[axis] = dev->snapshot_abs[axis].value;
                         dev->abs_min[axis] = dev->snapshot_abs[axis].minimum;
@@ -1089,9 +1094,6 @@ static bool pump_recovery(void)
                     unsigned int code = dev->sync_code;
                     bool down = test_bit(dev->snapshot_keys, code);
                     if (down != test_bit(dev->keys, code)) {
-                        if (SDLOP_EventQueueFree() < 3) {
-                            return false;
-                        }
                         SDLop_RawEvent ev = { .device = dev->index, .type = EV_KEY,
                                              .code = (Uint16)code, .value = down };
                         pump_key(&ev, true);
@@ -1119,7 +1121,6 @@ static bool pump_recovery(void)
             raw.source_lost = true; /* enable seat keyboard+mouse only after ALL raw releases */
         }
     }
-    return true;
 }
 
 void SDLOP_RawInputPump(void)
@@ -1154,16 +1155,17 @@ void SDLOP_RawInputPump(void)
     }
     SDLop_RawEvent ev;
     int n = 0;
-    /* Reserve layout + key + text headroom before any SDL state change. */
-    while (SDLOP_EventQueueFree() >= 3) {
+    /* Always consume and translate native records. Input senders update SDL
+     * state first, then drop notifications if the bounded queue lacks room. */
+    for (;;) {
         if (raw.have_sync) {
             /* Acquire head BEFORE checking snapshot readiness. Any record
              * published after a snapshot boundary then also makes ready
              * visible before we decide whether to discard that record. Do
              * not pop a newer record if this head snapshot was empty. */
             uint64_t head = atomic_load_explicit(&raw.sdl_ring.head, memory_order_acquire);
-            if (!pump_recovery() ||
-                atomic_load_explicit(&raw.sdl_ring.tail, memory_order_relaxed) == head) {
+            pump_recovery();
+            if (atomic_load_explicit(&raw.sdl_ring.tail, memory_order_relaxed) == head) {
                 break;
             }
         }
@@ -1188,9 +1190,7 @@ void SDLOP_RawInputPump(void)
             break;
         }
     }
-    if (n) {
-        SDLOP_KeyboardProcessRepeats();
-    }
+    SDLOP_KeyboardProcessRepeats();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1203,7 +1203,7 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
         return SDL_SetError("NULL callback");
     }
     pthread_mutex_lock(&raw.cb_mutex);
-    SDLOP_CallbackSet *old = raw.callbacks;
+    SDLOP_CallbackSet *old = atomic_load_explicit(&raw.callbacks, memory_order_relaxed);
     int count = old ? old->count : 0;
     if (count >= SDLOP_MAX_CALLBACKS) {
         pthread_mutex_unlock(&raw.cb_mutex);
@@ -1221,7 +1221,7 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
     set->entries[count].userdata = userdata;
     set->count = count + 1;
     set->previous = old;
-    atomic_store_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, set, memory_order_release);
+    atomic_store_explicit(&raw.callbacks, set, memory_order_release);
     pthread_mutex_unlock(&raw.cb_mutex);
     /* Old versions remain alive for in-flight worker readers until join. */
     return true;
@@ -1230,7 +1230,7 @@ bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
 void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
 {
     pthread_mutex_lock(&raw.cb_mutex);
-    SDLOP_CallbackSet *old = raw.callbacks;
+    SDLOP_CallbackSet *old = atomic_load_explicit(&raw.callbacks, memory_order_relaxed);
     bool found = false;
     for (int i = 0; old && i < old->count; i++) {
         if (old->entries[i].cb == cb) {
@@ -1254,7 +1254,7 @@ void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
         }
     }
     set->previous = old;
-    atomic_store_explicit((_Atomic(SDLOP_CallbackSet *) *)&raw.callbacks, set, memory_order_release);
+    atomic_store_explicit(&raw.callbacks, set, memory_order_release);
     pthread_mutex_unlock(&raw.cb_mutex);
 }
 
@@ -1281,6 +1281,8 @@ bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
     if (!stats) {
         return SDL_InvalidParamError("stats");
     }
+    stats->version = SDLOP_RAW_INPUT_STATS_VERSION;
+    stats->size = (Uint32)sizeof(*stats);
     stats->events_seen = atomic_load_explicit(&raw.event_count, memory_order_relaxed);
     stats->sdl_ring_dropped = atomic_load_explicit(&raw.sdl_dropped, memory_order_acquire);
     stats->poll_ring_dropped = atomic_load_explicit(&raw.poll_dropped, memory_order_relaxed);
