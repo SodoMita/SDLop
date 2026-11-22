@@ -41,9 +41,11 @@
 #include <SDL3/SDL_vulkan.h>
 #include <SDL3/SDL_atomic.h>
 #include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_system.h>
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_joystick.h>
+#include <SDL3/SDL_haptic.h>
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_camera.h>
 #include <SDL3/SDL_guid.h>

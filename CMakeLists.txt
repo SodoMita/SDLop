@@ -55,6 +55,9 @@ if(EMSCRIPTEN)
     src/SDL_thread.c
     src/SDL_misc.c
     src/SDL_joystick.c
+    src/SDL_joystick_dummy_backend.c
+    src/SDL_haptic.c
+    src/SDL_haptic_dummy.c
     src/SDL_filesystem.c
     src/SDL_main.c
     src/SDL_rect.c
@@ -332,6 +335,8 @@ set(SDLop_SOURCES
   src/SDL_thread.c
   src/SDL_misc.c
   src/SDL_joystick.c
+  src/SDL_haptic.c
+  src/SDL_haptic_dummy.c
   src/SDL_filesystem.c
   src/SDL_main.c
   src/SDL_rect.c
@@ -366,6 +371,12 @@ set(SDLop_SOURCES
   src/video/fbdev/sdlop_fbdev.c
   src/video/dummy/sdlop_dummy.c
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND SDLop_SOURCES src/SDL_joystick_evdev.c)
+else()
+  list(APPEND SDLop_SOURCES src/SDL_joystick_dummy_backend.c)
+endif()
+
 set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
 if(SDLOP_VIDEO_X11)
   list(APPEND SDLop_SOURCES
@@ -538,6 +549,14 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(test_evdev_uinput PRIVATE src tests)
   target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
   add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
+
+  # End-to-end evdev joystick/gamepad backend through uinput.
+  add_executable(test_evdev_joystick tests/test_evdev_joystick.c tests/uinput_synth.c)
+  target_link_libraries(test_evdev_joystick PRIVATE sdlop)
+  target_include_directories(test_evdev_joystick PRIVATE src tests)
+  target_compile_options(test_evdev_joystick PRIVATE -UNDEBUG)
+  add_test(NAME test_evdev_joystick COMMAND test_evdev_joystick)
+  set_tests_properties(test_evdev_joystick PROPERTIES TIMEOUT 20)
 
   # Deterministic queue-pressure test through the real evdev worker. The
   # process-local transport uses no input devices, root or display server.

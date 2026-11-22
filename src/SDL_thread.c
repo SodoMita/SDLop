@@ -11,7 +11,8 @@
       or on SDL_CleanupTLS();
     - SDL_SetCurrentThreadPriority() maps to nice values (19/0/-10/-20) or
       SCHED_RR when SDL_HINT_THREAD_FORCE_REALTIME_TIME_CRITICAL is set.
-      There is no RealtimeKit fallback.
+      There is no RealtimeKit fallback; the SDL_system.h Linux priority
+      entry points use setpriority() / sched_setscheduler() directly.
 
   Copyright (C) 1997-2026 Sam Lantinga (SDL3 parts), zlib license.
 
@@ -568,6 +569,73 @@ void SDL_CleanupTLS(void)
     }
 }
 
+/* SDL3's SDL_GetPersistentString(): return a per-thread stable copy, so
+ * strings like device names stay valid after the owning object is freed.
+ * Uses the TLS machinery above; SDL_CleanupTLS() frees the pool. */
+typedef struct PersistentStrings
+{
+    char **items;
+    int count;
+    int capacity;
+} PersistentStrings;
+
+static SDL_TLSID persistent_strings_id;
+
+static void sdloP_free_persistent_strings(void *value)
+{
+    PersistentStrings *strings = (PersistentStrings *)value;
+    if (strings) {
+        for (int i = 0; i < strings->count; ++i) {
+            SDL_free(strings->items[i]);
+        }
+        SDL_free(strings->items);
+        SDL_free(strings);
+    }
+}
+
+const char *SDLOP_GetPersistentString(const char *string)
+{
+    if (!string) {
+        return NULL;
+    }
+    if (!*string) {
+        return "";
+    }
+
+    PersistentStrings *strings = (PersistentStrings *)SDL_GetTLS(&persistent_strings_id);
+    if (!strings) {
+        strings = (PersistentStrings *)SDL_calloc(1, sizeof(*strings));
+        if (!strings) {
+            return NULL;
+        }
+        if (!SDL_SetTLS(&persistent_strings_id, strings, sdloP_free_persistent_strings)) {
+            SDL_free(strings);
+            return NULL;
+        }
+    }
+
+    for (int i = 0; i < strings->count; ++i) {
+        if (strcmp(strings->items[i], string) == 0) {
+            return strings->items[i];
+        }
+    }
+    if (strings->count == strings->capacity) {
+        int capacity = strings->capacity ? strings->capacity * 2 : 8;
+        char **items = (char **)SDL_realloc(strings->items, (size_t)capacity * sizeof(*items));
+        if (!items) {
+            return NULL;
+        }
+        strings->items = items;
+        strings->capacity = capacity;
+    }
+    char *copy = SDL_strdup(string);
+    if (!copy) {
+        return NULL;
+    }
+    strings->items[strings->count++] = copy;
+    return copy;
+}
+
 /* ------------------------------------------------------------------ */
 /* Threads                                                             */
 /* ------------------------------------------------------------------ */
@@ -881,6 +949,75 @@ bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority priority)
     }
     pid_t tid = (pid_t)syscall(SYS_gettid);
     if (setpriority(PRIO_PROCESS, (id_t)tid, nice_value) == 0) {
+        return true;
+    }
+    return SDL_SetError("setpriority() failed");
+}
+
+/* ------------------------------------------------------------------ */
+/* Platform-specific thread priority (SDL_system.h, Linux)             */
+/* ------------------------------------------------------------------ */
+
+/* SDL3 maps SDL priorities onto nice values for SCHED_OTHER and onto
+ * 1 / 74 / 99 / 49 for SCHED_RR and SCHED_FIFO. Stock SDL escalates the
+ * latter through RealtimeKit over D-Bus; SDLop has no D-Bus dependency,
+ * so apply the policy directly with sched_setscheduler() (a Linux thread
+ * ID is also a schedulable task ID). */
+bool SDL_SetLinuxThreadPriority(Sint64 threadID, int priority)
+{
+    if (setpriority(PRIO_PROCESS, (id_t)threadID, priority) == 0) {
+        return true;
+    }
+    return SDL_SetError("setpriority() failed");
+}
+
+bool SDL_SetLinuxThreadPriorityAndPolicy(Sint64 threadID, int sdlPriority, int schedPolicy)
+{
+    int osPriority;
+
+    if (schedPolicy == SCHED_RR || schedPolicy == SCHED_FIFO) {
+        /* Same realtime range SDL3 uses for its RealtimeKit requests. */
+        enum { SDL_MAX_REALTIME_PRIORITY = 99 };
+
+        switch (sdlPriority) {
+        case SDL_THREAD_PRIORITY_LOW:
+            osPriority = 1;
+            break;
+        case SDL_THREAD_PRIORITY_HIGH:
+            osPriority = SDL_MAX_REALTIME_PRIORITY * 3 / 4;
+            break;
+        case SDL_THREAD_PRIORITY_TIME_CRITICAL:
+            osPriority = SDL_MAX_REALTIME_PRIORITY;
+            break;
+        default:
+            osPriority = SDL_MAX_REALTIME_PRIORITY / 2;
+            break;
+        }
+
+        struct sched_param param;
+        SDL_zero(param);
+        param.sched_priority = osPriority;
+        if (sched_setscheduler((pid_t)threadID, schedPolicy, &param) == 0) {
+            return true;
+        }
+        return SDL_SetError("sched_setscheduler() failed");
+    }
+
+    switch (sdlPriority) {
+    case SDL_THREAD_PRIORITY_LOW:
+        osPriority = 19;
+        break;
+    case SDL_THREAD_PRIORITY_HIGH:
+        osPriority = -10;
+        break;
+    case SDL_THREAD_PRIORITY_TIME_CRITICAL:
+        osPriority = -20;
+        break;
+    default:
+        osPriority = 0;
+        break;
+    }
+    if (setpriority(PRIO_PROCESS, (id_t)threadID, osPriority) == 0) {
         return true;
     }
     return SDL_SetError("setpriority() failed");

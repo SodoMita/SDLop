@@ -6,6 +6,7 @@
 */
 
 #include "internal/sdlop_internal.h"
+#include "internal/sdlop_joystick_internal.h"
 #ifndef __EMSCRIPTEN__
 #include <sys/eventfd.h>
 #endif
@@ -171,6 +172,16 @@ Uint64 SDLOP_MonotonicNS(void)
 
 static bool subsystem_init(SDL_InitFlags flags)
 {
+    if (flags & SDL_INIT_HAPTIC) {
+        if (!SDLOP_InitHaptics()) {
+            return false;
+        }
+    }
+    if (flags & (SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
+        if (!SDLOP_InitJoysticks()) {
+            return false;
+        }
+    }
     if (flags & SDL_INIT_VIDEO) {
         if (!SDLOP_VideoInit()) {
             SDLOP_RawInputQuit(); /* a console driver may have started it */
@@ -192,6 +203,12 @@ static bool subsystem_init(SDL_InitFlags flags)
 
 static void subsystem_quit(SDL_InitFlags flags)
 {
+    if (flags & (SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
+        SDLOP_QuitJoysticks();
+    }
+    if (flags & SDL_INIT_HAPTIC) {
+        SDLOP_QuitHaptics();
+    }
     if (flags & SDL_INIT_VIDEO) {
         SDLOP_RawInputQuit();
         SDLOP_VideoQuit();

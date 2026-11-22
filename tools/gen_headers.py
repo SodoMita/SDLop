@@ -44,9 +44,10 @@ HEADERS = [
     "SDL_keyboard.h", "SDL_keycode.h", "SDL_scancode.h", "SDL_mouse.h",
     "SDL_touch.h", "SDL_clipboard.h", "SDL_misc.h", "SDL_messagebox.h",
     "SDL_vulkan.h", "SDL_main.h", "SDL_main_impl.h",
-    "SDL_atomic.h", "SDL_thread.h", "SDL_filesystem.h",
-    # no-device stubs (SDL_joystick.c): enumeration is empty, opening fails
-    "SDL_gamepad.h", "SDL_joystick.h",
+    "SDL_atomic.h", "SDL_thread.h", "SDL_system.h", "SDL_filesystem.h",
+    # joystick/gamepad API (evdev backend + no-device fallback), and SDL3's
+    # haptic core with a dummy backend
+    "SDL_gamepad.h", "SDL_joystick.h", "SDL_haptic.h",
     # types only (referenced by the above)
     "SDL_audio.h", "SDL_camera.h", "SDL_guid.h", "SDL_iostream.h",
     "SDL_mutex.h", "SDL_pen.h", "SDL_power.h", "SDL_sensor.h",

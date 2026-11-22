@@ -24,6 +24,7 @@
 */
 
 #include "internal/sdlop_internal.h"
+#include "internal/sdlop_joystick_internal.h"
 #include <poll.h>
 #include <unistd.h>
 
@@ -741,13 +742,16 @@ void SDL_PumpEvents(void)
     /* 1. drain raw input ring -> SDL events */
     SDLOP_RawInputPump();
 
-    /* 2. drain window system (non-blocking) */
+    /* 2. poll evdev joysticks/gamepads for state changes and hotplug */
+    SDLOP_JoystickPump();
+
+    /* 3. drain window system (non-blocking) */
     if (sdlop.video) {
         sdlop.video->PumpEvents(sdlop.video, -1);
         SDLOP_UpdateCursorAnimation();
     }
 
-    /* 3. events pushed by other threads */
+    /* 4. events pushed by other threads */
     merge_side_queue();
     pumping = false;
 }
@@ -911,9 +915,15 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         }
 
         int video_fd = sdlop.video ? sdlop.video->GetEventFD(sdlop.video) : -1;
-        struct pollfd pfds[2];
+        /* Match the evdev backend's device cap so no controller is left out
+         * of the wake-up poll set. */
+        int joy_fds[64];
+        int num_joy = SDLOP_JoystickGetEventFDs(joy_fds, (int)SDL_arraysize(joy_fds));
+        struct pollfd pfds[66]; /* wake fd + video fd + joystick fds */
         int nfds = 0;
+        int wake_index = -1;
         if (sdlop.wake_fd >= 0) {
+            wake_index = nfds;
             pfds[nfds].fd = sdlop.wake_fd;
             pfds[nfds].events = POLLIN;
             nfds++;
@@ -923,9 +933,14 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
             pfds[nfds].events = POLLIN;
             nfds++;
         }
+        for (int i = 0; i < num_joy && nfds < (int)SDL_arraysize(pfds); ++i) {
+            pfds[nfds].fd = joy_fds[i];
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
         if (nfds > 0) {
             poll(pfds, (nfds_t)nfds, wait_ms);
-            if (sdlop.wake_fd >= 0 && (pfds[0].revents & POLLIN)) {
+            if (wake_index >= 0 && (pfds[wake_index].revents & POLLIN)) {
                 uint64_t val;
                 (void)!read(sdlop.wake_fd, &val, sizeof(val)); /* reset */
             }
