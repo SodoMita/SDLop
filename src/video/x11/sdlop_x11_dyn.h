@@ -12,7 +12,8 @@
   Library names can be overridden per module (SDLOP_LIB_XCB,
   SDLOP_LIB_XCB_SHM, SDLOP_LIB_XCB_XKB, SDLOP_LIB_XKBCOMMON_X11,
   SDLOP_LIB_XCB_XINPUT, SDLOP_LIB_XCB_RANDR,
-  SDLOP_LIB_XCB_RENDER, SDLOP_LIB_XCB_XFIXES, SDLOP_LIB_XCB_SYNC). Setting an optional module's
+  SDLOP_LIB_XCB_RENDER, SDLOP_LIB_XCB_XFIXES, SDLOP_LIB_XCB_SYNC,
+  SDLOP_LIB_XCB_SHAPE). Setting an optional module's
   variable to "none" disables it, which is how the fallback paths are
   tested.
 
@@ -102,6 +103,8 @@ xcb_void_cookie_t xcb_sync_create_counter(xcb_connection_t *c, xcb_sync_counter_
 xcb_void_cookie_t xcb_sync_destroy_counter(xcb_connection_t *c, xcb_sync_counter_t counter);
 xcb_void_cookie_t xcb_sync_set_counter(xcb_connection_t *c, xcb_sync_counter_t counter, xcb_sync_int64_t value);
 #endif
+/* always there: xcb/xinput.h includes xfixes.h, which includes shape.h */
+#include <xcb/shape.h>
 #include <xkbcommon/xkbcommon-x11.h>
 
 #ifdef __cplusplus

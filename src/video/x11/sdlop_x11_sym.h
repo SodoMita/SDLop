@@ -19,6 +19,7 @@
     RENDER  libxcb-render.so.0      optional - ARGB cursors
     XFIXES  libxcb-xfixes.so.0      optional - clipboard owner-change events
     SYNC    libxcb-sync.so.1        optional - _NET_WM_SYNC_REQUEST resize sync
+    SHAPE   libxcb-shape.so.0       optional - SDL_SetWindowShape input shapes, tooltips
 
   (libX11 is only needed as a fallback for EGL implementations without
   EGL_EXT_platform_xcb; sdlop_x11_gl.c dlopens it on demand.)
@@ -195,3 +196,11 @@ SDLOP_X11_SYM(SYNC, xcb_sync_initialize_reply)
 SDLOP_X11_SYM(SYNC, xcb_sync_create_counter)
 SDLOP_X11_SYM(SYNC, xcb_sync_destroy_counter)
 SDLOP_X11_SYM(SYNC, xcb_sync_set_counter)
+
+/* -------------------------------------------------------------- SHAPE */
+SDLOP_X11_MODULE(SHAPE)
+SDLOP_X11_DATA(SHAPE, xcb_shape_id)
+SDLOP_X11_SYM(SHAPE, xcb_shape_query_version)
+SDLOP_X11_SYM(SHAPE, xcb_shape_query_version_reply)
+SDLOP_X11_SYM(SHAPE, xcb_shape_rectangles)
+SDLOP_X11_SYM(SHAPE, xcb_shape_mask)

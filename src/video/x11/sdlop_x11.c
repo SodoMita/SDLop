@@ -211,6 +211,7 @@ typedef struct X11DeviceData
     bool detectable_repeat;
     bool has_xi2;
     bool has_sync;                /* SYNC >= 3.0 (resize sync counters) */
+    bool has_shape;               /* SHAPE >= 1.1 (input shapes) */
     uint8_t xi_opcode;
     /* XI2.2 touch sequences: per-finger last position for dx/dy, and
      * the window the sequence started on (SDL3 semantics) */
@@ -2029,6 +2030,17 @@ static bool x11_Init(SDLop_VideoDevice *device)
         }
     }
 
+    /* SHAPE >= 1.1 for input shapes (SDL_SetWindowShape, tooltips) */
+    if (SDLOP_X11_HAVE(SHAPE)) {
+        const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_shape_id);
+        if (ext && ext->present) {
+            xcb_shape_query_version_reply_t *v =
+                X11_xcb_shape_query_version_reply(x11.conn, X11_xcb_shape_query_version(x11.conn), NULL);
+            x11.has_shape = v && (v->major_version > 1 || (v->major_version == 1 && v->minor_version >= 1));
+            free(v);
+        }
+    }
+
     /* XInput2 >= 2.2 for raw motion (relative mouse) */
     if (SDLOP_X11_HAVE(XINPUT)) {
         const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_input_id);
@@ -2228,6 +2240,11 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         type = x11.atom._NET_WM_WINDOW_TYPE_DIALOG;
     }
     set_property(wd->xid, x11.atom._NET_WM_WINDOW_TYPE, XCB_ATOM_ATOM, 32, 1, &type);
+    if ((window->flags & SDL_WINDOW_TOOLTIP) && x11.has_shape) {
+        /* tooltips do not receive input (stock): empty input shape */
+        X11_xcb_shape_rectangles(x11.conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED, wd->xid,
+                                 0, 0, 0, NULL);
+    }
     if (SDLOP_WINDOW_IS_POPUP(window)) {
         /* SDL3 X11: popups bypass the WM so they land exactly at the
          * requested offset and never steal the focus */
@@ -3399,6 +3416,86 @@ static bool x11_SetWindowHitTest(SDLop_VideoDevice *device, SDL_Window *window, 
 
 /* the WM's window menu (GTK protocol, understood by mutter, KWin, xfwm4,
  * openbox ...; stock) at window coordinates x, y */
+/* SDL_SetWindowShape: as stock, the alpha channel (stretched to the window
+ * size) becomes the input shape - pixels with alpha 0 let clicks through;
+ * what is visible is up to the ARGB contents. NULL restores the default. */
+static bool x11_UpdateWindowShape(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *shape)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return SDL_SetError("Invalid window");
+    }
+    if (!x11.has_shape) {
+        return SDL_Unsupported();
+    }
+    if (!shape) {
+        X11_xcb_shape_mask(x11.conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT, wd->xid, 0, 0, XCB_NONE);
+        x11_flush();
+        return true;
+    }
+    const int w = window->w, h = window->h;
+    if (w <= 0 || h <= 0) {
+        return true;
+    }
+    SDL_Surface *stretched = NULL;
+    if (shape->w != w || shape->h != h) {
+        stretched = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ARGB32);
+        if (!stretched) {
+            return false;
+        }
+        if (!SDL_StretchSurface(shape, NULL, stretched, NULL, SDL_SCALEMODE_LINEAR)) {
+            SDL_DestroySurface(stretched);
+            return false;
+        }
+        shape = stretched;
+    }
+    /* 1-bit image in the server's bitmap format (scanline pad, bit order) */
+    const xcb_setup_t *setup = X11_xcb_get_setup(x11.conn);
+    const int pad = setup->bitmap_format_scanline_pad ? setup->bitmap_format_scanline_pad : 32;
+    const size_t stride = (size_t)(((w + pad - 1) / pad) * pad) / 8;
+    const bool msb = setup->bitmap_format_bit_order == XCB_IMAGE_ORDER_MSB_FIRST;
+    uint8_t *bits = (uint8_t *)calloc((size_t)h, stride);
+    if (!bits) {
+        if (stretched) {
+            SDL_DestroySurface(stretched);
+        }
+        return SDL_OutOfMemory();
+    }
+    for (int y = 0; y < h; y++) {
+        /* ARGB32 is A,R,G,B in memory: alpha is byte 0 */
+        const Uint8 *a = (const Uint8 *)shape->pixels + (size_t)y * (size_t)shape->pitch;
+        uint8_t *row = bits + (size_t)y * stride;
+        for (int x = 0; x < w; x++, a += 4) {
+            if (*a != SDL_ALPHA_TRANSPARENT) {
+                row[x / 8] |= (uint8_t)(msb ? 0x80 >> (x % 8) : 1 << (x % 8));
+            }
+        }
+    }
+    if (stretched) {
+        SDL_DestroySurface(stretched);
+    }
+    xcb_pixmap_t pm = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_pixmap(x11.conn, 1, pm, wd->xid, (uint16_t)w, (uint16_t)h);
+    xcb_gcontext_t gc = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_gc(x11.conn, gc, pm, 0, NULL);
+    int rows = (int)((x11.max_request_bytes - 64) / stride);
+    if (rows < 1) {
+        rows = 1;
+    }
+    for (int y = 0; y < h; y += rows) {
+        const int n = SDL_min(rows, h - y);
+        X11_xcb_put_image(x11.conn, XCB_IMAGE_FORMAT_XY_PIXMAP, pm, gc, (uint16_t)w, (uint16_t)n, 0, (int16_t)y, 0, 1,
+                          (uint32_t)(stride * (size_t)n), bits + (size_t)y * stride);
+    }
+    free(bits);
+    X11_xcb_shape_mask(x11.conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT, wd->xid, 0, 0, pm);
+    X11_xcb_free_gc(x11.conn, gc);
+    X11_xcb_free_pixmap(x11.conn, pm);
+    x11_flush();
+    return true;
+}
+
 static void x11_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *window, int x, int y)
 {
     (void)device;
@@ -3975,6 +4072,7 @@ SDLop_VideoDevice SDLop_x11_device = {
     .SetWindowParent = x11_SetWindowParent,
     .SetWindowHitTest = x11_SetWindowHitTest,
     .ShowWindowSystemMenu = x11_ShowWindowSystemMenu,
+    .UpdateWindowShape = x11_UpdateWindowShape,
     .SetWindowModal = x11_SetWindowModal,
     .SetWindowBordered = x11_SetWindowBordered,
     .SetWindowResizable = x11_SetWindowResizable,

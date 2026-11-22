@@ -553,6 +553,14 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
         SDLOP_OnWindowMoved(window);
     } else if (window && type == SDL_EVENT_WINDOW_RESIZED) {
         SDLOP_GL_NotifyWindowResized(window);
+        /* SDL_OnWindowResized: the shape follows the window size */
+        if ((window->flags & SDL_WINDOW_TRANSPARENT) && sdlop.video && sdlop.video->UpdateWindowShape) {
+            SDL_Surface *shape =
+                (SDL_Surface *)SDL_GetPointerProperty(window->props, SDL_PROP_WINDOW_SHAPE_POINTER, NULL);
+            if (shape) {
+                sdlop.video->UpdateWindowShape(sdlop.video, window, shape);
+            }
+        }
     }
     /* SDL_OnWindowFocusGained/Lost: grabs only hold while focused */
     if (window && (type == SDL_EVENT_WINDOW_FOCUS_GAINED || type == SDL_EVENT_WINDOW_FOCUS_LOST) &&
