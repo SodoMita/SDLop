@@ -651,6 +651,11 @@ if(SDLop_BUILD_TESTS)
       add_test(NAME ${t} COMMAND ${t})
     endforeach()
     set_tests_properties(test_win32_scancodes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+    # These two inject keyboard input through SendInput and assert exactly one
+    # delivery: run beside a test that steals the foreground window and the
+    # injected keys go to the other window, so every event count reads 0.
+    set_tests_properties(test_win32_raw_keyboard_once test_win32_raw_input_events
+                         PROPERTIES RUN_SERIAL TRUE)
     # These inject input or drive global OS state (clipboard, foreground
     # window, system-wide button mask), so they must not run beside anything.
     foreach(t test_win32_cursor test_win32_hittest test_win32_shape

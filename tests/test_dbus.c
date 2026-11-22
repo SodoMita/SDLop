@@ -82,7 +82,7 @@ static bool send_msg(int fd, SDLop_DBusMsg *m)
     size_t len;
     SDLOP_DBus_SetSender(m, "org.freedesktop.DBus");
     Uint8 *b = SDLOP_DBus_Serialize(m, ++server_serial, &len);
-    bool ok = b && write(fd, b, len) == (ssize_t)len;
+    bool ok = b && send(fd, b, len, MSG_NOSIGNAL) == (ssize_t)len; /* client may be gone */
     free(b);
     SDLOP_DBus_FreeMessage(m);
     return ok;
@@ -292,7 +292,7 @@ static void serve(int fd, int conn)
         return;
     }
     const char *ok = "OK 0123456789abcdef0123456789abcdef\r\n";
-    if (write(fd, ok, strlen(ok)) < 0) {
+    if (send(fd, ok, strlen(ok), MSG_NOSIGNAL) < 0) {
         return;
     }
     Uint8 *buf = malloc(65536);

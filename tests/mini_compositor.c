@@ -2653,6 +2653,9 @@ static struct wl_listener client_listener = { .notify = client_connected };
 
 int main(void)
 {
+    /* data-offer pipes and client sockets: a client that went away must not
+     * kill the compositor mid-test (a standalone process, nothing inherits) */
+    signal(SIGPIPE, SIG_IGN);
     M.display = wl_display_create();
     if (!M.display) {
         fprintf(stderr, "mini: wl_display_create failed\n");

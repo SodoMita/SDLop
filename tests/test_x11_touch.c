@@ -97,8 +97,8 @@ static int connect_real_server(void)
 static bool write_all(int fd, const unsigned char *p, size_t n)
 {
     while (n > 0) {
-        /* the peer may already be gone during teardown; a bare write() then
-         * raises SIGPIPE and kills the whole test with no output at all */
+        /* not write(): a peer closed during teardown would raise SIGPIPE
+         * and kill the test silently (rc 141, no output) */
         ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
         if (w < 0) {
             if (errno == EINTR) {

@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
@@ -243,11 +244,18 @@ static void *offer_receive(Offer *o, const char *mime, size_t *length)
 
 static void write_pipe(int fd, const void *data, size_t size)
 {
-    /* the reader may go away mid-transfer: no SIGPIPE (stock does the same) */
-    struct sigaction ign, old;
-    memset(&ign, 0, sizeof(ign));
-    ign.sa_handler = SIG_IGN;
-    sigaction(SIGPIPE, &ign, &old);
+    /* The reader may go away mid-transfer. Block SIGPIPE in this thread
+     * only, as stock does: changing the process-wide disposition would also
+     * drop the application's own SIGPIPE handling in every other thread for
+     * the length of the transfer. A SIGPIPE raised by our write stays pending
+     * and is consumed below, unless one was already pending before. */
+    sigset_t pipe_set, old_set, pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &old_set);
+    sigpending(&pending);
+    const bool was_pending = sigismember(&pending, SIGPIPE) == 1;
+    bool got_epipe = false;
     int flags = fcntl(fd, F_GETFL);
     if (flags >= 0) {
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -262,6 +270,7 @@ static void write_pipe(int fd, const void *data, size_t size)
             continue;
         }
         if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            got_epipe = errno == EPIPE;
             break; /* EPIPE: reader gone */
         }
         if (SDLOP_MonotonicNS() - last > 2000000000ull) {
@@ -270,7 +279,12 @@ static void write_pipe(int fd, const void *data, size_t size)
         struct pollfd pfd = { fd, POLLOUT, 0 };
         poll(&pfd, 1, 50);
     }
-    sigaction(SIGPIPE, &old, NULL);
+    if (got_epipe && !was_pending) {
+        const struct timespec zero = { 0, 0 };
+        while (sigtimedwait(&pipe_set, NULL, &zero) < 0 && errno == EINTR) {
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &old_set, NULL);
 }
 
 static void source_target(void *data, struct wl_data_source *source, const char *mime)
