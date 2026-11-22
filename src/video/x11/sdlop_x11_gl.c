@@ -757,7 +757,7 @@ static bool glx_init(void)
  * used, which is what stock does (it takes the first config regardless of
  * the window's visual); Mesa accepts a context config of the window's depth
  * on that drawable. */
-static bool glx_pick_config(xcb_visualid_t visual, GLXFBConfig_ *out, xcb_visualid_t *out_visual)
+static bool glx_pick_config(xcb_visualid_t visual, GLXFBConfig_ *out, xcb_visualid_t *out_visual, bool prefer_argb)
 {
     int attribs[64];
     int n = 0;
@@ -813,6 +813,20 @@ static bool glx_pick_config(xcb_visualid_t visual, GLXFBConfig_ *out, xcb_visual
     }
     int exact = -1, compatible = -1;
     xcb_visualid_t compatible_vid = 0;
+    /* SDL_WINDOW_TRANSPARENT: the first config on an ARGB visual, as stock's
+     * X11_GL_GetVisual(transparent) */
+    for (int i = 0; prefer_argb && !visual && i < num; i++) {
+        int vid = 0;
+        if (glx.GetFBConfigAttrib(glx.dpy, configs[i], GLX_VISUAL_ID_, &vid) == 0 &&
+            SDLOP_X11_IsARGBVisual((xcb_visualid_t)vid)) {
+            *out = configs[i];
+            if (out_visual) {
+                *out_visual = (xcb_visualid_t)vid;
+            }
+            glx.XFree(configs);
+            return true;
+        }
+    }
     for (int i = 0; i < num && exact < 0; i++) {
         int vid = 0;
         if (glx.GetFBConfigAttrib(glx.dpy, configs[i], GLX_VISUAL_ID_, &vid) != 0 || vid == 0) {
@@ -820,7 +834,8 @@ static bool glx_pick_config(xcb_visualid_t visual, GLXFBConfig_ *out, xcb_visual
         }
         if (visual && (xcb_visualid_t)vid == visual) {
             exact = i;
-        } else if (compatible < 0 && SDLOP_X11_IsCompatibleVisual((xcb_visualid_t)vid)) {
+        } else if (compatible < 0 && (SDLOP_X11_IsARGBVisual(visual) ? SDLOP_X11_IsARGBVisual((xcb_visualid_t)vid)
+                                                                     : SDLOP_X11_IsCompatibleVisual((xcb_visualid_t)vid))) {
             compatible = i;
             compatible_vid = (xcb_visualid_t)vid;
             if (!visual) {
@@ -851,7 +866,7 @@ static void *glx_CreateContext(xcb_visualid_t visual)
 {
     const bool es = sdlop_glattrs.profile_mask == SDL_GL_CONTEXT_PROFILE_ES;
     GLXFBConfig_ config = NULL;
-    if (!glx_pick_config(visual, &config, NULL)) {
+    if (!glx_pick_config(visual, &config, NULL, false)) {
         return NULL;
     }
     GLXContext_ share = NULL;
@@ -1045,7 +1060,7 @@ static bool current_is_glx(void)
     return cur && cur->backend == X11GL_BACKEND_GLX;
 }
 
-xcb_visualid_t SDLOP_X11_GL_ChooseWindowVisual(void)
+xcb_visualid_t SDLOP_X11_GL_ChooseWindowVisual(bool transparent)
 {
     /* the generic offload path never renders into the X drawable */
     if (SDLOP_GLOffload_GetPolicy() == SDLOP_GL_OFFLOAD_FORCE && SDLOP_GLOffload_HasHardwareGPU()) {
@@ -1061,7 +1076,7 @@ xcb_visualid_t SDLOP_X11_GL_ChooseWindowVisual(void)
     /* EGL contexts keep the default visual: EGL's configs carry the visual
      * of the window they are created for, so pick_config honours the
      * request on it already */
-    if (want_glx() && glx_pick_config(0, &config, &visual)) {
+    if (want_glx() && glx_pick_config(0, &config, &visual, transparent)) {
         SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO, "SDLop: GL window visual 0x%x (default 0x%x)", (unsigned)visual,
                      (unsigned)SDLOP_X11_GetVisual());
     } else {
@@ -1089,7 +1104,7 @@ void *SDLOP_X11_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     const bool es = sdlop_glattrs.profile_mask == SDL_GL_CONTEXT_PROFILE_ES;
     if (want_glx()) {
         GLXFBConfig_ probe = NULL;
-        if (glx_pick_config(visual, &probe, NULL)) {
+        if (glx_pick_config(visual, &probe, NULL, false)) {
             void *ctx = glx_CreateContext(visual);
             if (ctx || !es) {
                 /* desktop GL: a refused version is the answer, as in stock */

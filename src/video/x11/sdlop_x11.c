@@ -143,7 +143,9 @@ typedef struct X11WindowData
     /* GL */
     bool gl_active;
     void *egl_surface;
-    xcb_visualid_t visual;        /* x11.visual, or the GLX config's visual */
+    xcb_visualid_t visual;        /* x11.visual, the GLX config's visual or x11.argb_visual */
+    uint8_t depth;                /* depth of that visual: x11.depth, or 32 for ARGB */
+    bool clear_explicit;          /* SDLop_SetWindowClearColor called (opaque even when ARGB) */
     xcb_colormap_t colormap;      /* own colormap for a non-default visual */
 
     /* state the app has been told about (window->flags may be preset by
@@ -197,6 +199,7 @@ typedef struct X11DeviceData
     xcb_visualid_t visual;
     uint8_t depth;
     bool fb_format_ok;            /* root visual is 24/32-bit TrueColor XRGB */
+    xcb_visualid_t argb_visual;   /* depth-32 TrueColor ARGB8888 visual (SDL_WINDOW_TRANSPARENT), 0 = none */
     uint32_t max_request_bytes;
     X11Atoms atom;
     bool dead;                    /* connection error seen */
@@ -685,6 +688,10 @@ static void fb_fill_clear(SDL_Window *window)
 {
     X11WindowData *wd = wdata(window);
     uint32_t color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
+    if (wd->depth == 32) {
+        /* SDL_WINDOW_TRANSPARENT: fully transparent unless a colour was set */
+        color = wd->clear_explicit ? (color | 0xff000000u) : 0;
+    }
     size_t n = (size_t)wd->fb_w * (size_t)wd->fb_h;
     for (size_t i = 0; i < n; i++) {
         wd->pixels[i] = color;
@@ -769,7 +776,7 @@ static void fb_put(X11WindowData *wd, int x, int y, int w, int h)
     if (wd->fb_shm) {
         X11_xcb_shm_put_image(x11.conn, wd->xid, wd->gc, (uint16_t)wd->fb_w, (uint16_t)wd->fb_h,
                               (int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h, (int16_t)x, (int16_t)y,
-                              x11.depth, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, wd->shm_seg, 0);
+                              wd->depth, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, wd->shm_seg, 0);
         return;
     }
     /* full-width row bands that fit the maximum request size */
@@ -781,7 +788,7 @@ static void fb_put(X11WindowData *wd, int x, int y, int w, int h)
     for (int row = y; row < y + h; row += rows) {
         int n = SDL_min(rows, y + h - row);
         X11_xcb_put_image(x11.conn, XCB_IMAGE_FORMAT_Z_PIXMAP, wd->xid, wd->gc, (uint16_t)wd->fb_w,
-                          (uint16_t)n, 0, (int16_t)row, 0, x11.depth, (uint32_t)(stride * (size_t)n),
+                          (uint16_t)n, 0, (int16_t)row, 0, wd->depth, (uint32_t)(stride * (size_t)n),
                           (const uint8_t *)(wd->pixels + (size_t)row * (size_t)wd->fb_w));
     }
 }
@@ -836,7 +843,9 @@ static bool x11_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *w
     if (!fb_alloc(window, window->w, window->h)) {
         return false;
     }
-    SDL_Surface *s = SDL_CreateSurfaceFrom(wd->fb_w, wd->fb_h, SDL_PIXELFORMAT_XRGB8888, wd->pixels, wd->fb_w * 4);
+    /* ARGB visual: the compositor takes the alpha channel (premultiplied) */
+    const SDL_PixelFormat fmt = wd->depth == 32 ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_XRGB8888;
+    SDL_Surface *s = SDL_CreateSurfaceFrom(wd->fb_w, wd->fb_h, fmt, wd->pixels, wd->fb_w * 4);
     if (!s) {
         return false;
     }
@@ -918,6 +927,30 @@ bool SDLOP_X11_IsCompatibleVisual(xcb_visualid_t visual)
         for (; vi.rem; X11_xcb_visualtype_next(&vi)) {
             if (vi.data->visual_id == visual) {
                 return vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR;
+            }
+        }
+    }
+    return false;
+}
+
+bool SDLOP_X11_IsARGBVisual(xcb_visualid_t visual)
+{
+    if (!x11.screen || visual == 0 || !x11.argb_visual) {
+        return false;
+    }
+    if (visual == x11.argb_visual) {
+        return true;
+    }
+    xcb_depth_iterator_t di = X11_xcb_screen_allowed_depths_iterator(x11.screen);
+    for (; di.rem; X11_xcb_depth_next(&di)) {
+        if (di.data->depth != 32) {
+            continue;
+        }
+        xcb_visualtype_iterator_t vi = X11_xcb_depth_visuals_iterator(di.data);
+        for (; vi.rem; X11_xcb_visualtype_next(&vi)) {
+            if (vi.data->visual_id == visual) {
+                return vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR && vi.data->red_mask == 0xff0000 &&
+                       vi.data->green_mask == 0x00ff00 && vi.data->blue_mask == 0x0000ff;
             }
         }
     }
@@ -1841,6 +1874,36 @@ static Uint32 x11_device_next_id(void)
     return ++next_id;
 }
 
+/* the visual compositors treat as translucent: depth 32, TrueColor, the
+ * remaining 8 bits alpha; needs a 32 bpp pixmap format for depth 32 */
+static void find_argb_visual(bool order_ok)
+{
+    x11.argb_visual = 0;
+    const xcb_setup_t *setup = X11_xcb_get_setup(x11.conn);
+    const xcb_format_t *fmts = X11_xcb_setup_pixmap_formats(setup);
+    bool bpp32 = false;
+    for (int i = 0; i < X11_xcb_setup_pixmap_formats_length(setup); i++) {
+        bpp32 = bpp32 || (fmts[i].depth == 32 && fmts[i].bits_per_pixel == 32);
+    }
+    if (!bpp32 || !order_ok) {
+        return;
+    }
+    xcb_depth_iterator_t di = X11_xcb_screen_allowed_depths_iterator(x11.screen);
+    for (; di.rem && !x11.argb_visual; X11_xcb_depth_next(&di)) {
+        if (di.data->depth != 32) {
+            continue;
+        }
+        xcb_visualtype_iterator_t vi = X11_xcb_depth_visuals_iterator(di.data);
+        for (; vi.rem; X11_xcb_visualtype_next(&vi)) {
+            if (vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR && vi.data->red_mask == 0xff0000 &&
+                vi.data->green_mask == 0x00ff00 && vi.data->blue_mask == 0x0000ff) {
+                x11.argb_visual = vi.data->visual_id;
+                break;
+            }
+        }
+    }
+}
+
 static bool find_visual_format(void)
 {
     x11.visual = x11.screen->root_visual;
@@ -1868,6 +1931,7 @@ static bool find_visual_format(void)
             bool little = *(const uint8_t *)&one == 1;
             bool order_ok = (setup->image_byte_order == XCB_IMAGE_ORDER_LSB_FIRST) == little;
             x11.fb_format_ok = truecolor && xrgb && bpp32 && order_ok && (x11.depth == 24 || x11.depth == 32);
+            find_argb_visual(order_ok);
             return true;
         }
     }
@@ -2070,11 +2134,22 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
      * the root visual is bound to one fixed config (typically RGBA8888 with
      * depth 24 / stencil 8), so keeping it would override the request. */
     wd->visual = x11.visual;
+    wd->depth = x11.depth;
+    const bool transparent = (window->flags & SDL_WINDOW_TRANSPARENT) && x11.argb_visual;
     if (window->flags & SDL_WINDOW_OPENGL) {
-        xcb_visualid_t gl_visual = SDLOP_X11_GL_ChooseWindowVisual();
-        if (gl_visual && SDLOP_X11_IsCompatibleVisual(gl_visual)) {
+        xcb_visualid_t gl_visual = SDLOP_X11_GL_ChooseWindowVisual(transparent);
+        if (gl_visual && (SDLOP_X11_IsCompatibleVisual(gl_visual) ||
+                          (transparent && SDLOP_X11_IsARGBVisual(gl_visual)))) {
             wd->visual = gl_visual;
         }
+    }
+    /* SDL_WINDOW_TRANSPARENT: an ARGB visual (software surfaces too, and
+     * EGL, whose config follows the window's visual) */
+    if (transparent && (wd->visual == x11.visual || SDLOP_X11_IsARGBVisual(wd->visual))) {
+        if (wd->visual == x11.visual) {
+            wd->visual = x11.argb_visual;
+        }
+        wd->depth = 32;
     }
     /* a visual other than the parent's needs its own colormap (BadMatch) */
     if (wd->visual != x11.visual) {
@@ -2085,7 +2160,7 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     uint32_t mask = (gpu ? XCB_CW_BACK_PIXMAP : XCB_CW_BACK_PIXEL) | XCB_CW_BORDER_PIXEL |
                     XCB_CW_BIT_GRAVITY | XCB_CW_EVENT_MASK | (wd->colormap ? XCB_CW_COLORMAP : 0);
     uint32_t values[5] = {
-        gpu ? XCB_BACK_PIXMAP_NONE : clear,
+        gpu ? XCB_BACK_PIXMAP_NONE : (wd->depth == 32 ? 0 : clear),
         0,
         XCB_GRAVITY_NORTH_WEST,
         XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS |
@@ -2095,7 +2170,7 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         wd->colormap, /* value order follows the mask bits: COLORMAP is last */
     };
     xcb_generic_error_t *err = X11_xcb_request_check(
-        x11.conn, X11_xcb_create_window_checked(x11.conn, XCB_COPY_FROM_PARENT, wd->xid, x11.root,
+        x11.conn, X11_xcb_create_window_checked(x11.conn, wd->depth, wd->xid, x11.root,
                                                 (int16_t)window->x, (int16_t)window->y, (uint16_t)window->w,
                                                 (uint16_t)window->h, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
                                                 wd->visual, mask, values));
@@ -2634,6 +2709,10 @@ static void x11_SetWindowClearColor(SDLop_VideoDevice *device, SDL_Window *windo
         return;
     }
     uint32_t color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
+    wd->clear_explicit = true;
+    if (wd->depth == 32) {
+        color |= 0xff000000u; /* ARGB visual: an explicit clear colour is opaque */
+    }
     if (!(window->flags & (SDL_WINDOW_OPENGL | SDL_WINDOW_VULKAN))) {
         X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_BACK_PIXEL, &color);
     }
