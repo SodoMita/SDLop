@@ -180,14 +180,9 @@ static bool touch_mouse_enabled(void)
     return SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_TOUCH_MOUSE_EVENTS), true);
 }
 
-static void touch_mouse_event(Uint32 type, SDL_Window *window, float x, float y, Uint64 timestamp_ns)
+void SDLOP_SendSyntheticMouse(Uint32 type, SDL_Window *window, float fx, float fy, Uint8 button,
+                              SDL_MouseID which, Uint64 timestamp_ns)
 {
-    /* SDL3: position = normalized * window size, clamped into the window */
-    float fx = x * (float)window->w;
-    float fy = y * (float)window->h;
-    fx = SDL_max(0.0f, SDL_min(fx, (float)(window->w - 1)));
-    fy = SDL_max(0.0f, SDL_min(fy, (float)(window->h - 1)));
-
     if (sdlop.mouse_focus != window && type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
         /* SDL_UpdateMouseFocus: the touched window gets the mouse focus */
         if (sdlop.mouse_focus) {
@@ -216,7 +211,7 @@ static void touch_mouse_event(Uint32 type, SDL_Window *window, float x, float y,
         event.motion.type = SDL_EVENT_MOUSE_MOTION;
         event.motion.timestamp = ts;
         event.motion.windowID = window->id;
-        event.motion.which = SDL_TOUCH_MOUSEID;
+        event.motion.which = which;
         event.motion.state = sdlop.mouse_buttons;
         event.motion.x = fx;
         event.motion.y = fy;
@@ -229,21 +224,31 @@ static void touch_mouse_event(Uint32 type, SDL_Window *window, float x, float y,
     }
     bool down = type == SDL_EVENT_MOUSE_BUTTON_DOWN;
     if (down) {
-        sdlop.mouse_buttons |= SDL_BUTTON_LMASK;
+        sdlop.mouse_buttons |= SDL_BUTTON_MASK(button);
     } else {
-        sdlop.mouse_buttons &= ~SDL_BUTTON_LMASK;
+        sdlop.mouse_buttons &= ~SDL_BUTTON_MASK(button);
     }
     SDL_zero(event);
     event.button.type = type;
     event.button.timestamp = ts;
     event.button.windowID = window->id;
-    event.button.which = SDL_TOUCH_MOUSEID;
-    event.button.button = SDL_BUTTON_LEFT;
+    event.button.which = which;
+    event.button.button = button;
     event.button.down = down;
     event.button.clicks = 1;
     event.button.x = fx;
     event.button.y = fy;
     SDLOP_PushEventInternal(&event);
+}
+
+static void touch_mouse_event(Uint32 type, SDL_Window *window, float x, float y, Uint64 timestamp_ns)
+{
+    /* SDL3: position = normalized * window size, clamped into the window */
+    float fx = x * (float)window->w;
+    float fy = y * (float)window->h;
+    fx = SDL_max(0.0f, SDL_min(fx, (float)(window->w - 1)));
+    fy = SDL_max(0.0f, SDL_min(fy, (float)(window->h - 1)));
+    SDLOP_SendSyntheticMouse(type, window, fx, fy, SDL_BUTTON_LEFT, SDL_TOUCH_MOUSEID, timestamp_ns);
 }
 
 static void touch_to_mouse(Uint32 type, SDL_TouchID touchID, SDL_FingerID fingerID, float x, float y,
@@ -299,8 +304,11 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
                      Uint64 timestamp_ns)
 {
     SDLOP_TrackTouch(type, touchID, fingerID, x, y, pressure);
-    /* SDL3 order: the synthetic mouse events precede the finger event */
-    touch_to_mouse(type, touchID, fingerID, x, y, windowID, timestamp_ns);
+    /* SDL3 order: the synthetic mouse events precede the finger event; pens
+     * make their own mouse events (SDL_HINT_PEN_MOUSE_EVENTS) */
+    if (touchID != SDL_PEN_TOUCHID) {
+        touch_to_mouse(type, touchID, fingerID, x, y, windowID, timestamp_ns);
+    }
 
     SDL_Event event;
     SDL_zero(event);
@@ -317,8 +325,31 @@ void SDLOP_SendTouch(Uint32 type, Uint64 touchID, Uint64 fingerID, float x, floa
     SDLOP_PushEventInternal(&event);
 }
 
+/* stock SDL_SendPinch: the backends pass the protocol's scale through
+ * (Wayland and XI 2.4 both report it relative to the gesture start) */
+void SDLOP_SendPinch(Uint32 type, Uint64 timestamp_ns, SDL_Window *window, float scale)
+{
+    if (!SDL_EventEnabled(type)) {
+        return;
+    }
+    SDL_Event event;
+    SDL_zero(event);
+    event.pinch.type = type;
+    event.pinch.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
+    event.pinch.scale = scale;
+    event.pinch.windowID = window ? window->id : 0;
+    SDLOP_PushEventInternal(&event);
+}
+
 
 void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
+{
+    SDLOP_SendMouseWheelDirection(x, y, SDL_MOUSEWHEEL_NORMAL, timestamp_ns);
+}
+
+/* FLIPPED: natural scrolling; like stock the values are not negated, the
+ * application multiplies by -1 if it wants the physical direction */
+void SDLOP_SendMouseWheelDirection(float x, float y, SDL_MouseWheelDirection direction, Uint64 timestamp_ns)
 {
     if (x == 0.0f && y == 0.0f) {
         return;
@@ -331,7 +362,7 @@ void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
     event.wheel.which = 0;
     event.wheel.x = x;
     event.wheel.y = y;
-    event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+    event.wheel.direction = direction;
     event.wheel.mouse_x = sdlop.mouse_x;
     event.wheel.mouse_y = sdlop.mouse_y;
     SDLOP_PushEventInternal(&event);

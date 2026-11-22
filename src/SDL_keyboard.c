@@ -692,6 +692,22 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
     }
     SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[rawcode];
     if (!xkb_st) {
+        /* built-in US table: everything but modifiers and locks repeats
+         * (xkb's default), printable keys type their character unless a
+         * command modifier is held */
+        const bool modifier_or_lock = (sc >= SDL_SCANCODE_LCTRL && sc <= SDL_SCANCODE_RGUI) ||
+                                      sc == SDL_SCANCODE_CAPSLOCK || sc == SDL_SCANCODE_NUMLOCKCLEAR ||
+                                      sc == SDL_SCANCODE_SCROLLLOCK || sc == SDL_SCANCODE_MODE;
+        if (repeats_out) {
+            *repeats_out = sc != SDL_SCANCODE_UNKNOWN && !modifier_or_lock;
+        }
+        if (key_event && text_utf8 && text_size >= 2 && !(sdlop.modstate & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+            const SDL_Keycode t = default_key_from_scancode(sc, sdlop.modstate);
+            if (t >= 0x20 && t < 0x7f) {
+                text_utf8[0] = (char)t;
+                text_utf8[1] = '\0';
+            }
+        }
         return default_key_from_scancode(sc, SDL_KMOD_NONE);
     }
     xkb_keycode_t xk = (xkb_keycode_t)rawcode + 8; /* evdev -> xkb offset */
@@ -791,6 +807,17 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
      * track modifiers/locks; wayland additionally receives absolute masks
      * from the compositor, which simply re-assert this state). Repeats are
      * already reflected in the state from the initial press. */
+    if (!xkb_st && down && !repeat) {
+        /* no xkb state to track the locks: toggle them here */
+        if (scancode == SDL_SCANCODE_CAPSLOCK) {
+            mod ^= SDL_KMOD_CAPS;
+        } else if (scancode == SDL_SCANCODE_NUMLOCKCLEAR) {
+            mod ^= SDL_KMOD_NUM;
+        } else if (scancode == SDL_SCANCODE_SCROLLLOCK) {
+            mod ^= SDL_KMOD_SCROLL;
+        }
+        sdlop.modstate = mod;
+    }
     if (xkb_st && xkb_raw && !repeat) {
         SDLOP_XKB_xkb_state_update_key(xkb_st, (xkb_keycode_t)xkb_raw + 8,
                                        down ? XKB_KEY_DOWN : XKB_KEY_UP);
@@ -824,7 +851,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
 
     /* key repeat management (raw path has no server-generated repeats) */
     if (down && !repeat) {
-        if (key_repeats) {
+        if (key_repeats && !sdlop.repeat_disabled) {
             sdlop.repeat_scancode = scancode;
             sdlop.repeat_rawcode = rawcode;
             sdlop.repeat_active = true;

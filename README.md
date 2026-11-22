@@ -248,7 +248,7 @@ and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
 
 ## API surface (SDL3-compatible)
 
-737 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+741 SDL3 functions; every one is declared in `include/SDL3/` (generated from
 the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
 with the same signature as SDL3, and checked by the `api_exports` test.
 
@@ -263,7 +263,7 @@ with the same signature as SDL3, and checked by the `api_exports` test.
 | OpenGL / Vulkan | GLX (X11 desktop GL) and EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks; NULL for GLX contexts, as stock), Vulkan WSI (`SDL_Vulkan_*`) |
 | Filesystem | `SDL_GetBasePath`, `SDL_GetPrefPath`, `SDL_GetUserFolder` (XDG), `SDL_CreateDirectory`, `SDL_EnumerateDirectory`, `SDL_GetPathInfo`, `SDL_CopyFile`, `SDL_RenamePath`, `SDL_RemovePath`, `SDL_GetCurrentDirectory` (no `SDL_GlobDirectory`) |
 | Joystick / gamepad | the whole `SDL_joystick.h` / `SDL_gamepad.h` API, behaving like stock SDL3 with no controller attached: empty device lists, opens fail with an error, NULL handles are harmless, string/label helpers work |
-| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings |
+| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings, system theme (settings portal, `SDL_EVENT_SYSTEM_THEME_CHANGED`) and window progress (Unity launcher API) over a built-in D-Bus client (no libdbus; `SDLOP_NO_DBUS=1` turns it off), file dialogs (`SDL_Show*FileDialog`, `SDL_ShowOpenFolderDialog`: xdg-desktop-portal, else zenity; `SDL_HINT_FILE_DIALOG_DRIVER`; modal to the parent window on X11 and, through xdg-foreign, on Wayland) |
 
 Unsupported with an SDL error (like a stock SDL3 build without that feature):
 FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).
@@ -486,12 +486,22 @@ Highlights:
 - Wayland cannot position toplevel windows: `SDL_SetWindowPosition` returns
   false for them. Popup and tooltip windows are `xdg_popup`s placed relative
   to their parent (menus grab input and close on outside clicks). Requests
-  without a Wayland protocol (always-on-top, opacity, icon, modal, borders
-  size) report "That operation is not supported", as in SDL3. Optional
-  protocols used when the compositor offers them: xdg-decoration (server-side
-  borders), xdg-activation (raise/flash), idle-inhibit (screensaver),
-  keyboard-shortcuts-inhibit (keyboard grab), pointer constraints (mouse grab,
-  mouse rect, relative mode).
+  without a Wayland protocol (always-on-top, borders size; opacity and icon
+  when the compositor lacks alpha-modifier / xdg-toplevel-icon) report "That
+  operation is not supported", as in SDL3. Optional protocols used when the
+  compositor offers them: xdg-decoration (server-side borders), xdg-activation
+  (raise/flash), idle-inhibit (screensaver), keyboard-shortcuts-inhibit
+  (keyboard grab), pointer constraints (mouse grab, mouse rect, relative
+  mode), alpha-modifier (opacity), xdg-toplevel-icon, xdg-dialog (modal),
+  xdg-foreign (`SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING`,
+  the file chooser portal's parent).
+  `SDL_WINDOW_TRANSPARENT` windows get ARGB8888 shm buffers and window
+  surfaces (premultiplied alpha, as in stock), start fully transparent
+  (`SDLop_SetWindowClearColor` makes the clear opaque) and EGL configs with
+  alpha (`SDL_GL_ALPHA_SIZE` 8 when it was 0); every other window that is
+  fully opaque sets a `wl_surface` opaque region so the compositor can skip
+  blending. GL rendered through the offload fallback (no native EGL window)
+  is still presented opaque.
 - X11 specifics: EWMH (`_NET_WM_STATE`) is used for fullscreen/maximize when a
   WM advertises it; without a WM SDLop emulates both (borderless
   display-sized window, like SDL3's legacy path). Key repeat is detected via
@@ -518,7 +528,13 @@ Highlights:
   `SDL_GL_CONTEXT_ROBUST_ACCESS_FLAG` / `SDL_GL_CONTEXT_RESET_NOTIFICATION`
   (`GLX_ARB_create_context_robustness`) and
   `SDL_GL_CONTEXT_RELEASE_BEHAVIOR` (`GLX_ARB_context_flush_control`), each
-  only when the server has the extension (otherwise ignored). Swap control:
+  only when the server has the extension (otherwise ignored). Framebuffer
+  attributes (`SDL_GL_ALPHA_SIZE`, `SDL_GL_DEPTH_SIZE`, `SDL_GL_STENCIL_SIZE`,
+  ...) pick the driver's best `glXChooseFBConfig` match and OpenGL windows
+  are created with that config's X visual, as in stock SDL3 / GLFW (RGB888 +
+  depth 0 gets exactly that; set them before `SDL_CreateWindow`).
+  `SDL_GL_GetAttribute` reports the realised sizes of the current context
+  (all backends), like stock. Swap control:
   `GLX_EXT_swap_control` (+ `_tear` for adaptive vsync, interval -1), else
   MESA, else SGI; as in stock SDL3, `SDL_GL_SetSwapInterval` fails with "not
   supported" when there is none (e.g. Xvfb).

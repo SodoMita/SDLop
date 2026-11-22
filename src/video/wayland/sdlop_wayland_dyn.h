@@ -108,6 +108,10 @@ extern void SDLOP_Wayland_UnloadSymbols(void);
 #define wl_surface_interface SDLOP_WL_wl_surface_interface_obj
 #define wl_region_interface SDLOP_WL_wl_region_interface_obj
 #define wl_output_interface SDLOP_WL_wl_output_interface_obj
+#define wl_data_device_manager_interface SDLOP_WL_wl_data_device_manager_interface_obj
+#define wl_data_device_interface SDLOP_WL_wl_data_device_interface_obj
+#define wl_data_source_interface SDLOP_WL_wl_data_source_interface_obj
+#define wl_data_offer_interface SDLOP_WL_wl_data_offer_interface_obj
 
 /* Inlines + core protocol structs, compiled against the macros above */
 #include <wayland-client-protocol.h>

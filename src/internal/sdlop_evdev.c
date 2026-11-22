@@ -51,6 +51,12 @@ typedef struct SDLOP_RawDevice
     Uint32 index;
     bool is_keyboard;
     bool is_pointer;
+    /* absolute pointer (VM/USB tablet, pen tablet, single-touch screen):
+     * EV_ABS X/Y ranges; BTN_TOUCH is the left button when there's no
+     * BTN_LEFT */
+    bool is_abs;
+    bool touch_is_left;
+    int abs_min[2], abs_range[2];
 } SDLOP_RawDevice;
 
 typedef struct SDLOP_CallbackSet
@@ -139,8 +145,10 @@ static int open_input_devices(void)
         dev->index = (Uint32)raw.num_devices;
         dev->is_keyboard = dev->is_pointer = false;
 
+        dev->is_abs = dev->touch_is_left = false;
+
+        unsigned long keybits[KEY_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
         if (test_bit(evbits, EV_KEY)) {
-            unsigned long keybits[KEY_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
             if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0) {
                 if (test_bit(keybits, KEY_W) || test_bit(keybits, KEY_A)) {
                     dev->is_keyboard = true;
@@ -153,6 +161,29 @@ static int open_input_devices(void)
                 if (test_bit(relbits, REL_X) && test_bit(relbits, REL_Y)) {
                     dev->is_pointer = true;
                 }
+            }
+        }
+        if (!dev->is_pointer && test_bit(evbits, EV_ABS)) {
+            /* udev's input_id rules: X/Y plus a pointer button, not a
+             * touchpad (BTN_TOOL_FINGER: the window system turns those into
+             * relative motion and gestures) and not a joystick */
+            unsigned long absbits[ABS_MAX / (8 * sizeof(unsigned long)) + 1] = { 0 };
+            struct input_absinfo ax, ay;
+            const bool pen = test_bit(keybits, BTN_TOOL_PEN) || test_bit(keybits, BTN_STYLUS);
+            const bool touchpad = test_bit(keybits, BTN_TOOL_FINGER) && !pen;
+            const bool joystick = test_bit(keybits, BTN_TRIGGER) || test_bit(keybits, BTN_A) ||
+                                  test_bit(keybits, BTN_1) || test_bit(keybits, BTN_JOYSTICK);
+            const bool button = test_bit(keybits, BTN_LEFT) || test_bit(keybits, BTN_TOUCH);
+            if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0 && test_bit(absbits, ABS_X) &&
+                test_bit(absbits, ABS_Y) && button && !touchpad && !joystick &&
+                ioctl(fd, EVIOCGABS(ABS_X), &ax) >= 0 && ioctl(fd, EVIOCGABS(ABS_Y), &ay) >= 0 &&
+                ax.maximum > ax.minimum && ay.maximum > ay.minimum) {
+                dev->is_pointer = dev->is_abs = true;
+                dev->touch_is_left = !test_bit(keybits, BTN_LEFT);
+                dev->abs_min[0] = ax.minimum;
+                dev->abs_range[0] = ax.maximum - ax.minimum;
+                dev->abs_min[1] = ay.minimum;
+                dev->abs_range[1] = ay.maximum - ay.minimum;
             }
         }
 
@@ -581,10 +612,138 @@ static bool winsys_keyboard_focus(void)
     return sdlop.keyboard_focus && !sdlop.keyboard_grabbed_elsewhere;
 }
 
+/* absolute pointers, per device (main thread) */
+typedef struct
+{
+    int cur[2];  /* latest raw X/Y */
+    int last[2]; /* raw X/Y of the last motion sent */
+    bool has_cur[2];
+    bool has_last;
+    bool dirty;
+} SDLOP_AbsState;
+static SDLOP_AbsState abs_state[SDLOP_MAX_DEVICES];
+
+/* union of all displays: what an absolute device spans on a desktop */
+static void desktop_size(float *w, float *h)
+{
+    int n = 0;
+    SDL_DisplayID *ids = SDL_GetDisplays(&n);
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    for (int i = 0; ids && i < n; i++) {
+        SDL_Rect r;
+        if (SDL_GetDisplayBounds(ids[i], &r)) {
+            if (i == 0 || r.x < x0) {
+                x0 = r.x;
+            }
+            if (i == 0 || r.y < y0) {
+                y0 = r.y;
+            }
+            if (i == 0 || r.x + r.w > x1) {
+                x1 = r.x + r.w;
+            }
+            if (i == 0 || r.y + r.h > y1) {
+                y1 = r.y + r.h;
+            }
+        }
+    }
+    SDL_free(ids);
+    *w = x1 > x0 ? (float)(x1 - x0) : 1920.0f;
+    *h = y1 > y0 ? (float)(y1 - y0) : 1080.0f;
+}
+
+static void abs_motion(const SDLOP_RawDevice *dev, Uint64 timestamp_ns, bool winsys)
+{
+    SDLOP_AbsState *st = &abs_state[dev->index];
+    if (!st->dirty || !st->has_cur[0] || !st->has_cur[1]) {
+        return;
+    }
+    st->dirty = false;
+    const float nx = (float)(st->cur[0] - dev->abs_min[0]) / (float)dev->abs_range[0];
+    const float ny = (float)(st->cur[1] - dev->abs_min[1]) / (float)dev->abs_range[1];
+    SDL_Window *w = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.keyboard_focus;
+    if (!winsys) {
+        /* console: the window covers the display, like stock's mapping
+         * onto the display mode */
+        if (!w || w->w <= 0 || w->h <= 0) {
+            return;
+        }
+        const float x = SDL_clamp(nx * (float)w->w, 0.0f, (float)(w->w - 1));
+        const float y = SDL_clamp(ny * (float)w->h, 0.0f, (float)(w->h - 1));
+        const float dx = sdlop.mouse_has_position ? x - sdlop.mouse_x : 0.0f;
+        const float dy = sdlop.mouse_has_position ? y - sdlop.mouse_y : 0.0f;
+        st->last[0] = st->cur[0];
+        st->last[1] = st->cur[1];
+        st->has_last = true;
+        SDLOP_SendMouseMotion(x, y, dx, dy, timestamp_ns);
+        return;
+    }
+    /* window system: the device spans the desktop and the window's place
+     * on it is unknown (Wayland), so move by the device's motion scaled to
+     * the desktop, anchored where the window system said the pointer
+     * entered - like relative mice */
+    const bool had_last = st->has_last;
+    const int lx = st->last[0], ly = st->last[1];
+    st->last[0] = st->cur[0];
+    st->last[1] = st->cur[1];
+    st->has_last = true;
+    if (!had_last || (!winsys_pointer_focus() && !sdlop.mouse_buttons)) {
+        return; /* first sample, or not over our window: just track */
+    }
+    float dw, dh;
+    desktop_size(&dw, &dh);
+    const float dx = (float)(st->cur[0] - lx) * dw / (float)dev->abs_range[0];
+    const float dy = (float)(st->cur[1] - ly) * dh / (float)dev->abs_range[1];
+    if (dx == 0.0f && dy == 0.0f) {
+        return;
+    }
+    float x = SDLOP_NO_POS, y = SDLOP_NO_POS;
+    if (w && !sdlop.relative_mode_window) {
+        x = SDL_clamp(sdlop.mouse_x + dx, 0.0f, (float)(w->w - 1));
+        y = SDL_clamp(sdlop.mouse_y + dy, 0.0f, (float)(w->h - 1));
+    } else if (w) {
+        x = sdlop.mouse_x + dx;
+        y = sdlop.mouse_y + dy;
+    }
+    SDLOP_SendMouseMotion(x, y, dx, dy, timestamp_ns);
+}
+
 static void pump_event(const SDLop_RawEvent *ev)
 {
     static float hi_res_x_acc, hi_res_y_acc;
     const bool winsys = raw.winsys;
+    const SDLOP_RawDevice *dev = ev->device < (Uint32)raw.num_devices ? &raw.devices[ev->device] : NULL;
+
+    if (dev && dev->is_abs) {
+        if (ev->type == SDLop_EV_ABS && (ev->code == ABS_X || ev->code == ABS_Y)) {
+            const int axis = ev->code == ABS_Y;
+            abs_state[dev->index].cur[axis] = ev->value;
+            abs_state[dev->index].has_cur[axis] = true;
+            abs_state[dev->index].dirty = true;
+            return;
+        }
+        if (ev->type == SDLop_EV_SYN && ev->code == SDLop_SYN_REPORT) {
+            abs_motion(dev, ev->timestamp_ns, winsys); /* motion first, then this frame's buttons */
+        }
+        if (ev->type == SDLop_EV_KEY && ev->code >= BTN_LEFT && ev->code <= BTN_EXTRA) {
+            abs_motion(dev, ev->timestamp_ns, winsys); /* click where the pointer is */
+        }
+        if (ev->type == SDLop_EV_KEY && (ev->code == BTN_TOUCH || ev->code == BTN_STYLUS || ev->code == BTN_STYLUS2)) {
+            /* pen tip / touch = left, barrel buttons = right / middle */
+            const Uint8 btn = ev->code == BTN_STYLUS ? SDL_BUTTON_RIGHT
+                              : ev->code == BTN_STYLUS2 ? SDL_BUTTON_MIDDLE
+                              : dev->touch_is_left ? SDL_BUTTON_LEFT : 0;
+            if (!btn || ev->value == 2) {
+                return;
+            }
+            abs_motion(dev, ev->timestamp_ns, winsys); /* press where the tip is */
+            if (winsys && !winsys_pointer_focus() &&
+                !(ev->value == 0 && (sdlop.mouse_buttons & SDL_BUTTON_MASK(btn)))) {
+                return;
+            }
+            SDLOP_SendMouseButton(ev->value != 0, btn, SDLOP_NO_POS, SDLOP_NO_POS, ev->timestamp_ns);
+            return;
+        }
+    }
 
     switch (ev->type) {
     case SDLop_EV_KEY: {
@@ -618,8 +777,11 @@ static void pump_event(const SDLop_RawEvent *ev)
         if (sdlop_vt_handle_chord(ev)) {
             return;
         }
-        if (raw_console_foreground() && sc != SDL_SCANCODE_UNKNOWN) {
-            SDLOP_SendKeyboardKey(ev->value != 0, ev->value == 2, sc, ev->code, ev->timestamp_ns);
+        /* kernel autorepeat (value 2) is dropped here too: SDL's own repeat
+           (armed by the press) is the one source of repeats - forwarding
+           both doubled them */
+        if (raw_console_foreground() && sc != SDL_SCANCODE_UNKNOWN && ev->value != 2) {
+            SDLOP_SendKeyboardKey(ev->value != 0, false, sc, ev->code, ev->timestamp_ns);
         }
         break;
     }
@@ -672,6 +834,40 @@ static void pump_event(const SDLop_RawEvent *ev)
     default:
         break;
     }
+}
+
+/* tests: one event through the main-thread translation as if the worker
+ * had read it, under the window-system or console policy */
+/* tests: a fake device entry (no fd) for SDLOP_RawInputTestFeed; only while
+ * the worker isn't running. Returns its index or -1. */
+int SDLOP_RawInputTestAddDevice(bool keyboard, bool pointer, bool absolute, int min_x, int max_x, int min_y, int max_y,
+                                bool touch_is_left)
+{
+    if (raw.running || raw.num_devices >= SDLOP_MAX_DEVICES) {
+        return -1;
+    }
+    SDLOP_RawDevice *dev = &raw.devices[raw.num_devices];
+    memset(dev, 0, sizeof(*dev));
+    dev->fd = -1;
+    dev->index = (Uint32)raw.num_devices;
+    dev->is_keyboard = keyboard;
+    dev->is_pointer = pointer || absolute;
+    dev->is_abs = absolute;
+    dev->touch_is_left = touch_is_left;
+    dev->abs_min[0] = min_x;
+    dev->abs_range[0] = max_x - min_x;
+    dev->abs_min[1] = min_y;
+    dev->abs_range[1] = max_y - min_y;
+    memset(&abs_state[dev->index], 0, sizeof(abs_state[0]));
+    return raw.num_devices++;
+}
+
+void SDLOP_RawInputTestFeed(const SDLop_RawEvent *ev, bool winsys)
+{
+    const bool saved = raw.winsys;
+    raw.winsys = winsys;
+    pump_event(ev);
+    raw.winsys = saved;
 }
 
 void SDLOP_RawInputPump(void)

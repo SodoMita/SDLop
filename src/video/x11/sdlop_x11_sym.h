@@ -14,9 +14,12 @@
     SHM     libxcb-shm.so.0         optional - MIT-SHM software framebuffer
     XKB     libxcb-xkb.so.1         optional - keymap/state events, detectable repeat
     XKBX11  libxkbcommon-x11.so.0   optional - server keymap -> xkbcommon
-    XINPUT  libxcb-xinput.so.0      optional - XI2 raw motion (relative mouse)
+    XINPUT  libxcb-xinput.so.0      optional - XI2 raw motion (relative mouse), touch, pens
     RANDR   libxcb-randr.so.0       optional - monitors, modes, refresh rates
     RENDER  libxcb-render.so.0      optional - ARGB cursors
+    XFIXES  libxcb-xfixes.so.0      optional - clipboard owner-change events
+    SYNC    libxcb-sync.so.1        optional - _NET_WM_SYNC_REQUEST resize sync
+    SHAPE   libxcb-shape.so.0       optional - SDL_SetWindowShape input shapes, tooltips
 
   (libX11 is only needed as a fallback for EGL implementations without
   EGL_EXT_platform_xcb; sdlop_x11_gl.c dlopens it on demand.)
@@ -55,6 +58,12 @@ SDLOP_X11_SYM(XCB, xcb_get_atom_name_name)
 SDLOP_X11_SYM(XCB, xcb_get_atom_name_name_length)
 SDLOP_X11_SYM(XCB, xcb_create_window_checked)
 SDLOP_X11_SYM(XCB, xcb_destroy_window)
+SDLOP_X11_SYM(XCB, xcb_set_selection_owner)
+SDLOP_X11_SYM(XCB, xcb_get_selection_owner)
+SDLOP_X11_SYM(XCB, xcb_get_selection_owner_reply)
+SDLOP_X11_SYM(XCB, xcb_grab_server)
+SDLOP_X11_SYM(XCB, xcb_ungrab_server)
+SDLOP_X11_SYM(XCB, xcb_convert_selection)
 SDLOP_X11_SYM(XCB, xcb_map_window)
 SDLOP_X11_SYM(XCB, xcb_unmap_window)
 SDLOP_X11_SYM(XCB, xcb_configure_window)
@@ -135,6 +144,10 @@ SDLOP_X11_SYM(XINPUT, xcb_input_xi_query_version_reply)
 SDLOP_X11_SYM(XINPUT, xcb_input_xi_select_events_checked)
 SDLOP_X11_SYM(XINPUT, xcb_input_raw_button_press_valuator_mask)
 SDLOP_X11_SYM(XINPUT, xcb_input_raw_button_press_axisvalues_raw)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_query_device)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_query_device_reply)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_get_property)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_get_property_reply)
 
 /* -------------------------------------------------------------- RANDR */
 SDLOP_X11_MODULE(RANDR)
@@ -160,6 +173,11 @@ SDLOP_X11_SYM(RANDR, xcb_randr_get_output_info_modes_length)
 SDLOP_X11_SYM(RANDR, xcb_randr_get_crtc_info)
 SDLOP_X11_SYM(RANDR, xcb_randr_get_crtc_info_reply)
 SDLOP_X11_SYM(RANDR, xcb_randr_select_input)
+SDLOP_X11_SYM(RANDR, xcb_randr_get_screen_resources_current_crtcs)
+SDLOP_X11_SYM(RANDR, xcb_randr_get_screen_resources_current_crtcs_length)
+SDLOP_X11_SYM(RANDR, xcb_randr_set_crtc_config)
+SDLOP_X11_SYM(RANDR, xcb_randr_set_crtc_config_reply)
+SDLOP_X11_SYM(RANDR, xcb_randr_set_screen_size_checked)
 
 /* ------------------------------------------------------------- RENDER */
 SDLOP_X11_MODULE(RENDER)
@@ -171,3 +189,29 @@ SDLOP_X11_SYM(RENDER, xcb_render_pictforminfo_next)
 SDLOP_X11_SYM(RENDER, xcb_render_create_picture)
 SDLOP_X11_SYM(RENDER, xcb_render_free_picture)
 SDLOP_X11_SYM(RENDER, xcb_render_create_cursor)
+
+/* ------------------------------------------------------------- XFIXES */
+SDLOP_X11_MODULE(XFIXES)
+SDLOP_X11_DATA(XFIXES, xcb_xfixes_id)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_query_version)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_query_version_reply)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_select_selection_input)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_create_pointer_barrier)
+SDLOP_X11_SYM(XFIXES, xcb_xfixes_delete_pointer_barrier)
+
+/* --------------------------------------------------------------- SYNC */
+SDLOP_X11_MODULE(SYNC)
+SDLOP_X11_DATA(SYNC, xcb_sync_id)
+SDLOP_X11_SYM(SYNC, xcb_sync_initialize)
+SDLOP_X11_SYM(SYNC, xcb_sync_initialize_reply)
+SDLOP_X11_SYM(SYNC, xcb_sync_create_counter)
+SDLOP_X11_SYM(SYNC, xcb_sync_destroy_counter)
+SDLOP_X11_SYM(SYNC, xcb_sync_set_counter)
+
+/* -------------------------------------------------------------- SHAPE */
+SDLOP_X11_MODULE(SHAPE)
+SDLOP_X11_DATA(SHAPE, xcb_shape_id)
+SDLOP_X11_SYM(SHAPE, xcb_shape_query_version)
+SDLOP_X11_SYM(SHAPE, xcb_shape_query_version_reply)
+SDLOP_X11_SYM(SHAPE, xcb_shape_rectangles)
+SDLOP_X11_SYM(SHAPE, xcb_shape_mask)

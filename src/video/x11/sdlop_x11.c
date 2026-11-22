@@ -23,6 +23,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
@@ -90,6 +91,10 @@ typedef union X11Event32
     X(_NET_WM_STATE_SKIP_TASKBAR)         \
     X(_NET_WM_STATE_SKIP_PAGER)           \
     X(_NET_WM_STATE_MODAL)                \
+    X(_NET_WM_MOVERESIZE)                 \
+    X(_GTK_SHOW_WINDOW_MENU)              \
+    X(_NET_WM_SYNC_REQUEST)               \
+    X(_NET_WM_SYNC_REQUEST_COUNTER)       \
     X(_NET_WM_STATE_DEMANDS_ATTENTION)    \
     X(_NET_WM_WINDOW_TYPE)                \
     X(_NET_WM_WINDOW_TYPE_NORMAL)         \
@@ -139,6 +144,10 @@ typedef struct X11WindowData
     /* GL */
     bool gl_active;
     void *egl_surface;
+    xcb_visualid_t visual;        /* x11.visual, the GLX config's visual or x11.argb_visual */
+    uint8_t depth;                /* depth of that visual: x11.depth, or 32 for ARGB */
+    bool clear_explicit;          /* SDLop_SetWindowClearColor called (opaque even when ARGB) */
+    xcb_colormap_t colormap;      /* own colormap for a non-default visual */
 
     /* state the app has been told about (window->flags may be preset by
      * the core before the request is confirmed, e.g. FULLSCREEN) */
@@ -153,7 +162,23 @@ typedef struct X11WindowData
     bool want_grab;               /* relative mode: pointer grab pending */
     bool mouse_grab;              /* SDL_SetWindowMouseGrab: confine wanted */
     bool keyboard_grab;           /* SDL_SetWindowKeyboardGrab: grab wanted */
+
+    int hit_test_result;          /* SDL_HitTestResult under the pointer */
+    bool pending_move;            /* hit-test drag started while unfocused (stock) */
+    int16_t pending_move_x, pending_move_y; /* root coordinates of that press */
+
+    /* _NET_WM_SYNC_REQUEST (SDL_HINT_VIDEO_X11_ENABLE_XSYNC_EXT) */
+    uint32_t sync_counter;        /* XSync counter, 0 = not used */
+    xcb_sync_int64_t sync_value;  /* value of the last request */
+    int sync_state;               /* SYNC_IDLE / SYNC_REQUESTED / SYNC_CONFIGURED */
 } X11WindowData;
+
+enum
+{
+    SYNC_IDLE,
+    SYNC_REQUESTED,  /* request seen, waiting for the ConfigureNotify */
+    SYNC_CONFIGURED  /* configured: the next present updates the counter */
+};
 
 typedef struct X11Monitor
 {
@@ -163,8 +188,17 @@ typedef struct X11Monitor
     bool primary;
     int num_modes;
     SDL_DisplayMode modes[48];
+    xcb_randr_mode_t mode_ids[48]; /* RandR mode behind modes[i] */
+    xcb_randr_output_t output;     /* the output modes came from (0: no RandR) */
     SDL_DisplayID display_id;
 } X11Monitor;
+
+/* a display switched away from its desktop mode (exclusive fullscreen) */
+typedef struct X11ModeSave
+{
+    SDL_DisplayID display_id;
+    xcb_randr_mode_t desktop_mode;
+} X11ModeSave;
 
 typedef struct X11DeviceData
 {
@@ -175,6 +209,7 @@ typedef struct X11DeviceData
     xcb_visualid_t visual;
     uint8_t depth;
     bool fb_format_ok;            /* root visual is 24/32-bit TrueColor XRGB */
+    xcb_visualid_t argb_visual;   /* depth-32 TrueColor ARGB8888 visual (SDL_WINDOW_TRANSPARENT), 0 = none */
     uint32_t max_request_bytes;
     X11Atoms atom;
     bool dead;                    /* connection error seen */
@@ -185,6 +220,10 @@ typedef struct X11DeviceData
     int32_t xkb_device_id;
     bool detectable_repeat;
     bool has_xi2;
+    bool has_xi24; /* XI 2.4: touchpad gesture events */
+    bool has_sync;                /* SYNC >= 3.0 (resize sync counters) */
+    bool has_shape;               /* SHAPE >= 1.1 (input shapes) */
+    xcb_atom_t icc_atom;          /* _ICC_PROFILE, or _ICC_PROFILE_<n> on screen n > 0 */
     uint8_t xi_opcode;
     /* XI2.2 touch sequences: per-finger last position for dx/dy, and
      * the window the sequence started on (SDL3 semantics) */
@@ -198,6 +237,8 @@ typedef struct X11DeviceData
     } fingers[16];
     bool has_randr;
     uint8_t randr_event_base;
+    X11ModeSave mode_saves[SDLOP_MAX_DISPLAYS];
+    int num_mode_saves;
     bool randr_monitors;          /* RandR >= 1.5 */
     bool displays_dirty;
 
@@ -207,11 +248,16 @@ typedef struct X11DeviceData
 
     xcb_cursor_t blank_cursor;
     xcb_cursor_t current_cursor;  /* what SDL wants shown (blank when hidden) */
+    xcb_cursor_t hit_test_cursors[SDL_HITTEST_RESIZE_LEFT + 1]; /* resize areas, created on demand */
     struct sdlop_xcursor_theme *cursor_theme;
     bool cursor_theme_tried;
     bool render_checked;
     xcb_render_pictformat_t argb_format; /* 0 = no ARGB cursors */
     SDL_Window *confine_window;   /* pointer grabbed by SDL_SetWindowMouseGrab */
+    bool has_barriers;            /* XFixes >= 5 pointer barriers */
+    SDL_Window *barrier_window;   /* window whose SDL_SetWindowMouseRect is fenced in */
+    SDL_Rect barrier_rect;        /* ...in root coordinates */
+    xcb_xfixes_barrier_t barriers[4];
     SDL_Window *capture_window;   /* pointer grabbed by SDL_CaptureMouse */
     SDL_Window *keyboard_grab_window;
     Uint64 screensaver_reset_ns;
@@ -661,6 +707,10 @@ static void fb_fill_clear(SDL_Window *window)
 {
     X11WindowData *wd = wdata(window);
     uint32_t color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
+    if (wd->depth == 32) {
+        /* SDL_WINDOW_TRANSPARENT: fully transparent unless a colour was set */
+        color = wd->clear_explicit ? (color | 0xff000000u) : 0;
+    }
     size_t n = (size_t)wd->fb_w * (size_t)wd->fb_h;
     for (size_t i = 0; i < n; i++) {
         wd->pixels[i] = color;
@@ -745,7 +795,7 @@ static void fb_put(X11WindowData *wd, int x, int y, int w, int h)
     if (wd->fb_shm) {
         X11_xcb_shm_put_image(x11.conn, wd->xid, wd->gc, (uint16_t)wd->fb_w, (uint16_t)wd->fb_h,
                               (int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h, (int16_t)x, (int16_t)y,
-                              x11.depth, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, wd->shm_seg, 0);
+                              wd->depth, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, wd->shm_seg, 0);
         return;
     }
     /* full-width row bands that fit the maximum request size */
@@ -757,9 +807,23 @@ static void fb_put(X11WindowData *wd, int x, int y, int w, int h)
     for (int row = y; row < y + h; row += rows) {
         int n = SDL_min(rows, y + h - row);
         X11_xcb_put_image(x11.conn, XCB_IMAGE_FORMAT_Z_PIXMAP, wd->xid, wd->gc, (uint16_t)wd->fb_w,
-                          (uint16_t)n, 0, (int16_t)row, 0, x11.depth, (uint32_t)(stride * (size_t)n),
+                          (uint16_t)n, 0, (int16_t)row, 0, wd->depth, (uint32_t)(stride * (size_t)n),
                           (const uint8_t *)(wd->pixels + (size_t)row * (size_t)wd->fb_w));
     }
+}
+
+/* _NET_WM_SYNC_REQUEST: after the first frame drawn for the configure
+ * that followed the request, set the counter to the requested value so
+ * the WM knows the client caught up (stock X11_HandlePresent) */
+void SDLOP_X11_HandlePresent(SDL_Window *window)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd || !wd->sync_counter || wd->sync_state != SYNC_CONFIGURED) {
+        return;
+    }
+    X11_xcb_sync_set_counter(x11.conn, wd->sync_counter, wd->sync_value);
+    wd->sync_state = SYNC_IDLE;
+    x11_flush();
 }
 
 static void fb_present(SDL_Window *window, const SDL_Rect *rects, int numrects)
@@ -775,6 +839,7 @@ static void fb_present(SDL_Window *window, const SDL_Rect *rects, int numrects)
     } else {
         fb_put(wd, 0, 0, wd->fb_w, wd->fb_h);
     }
+    SDLOP_X11_HandlePresent(window);
     if (wd->fb_shm) {
         /* the server reads SHM asynchronously; don't let the app scribble
          * over pixels that are still being copied (SDL3 does XSync too) */
@@ -797,7 +862,9 @@ static bool x11_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *w
     if (!fb_alloc(window, window->w, window->h)) {
         return false;
     }
-    SDL_Surface *s = SDL_CreateSurfaceFrom(wd->fb_w, wd->fb_h, SDL_PIXELFORMAT_XRGB8888, wd->pixels, wd->fb_w * 4);
+    /* ARGB visual: the compositor takes the alpha channel (premultiplied) */
+    const SDL_PixelFormat fmt = wd->depth == 32 ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_XRGB8888;
+    SDL_Surface *s = SDL_CreateSurfaceFrom(wd->fb_w, wd->fb_h, fmt, wd->pixels, wd->fb_w * 4);
     if (!s) {
         return false;
     }
@@ -835,6 +902,11 @@ xcb_connection_t *SDLOP_X11_GetConnection(void)
     return x11.conn;
 }
 
+xcb_window_t SDLOP_X11_GetRoot(void)
+{
+    return x11.root;
+}
+
 int SDLOP_X11_GetScreenNumber(void)
 {
     return x11.screen_num;
@@ -845,10 +917,68 @@ xcb_visualid_t SDLOP_X11_GetVisual(void)
     return x11.visual;
 }
 
+SDL_Window *SDLOP_X11_WindowFromXID(xcb_window_t xid)
+{
+    return window_from_xid(xid);
+}
+
 xcb_window_t SDLOP_X11_GetWindowXID(SDL_Window *window)
 {
     X11WindowData *wd = wdata(window);
     return wd ? wd->xid : XCB_WINDOW_NONE;
+}
+
+xcb_visualid_t SDLOP_X11_GetWindowVisual(SDL_Window *window)
+{
+    X11WindowData *wd = wdata(window);
+    return (wd && wd->visual) ? wd->visual : x11.visual;
+}
+
+bool SDLOP_X11_IsCompatibleVisual(xcb_visualid_t visual)
+{
+    if (visual == x11.visual) {
+        return true;
+    }
+    if (!x11.screen || visual == 0) {
+        return false;
+    }
+    xcb_depth_iterator_t di = X11_xcb_screen_allowed_depths_iterator(x11.screen);
+    for (; di.rem; X11_xcb_depth_next(&di)) {
+        if (di.data->depth != x11.depth) {
+            continue;
+        }
+        xcb_visualtype_iterator_t vi = X11_xcb_depth_visuals_iterator(di.data);
+        for (; vi.rem; X11_xcb_visualtype_next(&vi)) {
+            if (vi.data->visual_id == visual) {
+                return vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR;
+            }
+        }
+    }
+    return false;
+}
+
+bool SDLOP_X11_IsARGBVisual(xcb_visualid_t visual)
+{
+    if (!x11.screen || visual == 0 || !x11.argb_visual) {
+        return false;
+    }
+    if (visual == x11.argb_visual) {
+        return true;
+    }
+    xcb_depth_iterator_t di = X11_xcb_screen_allowed_depths_iterator(x11.screen);
+    for (; di.rem; X11_xcb_depth_next(&di)) {
+        if (di.data->depth != 32) {
+            continue;
+        }
+        xcb_visualtype_iterator_t vi = X11_xcb_depth_visuals_iterator(di.data);
+        for (; vi.rem; X11_xcb_visualtype_next(&vi)) {
+            if (vi.data->visual_id == visual) {
+                return vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR && vi.data->red_mask == 0xff0000 &&
+                       vi.data->green_mask == 0x00ff00 && vi.data->blue_mask == 0x0000ff;
+            }
+        }
+    }
+    return false;
 }
 
 void SDLOP_X11_SetGLActive(SDL_Window *window, bool active)
@@ -1050,6 +1180,7 @@ static void x11_sync_repeat_info(void)
     xcb_xkb_get_controls_reply_t *c = X11_xcb_xkb_get_controls_reply(
         x11.conn, X11_xcb_xkb_get_controls(x11.conn, (xcb_xkb_device_spec_t)x11.xkb_device_id), NULL);
     if (c) {
+        sdlop.repeat_disabled = !(c->enabledControls & XCB_XKB_BOOL_CTRL_REPEAT_KEYS); /* xset r off */
         if (c->repeatDelay > 0 && c->repeatInterval > 0) {
             SDLOP_RawInputSetRepeatInfo(c->repeatDelay, c->repeatInterval);
         }
@@ -1095,7 +1226,7 @@ static void handle_xkb_event(xcb_generic_event_t *ev)
     }
 }
 
-static void handle_key(xcb_key_press_event_t *kev, bool down)
+static void handle_key(const xcb_key_press_event_t *kev, bool down, bool from_im)
 {
     SDL_Window *window = window_from_xid(kev->event);
     (void)window;
@@ -1104,6 +1235,9 @@ static void handle_key(xcb_key_press_event_t *kev, bool down)
     }
     if (kev->detail < 8) {
         return;
+    }
+    if (!from_im && SDLOP_X11_XIM_FilterKey(kev)) {
+        return; /* taken by the input method: no key event (stock) */
     }
     Uint16 evdev = (Uint16)(kev->detail - 8);
     SDL_Scancode sc = SDL_SCANCODE_UNKNOWN;
@@ -1132,6 +1266,11 @@ static void handle_key(xcb_key_press_event_t *kev, bool down)
     SDLOP_SendKeyboardKey(down, false, sc, evdev, SDLOP_MonotonicNS());
 }
 
+void SDLOP_X11_HandleKeyFromIM(const xcb_key_press_event_t *kev)
+{
+    handle_key(kev, (kev->response_type & 0x7f) == XCB_KEY_PRESS, true);
+}
+
 /* ------------------------------------------------------------------ */
 /* focus / pointer                                                     */
 /* ------------------------------------------------------------------ */
@@ -1152,6 +1291,7 @@ static void set_keyboard_focus(SDL_Window *window)
         window->flags |= SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
     }
+    SDLOP_X11_XIM_Update();
 }
 
 static bool grab_pointer(SDL_Window *window)
@@ -1193,25 +1333,77 @@ static void select_raw_motion(bool on)
     free(X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, x11.root, 1, &em.head)));
 }
 
-/* XI2.2 multitouch on our windows (SDL3 xinput2_select_touch). With a
- * touch selection the server stops emulating the pointer for these
- * sequences; the core synthesizes the SDL_TOUCH_MOUSEID mouse instead. */
-static void select_touch(xcb_window_t xid)
+/* XI 2.4 gesture events (wire numbers: older xcb-proto lacks them) */
+#define X11_XI_GESTURE_PINCH_BEGIN 27
+#define X11_XI_GESTURE_PINCH_UPDATE 28
+#define X11_XI_GESTURE_PINCH_END 29
+#define X11_XI_MASK_GESTURE_PINCH ((1u << 27) | (1u << 28) | (1u << 29))
+
+static bool select_master_events(xcb_window_t xid, uint32_t mask)
 {
-    if (!x11.has_xi2 || SDLOP_HintFlag("SDLOP_X11_NO_TOUCH", false)) {
-        return;
-    }
     struct {
         xcb_input_event_mask_t head;
         uint32_t mask;
     } em;
     em.head.deviceid = X11_XI_ALL_MASTER_DEVICES;
     em.head.mask_len = 1;
-    em.mask = XCB_INPUT_XI_EVENT_MASK_TOUCH_BEGIN | XCB_INPUT_XI_EVENT_MASK_TOUCH_UPDATE |
-              XCB_INPUT_XI_EVENT_MASK_TOUCH_END;
-    /* BadAccess if another client holds the touch selection: then the
-     * pointer emulation simply keeps working */
-    free(X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, xid, 1, &em.head)));
+    em.mask = mask;
+    xcb_generic_error_t *err =
+        X11_xcb_request_check(x11.conn, X11_xcb_input_xi_select_events_checked(x11.conn, xid, 1, &em.head));
+    free(err);
+    return err == NULL;
+}
+
+/* XI2.2 multitouch on our windows (SDL3 xinput2_select_touch). With a
+ * touch selection the server stops emulating the pointer for these
+ * sequences; the core synthesizes the SDL_TOUCH_MOUSEID mouse instead.
+ * XI 2.4 touchpad pinches go in the same per-window master mask. */
+static void select_touch(xcb_window_t xid)
+{
+    if (!x11.has_xi2) {
+        return;
+    }
+    const uint32_t touch = SDLOP_HintFlag("SDLOP_X11_NO_TOUCH", false)
+                               ? 0
+                               : (XCB_INPUT_XI_EVENT_MASK_TOUCH_BEGIN | XCB_INPUT_XI_EVENT_MASK_TOUCH_UPDATE |
+                                  XCB_INPUT_XI_EVENT_MASK_TOUCH_END);
+    const uint32_t gesture =
+        x11.has_xi24 && !SDLOP_HintFlag("SDLOP_X11_NO_GESTURES", false) ? X11_XI_MASK_GESTURE_PINCH : 0;
+    if (!(touch | gesture)) {
+        return;
+    }
+    /* BadAccess if another client holds the touch (or gesture) selection:
+     * then try them one by one; pointer emulation keeps working anyway */
+    if (!select_master_events(xid, touch | gesture) && touch && gesture) {
+        if (!select_master_events(xid, gesture)) {
+            select_master_events(xid, touch);
+        }
+    }
+}
+
+/* XI 2.4 pinch (stock: scale passed through, it's relative to the start) */
+static void handle_pinch(const xcb_ge_generic_event_t *ge)
+{
+    const uint8_t *b = (const uint8_t *)ge;
+    const size_t size = 36 + (size_t)ge->length * 4; /* + xcb's full_sequence */
+    if (size < 72) {
+        return;
+    }
+    xcb_window_t event_win;
+    int32_t scale_fp;
+    memcpy(&event_win, b + 24, 4);
+    memcpy(&scale_fp, b + 68, 4); /* wire offset 64, after full_sequence */
+    SDL_Window *window = window_from_xid(event_win);
+    if (!window) {
+        return;
+    }
+    if (ge->event_type == X11_XI_GESTURE_PINCH_BEGIN) {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_BEGIN, 0, window, 0.0f);
+    } else if (ge->event_type == X11_XI_GESTURE_PINCH_UPDATE) {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_UPDATE, 0, window, (float)scale_fp / 65536.0f);
+    } else {
+        SDLOP_SendPinch(SDL_EVENT_PINCH_END, 0, window, 0.0f);
+    }
 }
 
 static void warp_to_center(SDL_Window *window)
@@ -1222,10 +1414,14 @@ static void warp_to_center(SDL_Window *window)
     X11_xcb_warp_pointer(x11.conn, XCB_WINDOW_NONE, wd->xid, 0, 0, 0, 0, (int16_t)x11.warp_cx, (int16_t)x11.warp_cy);
 }
 
+static void update_hit_test(SDL_Window *window, int x, int y, bool force);
+static bool trigger_hit_test(SDL_Window *window, int16_t root_x, int16_t root_y);
+static void send_moveresize(SDL_Window *window, int16_t root_x, int16_t root_y, uint32_t direction);
+
 static void handle_motion(xcb_motion_notify_event_t *mev)
 {
     SDL_Window *window = window_from_xid(mev->event);
-    if (!window) {
+    if (!window || SDLOP_X11_Pen_FilterCore(mev->time)) {
         return;
     }
     Uint64 ts = SDLOP_MonotonicNS();
@@ -1248,6 +1444,7 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
         window->flags |= SDL_WINDOW_MOUSE_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
     }
+    update_hit_test(window, mev->event_x, mev->event_y, false);
     if (SDLOP_RawInputIsSource()) {
         /* evdev sends the motion; the server's pointer only re-anchors the
            absolute position evdev's relative deltas are added to */
@@ -1258,8 +1455,8 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
     }
     if ((window->flags & SDL_WINDOW_INPUT_FOCUS) && !SDL_RectEmpty(&window->mouse_rect) &&
         !(window->flags & SDL_WINDOW_MOUSE_CAPTURE)) {
-        /* SDL_SetWindowMouseRect: keep the pointer inside (SDL3 X11 uses
-         * XFixes barriers; warping back has the same visible effect) */
+        /* SDL_SetWindowMouseRect: XFixes barriers fence the pointer in;
+         * without them (or before they are up) warp it back */
         const SDL_Rect *r = &window->mouse_rect;
         int cx = SDL_clamp((int)mev->event_x, r->x, r->x + r->w - 1);
         int cy = SDL_clamp((int)mev->event_y, r->y, r->y + r->h - 1);
@@ -1273,7 +1470,7 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
 static void handle_button(xcb_button_press_event_t *bev, bool down)
 {
     SDL_Window *window = window_from_xid(bev->event);
-    if (!window) {
+    if (!window || SDLOP_X11_Pen_FilterCore(bev->time)) {
         return;
     }
     Uint64 ts = SDLOP_MonotonicNS();
@@ -1301,6 +1498,10 @@ static void handle_button(xcb_button_press_event_t *bev, bool down)
     }
     if (down && x11.relative_window == window && x11.pointer_grabbed == false && wdata(window)->want_grab) {
         grab_pointer(window);
+    }
+    if (down && button == SDL_BUTTON_LEFT && x11.relative_window != window &&
+        trigger_hit_test(window, bev->root_x, bev->root_y)) {
+        return; /* not passed on to the app (stock) */
     }
     if (raw_source) {
         return;
@@ -1412,6 +1613,13 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
         handle_touch((xcb_input_touch_begin_event_t *)ge);
         return;
     }
+    if (SDLOP_X11_Pen_HandleEvent(ge)) {
+        return;
+    }
+    if (ge->event_type >= X11_XI_GESTURE_PINCH_BEGIN && ge->event_type <= X11_XI_GESTURE_PINCH_END) {
+        handle_pinch(ge);
+        return;
+    }
     if (ge->event_type != XCB_INPUT_RAW_MOTION || !x11.relative_window) {
         return;
     }
@@ -1420,6 +1628,9 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
         return;
     }
     xcb_input_raw_button_press_event_t *raw = (xcb_input_raw_button_press_event_t *)ge;
+    if (SDLOP_X11_Pen_IsPenDevice(raw->sourceid)) {
+        return; /* pens are absolute: no relative motion (stock) */
+    }
     const uint32_t *mask = X11_xcb_input_raw_button_press_valuator_mask(raw);
     const xcb_input_fp3232_t *values = X11_xcb_input_raw_button_press_axisvalues_raw(raw);
     double dx = 0.0, dy = 0.0;
@@ -1445,7 +1656,7 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
 
 static float x11_global_content_scale(void)
 {
-    /* SDL3 order: explicit override, Xft.dpi, GDK_SCALE */
+    /* SDL3 order: explicit override, Xft.dpi, XSETTINGS, GDK_SCALE */
     const char *env = SDL_GetHint(SDL_HINT_VIDEO_X11_SCALING_FACTOR);
     if (env && *env) {
         float f = strtof(env, NULL);
@@ -1471,6 +1682,14 @@ static float x11_global_content_scale(void)
         }
     }
     free(res);
+    /* then XSETTINGS: the GDK window scale, Xft/DPI in 1024ths */
+    int value;
+    if (scale <= 0.0f && SDLOP_X11_XSettings_GetInt("Gdk/WindowScalingFactor", &value) && value > 0) {
+        scale = (float)value;
+    }
+    if (scale <= 0.0f && SDLOP_X11_XSettings_GetInt("Xft/DPI", &value) && value > 0) {
+        scale = (float)value / 1024.0f / 96.0f;
+    }
     if (scale <= 0.0f) {
         env = getenv("GDK_SCALE");
         if (env && *env) {
@@ -1535,6 +1754,7 @@ static void fill_output_modes(X11Monitor *mon, xcb_randr_get_screen_resources_cu
         if (!m || (m->mode_flags & XCB_RANDR_MODE_FLAG_INTERLACE)) {
             continue;
         }
+        mon->mode_ids[mon->num_modes] = m->id;
         SDL_DisplayMode *dm = &mon->modes[mon->num_modes++];
         memset(dm, 0, sizeof(*dm));
         dm->format = SDL_PIXELFORMAT_ARGB8888;
@@ -1588,7 +1808,8 @@ static int enumerate_monitors(X11Monitor *out, int max)
                     snprintf(mon->name, sizeof(mon->name), "x11-%d", count + 1);
                 }
                 if (res && X11_xcb_randr_monitor_info_outputs_length(mi) > 0) {
-                    fill_output_modes(mon, res, X11_xcb_randr_monitor_info_outputs(mi)[0]);
+                    mon->output = X11_xcb_randr_monitor_info_outputs(mi)[0];
+                    fill_output_modes(mon, res, mon->output);
                 }
                 count++;
             }
@@ -1627,6 +1848,18 @@ static void apply_monitor_to_display(const X11Monitor *mon)
     sdlop.displays[idx].content_scale = x11.content_scale;
 }
 
+static void destroy_barriers(void);
+
+static X11ModeSave *x11_mode_save(SDL_DisplayID id)
+{
+    for (int i = 0; i < x11.num_mode_saves; i++) {
+        if (x11.mode_saves[i].display_id == id) {
+            return &x11.mode_saves[i];
+        }
+    }
+    return NULL;
+}
+
 static void x11_update_displays(bool send_events)
 {
     X11Monitor fresh[SDLOP_MAX_DISPLAYS];
@@ -1661,7 +1894,14 @@ static void x11_update_displays(bool send_events)
                 SDLOP_SendDisplayEvent(nm->display_id, SDL_EVENT_DISPLAY_MOVED, 0, 0);
             }
         }
-        if (nm->rect.w != old->rect.w || nm->rect.h != old->rect.h || nm->refresh_mhz != old->refresh_mhz) {
+        /* while switched (exclusive fullscreen) the monitor shows the
+         * fullscreen mode, not the desktop one */
+        const int desk_mhz = d->desktop_mode.refresh_rate_denominator
+                                 ? (int)((Sint64)d->desktop_mode.refresh_rate_numerator * 1000 /
+                                         d->desktop_mode.refresh_rate_denominator)
+                                 : 0;
+        if (!x11_mode_save(nm->display_id) &&
+            (nm->rect.w != d->desktop_mode.w || nm->rect.h != d->desktop_mode.h || nm->refresh_mhz != desk_mhz)) {
             d->desktop_mode.w = nm->rect.w;
             d->desktop_mode.h = nm->rect.h;
             d->desktop_mode.refresh_rate = nm->refresh_mhz / 1000.0f;
@@ -1709,6 +1949,152 @@ static void x11_update_displays(bool send_events)
     }
 }
 
+/* stock X11_SetDisplayMode, minus its single-monitor screen size: the
+ * screen becomes the bounding box of every lit crtc with this one resized */
+static bool x11_SetDisplayMode(SDLop_VideoDevice *device, SDLop_Display *display, const SDL_DisplayMode *mode)
+{
+    (void)device;
+    const SDL_DisplayID id = display->id;
+    X11Monitor *mon = NULL;
+    for (int i = 0; i < x11.num_monitors; i++) {
+        if (x11.monitors[i].display_id == id) {
+            mon = &x11.monitors[i];
+        }
+    }
+    if (!x11.has_randr || !mon || !mon->output) {
+        return SDL_SetError("XRandR mode switching unavailable on this display");
+    }
+    X11ModeSave *save = x11_mode_save(id);
+    const bool to_desktop = mode->w == display->desktop_mode.w && mode->h == display->desktop_mode.h &&
+                            fabsf(mode->refresh_rate - display->desktop_mode.refresh_rate) < 0.01f;
+    xcb_randr_mode_t want = XCB_NONE;
+    if (to_desktop) {
+        if (!save) {
+            return true; /* never left it */
+        }
+        want = save->desktop_mode;
+    } else {
+        for (int i = 0; i < mon->num_modes && want == XCB_NONE; i++) {
+            const SDL_DisplayMode *m = &mon->modes[i];
+            if (m->w == mode->w && m->h == mode->h && fabsf(m->refresh_rate - mode->refresh_rate) < 0.01f) {
+                want = mon->mode_ids[i];
+            }
+        }
+        if (want == XCB_NONE) {
+            return SDL_SetError("Display mode %dx%d@%g not offered by XRandR", mode->w, mode->h,
+                                (double)mode->refresh_rate);
+        }
+    }
+
+    xcb_randr_get_screen_resources_current_reply_t *res = X11_xcb_randr_get_screen_resources_current_reply(
+        x11.conn, X11_xcb_randr_get_screen_resources_current(x11.conn, x11.root), NULL);
+    if (!res) {
+        return SDL_SetError("Couldn't get XRandR screen resources");
+    }
+    bool ok = false;
+    xcb_randr_get_output_info_reply_t *oi = X11_xcb_randr_get_output_info_reply(
+        x11.conn, X11_xcb_randr_get_output_info(x11.conn, mon->output, res->config_timestamp), NULL);
+    xcb_randr_get_crtc_info_reply_t *ci = NULL;
+    if (oi && oi->crtc != XCB_NONE) {
+        ci = X11_xcb_randr_get_crtc_info_reply(
+            x11.conn, X11_xcb_randr_get_crtc_info(x11.conn, oi->crtc, res->config_timestamp), NULL);
+    }
+    const xcb_randr_mode_info_t *mi = find_mode(res, want);
+    if (!ci || !mi) {
+        SDL_SetError("Couldn't get XRandR output/crtc info");
+        goto done;
+    }
+    if (ci->mode == want) {
+        ok = true;
+        goto done;
+    }
+    const xcb_randr_crtc_t crtc = oi->crtc;
+    const bool sideways = (ci->rotation & (XCB_RANDR_ROTATION_ROTATE_90 | XCB_RANDR_ROTATION_ROTATE_270)) != 0;
+    int screen_w = ci->x + (sideways ? mi->height : mi->width);
+    int screen_h = ci->y + (sideways ? mi->width : mi->height);
+    xcb_randr_crtc_t *crtcs = X11_xcb_randr_get_screen_resources_current_crtcs(res);
+    for (int i = 0; i < X11_xcb_randr_get_screen_resources_current_crtcs_length(res); i++) {
+        if (crtcs[i] == crtc) {
+            continue;
+        }
+        xcb_randr_get_crtc_info_reply_t *o = X11_xcb_randr_get_crtc_info_reply(
+            x11.conn, X11_xcb_randr_get_crtc_info(x11.conn, crtcs[i], res->config_timestamp), NULL);
+        if (o) {
+            if (o->mode != XCB_NONE) {
+                screen_w = SDL_max(screen_w, o->x + o->width);
+                screen_h = SDL_max(screen_h, o->y + o->height);
+            }
+            free(o);
+        }
+    }
+    /* keep the physical size ratio the server started with */
+    const int mm_w = x11.screen->width_in_pixels
+                         ? (int)((Sint64)screen_w * x11.screen->width_in_millimeters / x11.screen->width_in_pixels)
+                         : 0;
+    const int mm_h = x11.screen->height_in_pixels
+                         ? (int)((Sint64)screen_h * x11.screen->height_in_millimeters / x11.screen->height_in_pixels)
+                         : 0;
+    const xcb_randr_mode_t was = ci->mode;
+
+    X11_xcb_grab_server(x11.conn);
+    xcb_randr_set_crtc_config_reply_t *r = X11_xcb_randr_set_crtc_config_reply(
+        x11.conn,
+        X11_xcb_randr_set_crtc_config(x11.conn, crtc, XCB_CURRENT_TIME, res->config_timestamp, 0, 0, XCB_NONE,
+                                      ci->rotation, 0, NULL),
+        NULL);
+    const bool disabled = r && r->status == XCB_RANDR_SET_CONFIG_SUCCESS;
+    xcb_timestamp_t cfg = res->config_timestamp;
+    free(r);
+    if (disabled) {
+        /* BadMatch/BadValue here are known and harmless (stock SDL #4561, #4840) */
+        free(X11_xcb_request_check(x11.conn, X11_xcb_randr_set_screen_size_checked(
+                                                 x11.conn, x11.root, (uint16_t)screen_w, (uint16_t)screen_h,
+                                                 (uint32_t)SDL_max(mm_w, 1), (uint32_t)SDL_max(mm_h, 1))));
+        xcb_randr_output_t out = mon->output;
+        r = X11_xcb_randr_set_crtc_config_reply(
+            x11.conn,
+            X11_xcb_randr_set_crtc_config(x11.conn, crtc, XCB_CURRENT_TIME, cfg, ci->x, ci->y, want, ci->rotation,
+                                          1, &out),
+            NULL);
+        ok = r && r->status == XCB_RANDR_SET_CONFIG_SUCCESS;
+        if (!ok) {
+            /* light the crtc up again the way it was */
+            free(r);
+            r = X11_xcb_randr_set_crtc_config_reply(
+                x11.conn,
+                X11_xcb_randr_set_crtc_config(x11.conn, crtc, XCB_CURRENT_TIME, cfg, ci->x, ci->y, was,
+                                              ci->rotation, 1, &out),
+                NULL);
+        }
+        free(r);
+    }
+    X11_xcb_ungrab_server(x11.conn);
+    x11_flush();
+    if (!ok) {
+        SDL_SetError("XRandR refused the mode switch");
+        goto done;
+    }
+    if (to_desktop) {
+        *save = x11.mode_saves[--x11.num_mode_saves];
+    } else if (!save && x11.num_mode_saves < (int)SDL_arraysize(x11.mode_saves)) {
+        x11.mode_saves[x11.num_mode_saves].display_id = id;
+        x11.mode_saves[x11.num_mode_saves].desktop_mode = was;
+        x11.num_mode_saves++;
+    }
+
+done:
+    free(ci);
+    free(oi);
+    free(res);
+    if (ok) {
+        /* bounds follow now (fullscreen windows are fitted to them), not
+         * when the RandR notify comes round */
+        x11_update_displays(true);
+        x11.displays_dirty = false;
+    }
+    return ok;
+}
+
 static void x11_init_randr(void)
 {
     if (!SDLOP_X11_HAVE(RANDR)) {
@@ -1742,6 +2128,36 @@ static Uint32 x11_device_next_id(void)
     return ++next_id;
 }
 
+/* the visual compositors treat as translucent: depth 32, TrueColor, the
+ * remaining 8 bits alpha; needs a 32 bpp pixmap format for depth 32 */
+static void find_argb_visual(bool order_ok)
+{
+    x11.argb_visual = 0;
+    const xcb_setup_t *setup = X11_xcb_get_setup(x11.conn);
+    const xcb_format_t *fmts = X11_xcb_setup_pixmap_formats(setup);
+    bool bpp32 = false;
+    for (int i = 0; i < X11_xcb_setup_pixmap_formats_length(setup); i++) {
+        bpp32 = bpp32 || (fmts[i].depth == 32 && fmts[i].bits_per_pixel == 32);
+    }
+    if (!bpp32 || !order_ok) {
+        return;
+    }
+    xcb_depth_iterator_t di = X11_xcb_screen_allowed_depths_iterator(x11.screen);
+    for (; di.rem && !x11.argb_visual; X11_xcb_depth_next(&di)) {
+        if (di.data->depth != 32) {
+            continue;
+        }
+        xcb_visualtype_iterator_t vi = X11_xcb_depth_visuals_iterator(di.data);
+        for (; vi.rem; X11_xcb_visualtype_next(&vi)) {
+            if (vi.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR && vi.data->red_mask == 0xff0000 &&
+                vi.data->green_mask == 0x00ff00 && vi.data->blue_mask == 0x0000ff) {
+                x11.argb_visual = vi.data->visual_id;
+                break;
+            }
+        }
+    }
+}
+
 static bool find_visual_format(void)
 {
     x11.visual = x11.screen->root_visual;
@@ -1769,6 +2185,7 @@ static bool find_visual_format(void)
             bool little = *(const uint8_t *)&one == 1;
             bool order_ok = (setup->image_byte_order == XCB_IMAGE_ORDER_LSB_FIRST) == little;
             x11.fb_format_ok = truecolor && xrgb && bpp32 && order_ok && (x11.depth == 24 || x11.depth == 32);
+            find_argb_visual(order_ok);
             return true;
         }
     }
@@ -1843,6 +2260,20 @@ static bool x11_Init(SDLop_VideoDevice *device)
         x11_Quit(device);
         return SDL_SetError("Could not intern X11 atoms");
     }
+    /* ICC Profiles in X Specification: the root's _ICC_PROFILE (screen 0)
+     * or _ICC_PROFILE_<n> */
+    {
+        char icc[32];
+        if (x11.screen_num > 0) {
+            snprintf(icc, sizeof(icc), "_ICC_PROFILE_%d", x11.screen_num);
+        } else {
+            snprintf(icc, sizeof(icc), "_ICC_PROFILE");
+        }
+        xcb_intern_atom_reply_t *r = X11_xcb_intern_atom_reply(
+            x11.conn, X11_xcb_intern_atom(x11.conn, 0, (uint16_t)strlen(icc), icc), NULL);
+        x11.icc_atom = r ? r->atom : XCB_NONE;
+        free(r);
+    }
 
     /* MIT-SHM (env SDLOP_X11_NO_SHM=1 or SDLOP_LIB_XCB_SHM=none disables) */
     if (SDLOP_X11_HAVE(SHM) && !SDLOP_HintFlag("SDLOP_X11_NO_SHM", false)) {
@@ -1855,24 +2286,56 @@ static bool x11_Init(SDLop_VideoDevice *device)
         }
     }
 
-    /* XInput2 >= 2.2 for raw motion (relative mouse) */
+    /* SYNC >= 3.0 for _NET_WM_SYNC_REQUEST counters */
+    if (SDLOP_X11_HAVE(SYNC)) {
+        const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_sync_id);
+        if (ext && ext->present) {
+            xcb_sync_initialize_reply_t *v =
+                X11_xcb_sync_initialize_reply(x11.conn, X11_xcb_sync_initialize(x11.conn, 3, 1), NULL);
+            x11.has_sync = v && v->major_version >= 3;
+            free(v);
+        }
+    }
+
+    /* SHAPE >= 1.1 for input shapes (SDL_SetWindowShape, tooltips) */
+    if (SDLOP_X11_HAVE(SHAPE)) {
+        const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_shape_id);
+        if (ext && ext->present) {
+            xcb_shape_query_version_reply_t *v =
+                X11_xcb_shape_query_version_reply(x11.conn, X11_xcb_shape_query_version(x11.conn), NULL);
+            x11.has_shape = v && (v->major_version > 1 || (v->major_version == 1 && v->minor_version >= 1));
+            free(v);
+        }
+    }
+
+    /* XInput2 >= 2.2 for raw motion (relative mouse), touch and pens;
+     * 2.4 adds touchpad gestures (the server answers with what it has) */
     if (SDLOP_X11_HAVE(XINPUT)) {
         const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_input_id);
         if (ext && ext->present) {
             xcb_input_xi_query_version_reply_t *v = X11_xcb_input_xi_query_version_reply(
-                x11.conn, X11_xcb_input_xi_query_version(x11.conn, 2, 2), NULL);
+                x11.conn, X11_xcb_input_xi_query_version(x11.conn, 2, 4), NULL);
             if (v && (v->major_version > 2 || (v->major_version == 2 && v->minor_version >= 2))) {
                 x11.has_xi2 = true;
+                x11.has_xi24 = v->major_version > 2 || v->minor_version >= 4;
                 x11.xi_opcode = ext->major_opcode;
             }
             free(v);
         }
     }
 
+    if (x11.has_xi2) {
+        SDLOP_X11_Pen_Init(x11.xi_opcode);
+    }
     x11_init_xkb();
     x11_load_keymap();
     x11_sync_repeat_info();
     x11_init_randr();
+    /* root: RESOURCE_MANAGER changes (Xft.dpi) and XSETTINGS MANAGER
+     * announcements (sent with StructureNotify) */
+    uint32_t root_mask = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+    X11_xcb_change_window_attributes(x11.conn, x11.root, XCB_CW_EVENT_MASK, &root_mask);
+    SDLOP_X11_XSettings_Init();
     x11_update_displays(false);
 
     /* invisible cursor for relative mode: 1x1 empty bitmap */
@@ -1887,6 +2350,20 @@ static bool x11_Init(SDLop_VideoDevice *device)
     x11.mouse_id = x11_device_next_id();
     SDLOP_AddMouse(x11.mouse_id, NULL);
 
+    SDLOP_X11_Clipboard_Init();
+    SDLOP_X11_DnD_Init();
+    /* pointer barriers for SDL_SetWindowMouseRect: XFixes 5 */
+    x11.has_barriers = false;
+    if (SDLOP_X11_HAVE(XFIXES)) {
+        const xcb_query_extension_reply_t *ext = X11_xcb_get_extension_data(x11.conn, X11_xcb_xfixes_id);
+        if (ext && ext->present) {
+            xcb_xfixes_query_version_reply_t *v = X11_xcb_xfixes_query_version_reply(
+                x11.conn, X11_xcb_xfixes_query_version(x11.conn, 5, 0), NULL);
+            x11.has_barriers = v && v->major_version >= 5;
+            free(v);
+        }
+    }
+
     x11_flush();
     SDL_LogInfo(SDL_LOG_CATEGORY_VIDEO,
                 "SDLop x11: %s, %d display(s), shm=%d xkb=%d%s xi2=%d randr=%d%s scale=%g",
@@ -1899,16 +2376,27 @@ static bool x11_Init(SDLop_VideoDevice *device)
 static void x11_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    destroy_barriers();
     SDLOP_X11_GL_Quit(); /* also releases libEGL */
     for (int i = 0; i < x11.num_monitors; i++) {
         SDLOP_DelDisplay(x11.monitors[i].display_id, false);
     }
     x11.num_monitors = 0;
+    SDLOP_X11_Clipboard_Quit();
+    SDLOP_X11_DnD_Quit();
+    SDLOP_X11_XSettings_Quit();
+    SDLOP_X11_XIM_Quit();
+    SDLOP_X11_Pen_Quit();
     free(x11.peeked);
     x11.peeked = NULL;
     if (x11.conn) {
         if (x11.blank_cursor) {
             X11_xcb_free_cursor(x11.conn, x11.blank_cursor);
+        }
+        for (size_t i = 0; i < SDL_arraysize(x11.hit_test_cursors); i++) {
+            if (x11.hit_test_cursors[i]) {
+                X11_xcb_free_cursor(x11.conn, x11.hit_test_cursors[i]);
+            }
         }
         if (x11.cursor_theme) {
             sdlop_xcursor_theme_destroy(x11.cursor_theme);
@@ -1938,34 +2426,75 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     wd->parent = x11.root;
     uint32_t clear = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
     bool gpu = (window->flags & (SDL_WINDOW_OPENGL | SDL_WINDOW_VULKAN)) != 0;
+    /* OpenGL windows take the X visual of the GLX framebuffer config that
+     * matches the SDL_GL_* attributes, as in stock SDL3 (X11_GL_GetVisual):
+     * the root visual is bound to one fixed config (typically RGBA8888 with
+     * depth 24 / stencil 8), so keeping it would override the request. */
+    wd->visual = x11.visual;
+    wd->depth = x11.depth;
+    const bool transparent = (window->flags & SDL_WINDOW_TRANSPARENT) && x11.argb_visual;
+    if (window->flags & SDL_WINDOW_OPENGL) {
+        xcb_visualid_t gl_visual = SDLOP_X11_GL_ChooseWindowVisual(transparent);
+        if (gl_visual && (SDLOP_X11_IsCompatibleVisual(gl_visual) ||
+                          (transparent && SDLOP_X11_IsARGBVisual(gl_visual)))) {
+            wd->visual = gl_visual;
+        }
+    }
+    /* SDL_WINDOW_TRANSPARENT: an ARGB visual (software surfaces too, and
+     * EGL, whose config follows the window's visual) */
+    if (transparent && (wd->visual == x11.visual || SDLOP_X11_IsARGBVisual(wd->visual))) {
+        if (wd->visual == x11.visual) {
+            wd->visual = x11.argb_visual;
+        }
+        wd->depth = 32;
+    }
+    /* a visual other than the parent's needs its own colormap (BadMatch) */
+    if (wd->visual != x11.visual) {
+        wd->colormap = X11_xcb_generate_id(x11.conn);
+        X11_xcb_create_colormap(x11.conn, XCB_COLORMAP_ALLOC_NONE, wd->colormap, x11.root, wd->visual);
+    }
     /* GPU windows get no background so resizes don't flash */
     uint32_t mask = (gpu ? XCB_CW_BACK_PIXMAP : XCB_CW_BACK_PIXEL) | XCB_CW_BORDER_PIXEL |
-                    XCB_CW_BIT_GRAVITY | XCB_CW_EVENT_MASK;
-    uint32_t values[4] = {
-        gpu ? XCB_BACK_PIXMAP_NONE : clear,
+                    XCB_CW_BIT_GRAVITY | XCB_CW_EVENT_MASK | (wd->colormap ? XCB_CW_COLORMAP : 0);
+    uint32_t values[5] = {
+        gpu ? XCB_BACK_PIXMAP_NONE : (wd->depth == 32 ? 0 : clear),
         0,
         XCB_GRAVITY_NORTH_WEST,
         XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS |
             XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
             XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_POINTER_MOTION |
             XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE,
+        wd->colormap, /* value order follows the mask bits: COLORMAP is last */
     };
     xcb_generic_error_t *err = X11_xcb_request_check(
-        x11.conn, X11_xcb_create_window_checked(x11.conn, XCB_COPY_FROM_PARENT, wd->xid, x11.root,
+        x11.conn, X11_xcb_create_window_checked(x11.conn, wd->depth, wd->xid, x11.root,
                                                 (int16_t)window->x, (int16_t)window->y, (uint16_t)window->w,
                                                 (uint16_t)window->h, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
-                                                x11.visual, mask, values));
+                                                wd->visual, mask, values));
     if (err) {
         int code = err->error_code;
         free(err);
+        if (wd->colormap) {
+            X11_xcb_free_colormap(x11.conn, wd->colormap);
+        }
         free(wd);
         window->driverdata = NULL;
         return SDL_SetError("xcb_create_window failed (X error %d)", code);
     }
 
     /* ICCCM / EWMH bookkeeping (swa: WM_PROTOCOLS + _NET_WM_PID) */
-    xcb_atom_t protocols[2] = { x11.atom.WM_DELETE_WINDOW, x11.atom._NET_WM_PING };
-    set_property(wd->xid, x11.atom.WM_PROTOCOLS, XCB_ATOM_ATOM, 32, 2, protocols);
+    xcb_atom_t protocols[3] = { x11.atom.WM_DELETE_WINDOW, x11.atom._NET_WM_PING, XCB_NONE };
+    uint32_t nprotocols = 2;
+    /* resize sync (opt-in as in stock; Vulkan presents bypass SDL) */
+    if (x11.has_sync && !(window->flags & SDL_WINDOW_VULKAN) &&
+        SDL_GetHintBoolean(SDL_HINT_VIDEO_X11_ENABLE_XSYNC_EXT, false)) {
+        xcb_sync_int64_t zero = { 0, 0 };
+        wd->sync_counter = X11_xcb_generate_id(x11.conn);
+        X11_xcb_sync_create_counter(x11.conn, wd->sync_counter, zero);
+        set_property(wd->xid, x11.atom._NET_WM_SYNC_REQUEST_COUNTER, XCB_ATOM_CARDINAL, 32, 1, &wd->sync_counter);
+        protocols[nprotocols++] = x11.atom._NET_WM_SYNC_REQUEST;
+    }
+    set_property(wd->xid, x11.atom.WM_PROTOCOLS, XCB_ATOM_ATOM, 32, nprotocols, protocols);
     uint32_t pid = (uint32_t)getpid();
     set_property(wd->xid, x11.atom._NET_WM_PID, XCB_ATOM_CARDINAL, 32, 1, &pid);
     char host[256];
@@ -1996,6 +2525,11 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         type = x11.atom._NET_WM_WINDOW_TYPE_DIALOG;
     }
     set_property(wd->xid, x11.atom._NET_WM_WINDOW_TYPE, XCB_ATOM_ATOM, 32, 1, &type);
+    if ((window->flags & SDL_WINDOW_TOOLTIP) && x11.has_shape) {
+        /* tooltips do not receive input (stock): empty input shape */
+        X11_xcb_shape_rectangles(x11.conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED, wd->xid,
+                                 0, 0, 0, NULL);
+    }
     if (SDLOP_WINDOW_IS_POPUP(window)) {
         /* SDL3 X11: popups bypass the WM so they land exactly at the
          * requested offset and never steal the focus */
@@ -2025,6 +2559,9 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     uint32_t gcv = 0;
     X11_xcb_create_gc(x11.conn, wd->gc, wd->xid, XCB_GC_GRAPHICS_EXPOSURES, &gcv);
     select_touch(wd->xid);
+    if (x11.has_xi2) {
+        SDLOP_X11_Pen_WindowCreated(wd->xid);
+    }
 
     wd->cfg_x = window->x;
     wd->cfg_y = window->y;
@@ -2035,11 +2572,11 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 }
 
 /* run the event loop until pred() holds or timeout_ms passes */
-static void pump_until(SDL_Window *window, bool (*pred)(SDL_Window *), int timeout_ms)
+void SDLOP_X11_PumpUntil(bool (*pred)(void *), void *userdata, int timeout_ms)
 {
     Uint64 deadline = SDLOP_MonotonicNS() + (Uint64)timeout_ms * 1000000ull;
     x11_flush();
-    while (!pred(window) && !x11.dead) {
+    while (!pred(userdata) && !x11.dead) {
         Uint64 now = SDLOP_MonotonicNS();
         if (now >= deadline) {
             break;
@@ -2061,6 +2598,24 @@ static void pump_until(SDL_Window *window, bool (*pred)(SDL_Window *), int timeo
         int ms = (int)((deadline - now) / 1000000ull) + 1;
         poll(&pfd, 1, ms);
     }
+}
+
+typedef struct WindowPred
+{
+    SDL_Window *window;
+    bool (*pred)(SDL_Window *);
+} WindowPred;
+
+static bool window_pred(void *userdata)
+{
+    WindowPred *wp = (WindowPred *)userdata;
+    return wp->pred(wp->window);
+}
+
+static void pump_until(SDL_Window *window, bool (*pred)(SDL_Window *), int timeout_ms)
+{
+    WindowPred wp = { window, pred };
+    SDLOP_X11_PumpUntil(window_pred, &wp, timeout_ms);
 }
 
 static bool is_mapped(SDL_Window *window)
@@ -2141,6 +2696,11 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!wd) {
         return;
     }
+    SDLOP_X11_DnD_WindowDestroyed(window);
+    SDLOP_X11_XIM_WindowDestroyed(window);
+    if (x11.barrier_window == window) {
+        destroy_barriers(); /* they are tied to the window anyway */
+    }
     if (x11.relative_window == window) {
         if (x11.pointer_grabbed) {
             X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
@@ -2176,7 +2736,13 @@ static void x11_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     fb_free(wd);
     X11_xcb_free_gc(x11.conn, wd->gc);
+    if (wd->sync_counter) {
+        X11_xcb_sync_destroy_counter(x11.conn, wd->sync_counter);
+    }
     X11_xcb_destroy_window(x11.conn, wd->xid);
+    if (wd->colormap) {
+        X11_xcb_free_colormap(x11.conn, wd->colormap);
+    }
     x11_flush();
     free(wd);
     window->driverdata = NULL;
@@ -2451,6 +3017,10 @@ static void x11_SetWindowClearColor(SDLop_VideoDevice *device, SDL_Window *windo
         return;
     }
     uint32_t color = ((uint32_t)window->clear_r << 16) | ((uint32_t)window->clear_g << 8) | window->clear_b;
+    wd->clear_explicit = true;
+    if (wd->depth == 32) {
+        color |= 0xff000000u; /* ARGB visual: an explicit clear colour is opaque */
+    }
     if (!(window->flags & (SDL_WINDOW_OPENGL | SDL_WINDOW_VULKAN))) {
         X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_BACK_PIXEL, &color);
     }
@@ -2719,11 +3289,89 @@ static bool x11_SetWindowKeyboardGrab(SDLop_VideoDevice *device, SDL_Window *win
     return true;
 }
 
+static void destroy_barriers(void)
+{
+    for (int i = 0; i < 4; i++) {
+        if (x11.barriers[i]) {
+            X11_xcb_xfixes_delete_pointer_barrier(x11.conn, x11.barriers[i]);
+            x11.barriers[i] = 0;
+        }
+    }
+    x11.barrier_window = NULL;
+    memset(&x11.barrier_rect, 0, sizeof(x11.barrier_rect));
+}
+
+/* stock X11_ConfineCursorWithFlags, kept in step with focus, mapping,
+ * geometry and capture: four barriers along the mouse rect's edges, each
+ * spanning all displays so the pointer can't slip out at a corner. Called
+ * after every event batch and on SDL_SetWindowMouseRect; idempotent. */
+static void x11_update_barriers(void)
+{
+    if (!x11.has_barriers) {
+        return;
+    }
+    SDL_Window *want = NULL;
+    SDL_Rect r = { 0, 0, 0, 0 };
+    SDL_Window *w = sdlop.keyboard_focus;
+    X11WindowData *wd = w ? wdata(w) : NULL;
+    if (wd && wd->mapped && !SDL_RectEmpty(&w->mouse_rect) &&
+        !(w->flags & (SDL_WINDOW_MOUSE_CAPTURE | SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))) {
+        const SDL_Rect wr = wd->cfg_known ? current_rect(w) : (SDL_Rect){ w->x, w->y, w->w, w->h };
+        const SDL_Rect *mr = &w->mouse_rect;
+        const int x1 = wr.x + SDL_max(mr->x, 0);
+        const int y1 = wr.y + SDL_max(mr->y, 0);
+        const int x2 = SDL_min(wr.x + mr->x + mr->w, wr.x + wr.w);
+        const int y2 = SDL_min(wr.y + mr->y + mr->h, wr.y + wr.h);
+        if (x2 > x1 && y2 > y1) {
+            want = w;
+            r = (SDL_Rect){ x1, y1, x2 - x1, y2 - y1 };
+        }
+    }
+    if (want == x11.barrier_window &&
+        (!want || (r.x == x11.barrier_rect.x && r.y == x11.barrier_rect.y && r.w == x11.barrier_rect.w &&
+                   r.h == x11.barrier_rect.h))) {
+        return;
+    }
+    destroy_barriers();
+    if (want) {
+        SDL_Rect span = { 0, 0, x11.screen->width_in_pixels, x11.screen->height_in_pixels };
+        for (int i = 0; i < sdlop.num_displays; i++) {
+            SDL_Rect u;
+            SDL_GetRectUnion(&span, &sdlop.displays[i].bounds, &u);
+            span = u;
+        }
+        const int sx1 = span.x, sy1 = span.y, sx2 = span.x + span.w, sy2 = span.y + span.h;
+        const int x2 = r.x + r.w, y2 = r.y + r.h;
+        const struct
+        {
+            int x1, y1, x2, y2;
+            uint32_t dir;
+        } b[4] = {
+            /* the pointer may cross each line inwards only */
+            { r.x, sy1, r.x, sy2, XCB_XFIXES_BARRIER_DIRECTIONS_POSITIVE_X },
+            { x2, sy1, x2, sy2, XCB_XFIXES_BARRIER_DIRECTIONS_NEGATIVE_X },
+            { sx1, r.y, sx2, r.y, XCB_XFIXES_BARRIER_DIRECTIONS_POSITIVE_Y },
+            { sx1, y2, sx2, y2, XCB_XFIXES_BARRIER_DIRECTIONS_NEGATIVE_Y },
+        };
+        for (int i = 0; i < 4; i++) {
+            x11.barriers[i] = X11_xcb_generate_id(x11.conn);
+            X11_xcb_xfixes_create_pointer_barrier(x11.conn, x11.barriers[i], wdata(want)->xid, (uint16_t)b[i].x1,
+                                                  (uint16_t)b[i].y1, (uint16_t)b[i].x2, (uint16_t)b[i].y2,
+                                                  b[i].dir, 0, NULL);
+        }
+        x11.barrier_window = want;
+        x11.barrier_rect = r;
+    }
+    x11_flush();
+}
+
 static bool x11_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
     (void)window;
-    return true; /* enforced in handle_motion */
+    /* handle_motion warps back where barriers aren't available */
+    x11_update_barriers();
+    return true;
 }
 
 static bool x11_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL_FlashOperation operation)
@@ -3035,6 +3683,233 @@ static void x11_FreeCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
     cursor->internal = NULL;
 }
 
+/* the cursor a window shows: blank in relative mode, a resize cursor over
+ * SDL_HITTEST_RESIZE_* areas (stock), else SDL's current cursor */
+static uint32_t window_cursor(SDL_Window *window)
+{
+    static const SDL_SystemCursor ids[] = {
+        SDL_SYSTEM_CURSOR_NW_RESIZE, SDL_SYSTEM_CURSOR_N_RESIZE, SDL_SYSTEM_CURSOR_NE_RESIZE,
+        SDL_SYSTEM_CURSOR_E_RESIZE,  SDL_SYSTEM_CURSOR_SE_RESIZE, SDL_SYSTEM_CURSOR_S_RESIZE,
+        SDL_SYSTEM_CURSOR_SW_RESIZE, SDL_SYSTEM_CURSOR_W_RESIZE
+    };
+    X11WindowData *wd = wdata(window);
+    if (x11.relative_window == window) {
+        return x11.blank_cursor;
+    }
+    const int rc = wd ? wd->hit_test_result : SDL_HITTEST_NORMAL;
+    if (window->hit_test && x11.current_cursor != x11.blank_cursor && rc >= SDL_HITTEST_RESIZE_TOPLEFT &&
+        rc <= SDL_HITTEST_RESIZE_LEFT) {
+        if (!x11.hit_test_cursors[rc]) {
+            x11.hit_test_cursors[rc] = create_system_cursor(ids[rc - SDL_HITTEST_RESIZE_TOPLEFT]);
+        }
+        if (x11.hit_test_cursors[rc]) {
+            return x11.hit_test_cursors[rc];
+        }
+    }
+    return x11.current_cursor;
+}
+
+static void update_hit_test(SDL_Window *window, int x, int y, bool force)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd || !window->hit_test || (!force && SDL_GetMouseState(NULL, NULL) != 0)) {
+        return;
+    }
+    const SDL_Point p = { x, y };
+    const int rc = (int)window->hit_test(window, &p, window->hit_test_data);
+    if (rc != wd->hit_test_result || force) {
+        wd->hit_test_result = rc;
+        uint32_t v = window_cursor(window);
+        X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &v);
+    }
+}
+
+/* EWMH interactive move / resize by the WM, which needs the pointer
+ * (implicit grab of the press included) released first (stock) */
+static void send_moveresize(SDL_Window *window, int16_t root_x, int16_t root_y, uint32_t direction)
+{
+    X11WindowData *wd = wdata(window);
+    X11_xcb_ungrab_pointer(x11.conn, XCB_CURRENT_TIME);
+    x11.pointer_grabbed = false;
+    x11.confine_window = x11.capture_window = NULL; /* re-confined on the next focus */
+    send_client_message(wd->xid, x11.atom._NET_WM_MOVERESIZE, (uint32_t)root_x, (uint32_t)root_y, direction,
+                        1 /* button */, 1 /* source: application */);
+    x11_flush();
+}
+
+#define NET_WM_MOVERESIZE_MOVE 8
+
+/* a left press on a draggable / resize area: the WM takes over */
+static bool trigger_hit_test(SDL_Window *window, int16_t root_x, int16_t root_y)
+{
+    X11WindowData *wd = wdata(window);
+    if (!wd || !window->hit_test) {
+        return false;
+    }
+    if (wd->hit_test_result == SDL_HITTEST_DRAGGABLE) {
+        /* some WMs get confused by a move racing the click-to-focus of the
+         * same press: wait for the focus (stock) */
+        if (window->flags & SDL_WINDOW_INPUT_FOCUS) {
+            send_moveresize(window, root_x, root_y, NET_WM_MOVERESIZE_MOVE);
+        } else {
+            wd->pending_move = true;
+            wd->pending_move_x = root_x;
+            wd->pending_move_y = root_y;
+        }
+        return true;
+    }
+    if (wd->hit_test_result >= SDL_HITTEST_RESIZE_TOPLEFT && wd->hit_test_result <= SDL_HITTEST_RESIZE_LEFT) {
+        /* _NET_WM_MOVERESIZE_SIZE_TOPLEFT (0) .. _SIZE_LEFT (7): SDL's order */
+        send_moveresize(window, root_x, root_y, (uint32_t)(wd->hit_test_result - SDL_HITTEST_RESIZE_TOPLEFT));
+        return true;
+    }
+    return false;
+}
+
+static bool x11_SetWindowHitTest(SDLop_VideoDevice *device, SDL_Window *window, bool enabled)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (wd) {
+        wd->hit_test_result = SDL_HITTEST_NORMAL;
+        wd->pending_move = false;
+        if (enabled && sdlop.mouse_focus == window && sdlop.mouse_has_position) {
+            update_hit_test(window, (int)sdlop.mouse_x, (int)sdlop.mouse_y, true);
+        }
+        uint32_t v = window_cursor(window);
+        X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &v);
+        x11_flush();
+    }
+    return true;
+}
+
+/* the WM's window menu (GTK protocol, understood by mutter, KWin, xfwm4,
+ * openbox ...; stock) at window coordinates x, y */
+/* SDL_SetWindowShape: as stock, the alpha channel (stretched to the window
+ * size) becomes the input shape - pixels with alpha 0 let clicks through;
+ * what is visible is up to the ARGB contents. NULL restores the default. */
+static bool x11_UpdateWindowShape(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *shape)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return SDL_SetError("Invalid window");
+    }
+    if (!x11.has_shape) {
+        return SDL_Unsupported();
+    }
+    if (!shape) {
+        X11_xcb_shape_mask(x11.conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT, wd->xid, 0, 0, XCB_NONE);
+        x11_flush();
+        return true;
+    }
+    const int w = window->w, h = window->h;
+    if (w <= 0 || h <= 0) {
+        return true;
+    }
+    SDL_Surface *stretched = NULL;
+    if (shape->w != w || shape->h != h) {
+        stretched = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ARGB32);
+        if (!stretched) {
+            return false;
+        }
+        if (!SDL_StretchSurface(shape, NULL, stretched, NULL, SDL_SCALEMODE_LINEAR)) {
+            SDL_DestroySurface(stretched);
+            return false;
+        }
+        shape = stretched;
+    }
+    /* 1-bit image in the server's bitmap format (scanline pad, bit order) */
+    const xcb_setup_t *setup = X11_xcb_get_setup(x11.conn);
+    const int pad = setup->bitmap_format_scanline_pad ? setup->bitmap_format_scanline_pad : 32;
+    const size_t stride = (size_t)(((w + pad - 1) / pad) * pad) / 8;
+    const bool msb = setup->bitmap_format_bit_order == XCB_IMAGE_ORDER_MSB_FIRST;
+    uint8_t *bits = (uint8_t *)calloc((size_t)h, stride);
+    if (!bits) {
+        if (stretched) {
+            SDL_DestroySurface(stretched);
+        }
+        return SDL_OutOfMemory();
+    }
+    for (int y = 0; y < h; y++) {
+        /* ARGB32 is A,R,G,B in memory: alpha is byte 0 */
+        const Uint8 *a = (const Uint8 *)shape->pixels + (size_t)y * (size_t)shape->pitch;
+        uint8_t *row = bits + (size_t)y * stride;
+        for (int x = 0; x < w; x++, a += 4) {
+            if (*a != SDL_ALPHA_TRANSPARENT) {
+                row[x / 8] |= (uint8_t)(msb ? 0x80 >> (x % 8) : 1 << (x % 8));
+            }
+        }
+    }
+    if (stretched) {
+        SDL_DestroySurface(stretched);
+    }
+    xcb_pixmap_t pm = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_pixmap(x11.conn, 1, pm, wd->xid, (uint16_t)w, (uint16_t)h);
+    xcb_gcontext_t gc = X11_xcb_generate_id(x11.conn);
+    X11_xcb_create_gc(x11.conn, gc, pm, 0, NULL);
+    int rows = (int)((x11.max_request_bytes - 64) / stride);
+    if (rows < 1) {
+        rows = 1;
+    }
+    for (int y = 0; y < h; y += rows) {
+        const int n = SDL_min(rows, h - y);
+        X11_xcb_put_image(x11.conn, XCB_IMAGE_FORMAT_XY_PIXMAP, pm, gc, (uint16_t)w, (uint16_t)n, 0, (int16_t)y, 0, 1,
+                          (uint32_t)(stride * (size_t)n), bits + (size_t)y * stride);
+    }
+    free(bits);
+    X11_xcb_shape_mask(x11.conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT, wd->xid, 0, 0, pm);
+    X11_xcb_free_gc(x11.conn, gc);
+    X11_xcb_free_pixmap(x11.conn, pm);
+    x11_flush();
+    return true;
+}
+
+/* SDL_GetWindowICCProfile: the screen's profile from the root window */
+static void *x11_GetWindowICCProfile(SDLop_VideoDevice *device, SDL_Window *window, size_t *size)
+{
+    (void)device;
+    (void)window;
+    xcb_get_property_reply_t *r =
+        x11.icc_atom ? X11_xcb_get_property_reply(x11.conn,
+                                                  X11_xcb_get_property(x11.conn, 0, x11.root, x11.icc_atom,
+                                                                       XCB_GET_PROPERTY_TYPE_ANY, 0, 1u << 24),
+                                                  NULL)
+                     : NULL;
+    const int len = (r && r->format == 8 && r->type != XCB_NONE) ? X11_xcb_get_property_value_length(r) : 0;
+    if (len <= 0) {
+        free(r);
+        SDL_SetError("Screen is not calibrated.");
+        return NULL;
+    }
+    void *data = SDL_malloc((size_t)len);
+    if (data) {
+        memcpy(data, X11_xcb_get_property_value(r), (size_t)len);
+        *size = (size_t)len;
+    }
+    free(r);
+    return data;
+}
+
+static void x11_ShowWindowSystemMenu(SDLop_VideoDevice *device, SDL_Window *window, int x, int y)
+{
+    (void)device;
+    X11WindowData *wd = wdata(window);
+    if (!wd) {
+        return;
+    }
+    int rx = x, ry = y;
+    xcb_translate_coordinates_reply_t *tr = X11_xcb_translate_coordinates_reply(
+        x11.conn, X11_xcb_translate_coordinates(x11.conn, wd->xid, x11.root, (int16_t)x, (int16_t)y), NULL);
+    if (tr) {
+        rx = tr->dst_x;
+        ry = tr->dst_y;
+        free(tr);
+    }
+    send_client_message(wd->xid, x11.atom._GTK_SHOW_WINDOW_MENU, 0 /* device */, (uint32_t)rx, (uint32_t)ry, 0, 0);
+    x11_flush();
+}
+
 static bool x11_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
 {
     (void)device;
@@ -3045,7 +3920,7 @@ static bool x11_ShowCursor(SDLop_VideoDevice *device, SDL_Cursor *cursor)
         if (!wd) {
             continue;
         }
-        uint32_t v = (x11.relative_window == w) ? x11.blank_cursor : c;
+        uint32_t v = window_cursor(w);
         X11_xcb_change_window_attributes(x11.conn, wd->xid, XCB_CW_CURSOR, &v);
     }
     x11_flush();
@@ -3140,6 +4015,9 @@ static SDL_MouseButtonFlags x11_GetGlobalMouseState(SDLop_VideoDevice *device, f
 static void handle_configure(SDL_Window *window, xcb_configure_notify_event_t *ce, bool synthetic)
 {
     X11WindowData *wd = wdata(window);
+    if (wd->sync_state == SYNC_REQUESTED) {
+        wd->sync_state = SYNC_CONFIGURED;
+    }
     int x = ce->x, y = ce->y;
     if (!synthetic && wd->parent != x11.root) {
         /* real events are relative to the WM frame; synthetic ones (sent
@@ -3188,6 +4066,14 @@ static void handle_client_message(SDL_Window *window, xcb_client_message_event_t
     xcb_atom_t proto = cm->data.data32[0];
     if (proto == x11.atom.WM_DELETE_WINDOW) {
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
+    } else if (proto == x11.atom._NET_WM_SYNC_REQUEST) {
+        /* data: protocol, timestamp, value low, value high */
+        X11WindowData *wd = wdata(window);
+        if (wd && wd->sync_counter) {
+            wd->sync_value.lo = cm->data.data32[2];
+            wd->sync_value.hi = (int32_t)cm->data.data32[3];
+            wd->sync_state = SYNC_REQUESTED;
+        }
     } else if (proto == x11.atom._NET_WM_PING) {
         /* EWMH: answer by bouncing the message to the root */
         X11Event32 reply;
@@ -3215,6 +4101,16 @@ static void x11_dispatch(xcb_generic_event_t *ev)
         handle_xkb_event(ev);
         return;
     }
+    if (SDLOP_X11_Clipboard_HandleEvent(ev) || SDLOP_X11_DnD_HandleEvent(ev)) {
+        return;
+    }
+    bool settings_changed = false;
+    if (SDLOP_X11_XSettings_HandleEvent(ev, &settings_changed)) {
+        if (settings_changed) {
+            x11.displays_dirty = true; /* the content scale may follow them */
+        }
+        return;
+    }
     if (x11.has_randr && (type == x11.randr_event_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY ||
                           type == x11.randr_event_base + XCB_RANDR_NOTIFY)) {
         x11.displays_dirty = true;
@@ -3224,7 +4120,7 @@ static void x11_dispatch(xcb_generic_event_t *ev)
     switch (type) {
     case XCB_KEY_PRESS:
     case XCB_KEY_RELEASE:
-        handle_key((xcb_key_press_event_t *)ev, type == XCB_KEY_PRESS);
+        handle_key((xcb_key_press_event_t *)ev, type == XCB_KEY_PRESS, false);
         break;
     case XCB_BUTTON_PRESS:
     case XCB_BUTTON_RELEASE:
@@ -3248,6 +4144,9 @@ static void x11_dispatch(xcb_generic_event_t *ev)
             window->flags |= SDL_WINDOW_MOUSE_FOCUS;
             sdlop.mouse_has_position = false;
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_ENTER, 0, 0);
+        }
+        if (x11.relative_window != window) {
+            update_hit_test(window, en->event_x, en->event_y, false);
         }
         if (x11.relative_window == window) {
             /* relative mode: no absolute position */
@@ -3315,6 +4214,10 @@ static void x11_dispatch(xcb_generic_event_t *ev)
             if (wd->keyboard_grab && x11.keyboard_grab_window != window) {
                 grab_keyboard(window);
             }
+            if (wd->pending_move) {
+                wd->pending_move = false;
+                send_moveresize(window, wd->pending_move_x, wd->pending_move_y, NET_WM_MOVERESIZE_MOVE);
+            }
         } else if (sdlop.keyboard_focus == window) {
             set_keyboard_focus(NULL);
         }
@@ -3379,6 +4282,13 @@ static void x11_dispatch(xcb_generic_event_t *ev)
         if (pn->window == x11.root) {
             if (pn->atom == x11.atom.RESOURCE_MANAGER) {
                 x11.displays_dirty = true; /* Xft.dpi may have changed */
+            } else if (pn->atom == x11.icc_atom && x11.icc_atom) {
+                /* all windows live on this screen */
+                for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+                    if (wdata(w)) {
+                        SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_ICCPROF_CHANGED, 0, 0);
+                    }
+                }
             }
             break;
         }
@@ -3426,8 +4336,9 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
          * roundtrips may have pulled events off the socket already */
         x11.peeked = X11_xcb_poll_for_queued_event(x11.conn);
         if (!x11.peeked) {
-            struct pollfd pfd = { X11_xcb_get_file_descriptor(x11.conn), POLLIN, 0 };
-            poll(&pfd, 1, timeout_ms);
+            struct pollfd pfd[2] = { { X11_xcb_get_file_descriptor(x11.conn), POLLIN, 0 },
+                                     { SDLOP_X11_XIM_GetFD(), POLLIN, 0 } };
+            poll(pfd, pfd[1].fd >= 0 ? 2 : 1, timeout_ms);
         }
     }
 
@@ -3453,6 +4364,7 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         SDLOP_SendQuitEvent();
         return;
     }
+    SDLOP_X11_XIM_Pump(); /* input method replies: commits, preedit, keys handed back */
     if (x11.keymap_dirty) {
         x11.keymap_dirty = false;
         x11_load_keymap();
@@ -3461,6 +4373,7 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
         x11.displays_dirty = false;
         x11_update_displays(true);
     }
+    x11_update_barriers(); /* focus, mapping, geometry may have moved */
     if (sdlop.suspend_screensaver) {
         /* SDL3 X11: XResetScreenSaver every 30 s while inhibited */
         Uint64 now = SDLOP_MonotonicNS();
@@ -3471,6 +4384,32 @@ static void x11_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
     }
     X11_xcb_flush(x11.conn);
     SDLOP_KeyboardProcessRepeats();
+}
+
+/* text input: XIM (sdlop_x11_xim.c) */
+static bool x11_StartTextInput(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props)
+{
+    (void)device;
+    (void)props;
+    return SDLOP_X11_XIM_Start(window);
+}
+
+static bool x11_StopTextInput(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_X11_XIM_Stop(window);
+}
+
+static bool x11_UpdateTextInputArea(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_X11_XIM_UpdateArea(window);
+}
+
+static bool x11_ClearComposition(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    return SDLOP_X11_XIM_ClearComposition(window);
 }
 
 static int x11_GetEventFD(SDLop_VideoDevice *device)
@@ -3534,6 +4473,11 @@ SDLop_VideoDevice SDLop_x11_device = {
     .GetWindowBordersSize = x11_GetWindowBordersSize,
     .SetWindowOpacity = x11_SetWindowOpacity,
     .SetWindowParent = x11_SetWindowParent,
+    .SetWindowHitTest = x11_SetWindowHitTest,
+    .ShowWindowSystemMenu = x11_ShowWindowSystemMenu,
+    .UpdateWindowShape = x11_UpdateWindowShape,
+    .GetWindowICCProfile = x11_GetWindowICCProfile,
+    .SetDisplayMode = x11_SetDisplayMode,
     .SetWindowModal = x11_SetWindowModal,
     .SetWindowBordered = x11_SetWindowBordered,
     .SetWindowResizable = x11_SetWindowResizable,
@@ -3553,4 +4497,16 @@ SDLop_VideoDevice SDLop_x11_device = {
     .WarpMouseGlobal = x11_WarpMouseGlobal,
     .CaptureMouse = x11_CaptureMouse,
     .GetGlobalMouseState = x11_GetGlobalMouseState,
+    .SetClipboardData = SDLOP_X11_SetClipboardData,
+    .GetClipboardData = SDLOP_X11_GetClipboardData,
+    .HasClipboardData = SDLOP_X11_HasClipboardData,
+    .GetTextMimeTypes = SDLOP_X11_GetTextMimeTypes,
+    .SetPrimarySelectionText = SDLOP_X11_SetPrimarySelectionText,
+    .GetPrimarySelectionText = SDLOP_X11_GetPrimarySelectionText,
+    .HasPrimarySelectionText = SDLOP_X11_HasPrimarySelectionText,
+    .AcceptDragAndDrop = SDLOP_X11_AcceptDragAndDrop,
+    .StartTextInput = x11_StartTextInput,
+    .StopTextInput = x11_StopTextInput,
+    .UpdateTextInputArea = x11_UpdateTextInputArea,
+    .ClearComposition = x11_ClearComposition,
 };

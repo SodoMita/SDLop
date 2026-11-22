@@ -17,7 +17,11 @@ struct wl_surface;
 
 /* main wayland module (sdlop_wayland.c) */
 struct wl_display *SDLOP_Wayland_GetDisplay(void);
+uint32_t SDLOP_Wayland_GetSelectionSerial(void);
 struct wl_surface *SDLOP_Wayland_GetWindowSurfaceHandle(SDL_Window *window);
+/* size of the window's buffers: round(size * scale) for
+ * SDL_WINDOW_HIGH_PIXEL_DENSITY windows, else the window size */
+void SDLOP_Wayland_GetWindowPixelSize(SDL_Window *window, int *pw, int *ph);
 
 /* per-window presentation state (WaylandWindowData fields, exposed so the
  * GL module can take over buffer management without EGL types here) */
@@ -50,5 +54,44 @@ void SDLOP_Wayland_GL_Deinit(void);
 /* Vulkan module (sdlop_wayland_vulkan.c) - vtable entry point */
 bool SDLOP_Wayland_Vulkan_CreateSurface(SDLop_VideoDevice *device, SDL_Window *window, void *instance, const void *allocator, Uint64 *surface);
 bool SDLOP_Wayland_Vulkan_GetPresentationSupport(SDLop_VideoDevice *device, void *instance, void *physical_device, Uint32 queue_family);
+
+/* clipboard module (sdlop_wayland_clipboard.c) */
+struct wl_registry;
+struct wl_seat;
+bool SDLOP_Wayland_Clipboard_Global(struct wl_registry *registry, uint32_t name, const char *interface,
+                                    uint32_t version); /* true = bound */
+void SDLOP_Wayland_Clipboard_SeatAdded(struct wl_seat *seat);
+void SDLOP_Wayland_Clipboard_Quit(void);
+bool SDLOP_Wayland_Clipboard_Available(void);
+bool SDLOP_Wayland_PrimarySelection_Available(void);
+bool SDLOP_Wayland_SetClipboardData(SDLop_VideoDevice *device);
+void *SDLOP_Wayland_GetClipboardData(SDLop_VideoDevice *device, const char *mime_type, size_t *size);
+bool SDLOP_Wayland_HasClipboardData(SDLop_VideoDevice *device, const char *mime_type);
+const char *const *SDLOP_Wayland_GetTextMimeTypes(SDLop_VideoDevice *device, size_t *num_mime_types);
+bool SDLOP_Wayland_SetPrimarySelectionText(SDLop_VideoDevice *device, const char *text);
+char *SDLOP_Wayland_GetPrimarySelectionText(SDLop_VideoDevice *device);
+bool SDLOP_Wayland_HasPrimarySelectionText(SDLop_VideoDevice *device);
+
+/* text input module (sdlop_wayland_textinput.c) */
+bool SDLOP_Wayland_TextInput_Global(struct wl_registry *registry, uint32_t name, const char *interface,
+                                    uint32_t version); /* true = bound */
+void SDLOP_Wayland_TextInput_SeatAdded(struct wl_seat *seat);
+bool SDLOP_Wayland_TextInput_Available(void);
+void SDLOP_Wayland_TextInput_Update(void); /* keyboard focus changed */
+bool SDLOP_Wayland_TextInput_Start(SDL_Window *window);
+bool SDLOP_Wayland_TextInput_Stop(SDL_Window *window);
+bool SDLOP_Wayland_TextInput_UpdateArea(SDL_Window *window);
+bool SDLOP_Wayland_TextInput_ClearComposition(SDL_Window *window);
+void SDLOP_Wayland_TextInput_WindowDestroyed(SDL_Window *window);
+void SDLOP_Wayland_TextInput_Quit(void);
+
+/* tablet module (sdlop_wayland_tablet.c) */
+bool SDLOP_Wayland_Tablet_Global(struct wl_registry *registry, uint32_t name, const char *interface,
+                                 uint32_t version); /* true = handled */
+void SDLOP_Wayland_Tablet_SeatAdded(struct wl_seat *seat);
+void SDLOP_Wayland_Tablet_WindowDestroyed(SDL_Window *window);
+void SDLOP_Wayland_Tablet_Quit(void);
+SDL_Window *SDLOP_Wayland_WindowFromSurface(struct wl_surface *surface);
+struct wp_cursor_shape_manager_v1 *SDLOP_Wayland_GetCursorShapeManager(void);
 
 #endif /* sdlop_wayland_internal_h_ */

@@ -101,9 +101,15 @@ static xcb_window_t xid_of(SDL_Window *window)
     return (xcb_window_t)SDL_GetNumberProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
 }
 
-static void obs_sync(void)
+/* Make SDLop's requests visible to `obs`: the server handles requests of
+ * one connection in order, but has no order between connections, and a
+ * flush only puts SDLop's requests in its socket. A round trip on SDLop's
+ * connection (SDL_SyncWindow; it needs a valid window, NULL is rejected
+ * like stock) proves the server has applied them, so whatever `obs` asks
+ * afterwards sees the result. */
+static void obs_sync(SDL_Window *w)
 {
-    SDL_SyncWindow(NULL);
+    CHECK(SDL_SyncWindow(w), "SDL_SyncWindow: %s", SDL_GetError());
     free(xcb_get_input_focus_reply(obs, xcb_get_input_focus(obs), NULL));
 }
 
@@ -116,7 +122,9 @@ static void query_pointer(xcb_window_t w, int *x, int *y)
 }
 
 /* can another client grab the pointer? (fails while SDLop holds a grab) */
-static bool pointer_grabbable(void)
+static int grab_status = -1; /* of the last failed probe, for the message */
+
+static bool pointer_grabbable_once(void)
 {
     const xcb_setup_t *setup = xcb_get_setup(obs);
     xcb_window_t root = xcb_setup_roots_iterator(setup).data->root;
@@ -125,12 +133,30 @@ static bool pointer_grabbable(void)
                               XCB_CURRENT_TIME),
         NULL);
     bool ok = r && r->status == XCB_GRAB_STATUS_SUCCESS;
+    grab_status = r ? r->status : -1;
     free(r);
     if (ok) {
         xcb_ungrab_pointer(obs, XCB_CURRENT_TIME);
         xcb_flush(obs);
     }
     return ok;
+}
+
+/* Requests on two X connections are not ordered: SDLop's flushed ungrab
+ * may still be unread by the server when our grab arrives, so SDLop's
+ * connection does a round trip first (SDL_SyncWindow). The window manager
+ * may also hold a short grab right after a raise/focus change: "released"
+ * means grabbable within a moment, a grab SDLop kept would never be. */
+static bool pointer_grabbable(SDL_Window *w)
+{
+    SDL_SyncWindow(w);
+    for (int i = 0; i < 20; i++) {
+        if (pointer_grabbable_once()) {
+            return true;
+        }
+        SDL_Delay(10);
+    }
+    return false;
 }
 #endif
 
@@ -202,7 +228,7 @@ static void test_size_limits(SDL_Window *w)
 #ifdef SDLOP_TEST_HAVE_XCB
     if (is_x11) {
         uint32_t h[18];
-        obs_sync();
+        obs_sync(w);
         int n = get_prop32(xid_of(w), XCB_ATOM_WM_NORMAL_HINTS, h, 18);
         CHECK(n == 18, "WM_NORMAL_HINTS present");
         if (n == 18) {
@@ -210,7 +236,7 @@ static void test_size_limits(SDL_Window *w)
             CHECK((h[0] & (1u << 5)) && h[7] == 800 && h[8] == 600, "PMaxSize 800x600 (%ux%u)", h[7], h[8]);
         }
         CHECK(SDL_SetWindowAspectRatio(w, 1.0f, 2.0f), "aspect: %s", SDL_GetError());
-        obs_sync();
+        obs_sync(w);
         n = get_prop32(xid_of(w), XCB_ATOM_WM_NORMAL_HINTS, h, 18);
         CHECK(n == 18 && (h[0] & (1u << 7)) && h[11] == h[12] && h[13] == 2 * h[14], "PAspect 1..2");
     }
@@ -266,7 +292,7 @@ static void test_state(SDL_Window *w)
 #ifdef SDLOP_TEST_HAVE_XCB
     if (is_x11) {
         SDL_SetWindowFocusable(w, false);
-        obs_sync();
+        obs_sync(w);
         xcb_window_t x = xid_of(w);
         uint32_t v[9];
         CHECK(get_prop32(x, XCB_ATOM_WM_HINTS, v, 9) >= 2 && (v[0] & 1) && v[1] == 0, "WM_HINTS input=False");
@@ -303,7 +329,7 @@ static void test_parent_popup(SDL_Window *w)
     CHECK(px == 15 && py == 25, "moved popup position: %d,%d", px, py);
 #ifdef SDLOP_TEST_HAVE_XCB
     if (is_x11) {
-        obs_sync();
+        obs_sync(tip);
         xcb_get_window_attributes_reply_t *a =
             xcb_get_window_attributes_reply(obs, xcb_get_window_attributes(obs, xid_of(tip)), NULL);
         CHECK(a && a->override_redirect, "tooltip is override-redirect");
@@ -328,7 +354,7 @@ static void test_parent_popup(SDL_Window *w)
 #ifdef SDLOP_TEST_HAVE_XCB
     if (is_x11) {
         SDL_ShowWindow(child);
-        obs_sync();
+        obs_sync(child);
         uint32_t tf = 0;
         CHECK(get_prop32(xid_of(child), XCB_ATOM_WM_TRANSIENT_FOR, &tf, 1) == 1 && tf == xid_of(w),
               "modal WM_TRANSIENT_FOR parent");
@@ -353,7 +379,8 @@ static void test_grabs(SDL_Window *w)
         CHECK(SDL_GetGrabbedWindow() == w, "grabbed window");
 #ifdef SDLOP_TEST_HAVE_XCB
         if (is_x11) {
-            CHECK(!pointer_grabbable(), "X pointer grabbed by SDLop");
+            SDL_SyncWindow(w);
+            CHECK(!pointer_grabbable_once(), "X pointer grabbed by SDLop");
         }
 #endif
     }
@@ -361,7 +388,7 @@ static void test_grabs(SDL_Window *w)
     CHECK(!SDL_GetWindowMouseGrab(w), "mouse ungrab readback");
 #ifdef SDLOP_TEST_HAVE_XCB
     if (is_x11) {
-        CHECK(pointer_grabbable(), "X pointer released");
+        CHECK(pointer_grabbable(w), "X pointer released (grab status %d)", grab_status);
     }
 #endif
     bool kg = SDL_SetWindowKeyboardGrab(w, true);
@@ -470,7 +497,7 @@ static void test_warp(SDL_Window *w)
         SDL_GetWindowPosition(w, &wx, &wy);
         CHECK(gx >= 0 && gy >= 0, "global mouse state %f,%f", gx, gy);
         CHECK(SDL_WarpMouseGlobal(5.0f, 6.0f), "warp global: %s", SDL_GetError());
-        obs_sync();
+        obs_sync(w);
         SDL_GetGlobalMouseState(&gx, &gy);
         CHECK(gx == 5.0f && gy == 6.0f, "global position after warp %f,%f", gx, gy);
         CHECK(SDL_CaptureMouse(true), "capture: %s", SDL_GetError());

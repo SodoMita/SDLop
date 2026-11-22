@@ -41,6 +41,10 @@ static const char *default_driver_order(void)
 
 static void video_post_init(void)
 {
+    /* desktop sessions: system theme from the settings portal (async) */
+    if (strcmp(sdlop.video->name, "wayland") == 0 || strcmp(sdlop.video->name, "x11") == 0) {
+        SDLOP_Desktop_Init();
+    }
     sdlop.grabbed_window = NULL;
     sdlop.suspend_screensaver = false;
     /* stock SDL3 inhibits the screensaver unless the app opts in */
@@ -88,6 +92,15 @@ void SDLOP_VideoQuit(void)
     while (sdlop.windows) {
         SDL_DestroyWindow(sdlop.windows);
     }
+    /* windows give their modes back on destroy; catch anything left over */
+    for (int i = 0; i < sdlop.num_displays; i++) {
+        SDLop_Display *d = &sdlop.displays[i];
+        d->fullscreen_window = NULL;
+        if (d->current_mode.w > 0 && sdlop.video && sdlop.video->SetDisplayMode) {
+            sdlop.video->SetDisplayMode(sdlop.video, d, &d->desktop_mode);
+        }
+        memset(&d->current_mode, 0, sizeof(d->current_mode));
+    }
     SDLOP_GL_Quit();
     SDLOP_Vulkan_Quit();
     SDLOP_MouseQuit(); /* cursors hold driver resources */
@@ -99,6 +112,10 @@ void SDLOP_VideoQuit(void)
         sdlop.video->Quit(sdlop.video);
         sdlop.video = NULL;
     }
+    SDLOP_RemoveAllPens();
+    SDLOP_Desktop_Quit();
+    SDLOP_Dialog_Quit();
+    SDLOP_DBus_Quit();
     /* drivers are responsible for DelDisplay at Quit; make sure nothing leaks */
     for (int i = 0; i < sdlop.num_displays; i++) {
         SDLop_Display *d = &sdlop.displays[i];
@@ -583,10 +600,104 @@ const SDL_DisplayMode *SDL_GetDesktopDisplayMode(SDL_DisplayID displayID)
 
 const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID)
 {
-    /* SDLop presents in the display's desktop mode; there is no separate
-     * current-mode tracking yet */
     SDLop_Display *d = display_by_id(displayID);
-    return d ? &d->desktop_mode : NULL;
+    if (!d) {
+        return NULL;
+    }
+    return d->current_mode.w > 0 ? &d->current_mode : &d->desktop_mode;
+}
+
+static bool same_mode(const SDL_DisplayMode *a, const SDL_DisplayMode *b)
+{
+    return a->w == b->w && a->h == b->h && a->pixel_density == b->pixel_density &&
+           fabsf(a->refresh_rate - b->refresh_rate) < 0.01f;
+}
+
+void SDLOP_SetCurrentDisplayMode(SDL_DisplayID displayID, const SDL_DisplayMode *mode)
+{
+    SDLop_Display *d = display_by_id(displayID);
+    if (!d) {
+        return;
+    }
+    SDL_DisplayMode next;
+    memset(&next, 0, sizeof(next));
+    if (mode && !same_mode(mode, &d->desktop_mode)) {
+        next = *mode;
+        next.displayID = displayID;
+        finalize_display_mode(&next);
+    }
+    const SDL_DisplayMode *was = d->current_mode.w > 0 ? &d->current_mode : &d->desktop_mode;
+    const SDL_DisplayMode *now = next.w > 0 ? &next : &d->desktop_mode;
+    const bool changed = !same_mode(was, now);
+    d->current_mode = next;
+    if (changed) {
+        SDLOP_SendDisplayEvent(displayID, SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED, 0, 0);
+    }
+}
+
+static Uint64 mode_switch_deadline;
+
+bool SDLOP_DisplayModeSwitchPending(void)
+{
+    return mode_switch_deadline && SDL_GetTicks() < mode_switch_deadline;
+}
+
+/* mode == NULL: back to the desktop mode */
+static bool set_display_mode(SDLop_Display *d, const SDL_DisplayMode *mode)
+{
+    const SDL_DisplayMode *target = mode ? mode : &d->desktop_mode;
+    const SDL_DisplayMode *cur = d->current_mode.w > 0 ? &d->current_mode : &d->desktop_mode;
+    if (same_mode(target, cur)) {
+        return true;
+    }
+    if (!sdlop.video || !sdlop.video->SetDisplayMode) {
+        return true; /* emulated */
+    }
+    const SDL_DisplayID id = d->id;
+    mode_switch_deadline = SDL_GetTicks() + 400; /* stock: PENDING_FOCUS_TIME * 2 */
+    if (!sdlop.video->SetDisplayMode(sdlop.video, d, target)) {
+        return false;
+    }
+    /* the driver may have refreshed the display table meanwhile */
+    SDLOP_SetCurrentDisplayMode(id, mode ? target : NULL);
+    return true;
+}
+
+void SDLOP_UpdateFullscreenMode(SDL_Window *window, bool enter)
+{
+    if (!sdlop.video || !sdlop.video->SetDisplayMode || !window) {
+        return;
+    }
+    const bool exclusive = enter && window->has_fullscreen_mode && window->fullscreen_mode.w > 0 &&
+                           (window->flags & SDL_WINDOW_FULLSCREEN) && !window->is_destroying &&
+                           !(window->flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
+    const SDL_DisplayID target = exclusive ? (window->fullscreen_mode.displayID ? window->fullscreen_mode.displayID
+                                                                                : SDL_GetDisplayForWindow(window))
+                                           : 0;
+    /* give back what this window holds elsewhere (or everywhere on leave) */
+    for (int i = 0; i < sdlop.num_displays; i++) {
+        SDLop_Display *d = &sdlop.displays[i];
+        if (d->fullscreen_window == window && d->id != target) {
+            d->fullscreen_window = NULL;
+            set_display_mode(d, NULL);
+        }
+    }
+    SDLop_Display *d = display_by_id(target);
+    if (!d) {
+        return;
+    }
+    SDL_DisplayMode m;
+    const SDL_DisplayMode *fm = &window->fullscreen_mode;
+    if (!SDL_GetClosestFullscreenDisplayMode(d->id, fm->w, fm->h, fm->refresh_rate, fm->pixel_density > 1.0f, &m)) {
+        return;
+    }
+    if (set_display_mode(d, &m)) {
+        /* display_by_id again: the driver may have re-sorted the table */
+        SDLop_Display *after = display_by_id(target);
+        if (after) {
+            after->fullscreen_window = window;
+        }
+    }
 }
 
 SDL_DisplayID SDL_GetDisplayForPoint(const SDL_Point *point)
@@ -648,8 +759,12 @@ SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window *window)
 
 float SDL_GetWindowPixelDensity(SDL_Window *window)
 {
-    (void)window;
-    return 1.0f; /* SDLop has no high-density path yet */
+    /* stock: pixel size / window size */
+    int w = 0, h = 0, pw = 0, ph = 0;
+    if (!SDL_GetWindowSize(window, &w, &h) || !SDL_GetWindowSizeInPixels(window, &pw, &ph)) {
+        return 0.0f;
+    }
+    return w > 0 ? (float)pw / (float)w : 1.0f;
 }
 
 /* ------------------------------------------------------------------ */
@@ -857,6 +972,9 @@ SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)
 
     SDLOP_AddWindow(window);
     SDLOP_UpdateWindowDisplay(window);
+    if (sdlop.video->AcceptDragAndDrop) {
+        sdlop.video->AcceptDragAndDrop(window, SDLOP_IsAcceptingDragAndDrop());
+    }
 
     if (!(flags & SDL_WINDOW_HIDDEN)) {
         SDL_ShowWindow(window);
@@ -920,6 +1038,7 @@ void SDL_DestroyWindow(SDL_Window *window)
     }
 
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_DESTROYED, 0, 0);
+    SDLOP_UpdateFullscreenMode(window, false); /* the desktop mode comes back */
     /* as stock SDL: a GL context current on this window is released (the
      * context itself stays valid for another window) */
     if (SDL_GL_GetCurrentWindow() == window) {
@@ -1127,6 +1246,9 @@ bool SDL_ShowWindow(SDL_Window *window)
     }
     if (window->flags & SDL_WINDOW_HIDDEN) {
         window->flags &= ~SDL_WINDOW_HIDDEN;
+        if (window->flags & SDL_WINDOW_FULLSCREEN) {
+            SDLOP_UpdateFullscreenMode(window, true);
+        }
         if (sdlop.video && sdlop.video->ShowWindow) {
             sdlop.video->ShowWindow(sdlop.video, window);
         }
@@ -1160,6 +1282,7 @@ bool SDL_HideWindow(SDL_Window *window)
             SDLOP_UpdateWindowGrab(window);
         }
         window->flags |= SDL_WINDOW_HIDDEN;
+        SDLOP_UpdateFullscreenMode(window, false);
         if (sdlop.video && sdlop.video->HideWindow) {
             sdlop.video->HideWindow(sdlop.video, window);
         }
@@ -1212,6 +1335,8 @@ bool SDL_SetWindowFullscreen(SDL_Window *window, bool fullscreen)
     }
     if (fullscreen) {
         window->flags |= SDL_WINDOW_FULLSCREEN;
+        /* exclusive mode first, so the window is fitted to it */
+        SDLOP_UpdateFullscreenMode(window, true);
     } else {
         window->flags &= ~SDL_WINDOW_FULLSCREEN;
     }
@@ -1220,11 +1345,15 @@ bool SDL_SetWindowFullscreen(SDL_Window *window, bool fullscreen)
             /* revert on failure */
             if (fullscreen) {
                 window->flags &= ~SDL_WINDOW_FULLSCREEN;
+                SDLOP_UpdateFullscreenMode(window, false);
             } else {
                 window->flags |= SDL_WINDOW_FULLSCREEN;
             }
             return false;
         }
+    }
+    if (!fullscreen) {
+        SDLOP_UpdateFullscreenMode(window, false);
     }
     return true;
 }
@@ -1256,6 +1385,9 @@ bool SDL_SetWindowFullscreenMode(SDL_Window *window, const SDL_DisplayMode *mode
     }
 
     /* if fullscreen is in effect, re-apply so the mode takes hold now */
+    if (window->flags & SDL_WINDOW_FULLSCREEN) {
+        SDLOP_UpdateFullscreenMode(window, true);
+    }
     if ((window->flags & SDL_WINDOW_FULLSCREEN) != 0 && sdlop.video && sdlop.video->SetWindowFullscreen) {
         if (!sdlop.video->SetWindowFullscreen(sdlop.video, window)) {
             return false; /* driver sets error */
@@ -1418,7 +1550,12 @@ bool SDL_GetWindowSizeInPixels(SDL_Window *window, int *w, int *h)
     SDL_GetWindowSize(window, w, h);
     const SDL_DisplayMode *mode;
     SDL_DisplayID displayID = SDL_GetDisplayForWindow(window);
-    if ((window->flags & SDL_WINDOW_FULLSCREEN) && SDL_GetWindowFullscreenMode(window)) {
+    const bool exclusive = (window->flags & SDL_WINDOW_FULLSCREEN) && SDL_GetWindowFullscreenMode(window);
+    if (!exclusive && sdlop.video && sdlop.video->GetWindowSizeInPixels) {
+        sdlop.video->GetWindowSizeInPixels(sdlop.video, window, w, h);
+        return true;
+    }
+    if (exclusive) {
         mode = SDL_GetCurrentDisplayMode(displayID);
     } else {
         mode = SDL_GetDesktopDisplayMode(displayID);
@@ -1863,7 +2000,8 @@ bool SDL_SetWindowProgressState(SDL_Window *window, SDL_ProgressState state)
         return SDL_InvalidParamError("state");
     }
     window->progress_state = state;
-    return true; /* stock SDL3 forwards this over DBus (Unity launcher API) */
+    SDLOP_Desktop_UpdateProgress(window); /* Unity launcher API over D-Bus (stock) */
+    return true;
 }
 
 SDL_ProgressState SDL_GetWindowProgressState(SDL_Window *window)
@@ -1878,6 +2016,7 @@ bool SDL_SetWindowProgressValue(SDL_Window *window, float value)
     CHECK_WINDOW(window, false);
     CHECK_WINDOW_NOT_POPUP(window, false);
     window->progress_value = SDL_clamp(value, 0.0f, 1.0f);
+    SDLOP_Desktop_UpdateProgress(window);
     return true;
 }
 
@@ -1980,7 +2119,15 @@ bool SDL_DisableScreenSaver(void)
 SDL_SystemTheme SDL_GetSystemTheme(void)
 {
     if (sdlop.video && sdlop.video->GetSystemTheme) {
-        return sdlop.video->GetSystemTheme(sdlop.video);
+        const SDL_SystemTheme t = sdlop.video->GetSystemTheme(sdlop.video);
+        if (t != SDL_SYSTEM_THEME_UNKNOWN) {
+            return t;
+        }
+    }
+    /* desktop sessions (dummy too, for headless tools and tests); consoles
+     * have no theme, like stock */
+    if (sdlop.video && strcmp(sdlop.video->name, "kmsdrm") != 0 && strcmp(sdlop.video->name, "fbdev") != 0) {
+        return SDLOP_Desktop_GetSystemTheme();
     }
     return SDL_SYSTEM_THEME_UNKNOWN;
 }

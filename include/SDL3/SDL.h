@@ -38,6 +38,7 @@
 #include <SDL3/SDL_clipboard.h>
 #include <SDL3/SDL_misc.h>
 #include <SDL3/SDL_messagebox.h>
+#include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_vulkan.h>
 #include <SDL3/SDL_atomic.h>
 #include <SDL3/SDL_thread.h>

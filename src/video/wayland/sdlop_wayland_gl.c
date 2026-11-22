@@ -368,8 +368,8 @@ bool SDLOP_Wayland_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window,
             if (!SDLOP_Wayland_AcquireOffloadShm(window, NULL, NULL, NULL, NULL)) {
                 return false;
             }
-            int w = window->w > 0 ? window->w : 1;
-            int h = window->h > 0 ? window->h : 1;
+            int w, h;
+            SDLOP_Wayland_GetWindowPixelSize(window, &w, &h);
             if (!*slot) {
                 *slot = SDLOP_GLOffload_CreateSurface(glctx->offload_ctx, w, h);
                 if (!*slot) {
@@ -413,7 +413,9 @@ bool SDLOP_Wayland_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window,
             }
             void **eglwin_slot = SDLOP_Wayland_GetGLEGLWindowSlot(window);
             if (eglwin_slot && !*eglwin_slot) {
-                *eglwin_slot = p_wl_egl_window_create(wls, window->w, window->h);
+                int pw, ph;
+                SDLOP_Wayland_GetWindowPixelSize(window, &pw, &ph);
+                *eglwin_slot = p_wl_egl_window_create(wls, pw, ph);
                 if (!*eglwin_slot) {
                     return SDL_SetError("wl_egl_window_create failed");
                 }
@@ -466,15 +468,16 @@ bool SDLOP_Wayland_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
         if (!SDLOP_Wayland_AcquireOffloadShm(window, &shm_pixels, &shm_pitch, &shm_w, &shm_h)) {
             return false;
         }
-        if (!SDLOP_GLOffload_ReadToXRGB8888(octx, (SDLOP_GLOffloadSurface *)*slot,
-                                            shm_pixels, shm_pitch, shm_w, shm_h)) {
+        /* transparent windows present ARGB8888 buffers: keep GL's alpha */
+        if (!SDLOP_GLOffload_ReadToARGB8888(octx, (SDLOP_GLOffloadSurface *)*slot, shm_pixels, shm_pitch, shm_w,
+                                            shm_h, (window->flags & SDL_WINDOW_TRANSPARENT) != 0)) {
             return false;
         }
         if (!SDLOP_Wayland_PresentOffloadShm(window)) {
             return false;
         }
-        int cur_w = window->w > 0 ? window->w : 1;
-        int cur_h = window->h > 0 ? window->h : 1;
+        int cur_w, cur_h;
+        SDLOP_Wayland_GetWindowPixelSize(window, &cur_w, &cur_h);
         int sw = 0, sh = 0;
         SDLOP_GLOffload_GetSurfaceSize((SDLOP_GLOffloadSurface *)*slot, &sw, &sh);
         if (sw != cur_w || sh != cur_h) {
@@ -562,8 +565,8 @@ void SDLOP_Wayland_GL_WindowResized(SDL_Window *window)
             ? cur->offload_ctx
             : (octx_slot ? (SDLOP_GLOffloadContext *)*octx_slot : NULL);
         if (octx && slot && *slot) {
-            int w = window->w > 0 ? window->w : 1;
-            int h = window->h > 0 ? window->h : 1;
+            int w, h;
+            SDLOP_Wayland_GetWindowPixelSize(window, &w, &h);
             int sw = 0, sh = 0;
             SDLOP_GLOffload_GetSurfaceSize((SDLOP_GLOffloadSurface *)*slot, &sw, &sh);
             if (sw != w || sh != h) {
@@ -578,7 +581,9 @@ void SDLOP_Wayland_GL_WindowResized(SDL_Window *window)
     }
     void **eglwin_slot = SDLOP_Wayland_GetGLEGLWindowSlot(window);
     if (eglwin_slot && *eglwin_slot && p_wl_egl_window_resize) {
-        p_wl_egl_window_resize((struct wl_egl_window *)*eglwin_slot, window->w, window->h, 0, 0);
+        int pw, ph;
+        SDLOP_Wayland_GetWindowPixelSize(window, &pw, &ph);
+        p_wl_egl_window_resize((struct wl_egl_window *)*eglwin_slot, pw, ph, 0, 0);
     }
 }
 

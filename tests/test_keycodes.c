@@ -126,28 +126,86 @@ int main(void)
     SDL_StartTextInput(w);
     key_result r = press(SDL_SCANCODE_A, KEY_A);
     CHECK(r.got_key && r.key == SDLK_A, "KEY_DOWN a -> SDLK_A (0x%x)", (unsigned)r.key);
-    if (!no_xkb) {
-        CHECK(r.got_text && strcmp(r.text, "a") == 0, "text 'a' (got '%s')", r.text);
-    }
+    CHECK(r.got_text && strcmp(r.text, "a") == 0, "text 'a' (got '%s')", r.text);
 
     SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_LSHIFT, KEY_LEFTSHIFT, 0);
     r = press(SDL_SCANCODE_A, KEY_A);
     CHECK(r.got_key && r.key == SDLK_A, "KEY_DOWN shift+a -> SDLK_A, unmodified like SDL3 (0x%x)", (unsigned)r.key);
     CHECK(r.mod & SDL_KMOD_LSHIFT, "shift+a carries LSHIFT");
-    if (!no_xkb) {
-        CHECK(r.got_text && strcmp(r.text, "A") == 0, "shift+a types 'A' (got '%s')", r.text);
-    }
+    CHECK(r.got_text && strcmp(r.text, "A") == 0, "shift+a types 'A' (got '%s')", r.text);
     r = press(SDL_SCANCODE_2, KEY_2);
     CHECK(r.got_key && r.key == SDLK_2, "KEY_DOWN shift+2 -> SDLK_2 (0x%x)", (unsigned)r.key);
-    if (!no_xkb) {
-        CHECK(r.got_text && strcmp(r.text, "@") == 0, "shift+2 types '@' (got '%s')", r.text);
-    }
+    CHECK(r.got_text && strcmp(r.text, "@") == 0, "shift+2 types '@' (got '%s')", r.text);
     SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_LSHIFT, KEY_LEFTSHIFT, 0);
 
     r = press(SDL_SCANCODE_SPACE, KEY_SPACE);
     CHECK(r.got_key && r.key == SDLK_SPACE, "KEY_DOWN space -> SDLK_SPACE (0x%x)", (unsigned)r.key);
     r = press(SDL_SCANCODE_1, KEY_1);
     CHECK(r.got_key && r.key == SDLK_1, "KEY_DOWN 1 -> SDLK_1");
+
+    /* --- held keys: repeats carry text (core path, then the raw evdev
+     * window-system path, where kernel repeats are dropped in favour of
+     * SDL's own); then with repeat turned off by the window system
+     * (wl_keyboard.repeat_info rate 0, xset r off) ----------------------- */
+    SDLOP_RawInputSetRepeatInfo(100, 20);
+    for (int pass = 0; pass < 3; pass++) {
+        const bool raw_path = pass == 1;
+        const bool disabled = pass == 2;
+        sdlop.repeat_disabled = disabled;
+        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+        SDLop_RawEvent re;
+        memset(&re, 0, sizeof(re));
+        re.type = 1; /* EV_KEY */
+        re.code = KEY_A;
+        re.value = 1;
+        if (raw_path) {
+            re.timestamp_ns = SDLOP_MonotonicNS();
+            SDLOP_RawInputTestFeed(&re, true);
+        } else {
+            SDLOP_SendKeyboardKey(true, false, SDL_SCANCODE_A, KEY_A, 0);
+        }
+        int downs = 0, repeats = 0, texts = 0, kernel = 0;
+        const Uint64 end = SDL_GetTicks() + 400;
+        while (SDL_GetTicks() < end) {
+            if (raw_path && kernel < 10) { /* kernel autorepeat (value 2) arrives too */
+                re.value = 2;
+                re.timestamp_ns = SDLOP_MonotonicNS();
+                SDLOP_RawInputTestFeed(&re, true);
+                kernel++;
+            }
+            SDL_PumpEvents();
+            SDL_Event e;
+            while (SDL_PollEvent(&e)) {
+                if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_A) {
+                    downs++;
+                    repeats += e.key.repeat;
+                } else if (e.type == SDL_EVENT_TEXT_INPUT && strcmp(e.text.text, "a") == 0) {
+                    texts++;
+                }
+            }
+            SDL_Delay(5);
+        }
+        re.value = 0;
+        if (raw_path) {
+            SDLOP_RawInputTestFeed(&re, true);
+        } else {
+            SDLOP_SendKeyboardKey(false, false, SDL_SCANCODE_A, KEY_A, 0);
+        }
+        const char *what = raw_path ? "raw evdev path" : "core path";
+        if (disabled) {
+            CHECK(downs == 1 && repeats == 0 && texts == 1, "repeat off: one key down, no repeats (%d downs, %d texts)",
+                  downs, texts);
+            sdlop.repeat_disabled = false;
+            continue;
+        }
+        /* 400 ms held, 100 ms delay, 20 ms interval: ~15 repeats */
+        CHECK(repeats >= 8 && repeats <= 20 && downs == repeats + 1, "%s: held key repeats (%d downs, %d repeats)", what,
+              downs, repeats);
+        CHECK(texts == downs, "%s: one TEXT_INPUT per key down incl. repeats (%d texts, %d downs)", what, texts,
+              downs);
+        SDL_PumpEvents();
+        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+    }
     SDL_StopTextInput(w);
 
     SDL_DestroyWindow(w);
