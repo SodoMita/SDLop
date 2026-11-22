@@ -35,6 +35,11 @@ typedef BOOL (WINAPI *PFNWGLCHOOSEPIXELFORMATARBPROC)(HDC, const int *, const FL
 #define WGL_CONTEXT_MINOR_VERSION_ARB 0x2092
 #define WGL_CONTEXT_FLAGS_ARB 0x2094
 #define WGL_CONTEXT_PROFILE_MASK_ARB 0x9126
+/* WGL_EXT_create_context_es2_profile / es_profile. SDL_GL_CONTEXT_PROFILE_ES is
+ * 0x0004 and WGL's ES2 profile bit is the same value, so the mask can be passed
+ * through unchanged -- which is what SDL3 does ("SDL profile bits match WGL
+ * profile bits"). */
+#define WGL_CONTEXT_ES2_PROFILE_BIT_EXT 0x0004
 #define WGL_CONTEXT_CORE_PROFILE_BIT_ARB 0x00000001
 #define WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB 0x00000002
 #define WGL_CONTEXT_DEBUG_BIT_ARB 0x00000001
@@ -257,10 +262,14 @@ void *SDLOP_Win32GLCreateContext(SDLop_VideoDevice *device, SDL_Window *window)
     const int profile = sdlop_glattrs.profile_mask;
     const bool debug = (sdlop_glattrs.flags & SDL_GL_CONTEXT_DEBUG_FLAG) != 0;
     const bool forward = (sdlop_glattrs.flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) != 0;
-    const bool core_requested = (profile & SDL_GL_CONTEXT_PROFILE_CORE) != 0;
 
     HGLRC ctx = NULL;
-    if (wgl.create_context_attribs && (major > 2 || core_requested)) {
+    /* The attribs path is also required whenever a profile is requested. An
+     * OpenGL ES request is major 2 with a non-core profile, so testing only
+     * "major > 2 || core" sent it down the legacy wglCreateContext branch,
+     * where the profile mask cannot be expressed at all -- the driver then
+     * hands back a desktop context and nothing reports an error. */
+    if (wgl.create_context_attribs && (major > 2 || profile != 0)) {
         int attribs[16];
         int n = 0;
         attribs[n++] = WGL_CONTEXT_MAJOR_VERSION_ARB;
@@ -268,8 +277,13 @@ void *SDLOP_Win32GLCreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         attribs[n++] = WGL_CONTEXT_MINOR_VERSION_ARB;
         attribs[n++] = minor;
         if (profile) {
+            /* Pass the mask through. Collapsing everything that is not CORE to
+             * COMPATIBILITY, as this used to, silently answered an OpenGL ES
+             * request with a desktop compatibility context: an app asking for
+             * ES 2.0 was handed "GL 4.5 (Compatibility Profile)" with no
+             * error. Measured. */
             attribs[n++] = WGL_CONTEXT_PROFILE_MASK_ARB;
-            attribs[n++] = core_requested ? WGL_CONTEXT_CORE_PROFILE_BIT_ARB : WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB;
+            attribs[n++] = profile;
         }
         if (debug || forward) {
             attribs[n++] = WGL_CONTEXT_FLAGS_ARB;
@@ -280,6 +294,20 @@ void *SDLOP_Win32GLCreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         HGLRC share = sdlop_glattrs.share_with_current_context ? wglGetCurrentContext() : NULL;
         ctx = wgl.create_context_attribs(hdc, share, attribs);
         if (!ctx) {
+            if (profile != 0) {
+                /* Do not substitute a desktop context for a profile request.
+                 * The legacy wglCreateContext cannot express a profile, so the
+                 * result would be a plain compatibility context handed back as
+                 * if it were what was asked for -- an OpenGL ES app would get
+                 * "GL 4.5 (Compatibility Profile)" and only discover the
+                 * mismatch when its shaders fail. Measured on llvmpipe, whose
+                 * WGL exposes no ES2 profile bit. Stock SDL3 fails here too
+                 * ("Could not create GL context") rather than downgrading. */
+                ReleaseDC(data->hwnd, hdc);
+                SDL_SetError("Could not create a GL context with the requested profile "
+                             "(the driver does not support it)");
+                return NULL;
+            }
             /* A driver that cannot give the requested version still gives a
              * legacy context; SDL3 falls back the same way. */
             ctx = wglCreateContext(hdc);

@@ -161,6 +161,62 @@ static void test_context_and_swap_interval(SDL_Window *window)
           "releasing the current context left the window in an inconsistent state");
 }
 
+/* An OpenGL ES request must either produce a real ES context or fail.
+ *
+ * It must never silently produce a desktop context: an ES app would then run
+ * against GL 4.x and only discover the mismatch when its ES-only shaders or
+ * missing entry points fail, with nothing in SDL_GetError() to explain it.
+ *
+ * Measured before the fix: requesting SDL_GL_CONTEXT_PROFILE_ES with major 2
+ * returned "GL 4.5 (Compatibility Profile)" and reported success. Two separate
+ * defects produced that: the legacy wglCreateContext branch was taken because
+ * the attribs path tested only "major > 2 || core", and when the profile
+ * context genuinely could not be created the driver fell back to a desktop
+ * context anyway.
+ *
+ * Both outcomes are accepted here; the silent downgrade is not. */
+static void test_es_profile_is_honest(void)
+{
+    SDL_Window *window;
+    SDL_GLContext context;
+    const char *version;
+
+    SDL_GL_ResetAttributes();
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+
+    window = SDL_CreateWindow("sdlop gl es", 160, 120, SDL_WINDOW_OPENGL);
+    if (!window) {
+        printf("test_win32_gl: ES section skipped, no window: %s\n", SDL_GetError());
+        SDL_GL_ResetAttributes();
+        return;
+    }
+    context = SDL_GL_CreateContext(window);
+    if (!context) {
+        /* Correct: the driver has no ES2 profile bit, and saying so is better
+         * than pretending. This is what llvmpipe does. */
+        const char *error = SDL_GetError();
+        printf("test_win32_gl: ES context refused (expected on a driver without "
+               "WGL_EXT_create_context_es2_profile): %s\n",
+               (error && *error) ? error : "(no error text)");
+        CHECK(error != NULL && *error != '\0',
+              "SDL_GL_CreateContext failed for an ES profile but left no error "
+              "message, so the caller cannot tell why");
+    } else {
+        version = (const char *)glGetString(GL_VERSION);
+        CHECK(version != NULL, "ES context created but GL_VERSION is unreadable");
+        CHECK(version && SDL_strncmp(version, "OpenGL ES", 9) == 0,
+              "an OpenGL ES profile was requested and a context was returned, but "
+              "GL_VERSION is \"%s\" -- a desktop context was substituted instead of "
+              "reporting that ES is unavailable",
+              version ? version : "(null)");
+        SDL_GL_DestroyContext(context);
+    }
+    SDL_DestroyWindow(window);
+    SDL_GL_ResetAttributes();
+}
+
 static void test_two_windows(void)
 {
     SDL_Window *a;
@@ -215,6 +271,7 @@ int main(void)
 
     test_context_and_swap_interval(window);
     test_two_windows();
+    test_es_profile_is_honest();
 
     SDL_DestroyWindow(window);
     SDL_Quit();
