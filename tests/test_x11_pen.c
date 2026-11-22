@@ -80,7 +80,7 @@ static size_t fake_infos_len = 0;
 static int fake_infos_count = 0;
 #define XI_QUERY_DEVICE 48
 /* diagnostics */
-static atomic_int stat_queries = 0, stat_query_replies = 0, stat_rewrites = 0;
+static atomic_int stat_queries = 0, stat_query_replies = 0, stat_rewrites = 0, stat_injections = 0;
 
 static int connect_real_server(void)
 {
@@ -305,6 +305,7 @@ static void *proxy_thread(void *arg)
                 i += 32 + 4u * len;
             }
             bool ok = write_all(pc->client, inject_buf, inject_len);
+            atomic_fetch_add(&stat_injections, 1);
             inject_len = 0;
             atomic_store(&inject_pending, 0);
             pthread_mutex_unlock(&inject_lock);
@@ -834,14 +835,22 @@ int main(int argc, char *argv[])
     CHECK(i >= 0 && log.ev[i].ptouch.which == eraser && log.ev[i].ptouch.eraser, "eraser: PEN_DOWN eraser=true");
 
     /* --- unplug ------------------------------------------------------- */
-    printf("test_x11_pen: before unplug: %d XIQueryDevice requests, %d replies, %d rewritten\n",
-           atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites));
+    fprintf(stderr, "test_x11_pen: before unplug: %d XIQueryDevice requests, %d replies, %d rewritten, %d injections\n",
+            atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites),
+            atomic_load(&stat_injections));
     atomic_store(&fake_present, false);
     queue_hierarchy(XCB_INPUT_HIERARCHY_MASK_SLAVE_REMOVED);
     flush_and_collect(&log);
-    printf("test_x11_pen: after unplug: %d XIQueryDevice requests, %d replies, %d rewritten; types %d %d\n",
-           atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites),
-           (int)SDL_GetPenDeviceType(stylus), (int)SDL_GetPenDeviceType(eraser));
+    fprintf(stderr, "test_x11_pen: after unplug: %d XIQueryDevice requests, %d replies, %d rewritten, %d injections; types %d %d\n",
+            atomic_load(&stat_queries), atomic_load(&stat_query_replies), atomic_load(&stat_rewrites),
+            atomic_load(&stat_injections), (int)SDL_GetPenDeviceType(stylus), (int)SDL_GetPenDeviceType(eraser));
+    if (SDL_GetPenDeviceType(stylus) != SDL_PEN_DEVICE_TYPE_INVALID) {
+        event_log late;
+        memset(&late, 0, sizeof(late));
+        pump(&late, 1500);
+        fprintf(stderr, "test_x11_pen: 1.5 s later: %d events, %d pen events, types %d %d\n", late.n, count_pen(&late),
+                (int)SDL_GetPenDeviceType(stylus), (int)SDL_GetPenDeviceType(eraser));
+    }
     int outs = 0;
     for (i = 0; i < log.n; i++) {
         outs += log.ev[i].type == SDL_EVENT_PEN_PROXIMITY_OUT;
