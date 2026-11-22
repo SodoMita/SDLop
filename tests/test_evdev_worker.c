@@ -157,6 +157,16 @@ int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout)
     return result;
 }
 
+#ifdef __GLIBC__
+/* Fortified glibc can redirect poll to __poll_chk (notably with ASan).
+ * Intercept that entry too: otherwise the producer gate is never released. */
+int __wrap___poll_chk(struct pollfd *fds, nfds_t count, int timeout, size_t bytes)
+{
+    assert(count <= bytes / sizeof(*fds));
+    return __wrap_poll(fds, count, timeout);
+}
+#endif
+
 static Uint64 clock_ns(clockid_t clock)
 {
     struct timespec now;
@@ -168,6 +178,12 @@ static void on_raw(const SDLop_RawEvent *event, void *userdata)
 {
     (void)userdata;
     callback_stamp = event->timestamp_ns;
+    /* Count publication remains per event, after the callback, not per read.
+     * Exercise this while the worker is the only writer of the public count. */
+    Uint64 completed = (Uint64)atomic_load_explicit(&records, memory_order_relaxed);
+    SDLop_RawInputStats stats;
+    assert(SDLop_GetRawEventCount() == completed);
+    assert(SDLop_GetRawInputStats(&stats) && stats.events_seen == completed);
     atomic_fetch_add_explicit(&records, 1, memory_order_release);
 }
 
@@ -291,6 +307,7 @@ int main(int argc, char **argv)
     }
     interrupt_shutdown = busy_test; /* first control write must retry EINTR */
     SDL_Quit();
+    assert(SDLop_GetRawEventCount() == (Uint64)atomic_load_explicit(&records, memory_order_acquire));
     if (busy_test) { assert(shutdown_interrupted == 1); }
     uinput_synth_destroy(device);
     printf("test_evdev_worker %s: %s\n", argv[1], failures ? "FAIL" : "PASS");

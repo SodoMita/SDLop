@@ -536,7 +536,7 @@ if(SDLop_BUILD_TESTS)
   target_compile_options(test_evdev_worker PRIVATE -UNDEBUG)
   target_link_options(test_evdev_worker PRIVATE
     -Wl,--wrap=opendir -Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=ioctl
-    -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=epoll_wait)
+    -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=__poll_chk -Wl,--wrap=epoll_wait)
   foreach(mode wake busy monotonic negotiated-authoritative fallback-monotonic fallback-realtime)
     add_test(NAME evdev_worker_${mode} COMMAND test_evdev_worker ${mode})
     set_tests_properties(evdev_worker_${mode} PROPERTIES TIMEOUT 15)
@@ -565,7 +565,7 @@ if(SDLop_BUILD_TESTS)
   target_include_directories(test_input_transport PRIVATE tests)
   target_compile_options(test_input_transport PRIVATE -UNDEBUG)
   target_link_options(test_input_transport PRIVATE
-    -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=clock_gettime)
+    -Wl,--wrap=write -Wl,--wrap=poll -Wl,--wrap=__poll_chk -Wl,--wrap=clock_gettime)
   add_test(NAME test_input_transport COMMAND test_input_transport)
   set_tests_properties(test_input_transport PROPERTIES TIMEOUT 5)
 

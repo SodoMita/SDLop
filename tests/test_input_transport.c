@@ -32,6 +32,15 @@ int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout)
     return 1;
 }
 
+#ifdef __GLIBC__
+/* Match fortified poll redirection without disabling fortification. */
+int __wrap___poll_chk(struct pollfd *fds, nfds_t count, int timeout, size_t bytes)
+{
+    assert(count <= bytes / sizeof(*fds));
+    return __wrap_poll(fds, count, timeout);
+}
+#endif
+
 int __wrap_clock_gettime(clockid_t clock, struct timespec *ts)
 {
     assert(clock == CLOCK_MONOTONIC);
