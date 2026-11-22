@@ -63,6 +63,7 @@
 #define SDLOP_HINT_X11_NO_SHM            "SDLOP_X11_NO_SHM"        /**< bool: do not use MIT-SHM */
 #define SDLOP_HINT_X11_NO_XIM           "SDLOP_X11_NO_XIM"        /**< bool: no input method (XIM via libX11) for text input */
 #define SDLOP_HINT_X11_NO_TOUCH          "SDLOP_X11_NO_TOUCH"      /**< bool: no XInput2 touch */
+#define SDLOP_HINT_X11_NO_PEN            "SDLOP_X11_NO_PEN"        /**< bool: no XInput2 pens (tablets stay plain mice); read at video init */
 #define SDLOP_HINT_X11_NO_XSETTINGS     "SDLOP_X11_NO_XSETTINGS"  /**< bool: do not read XSETTINGS (content scale from Gdk/WindowScalingFactor, Xft/DPI); read at video init */
 #define SDLOP_HINT_X11_RELATIVE_WARP     "SDLOP_X11_RELATIVE_WARP" /**< bool: relative mode by warping instead of XInput2 raw motion */
 /* GPU offload (headless GPU rendering presented through the window framebuffer) */

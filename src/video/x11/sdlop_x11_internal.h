@@ -19,6 +19,7 @@ void SDLOP_X11_PumpUntil(bool (*pred)(void *), void *userdata, int timeout_ms);
 int SDLOP_X11_GetScreenNumber(void);
 xcb_visualid_t SDLOP_X11_GetVisual(void);
 xcb_window_t SDLOP_X11_GetWindowXID(SDL_Window *window);
+SDL_Window *SDLOP_X11_WindowFromXID(xcb_window_t xid); /* NULL = not ours */
 /* X visual of the window: SDLOP_X11_GetVisual() unless it is an OpenGL window
  * created with the visual of its GLX framebuffer config */
 xcb_visualid_t SDLOP_X11_GetWindowVisual(SDL_Window *window);
@@ -82,6 +83,15 @@ void SDLOP_X11_DnD_Quit(void);
 bool SDLOP_X11_DnD_HandleEvent(xcb_generic_event_t *ev); /* true = consumed */
 void SDLOP_X11_DnD_WindowDestroyed(SDL_Window *window);
 void SDLOP_X11_AcceptDragAndDrop(SDL_Window *window, bool accept);
+
+/* sdlop_x11_pen.c - XInput 2 tablets */
+void SDLOP_X11_Pen_Init(uint8_t xi_opcode); /* XI 2.2 present */
+void SDLOP_X11_Pen_Quit(void);
+void SDLOP_X11_Pen_WindowCreated(xcb_window_t xid);
+bool SDLOP_X11_Pen_HandleEvent(const xcb_ge_generic_event_t *ge); /* true = consumed */
+bool SDLOP_X11_Pen_IsPenDevice(uint16_t deviceid);
+/* a core pointer event the master device made from pen input */
+bool SDLOP_X11_Pen_FilterCore(xcb_timestamp_t time);
 
 /* sdlop_x11_xim.c - input methods on a private Xlib connection */
 bool SDLOP_X11_XIM_Start(SDL_Window *window);

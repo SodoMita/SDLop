@@ -14,7 +14,7 @@
     SHM     libxcb-shm.so.0         optional - MIT-SHM software framebuffer
     XKB     libxcb-xkb.so.1         optional - keymap/state events, detectable repeat
     XKBX11  libxkbcommon-x11.so.0   optional - server keymap -> xkbcommon
-    XINPUT  libxcb-xinput.so.0      optional - XI2 raw motion (relative mouse)
+    XINPUT  libxcb-xinput.so.0      optional - XI2 raw motion (relative mouse), touch, pens
     RANDR   libxcb-randr.so.0       optional - monitors, modes, refresh rates
     RENDER  libxcb-render.so.0      optional - ARGB cursors
     XFIXES  libxcb-xfixes.so.0      optional - clipboard owner-change events
@@ -144,6 +144,10 @@ SDLOP_X11_SYM(XINPUT, xcb_input_xi_query_version_reply)
 SDLOP_X11_SYM(XINPUT, xcb_input_xi_select_events_checked)
 SDLOP_X11_SYM(XINPUT, xcb_input_raw_button_press_valuator_mask)
 SDLOP_X11_SYM(XINPUT, xcb_input_raw_button_press_axisvalues_raw)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_query_device)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_query_device_reply)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_get_property)
+SDLOP_X11_SYM(XINPUT, xcb_input_xi_get_property_reply)
 
 /* -------------------------------------------------------------- RANDR */
 SDLOP_X11_MODULE(RANDR)

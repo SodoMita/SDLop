@@ -916,6 +916,11 @@ xcb_visualid_t SDLOP_X11_GetVisual(void)
     return x11.visual;
 }
 
+SDL_Window *SDLOP_X11_WindowFromXID(xcb_window_t xid)
+{
+    return window_from_xid(xid);
+}
+
 xcb_window_t SDLOP_X11_GetWindowXID(SDL_Window *window)
 {
     X11WindowData *wd = wdata(window);
@@ -1362,7 +1367,7 @@ static void send_moveresize(SDL_Window *window, int16_t root_x, int16_t root_y, 
 static void handle_motion(xcb_motion_notify_event_t *mev)
 {
     SDL_Window *window = window_from_xid(mev->event);
-    if (!window) {
+    if (!window || SDLOP_X11_Pen_FilterCore(mev->time)) {
         return;
     }
     Uint64 ts = SDLOP_MonotonicNS();
@@ -1411,7 +1416,7 @@ static void handle_motion(xcb_motion_notify_event_t *mev)
 static void handle_button(xcb_button_press_event_t *bev, bool down)
 {
     SDL_Window *window = window_from_xid(bev->event);
-    if (!window) {
+    if (!window || SDLOP_X11_Pen_FilterCore(bev->time)) {
         return;
     }
     Uint64 ts = SDLOP_MonotonicNS();
@@ -1554,6 +1559,9 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
         handle_touch((xcb_input_touch_begin_event_t *)ge);
         return;
     }
+    if (SDLOP_X11_Pen_HandleEvent(ge)) {
+        return;
+    }
     if (ge->event_type != XCB_INPUT_RAW_MOTION || !x11.relative_window) {
         return;
     }
@@ -1562,6 +1570,9 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
         return;
     }
     xcb_input_raw_button_press_event_t *raw = (xcb_input_raw_button_press_event_t *)ge;
+    if (SDLOP_X11_Pen_IsPenDevice(raw->sourceid)) {
+        return; /* pens are absolute: no relative motion (stock) */
+    }
     const uint32_t *mask = X11_xcb_input_raw_button_press_valuator_mask(raw);
     const xcb_input_fp3232_t *values = X11_xcb_input_raw_button_press_axisvalues_raw(raw);
     double dx = 0.0, dy = 0.0;
@@ -2253,6 +2264,9 @@ static bool x11_Init(SDLop_VideoDevice *device)
         }
     }
 
+    if (x11.has_xi2) {
+        SDLOP_X11_Pen_Init(x11.xi_opcode);
+    }
     x11_init_xkb();
     x11_load_keymap();
     x11_sync_repeat_info();
@@ -2312,6 +2326,7 @@ static void x11_Quit(SDLop_VideoDevice *device)
     SDLOP_X11_DnD_Quit();
     SDLOP_X11_XSettings_Quit();
     SDLOP_X11_XIM_Quit();
+    SDLOP_X11_Pen_Quit();
     free(x11.peeked);
     x11.peeked = NULL;
     if (x11.conn) {
@@ -2484,6 +2499,9 @@ static bool x11_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     uint32_t gcv = 0;
     X11_xcb_create_gc(x11.conn, wd->gc, wd->xid, XCB_GC_GRAPHICS_EXPOSURES, &gcv);
     select_touch(wd->xid);
+    if (x11.has_xi2) {
+        SDLOP_X11_Pen_WindowCreated(wd->xid);
+    }
 
     wd->cfg_x = window->x;
     wd->cfg_y = window->y;

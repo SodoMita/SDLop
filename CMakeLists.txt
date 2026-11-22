@@ -413,6 +413,7 @@ if(SDLOP_VIDEO_X11)
     src/video/x11/sdlop_x11_clipboard.c
     src/video/x11/sdlop_x11_dnd.c
     src/video/x11/sdlop_x11_xsettings.c
+    src/video/x11/sdlop_x11_pen.c
     src/video/x11/sdlop_x11_xim.c
     src/video/x11/sdlop_x11_vulkan.c)
   list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
@@ -748,6 +749,14 @@ if(SDLop_BUILD_TESTS)
       target_compile_options(test_x11_touch PRIVATE -UNDEBUG)
       add_test(NAME test_x11_touch COMMAND test_x11_touch)
       set_tests_properties(test_x11_touch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # XI2 pens: the same kind of proxy adds a fake tablet to XIQueryDevice
+      add_executable(test_x11_pen tests/test_x11_pen.c)
+      target_link_libraries(test_x11_pen PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} pthread m)
+      target_include_directories(test_x11_pen PRIVATE ${X11_TOUCH_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_pen PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_pen COMMAND test_x11_pen on)
+      add_test(NAME test_x11_pen_off COMMAND test_x11_pen off)
+      set_tests_properties(test_x11_pen test_x11_pen_off PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
     endif()
   endif()
 
