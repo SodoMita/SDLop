@@ -308,11 +308,15 @@ static void remove_pen_at(int i, bool deselect)
 static void enumerate(void)
 {
     xcb_connection_t *c = SDLOP_X11_GetConnection();
+    xcb_generic_error_t *err = NULL;
     xcb_input_xi_query_device_reply_t *r =
-        X11_xcb_input_xi_query_device_reply(c, X11_xcb_input_xi_query_device(c, XCB_INPUT_DEVICE_ALL), NULL);
+        X11_xcb_input_xi_query_device_reply(c, X11_xcb_input_xi_query_device(c, XCB_INPUT_DEVICE_ALL), &err);
     if (!r) {
+        SDL_SetError("x11 pen enumerate: no reply (error %d)", err ? err->error_code : -1);
+        free(err);
         return;
     }
+    int parsed = 0;
     for (int i = 0; i < xp.num_pens; i++) {
         xp.pens[i]->seen = false;
     }
@@ -338,9 +342,16 @@ static void enumerate(void)
             break;
         }
         consider_device(info, q);
+        parsed++;
         p = q;
     }
+    const int num_infos = r->num_infos;
     free(r);
+    int removed = 0;
+    for (int i = 0; i < xp.num_pens; i++) {
+        removed += !xp.pens[i]->seen;
+    }
+    SDL_SetError("x11 pen enumerate: %d/%d infos, %d pens, %d gone", parsed, num_infos, xp.num_pens, removed);
     for (int i = xp.num_pens - 1; i >= 0; i--) {
         if (!xp.pens[i]->seen) {
             remove_pen_at(i, false); /* the device is gone: nothing to deselect */

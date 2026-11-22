@@ -847,11 +847,11 @@ int main(int argc, char *argv[])
         pump(&late, 1500);
         late_pen = count_pen(&late);
     }
-    char diag[256];
-    snprintf(diag, sizeof(diag), "queries %d->%d replies %d->%d rewrites %d->%d injections %d->%d late %d types %d %d",
+    char diag[512];
+    snprintf(diag, sizeof(diag), "queries %d->%d replies %d->%d rewrites %d->%d injections %d->%d late %d types %d %d [%s]",
              q0, atomic_load(&stat_queries), r0, atomic_load(&stat_query_replies), w0, atomic_load(&stat_rewrites), j0,
              atomic_load(&stat_injections), late_pen, (int)SDL_GetPenDeviceType(stylus),
-             (int)SDL_GetPenDeviceType(eraser));
+             (int)SDL_GetPenDeviceType(eraser), SDL_GetError());
     int outs = 0;
     for (i = 0; i < log.n; i++) {
         outs += log.ev[i].type == SDL_EVENT_PEN_PROXIMITY_OUT;
