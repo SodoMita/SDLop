@@ -1536,7 +1536,7 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
 
 static float x11_global_content_scale(void)
 {
-    /* SDL3 order: explicit override, Xft.dpi, GDK_SCALE */
+    /* SDL3 order: explicit override, Xft.dpi, XSETTINGS, GDK_SCALE */
     const char *env = SDL_GetHint(SDL_HINT_VIDEO_X11_SCALING_FACTOR);
     if (env && *env) {
         float f = strtof(env, NULL);
@@ -1562,6 +1562,14 @@ static float x11_global_content_scale(void)
         }
     }
     free(res);
+    /* then XSETTINGS: the GDK window scale, Xft/DPI in 1024ths */
+    int value;
+    if (scale <= 0.0f && SDLOP_X11_XSettings_GetInt("Gdk/WindowScalingFactor", &value) && value > 0) {
+        scale = (float)value;
+    }
+    if (scale <= 0.0f && SDLOP_X11_XSettings_GetInt("Xft/DPI", &value) && value > 0) {
+        scale = (float)value / 1024.0f / 96.0f;
+    }
     if (scale <= 0.0f) {
         env = getenv("GDK_SCALE");
         if (env && *env) {
@@ -1975,6 +1983,11 @@ static bool x11_Init(SDLop_VideoDevice *device)
     x11_load_keymap();
     x11_sync_repeat_info();
     x11_init_randr();
+    /* root: RESOURCE_MANAGER changes (Xft.dpi) and XSETTINGS MANAGER
+     * announcements (sent with StructureNotify) */
+    uint32_t root_mask = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+    X11_xcb_change_window_attributes(x11.conn, x11.root, XCB_CW_EVENT_MASK, &root_mask);
+    SDLOP_X11_XSettings_Init();
     x11_update_displays(false);
 
     /* invisible cursor for relative mode: 1x1 empty bitmap */
@@ -2011,6 +2024,7 @@ static void x11_Quit(SDLop_VideoDevice *device)
     x11.num_monitors = 0;
     SDLOP_X11_Clipboard_Quit();
     SDLOP_X11_DnD_Quit();
+    SDLOP_X11_XSettings_Quit();
     SDLOP_X11_XIM_Quit();
     free(x11.peeked);
     x11.peeked = NULL;
@@ -3517,6 +3531,13 @@ static void x11_dispatch(xcb_generic_event_t *ev)
         return;
     }
     if (SDLOP_X11_Clipboard_HandleEvent(ev) || SDLOP_X11_DnD_HandleEvent(ev)) {
+        return;
+    }
+    bool settings_changed = false;
+    if (SDLOP_X11_XSettings_HandleEvent(ev, &settings_changed)) {
+        if (settings_changed) {
+            x11.displays_dirty = true; /* the content scale may follow them */
+        }
         return;
     }
     if (x11.has_randr && (type == x11.randr_event_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY ||

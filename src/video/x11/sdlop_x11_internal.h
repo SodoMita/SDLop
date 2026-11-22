@@ -67,6 +67,14 @@ char *SDLOP_X11_GetPrimarySelectionText(SDLop_VideoDevice *device);
 bool SDLOP_X11_HasPrimarySelectionText(SDLop_VideoDevice *device);
 
 /* sdlop_x11_dnd.c */
+/* sdlop_x11_xsettings.c */
+void SDLOP_X11_XSettings_Init(void);
+void SDLOP_X11_XSettings_Quit(void);
+/* true = consumed; *changed is set when the settings changed */
+bool SDLOP_X11_XSettings_HandleEvent(xcb_generic_event_t *ev, bool *changed);
+bool SDLOP_X11_XSettings_GetInt(const char *name, int *value);
+const char *SDLOP_X11_XSettings_GetString(const char *name);
+
 void SDLOP_X11_DnD_Init(void);
 void SDLOP_X11_DnD_Quit(void);
 bool SDLOP_X11_DnD_HandleEvent(xcb_generic_event_t *ev); /* true = consumed */

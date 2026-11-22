@@ -409,6 +409,7 @@ if(SDLOP_VIDEO_X11)
     src/video/x11/sdlop_x11_gl.c
     src/video/x11/sdlop_x11_clipboard.c
     src/video/x11/sdlop_x11_dnd.c
+    src/video/x11/sdlop_x11_xsettings.c
     src/video/x11/sdlop_x11_xim.c
     src/video/x11/sdlop_x11_vulkan.c)
   list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
@@ -610,6 +611,15 @@ if(SDLop_BUILD_TESTS)
       target_compile_options(test_x11_hittest PRIVATE -UNDEBUG)
       add_test(NAME test_x11_hittest COMMAND test_x11_hittest)
       set_tests_properties(test_x11_hittest PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      # XSETTINGS content scale against a raw xcb settings manager
+      add_executable(test_x11_xsettings tests/test_x11_xsettings.c)
+      target_link_libraries(test_x11_xsettings PRIVATE sdlop m ${X11_TEST_DEPS_LIBRARIES})
+      target_include_directories(test_x11_xsettings PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+      target_compile_options(test_x11_xsettings PRIVATE -UNDEBUG)
+      add_test(NAME test_x11_xsettings COMMAND test_x11_xsettings)
+      add_test(NAME test_x11_xsettings_off COMMAND test_x11_xsettings)
+      set_tests_properties(test_x11_xsettings test_x11_xsettings_off PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+      set_tests_properties(test_x11_xsettings_off PROPERTIES ENVIRONMENT "SDLOP_X11_NO_XSETTINGS=1")
       # _NET_WM_SYNC_REQUEST resize sync (the test itself needs xcb-sync)
       pkg_check_modules(X11_SYNC_TEST_DEPS xcb xcb-sync)
       if(X11_SYNC_TEST_DEPS_FOUND)
