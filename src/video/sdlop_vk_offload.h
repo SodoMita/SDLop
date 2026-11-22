@@ -8,15 +8,20 @@
 
   When the application resolves Vulkan entry points through
   SDL_Vulkan_GetVkGetInstanceProcAddr(), hardware GPUs are prioritized over
-  software devices (lavapipe) and vkQueuePresentKHR automatically reads back
-  and blits presented swapchain images into the active driver's window
-  framebuffer (CreateWindowFramebuffer / UpdateWindowFramebuffer).
+  software devices (lavapipe). If an ICD cannot create a real headless
+  swapchain, swapchain images and acquisition are emulated with plain GPU
+  images; vkQueuePresentKHR then reads them back and blits them into the
+  active driver's window framebuffer (CreateWindowFramebuffer /
+  UpdateWindowFramebuffer).
 
   Controlled by SDLOP_VULKAN_OFFLOAD (alias SDLOP_VK_OFFLOAD), falling back
   to SDLOP_OFFLOAD:
     0 / off / false / no    - disable offload
     1 / on / true / force   - force offload when VK_EXT_headless_surface exists
-    unset / auto            - automatic when output lacks hw WSI + hw GPU exists
+    unset / auto            - automatic when the native WSI capability probe fails
+                              (KMSDRM checks displays, modes, planes, surface
+                              formats and present modes; NVIDIA's proprietary
+                              driver is treated as unsafe for auto selection)
 
   This software is provided 'as-is', without any express or implied
   warranty (zlib license, see LICENSE).

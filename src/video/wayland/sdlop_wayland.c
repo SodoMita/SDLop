@@ -35,7 +35,7 @@
 #include "pointer-warp-v1-client-protocol.h"
 #include "pointer-gestures-unstable-v1-client-protocol.h"
 #include "xdg-foreign-unstable-v2-client-protocol.h"
-#include "../kmsdrm/sdlop_xcursor.h"
+#include "../sdlop_xcursor.h"
 
 #include <errno.h>
 #include <poll.h>

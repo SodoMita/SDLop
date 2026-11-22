@@ -27,6 +27,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "qemu/vt_mask_check.h"
+#include "video/sdlop_xcursor.h"
 
 /* CHECK is used both from main (int failures) and from helpers that take an
  * int *failures. Increment through a pointer in both cases so the helpers'
@@ -272,8 +273,48 @@ static void cursor_phase(SDL_Window *window, SDL_Surface *s, int *failures)
     SDL_PumpEvents();
     SDL_UpdateWindowSurface(window);
 
-    /* the built-in arrow is white inside a black outline on the green band;
-       sample the band well away from both pointer positions */
+    /* The console drivers now share one bitmap source. Verify it reached the
+       framebuffer: every non-transparent pixel must land at the same hotspot
+       KMSDRM uses, with premultiplied alpha over the untouched app pixels. */
+    const struct sdlop_cursor_bitmap *shared =
+        sdlop_system_cursor_bitmap_fit(SDL_SYSTEM_CURSOR_DEFAULT, s->w, s->h);
+    CHECK(shared && shared->w > 0 && shared->h > 0,
+          "shared console cursor bitmap is available");
+    if (shared && shared->w > 0 && shared->h > 0 && shared->w <= s->w && shared->h <= s->h) {
+        const int x0 = SDL_clamp(s->w / 2 - shared->hot_x, 0, s->w - shared->w);
+        const int y0 = SDL_clamp(s->h / 2 - shared->hot_y, 0, s->h - shared->h);
+        int samples = 0, mismatches = 0;
+        for (int y = 0; y < shared->h; y++) {
+            for (int x = 0; x < shared->w; x++) {
+                const uint32_t px = shared->pixels[(size_t)y * (size_t)shared->w + (size_t)x];
+                const unsigned a = px >> 24;
+                if (a == 0) {
+                    continue;
+                }
+                const unsigned under = surface_pixel(s, x0 + x, y0 + y);
+                unsigned expected = 0;
+                if (a == 255) {
+                    expected = px & 0x00FFFFFFu;
+                } else {
+                    const unsigned inv = 255u - a;
+                    const unsigned r = ((under >> 16) & 0xFFu) * inv / 255u + ((px >> 16) & 0xFFu);
+                    const unsigned g = ((under >> 8) & 0xFFu) * inv / 255u + ((px >> 8) & 0xFFu);
+                    const unsigned b = (under & 0xFFu) * inv / 255u + (px & 0xFFu);
+                    expected = (r << 16) | (g << 8) | b;
+                }
+                const unsigned got = screen_pixel(s, x0 + x, y0 + y);
+                samples++;
+                if (!pixel_near(got, expected, 1)) {
+                    mismatches++;
+                }
+            }
+        }
+        CHECK(samples > 0, "shared cursor has opaque pixels to compare");
+        CHECK(mismatches == 0, "fbdev cursor uses the shared bitmap (%d/%d pixels differ)",
+              mismatches, samples);
+    }
+
+    /* sample the band well away from the pointer, whatever bitmap it uses */
     const unsigned band = screen_pixel(s, s->w / 8, s->h / 2);
     int drawn = 0;
     for (int y = s->h / 2 - 10; y < s->h / 2 + 10 && !drawn; y++) {
