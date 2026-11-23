@@ -159,9 +159,17 @@ jobs:
           Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp &
           export DISPLAY=:99
           for i in $(seq 100); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
-          # the DLL must sit beside the test binaries (the PE loader looks in
-          # the executable's directory first)
-          cp build/libSDLop.dll build/tests/ 2>/dev/null || true
+          # Binaries are written flat into the build dir, and the PE loader
+          # looks in the executable's own directory first. Copy the DLL next to
+          # them (and its MinGW runtime from the toolchain) rather than assuming
+          # a tests/ subdirectory, which is why the first run of this job failed
+          # every single test with a loader error rather than a test failure.
+          cp -v build/libSDLop.dll build/ 2>/dev/null || true
+          for dll in $(x86_64-w64-mingw32-gcc -print-file-name=libgcc_s_seh-1.dll) \
+                     $(find /usr -name 'libwinpthread-1.dll' 2>/dev/null | head -1); do
+            [ -f "$dll" ] && cp -v "$dll" build/ || true
+          done
+          export PATH="$PWD/build:$PATH"
           cd build
           if ! ctest --output-on-failure --timeout 180 -j1; then
             {
