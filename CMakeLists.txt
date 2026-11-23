@@ -696,7 +696,8 @@ if(SDLop_BUILD_TESTS)
     # These inject input or drive global OS state (clipboard, foreground
     # window, system-wide button mask), so they must not run beside anything.
     foreach(t test_win32_cursor test_win32_hittest test_win32_shape
-              test_win32_close test_win32_raw_keyboard_e2e test_win32_raw_mouse_e2e
+              test_win32_close test_win32_windowsize
+              test_win32_raw_keyboard_e2e test_win32_raw_mouse_e2e
               test_win32_gl test_win32_vulkan test_win32_clipboard)
       add_executable(${t} tests/${t}.c)
       target_link_libraries(${t} PRIVATE sdlop)

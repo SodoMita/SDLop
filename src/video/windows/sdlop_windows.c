@@ -65,6 +65,40 @@ bool SDLOP_Win32GetClientRectInPixels(SDL_Window *window, RECT *rc)
     return true;
 }
 
+/* The DPI whose border metrics apply to this window. SDL3 asks Win32 for the
+ * window's own DPI (AdjustWindowRectExForDpi) because the frame grows with the
+ * monitor's scale; the non-DPI AdjustWindowRectEx uses the system DPI and is
+ * wrong on any other monitor. */
+static UINT win32_frame_dpi(SDL_Window *window)
+{
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    UINT dpi = 0;
+    if (data && data->hwnd) {
+        dpi = GetDpiForWindow(data->hwnd);
+    }
+    if (!dpi) {
+        dpi = GetDpiForSystem();
+    }
+    return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
+}
+
+/* Grow a client rect into the window rect that has that client area. The style
+ * must be the one the window will actually have: sizing with a hardcoded
+ * WS_OVERLAPPEDWINDOW gives a window whose client area is short by the
+ * difference between the thin and thick frames (2x1 px, and taller still on
+ * scaled monitors). SDL3 passes the real style in the same way. */
+static void win32_adjust_window_rect_for_style(SDL_Window *window, DWORD style, DWORD exstyle, RECT *rc)
+{
+    /* Borderless and popup windows have no non-client area to account for. */
+    if ((window->flags & SDL_WINDOW_BORDERLESS) ||
+        (window->flags & (SDL_WINDOW_POPUP_MENU | SDL_WINDOW_TOOLTIP))) {
+        return;
+    }
+    if (!AdjustWindowRectExForDpi(rc, style, FALSE, exstyle, win32_frame_dpi(window))) {
+        AdjustWindowRectEx(rc, style, FALSE, exstyle);
+    }
+}
+
 void SDLOP_Win32AdjustWindowRect(SDL_Window *window, RECT *rc)
 {
     SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
@@ -74,10 +108,11 @@ void SDLOP_Win32AdjustWindowRect(SDL_Window *window, RECT *rc)
         style = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
         exstyle = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     } else {
+        /* No HWND yet: the style this window is about to be created with. */
         style = WS_OVERLAPPEDWINDOW;
         exstyle = 0;
     }
-    AdjustWindowRectEx(rc, style, FALSE, exstyle);
+    win32_adjust_window_rect_for_style(window, style, exstyle, rc);
 }
 
 /* Convert a Win32 message time (ms since boot) to an SDL timestamp. Both are
@@ -1005,12 +1040,18 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MOVE:
         if (window) {
-            const int x = (int)(short)LOWORD(lparam);
-            const int y = (int)(short)HIWORD(lparam);
-            if (x != window->x || y != window->y) {
-                window->x = x;
-                window->y = y;
-                SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, x, y);
+            /* lparam is the frame origin; SDL's coordinates start at the client
+             * area, which is what SDL_GetWindowPosition() reports (SDL3 derives
+             * it with ClientToScreen for the same reason). */
+            POINT client = { 0, 0 };
+            if (!ClientToScreen(hwnd, &client)) {
+                client.x = (int)(short)LOWORD(lparam);
+                client.y = (int)(short)HIWORD(lparam);
+            }
+            if (client.x != window->x || client.y != window->y) {
+                window->x = client.x;
+                window->y = client.y;
+                SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, client.x, client.y);
             }
         }
         return 0;
@@ -1262,11 +1303,57 @@ static void win32_add_displays(SDLop_VideoDevice *device)
 /* Clipboard sequence number as of the last pump; see win32_check_clipboard_update. */
 static DWORD win32_clipboard_sequence;
 
+/* SDL3 declares the process DPI awareness from SDL_HINT_WINDOWS_DPI_AWARENESS,
+ * defaulting to per-monitor-v2. That is what makes a window's client size
+ * follow the monitor it is on instead of being bitmap-stretched when it is
+ * dragged to a display with a different scale. SetProcessDPIAware() alone is
+ * the Vista-era "system" level, which pins everything to the primary monitor's
+ * scale. The hint must be read before the first window exists, and the level
+ * cannot be changed afterwards. */
+static void win32_declare_dpi_awareness(void)
+{
+    const char *hint = SDL_GetHint("SDL_WINDOWS_DPI_AWARENESS");
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    /* The pointer typedef is what _WIN32_WINNT gates; spelling it out keeps
+     * this compiling against older SDKs without a cast-function-type warning. */
+    typedef BOOL (WINAPI * PFN_setcontext)(DPI_AWARENESS_CONTEXT);
+    PFN_setcontext set_context = NULL;
+    if (user32) {
+        set_context = (PFN_setcontext)(void (*)(void))GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+    }
+
+    if (hint && SDL_strcmp(hint, "unaware") == 0) {
+        if (set_context) {
+            set_context(DPI_AWARENESS_CONTEXT_UNAWARE);
+        }
+        return;
+    }
+    if (hint && SDL_strcmp(hint, "system") == 0) {
+        if (set_context && set_context(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)) {
+            return;
+        }
+        SetProcessDPIAware();
+        return;
+    }
+    if (hint && SDL_strcmp(hint, "permonitor") == 0) {
+        if (set_context && set_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE)) {
+            return;
+        }
+        return; /* asked for v1; do not silently upgrade to v2 */
+    }
+    /* default, and "permonitorv2" */
+    if (set_context && set_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+        return;
+    }
+    /* Pre-1607 Windows: the best that is available there. */
+    SetProcessDPIAware();
+}
+
 static bool win32_Init(SDLop_VideoDevice *device)
 {
     SDL_zero(sdlop_win32);
     WM_TASKBARBUTTONCREATED = RegisterWindowMessageW(L"TaskbarButtonCreated");
-    SetProcessDPIAware(); /* SDL3: DPI aware by default */
+    win32_declare_dpi_awareness();
     if (!win32_register_class()) {
         return false;
     }
@@ -1358,6 +1445,8 @@ static wchar_t *utf8_to_wide_alloc(const char *text)
     return wide;
 }
 
+static void win32_update_display_scale(SDL_Window *window, Uint32 dpi);
+
 static void win32_AdjustWindowSize(SDL_Window *window, RECT *rc)
 {
     SDLOP_Win32AdjustWindowRect(window, rc);
@@ -1371,18 +1460,20 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_OutOfMemory();
     }
     SDLOP_MUTEX_INIT_ONCE(&data->surfacelock);
-    data->dpi = (Uint32)GetDpiForWindow(data->hwnd);
     window->driverdata = data;
 
+    /* Size with the style this window is actually created with -- the frame
+     * of a thin (non-resizable) window is smaller than a thick one, so using
+     * anything else leaves the client area off by the difference. */
+    DWORD style = window_style_for(window);
+    DWORD exstyle = window_exstyle_for(window);
     RECT rc = { 0, 0, window->w, window->h };
-    win32_AdjustWindowSize(window, &rc);
+    win32_adjust_window_rect_for_style(window, style, exstyle, &rc);
 
     const wchar_t *title_w = NULL;
     wchar_t *title_alloc = utf8_to_wide_alloc(window->title);
     title_w = title_alloc;
 
-    DWORD style = window_style_for(window);
-    DWORD exstyle = window_exstyle_for(window);
     if (window->flags & SDL_WINDOW_HIDDEN) {
         style &= ~WS_VISIBLE;
     }
@@ -1419,6 +1510,11 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
+    /* The window is on its monitor now, so its DPI is known. Without this the
+     * scale stays at the 1.0 the core sets until the user drags the window to
+     * a different monitor (WM_DPICHANGED), and every size in points on a
+     * scaled display is reported unscaled. */
+    win32_update_display_scale(window, GetDpiForWindow(hwnd));
     update_metrics(window);
     return true;
 }
@@ -1473,9 +1569,22 @@ static void win32_ShowWindow(SDLop_VideoDevice *device, SDL_Window *window)
     SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
     window->flags &= ~SDL_WINDOW_HIDDEN;
     if (data && data->hwnd) {
-        ShowWindow(data->hwnd, SW_SHOW);
-        SetForegroundWindow(data->hwnd);
-        SetFocus(data->hwnd);
+        /* SDL3 only takes the foreground when the hint (default on) allows it,
+         * so a window can be shown without yanking focus away from whatever the
+         * user is typing into. WS_EX_NOACTIVATE windows always stay passive. */
+        bool activate = SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN), true);
+        if ((DWORD)GetWindowLongPtrW(data->hwnd, GWL_EXSTYLE) & WS_EX_NOACTIVATE) {
+            activate = false;
+        }
+        if (activate) {
+            ShowWindow(data->hwnd, SW_SHOW);
+            SetForegroundWindow(data->hwnd);
+            SetFocus(data->hwnd);
+        } else {
+            /* SWP_SHOWWINDOW does not activate the window, unlike SW_SHOW. */
+            SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0,
+                         SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+        }
     }
 }
 
@@ -1505,6 +1614,36 @@ static bool win32_SetWindowTitle(SDLop_VideoDevice *device, SDL_Window *window)
     return true;
 }
 
+/* Change the window style without moving the drawing area. SetWindowLong +
+ * SWP_FRAMECHANGED alone makes Windows re-lay-out the frame around the old
+ * window rect, so the client area grows or shrinks by the difference between
+ * the old and new frames: a window toggled borderless grows by the whole title
+ * bar, and the application's content jumps. Re-apply the window rect computed
+ * from the client size it has now, keeping the client origin in place. */
+static void win32_apply_style_keeping_client(SDL_Window *window, DWORD style, DWORD exstyle)
+{
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data || !data->hwnd) {
+        return;
+    }
+    POINT client_origin = { 0, 0 };
+    const bool have_origin = ClientToScreen(data->hwnd, &client_origin) != 0;
+
+    SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, (LONG_PTR)exstyle);
+    SetWindowLongPtrW(data->hwnd, GWL_STYLE, (LONG_PTR)style);
+
+    RECT rc = { 0, 0, window->w, window->h };
+    win32_adjust_window_rect_for_style(window, style, exstyle, &rc);
+    /* rc.left/rc.top are negative: how far the frame extends beyond the client
+     * area. Placing the frame at client_origin + rc.left puts the client area
+     * back where it was. */
+    const int x = have_origin ? client_origin.x + (int)rc.left : window->x;
+    const int y = have_origin ? client_origin.y + (int)rc.top : window->y;
+    SetWindowPos(data->hwnd, NULL, x, y,
+                 rc.right - rc.left, rc.bottom - rc.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 static bool win32_SetWindowSize(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -1525,9 +1664,14 @@ static bool win32_SetWindowPosition(SDLop_VideoDevice *device, SDL_Window *windo
     (void)device;
     SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
     if (data && data->hwnd) {
-        RECT rc = { 0, 0, window->w, window->h };
+        /* SDL reports the position of the drawing area, not of the frame (WM_MOVE
+         * reads it back with ClientToScreen). SetWindowPos places the frame, so
+         * the border offset has to be applied or every set/get pair drifts by
+         * the frame offset. rc.left/top are negative for a bordered window, so
+         * adding them moves the frame up and left of the client area. */
+        RECT rc = { 0, 0, 0, 0 };
         win32_AdjustWindowSize(window, &rc);
-        SetWindowPos(data->hwnd, NULL, window->x, window->y, 0, 0,
+        SetWindowPos(data->hwnd, NULL, window->x + (int)rc.left, window->y + (int)rc.top, 0, 0,
                      SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, window->x, window->y);
@@ -1586,9 +1730,13 @@ static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *win
         SDL_zero(mi);
         mi.cbSize = sizeof(mi);
         if (GetMonitorInfoW(MonitorFromWindow(data->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            /* Only a window that asked to stay on top goes topmost. Forcing
+             * HWND_TOPMOST here made every fullscreen window topmost, and the
+             * Z-order boost is what SDL3 goes out of its way to avoid. */
+            const HWND top = (window->flags & SDL_WINDOW_ALWAYS_ON_TOP) ? HWND_TOPMOST : HWND_NOTOPMOST;
             SetWindowLongPtrW(data->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
             SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, data->windowed_exstyle & ~WS_EX_TOPMOST);
-            SetWindowPos(data->hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top,
+            SetWindowPos(data->hwnd, top, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right - mi.rcMonitor.left,
                          mi.rcMonitor.bottom - mi.rcMonitor.top,
                          SWP_NOCOPYBITS | SWP_SHOWWINDOW);
@@ -1598,7 +1746,9 @@ static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *win
         data->is_fullscreen = false;
         SetWindowLongPtrW(data->hwnd, GWL_STYLE, (LONG_PTR)data->windowed_style);
         SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, (LONG_PTR)data->windowed_exstyle);
-        SetWindowPos(data->hwnd, (data->windowed_exstyle & WS_EX_TOPMOST) ? HWND_TOPMOST : HWND_NOTOPMOST,
+        const bool was_topmost = (data->windowed_exstyle & WS_EX_TOPMOST) != 0 &&
+                                 (window->flags & SDL_WINDOW_ALWAYS_ON_TOP) != 0;
+        SetWindowPos(data->hwnd, was_topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
                      data->windowed_rect.left, data->windowed_rect.top,
                      data->windowed_rect.right - data->windowed_rect.left,
                      data->windowed_rect.bottom - data->windowed_rect.top,
@@ -1613,9 +1763,41 @@ static void win32_RaiseWindow(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
     SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
-    if (data && data->hwnd) {
-        SetForegroundWindow(data->hwnd);
-        BringWindowToTop(data->hwnd);
+    HWND hwnd = data ? data->hwnd : NULL;
+    if (!hwnd) {
+        return;
+    }
+
+    /* Windows refuses SetForegroundWindow() to a process the user is not
+     * interacting with, so a plain call silently only reorders the window.
+     * SDL3 attaches to the foreground thread's input queue to get the raise
+     * through when SDL_HINT_FORCE_RAISEWINDOW asks for it. */
+    const bool force = SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_FORCE_RAISEWINDOW), false);
+    const bool activate = SDLOP_GetStringBoolean(SDL_GetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED), true);
+    DWORD my_thread = 0, prev_thread = 0;
+    if (force) {
+        HWND previous = GetForegroundWindow();
+        my_thread = GetCurrentThreadId();
+        prev_thread = GetWindowThreadProcessId(previous, NULL);
+        ShowWindow(hwnd, SW_RESTORE);
+        if (prev_thread && prev_thread != my_thread) {
+            AttachThreadInput(prev_thread, my_thread, TRUE);
+        }
+    }
+
+    if (activate) {
+        SetForegroundWindow(hwnd);
+        BringWindowToTop(hwnd);
+    } else {
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    if (force) {
+        if (prev_thread && prev_thread != my_thread) {
+            AttachThreadInput(prev_thread, my_thread, FALSE);
+        }
+        SetFocus(hwnd);
+        SetActiveWindow(hwnd);
     }
 }
 
@@ -2015,10 +2197,7 @@ static void win32_SetWindowBordered(SDLop_VideoDevice *device, SDL_Window *windo
     } else {
         window->flags |= SDL_WINDOW_BORDERLESS;
     }
-    const DWORD style = window_style_for(window);
-    SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, (LONG_PTR)window_exstyle_for(window));
-    SetWindowLongPtrW(data->hwnd, GWL_STYLE, (LONG_PTR)style);
-    SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    win32_apply_style_keeping_client(window, window_style_for(window), window_exstyle_for(window));
 }
 
 /* Nothing to install: WM_SIZING consults the ratio on every drag. Apply it to
@@ -2037,18 +2216,16 @@ static void win32_SetWindowAspectRatio(SDLop_VideoDevice *device, SDL_Window *wi
 static void win32_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *window, bool resizable)
 {
     (void)device;
+    (void)resizable; /* the style comes from window->flags, already updated */
     SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
     if (!data || !data->hwnd) {
         return;
     }
-    DWORD style = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_STYLE);
-    if (resizable) {
-        style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
-    } else {
-        style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
-    }
-    SetWindowLongPtrW(data->hwnd, GWL_STYLE, style);
-    SetWindowPos(data->hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    /* A thick frame is wider than a thin one, so this is a frame change like
+     * any other: keep the drawing area and let the window rect follow. */
+    const DWORD style = window_style_for(window);
+    const DWORD exstyle = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_EXSTYLE);
+    win32_apply_style_keeping_client(window, style, exstyle);
 }
 
 /* Undocumented but the only way to show the system menu at a point; SDL3
