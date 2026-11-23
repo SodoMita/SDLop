@@ -235,6 +235,11 @@ static void do_disable(void)
 /* (re)evaluate after keyboard focus or text-input state changes */
 void SDLOP_Wayland_TextInput_Update(void)
 {
+    if (!ti.manager) {
+        /* no text-input-v3: a Fcitx / IBus client over D-Bus, as stock */
+        SDLOP_IME_DBus_Update();
+        return;
+    }
     if (!ti.ti) {
         return;
     }
@@ -253,6 +258,10 @@ void SDLOP_Wayland_TextInput_Update(void)
 
 bool SDLOP_Wayland_TextInput_Start(SDL_Window *window)
 {
+    if (!ti.manager) {
+        SDLOP_IME_DBus_Update();
+        return true;
+    }
     if (ti.ti && ti.enabled && ti.enabled_window == window) {
         /* new properties: re-enable so they take effect (stock re-applies
          * them on the next enable) */
@@ -273,6 +282,10 @@ bool SDLOP_Wayland_TextInput_Stop(SDL_Window *window)
 
 bool SDLOP_Wayland_TextInput_UpdateArea(SDL_Window *window)
 {
+    if (!ti.manager) {
+        SDLOP_IME_DBus_UpdateArea(window);
+        return true;
+    }
     if (ti.ti && ti.enabled && ti.enabled_window == window) {
         const SDL_Rect *r = &window->text_input_rect;
         if (r->x != ti.rect.x || r->y != ti.rect.y || r->w != ti.rect.w || r->h != ti.rect.h ||
@@ -287,6 +300,12 @@ bool SDLOP_Wayland_TextInput_UpdateArea(SDL_Window *window)
 
 bool SDLOP_Wayland_TextInput_ClearComposition(SDL_Window *window)
 {
+    if (!ti.manager) {
+        if (window == sdlop.keyboard_focus) {
+            SDLOP_IME_DBus_Reset();
+        }
+        return true;
+    }
     if (ti.ti && ti.enabled && ti.enabled_window == window) {
         /* enable resets the input method state, including its preedit */
         do_enable(window);
@@ -308,6 +327,7 @@ void SDLOP_Wayland_TextInput_WindowDestroyed(SDL_Window *window)
 
 void SDLOP_Wayland_TextInput_Quit(void)
 {
+    SDLOP_IME_DBus_Quit();
     if (ti.ti) {
         zwp_text_input_v3_destroy(ti.ti);
     }

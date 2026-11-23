@@ -382,6 +382,7 @@ set(SDLop_SOURCES
   src/SDL_devices.c
   src/SDL_video.c
   src/SDL_dbus.c
+  src/SDL_ime_dbus.c
   src/SDL_desktop.c
   src/SDL_dialog.c
   src/SDL_surface.c
@@ -532,7 +533,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(SDLop_BUILD_TESTS)
   enable_testing()
-  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device test_options test_dropin_compat test_raw_translate test_dbus test_ime_txn)
+  foreach(t test_ring test_scancode test_events test_surface test_web test_keycodes test_layouts test_core test_main_callbacks test_misc test_threads test_vt_mask test_fbdev_device test_options test_dropin_compat test_raw_translate test_dbus test_ime_dbus test_ime_txn)
     add_executable(${t} tests/${t}.c)
     target_link_libraries(${t} PRIVATE sdlop)
     target_include_directories(${t} PRIVATE src)
