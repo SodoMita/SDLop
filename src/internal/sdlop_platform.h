@@ -47,6 +47,13 @@
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
+#if !defined(__GLIBC__) && !defined(__ANDROID__)
+#include <stdatomic.h>
+#endif
+
+/* The sleep path owns a kernel timer on Windows and nothing here; SDL_Quit
+ * calls this unconditionally. */
+static inline void SDLOP_ReleaseTimerHandles(void) { }
 
 /* --- mutex ------------------------------------------------------- */
 
@@ -81,28 +88,50 @@ typedef pthread_mutex_t SDLOP_MUTEX_T;
 typedef struct SDLOP_StaticMutex
 {
     pthread_mutex_t id;
+#if !defined(__GLIBC__) && !defined(__ANDROID__)
+    /* 0 = uninitialised, 1 = initialising, 2 = ready. Only the fallback path
+     * needs it: the glibc spelling above is ready from the start. */
+    _Atomic int state;
+#endif
 } SDLOP_StaticMutex;
 
+/* Both branches have to yield a lock that is usable without any explicit init
+ * call, because SDLOP_SM() is the only thing the call sites do.
+ * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP is the glibc spelling of exactly
+ * that, and needs no work at all. Elsewhere (musl, *BSD, macOS) the only
+ * portable initialiser is PTHREAD_MUTEX_INITIALIZER, which is neither
+ * recursive nor able to carry a type, so the lock is built on first use --
+ * recursively, as CRITICAL_SECTION is on Windows -- and published through an
+ * atomic state in the object itself.
+ * The previous fallback defined a name##_ensure() helper that nothing ever
+ * called, so every lock went to pthread_mutex_lock on a mutex that had never
+ * been initialised. */
 #if defined(__GLIBC__) || defined(__ANDROID__)
 #define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP }
+#define SDLOP_SM(m) (&(m)->id)
 #else
-#define SDLOP_STATIC_MUTEX(name)                                       \
-    SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER };            \
-    static bool name##_inited;                                         \
-    static void name##_init(void)                                      \
-    {                                                                  \
-        SDLOP_MUTEX_INIT_RECURSIVE(&(name).id);                        \
-    }                                                                  \
-    static void name##_ensure(void)                                    \
-    {                                                                  \
-        static SDLOP_ONCE_T once = SDLOP_ONCE_INIT;                    \
-        if (!name##_inited) {                                          \
-            SDLOP_ONCE(&once, name##_init);                            \
-            name##_inited = true;                                      \
-        }                                                              \
+#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER, 0 }
+
+static inline SDLOP_MUTEX_T *SDLOP_StaticMutexGet(SDLOP_StaticMutex *m)
+{
+    int state = atomic_load_explicit(&m->state, memory_order_acquire);
+    if (state != 2) {
+        if (atomic_compare_exchange_strong_explicit(&m->state, &(int){ 0 }, 1,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            SDLOP_MUTEX_INIT_RECURSIVE(&m->id);
+            atomic_store_explicit(&m->state, 2, memory_order_release);
+        } else {
+            /* another thread is building it; it is ready when state hits 2 */
+            while (atomic_load_explicit(&m->state, memory_order_acquire) != 2) {
+                sched_yield();
+            }
+        }
     }
+    return &m->id;
+}
+#define SDLOP_SM(m) SDLOP_StaticMutexGet(m)
 #endif
-#define SDLOP_SM(m)              (&(m)->id)
 
 /* --- once -------------------------------------------------------- */
 
@@ -238,6 +267,9 @@ typedef struct SDLOP_StaticMutex
 BOOL CALLBACK SDLOP_StaticMutexInitTrampoline(PINIT_ONCE once, PVOID param, PVOID *ctx);
 
 #define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { { 0 }, INIT_ONCE_STATIC_INIT }
+
+/* Releases the one waitable timer the sleep path allocates, from SDL_Quit. */
+void SDLOP_ReleaseTimerHandles(void);
 
 static inline SDLOP_MUTEX_T *SDLOP_StaticMutexGet(SDLOP_StaticMutex *m)
 {

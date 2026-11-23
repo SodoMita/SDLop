@@ -333,6 +333,7 @@ void SDL_Quit(void)
 #endif
     SDLOP_EnvironmentQuit();
     SDLOP_ThreadsQuit();
+    SDLOP_ReleaseTimerHandles();
     memset(&sdlop, 0, sizeof(sdlop));
     sdlop.wake_fd = -1;
     SDLOP_ResetTouchMouse();
