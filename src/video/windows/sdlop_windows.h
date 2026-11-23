@@ -20,6 +20,7 @@
 typedef struct SDLop_Win32WindowData
 {
     HWND hwnd;
+    HDC hdc;            /* the window's own DC (CS_OWNDC), stable for its life */
     HDC dc;             /* memory DC holding the software DIB */
     HBITMAP bitmap;     /* the DIB itself */
     void *pixels;       /* its bits, as an SDL surface's pixel pointer */
@@ -29,6 +30,7 @@ typedef struct SDLop_Win32WindowData
     SDLOP_MUTEX_T surfacelock; /* UpdateWindowFramebuffer vs WM_SIZE */
 
     Uint32 dpi;
+    bool mouse_leave_armed; /* TrackMouseEvent(TME_LEAVE) is outstanding */
 
     /* fullscreen bookkeeping */
     bool is_fullscreen;   /* windowed_* below only describe a windowed window */

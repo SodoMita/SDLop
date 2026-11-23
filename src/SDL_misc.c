@@ -381,13 +381,13 @@ static bool win32_show_messagebox(const SDL_MessageBoxData *data, int *buttonID)
     } else if (data->flags & SDL_MESSAGEBOX_INFORMATION) {
         type = MB_ICONINFORMATION;
     }
-    if (data->numbuttons >= 2 && (data->flags & SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT)) {
-        type |= MB_OKCANCEL;
+    /* Win32 offers no way to lay out custom buttons, so the two- and
+     * three-button cases map onto the closest stock box. Both branches of the
+     * old left-to-right test were identical. */
+    if (data->numbuttons == 3) {
+        type |= MB_YESNOCANCEL;
     } else if (data->numbuttons >= 2) {
         type |= MB_OKCANCEL;
-    }
-    if (data->numbuttons == 3) {
-        type |= MB_YESNOCANCEL & ~(MB_OKCANCEL);
     }
 
     wchar_t *wtitle = utf8_to_wide(data->title);
@@ -400,7 +400,8 @@ static bool win32_show_messagebox(const SDL_MessageBoxData *data, int *buttonID)
     HWND parent = NULL;
     if (data->window) {
         SDL_PropertiesID props = SDL_GetWindowProperties(data->window);
-        parent = (HWND)(uintptr_t)SDL_GetNumberProperty(props, "SDL.window.win32.hwnd", 0);
+        /* It is a *pointer* property; SDL_GetNumberProperty returns 0 for it. */
+        parent = (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
     }
     const int rc = MessageBoxW(parent, wmessage, wtitle, type);
     SDL_free(wtitle);
@@ -415,7 +416,10 @@ static bool win32_show_messagebox(const SDL_MessageBoxData *data, int *buttonID)
         index = 0;
         break;
     case IDCANCEL:
-        index = (data->numbuttons > 1) ? 1 : 0;
+        /* A three-button box is MB_YESNOCANCEL, where Cancel is the *third*
+         * button. Mapping it to index 1 made it indistinguishable from No and
+         * left buttons[2] unreachable. */
+        index = (data->numbuttons >= 3) ? 2 : ((data->numbuttons > 1) ? 1 : 0);
         break;
     case IDYES:
         index = 0;

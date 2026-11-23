@@ -291,11 +291,16 @@ static void restore_cursor_clip(SDL_Window *window)
         GetClientRect(data->hwnd, &rc);
         MapWindowPoints(data->hwnd, NULL, (POINT *)&rc, 2);
         ClipCursor(&rc);
+        /* Record it, or release_cursor_clip() compares against an all-zero
+         * rect, never matches, and leaves the OS cursor trapped after focus
+         * is lost. */
+        data->cursor_clipped_rect = rc;
         SetCapture(data->hwnd);
     } else if (window->flags & SDL_WINDOW_MOUSE_GRABBED) {
         RECT rc;
         GetWindowRect(data->hwnd, &rc);
         ClipCursor(&rc);
+        data->cursor_clipped_rect = rc;
         SetCapture(data->hwnd);
     } else if (window->mouse_rect.w > 0 && window->mouse_rect.h > 0) {
         RECT clip;
@@ -305,6 +310,7 @@ static void restore_cursor_clip(SDL_Window *window)
         clip.bottom = clip.top + window->mouse_rect.h;
         MapWindowPoints(data->hwnd, NULL, (POINT *)&clip, 2);
         ClipCursor(&clip);
+        data->cursor_clipped_rect = clip;
     }
 }
 
@@ -962,6 +968,22 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MOUSEMOVE:
         if (window) {
+            /* Win32 only posts WM_MOUSELEAVE for a window that asked for it,
+             * and the request lapses after each leave. Without this the
+             * WM_MOUSELEAVE handler below could never run, so
+             * SDL_EVENT_WINDOW_MOUSE_LEAVE was never sent and the driver went
+             * on believing the pointer was inside a window it had left. */
+            if (!(window->flags & SDL_WINDOW_MOUSE_FOCUS) ||
+                !(((SDLop_Win32WindowData *)window->driverdata)->mouse_leave_armed)) {
+                TRACKMOUSEEVENT tme;
+                SDL_zero(tme);
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                if (TrackMouseEvent(&tme)) {
+                    ((SDLop_Win32WindowData *)window->driverdata)->mouse_leave_armed = true;
+                }
+            }
             if (!(window->flags & SDL_WINDOW_MOUSE_FOCUS)) {
                 set_mouse_focus(window, true);
             }
@@ -988,7 +1010,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_XBUTTONUP:
     case WM_XBUTTONDBLCLK:
         if (window) {
-            SetFocus(hwnd);
+            /* Focus only on a press: doing it on the button-up too steals focus
+             * from whatever the user clicked into during the drag, and a
+             * not-focusable or tooltip window must never take it at all. */
+            const bool is_press = (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+                                   msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN);
+            if (is_press && !(window->flags & (SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_TOOLTIP))) {
+                SetFocus(hwnd);
+            }
             if (!SDLOP_RawInputIsSource()) {
                 send_mouse_button(&m);
             }
@@ -1017,6 +1046,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MOUSELEAVE:
         if (window) {
+            /* the request covers one leave; re-arm on the next move */
+            ((SDLop_Win32WindowData *)window->driverdata)->mouse_leave_armed = false;
             set_mouse_focus(window, false);
         }
         return 0;
@@ -1477,9 +1508,13 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (window->flags & SDL_WINDOW_HIDDEN) {
         style &= ~WS_VISIBLE;
     }
+    /* window->x/y are the client origin (WM_MOVE reports it that way), but
+     * CreateWindowExW positions the frame: apply the same offset
+     * win32_SetWindowPosition() does, or a window created at 100,100 has its
+     * drawing area at the frame's client origin, not at 100,100. */
     HWND hwnd = CreateWindowExW(exstyle, SDLOP_WIN32_CLASS, title_w ? title_w : L"",
                                 style,
-                                window->x, window->y,
+                                window->x + (int)rc.left, window->y + (int)rc.top,
                                 rc.right - rc.left, rc.bottom - rc.top,
                                 NULL, NULL, GetModuleHandleW(NULL), NULL);
     SDL_free(title_alloc);
@@ -1492,6 +1527,12 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     data->hwnd = hwnd;
     SetPropW(hwnd, L"SDLopWindow", (HANDLE)window);
     sdlop_win32.window_count++;
+    /* The class is registered with CS_OWNDC, so this HDC is private to the
+     * window and valid until it is destroyed. It is what SDL_PROP_WINDOW_WIN32_
+     * HDC_POINTER must publish: the old value was data->dc, the memory DC used
+     * for the software framebuffer, which does not exist until the application
+     * asks for a window surface (and is recreated on every resize). */
+    data->hdc = GetDC(hwnd);
 
     /* SDL3 window properties. The X11 and Wayland drivers publish their
      * native handles this way, so applications (and SDL3's own tests) reach
@@ -1502,7 +1543,7 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     if (window->props) {
         SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, (void *)hwnd);
-        SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HDC_POINTER, (void *)data->dc);
+        SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HDC_POINTER, (void *)data->hdc);
         SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, (void *)GetModuleHandleW(NULL));
     }
 
@@ -1522,7 +1563,10 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 static void destroy_dib(SDLop_Win32WindowData *data)
 {
     if (data->surface) {
-        SDL_free(data->surface);
+        /* Created by SDL_CreateSurfaceFrom: SDL_DestroySurface frees the
+         * wrapper and anything attached to it (props, palette). SDL_free only
+         * released the struct and leaked those -- the other drivers do this. */
+        SDL_DestroySurface(data->surface);
         data->surface = NULL;
     }
     if (data->bitmap) {
@@ -1553,6 +1597,17 @@ static void win32_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     destroy_dib(data);
     SDLOP_MUTEX_UNLOCK(&data->surfacelock);
     if (data->hwnd) {
+        if (data->hdc) {
+            ReleaseDC(data->hwnd, data->hdc);
+            data->hdc = NULL;
+        }
+        /* A grabbed/clipped window that is destroyed would otherwise leave the
+         * OS cursor confined to a rect that no longer exists. */
+        release_cursor_clip(data);
+        if (data->icon) {
+            DestroyIcon(data->icon);
+            data->icon = NULL;
+        }
         RemovePropW(data->hwnd, L"SDLopWindow");
         DestroyWindow(data->hwnd);
         data->hwnd = NULL;
@@ -2210,7 +2265,17 @@ static void win32_SetWindowAspectRatio(SDLop_VideoDevice *device, SDL_Window *wi
     if (!data || !data->hwnd || !GetWindowRect(data->hwnd, &rc)) {
         return;
     }
-    win32_constrain_aspect(window, &rc);
+    RECT constrained = rc;
+    win32_constrain_aspect(window, &constrained);
+    /* Apply it: the constraint above only edits a local RECT, so without this
+     * a new ratio took effect only the next time the user dragged the edge. */
+    if (constrained.right != rc.right || constrained.bottom != rc.bottom) {
+        SetWindowPos(data->hwnd, NULL, 0, 0,
+                     constrained.right - constrained.left,
+                     constrained.bottom - constrained.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        update_metrics(window);
+    }
 }
 
 static void win32_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *window, bool resizable)
@@ -2501,6 +2566,11 @@ static bool win32_SuspendScreenSaver(SDLop_VideoDevice *device)
 {
     (void)device;
     if (!sdlop.suspend_screensaver) {
+        /* SDL_DisableScreenSaver(): drop the request. Returning early here
+         * left ES_DISPLAY_REQUIRED|ES_SYSTEM_REQUIRED in effect for the life
+         * of the process, so the screen saver and display sleep never came
+         * back after SDL_EnableScreenSaver(). */
+        SetThreadExecutionState(ES_CONTINUOUS);
         return true;
     }
     if (!SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)) {
@@ -2750,8 +2820,14 @@ static bool win32_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *wind
         clip.right = clip.left + window->mouse_rect.w;
         clip.bottom = clip.top + window->mouse_rect.h;
         MapWindowPoints(data->hwnd, NULL, (POINT *)&clip, 2);
-    } else {
+    } else if (window->flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_MOUSE_RELATIVE_MODE)) {
+        /* No rect but the pointer is grabbed: clip to the window, as before. */
         GetWindowRect(data->hwnd, &clip);
+    } else {
+        /* SDL_SetWindowMouseRect(w, NULL) on an ungrabbed window means "stop
+         * confining the pointer", not "confine it to the whole window". */
+        release_cursor_clip(data);
+        return true;
     }
     ClipCursor(&clip);
     data->cursor_clipped_rect = clip;
@@ -2950,8 +3026,19 @@ static bool win32_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, S
     }
     HICON old_small = (HICON)SendMessageW(data->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)handle);
     HICON old_big = (HICON)SendMessageW(data->hwnd, WM_SETICON, ICON_BIG, (LPARAM)handle);
-    if (old_small) DestroyIcon(old_small);
-    if (old_big) DestroyIcon(old_big);
+    /* Both slots held the same handle (the previous call set both), so only
+     * destroy it once; Icons are refcounted by user32, but double-destroying
+     * the same HICON is still a bug. */
+    if (old_small && old_small == old_big) {
+        DestroyIcon(old_small);
+    } else {
+        if (old_small) DestroyIcon(old_small);
+        if (old_big) DestroyIcon(old_big);
+    }
+    /* Replacing an icon must release the one this window owned. */
+    if (data->icon && data->icon != handle && data->icon != old_small && data->icon != old_big) {
+        DestroyIcon(data->icon);
+    }
     data->icon = handle;
     return true;
 }
@@ -3250,6 +3337,11 @@ static bool win32_SetClipboardData(SDLop_VideoDevice *device)
         }
     }
     CloseClipboard();
+    /* Own change: adopt the new sequence number, or the next SDL_PumpEvents
+     * sees a foreign sequence, concludes the clipboard changed hands and
+     * cancels the application's own offer (cleanup callback, MIME data freed,
+     * plus a spurious CLIPBOARD_UPDATE with owner == false). */
+    win32_clipboard_sequence = GetClipboardSequenceNumber();
     return result;
 }
 
@@ -3362,6 +3454,12 @@ static bool win32_HasClipboardData(SDLop_VideoDevice *device, const char *mime_t
 
 SDLop_VideoDevice SDLop_windows_device = {
     .name = "windows",
+    /* Popup windows are implemented here (window_style_for gives tooltips and
+     * popup menus their own styles, and their placement is computed against the
+     * parent), but the flag was never set, so SDL_CreatePopupWindow rejected
+     * every one of them with "That operation is not supported". Win32 input is
+     * not window_system_input: the window message loop is the source. */
+    .supports_popups = true,
     .Init = win32_Init,
     .Quit = win32_Quit,
     .CreateWindow = win32_CreateWindow,

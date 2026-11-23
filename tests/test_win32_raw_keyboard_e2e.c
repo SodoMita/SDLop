@@ -95,20 +95,28 @@ static int drain(SDLop_RawEvent *out, int max)
 
 int main(void)
 {
+    /* The worker publishes the Win32 raw code, (VK << 8) | scan, which is what
+     * the core's keyboard translator expects on this platform. What matters
+     * here is that the left and right keys, which share a scan code and differ
+     * only by the E0 prefix, still arrive as distinct virtual keys: that is
+     * the property this test exists for, and it has to survive the encoding. */
     static const struct {
         WORD scan;
         int extended;
         const char *name;
-        Uint16 want;
+        Uint8 want_vk;
+        Uint8 want_scan;
     } cases[] = {
-        /* distinct scan codes */
-        { 0x2A, 0, "LSHIFT", KEY_LEFTSHIFT },
-        { 0x36, 0, "RSHIFT", KEY_RIGHTSHIFT },
-        /* same scan code, separated only by the E0 prefix */
-        { 0x1D, 0, "LCTRL", KEY_LEFTCTRL },
-        { 0x1D, 1, "RCTRL", KEY_RIGHTCTRL },
-        { 0x38, 0, "LALT", KEY_LEFTALT },
-        { 0x38, 1, "RALT", KEY_RIGHTALT },
+        /* Distinct scan codes; Windows reports the generic VK_SHIFT for both,
+         * so the scan code is what tells them apart (measured). */
+        { 0x2A, 0, "LSHIFT", VK_SHIFT, 0x2A },
+        { 0x36, 0, "RSHIFT", VK_SHIFT, 0x36 },
+        /* Same scan code, separated only by the E0 prefix, which MapVirtualKeyW
+         * turns into the extended VK. */
+        { 0x1D, 0, "LCTRL", VK_CONTROL, 0x1D },
+        { 0x1D, 1, "RCTRL", VK_RCONTROL, 0x1D },
+        { 0x38, 0, "LALT", VK_MENU, 0x38 },
+        { 0x38, 1, "RALT", VK_RMENU, 0x38 },
     };
     SDL_Window *window;
     unsigned k;
@@ -163,6 +171,7 @@ int main(void)
         SDLop_RawEvent events[64];
         Uint16 pressed = 0;
         Uint16 released = 0;
+        static Uint16 seen_left;
         int count;
         int i;
 
@@ -171,7 +180,9 @@ int main(void)
         count = drain(events, 64);
 
         for (i = 0; i < count; i++) {
-            if (events[i].type != SDLop_EV_KEY || events[i].code != cases[k].want) {
+            const Uint8 vk = (Uint8)(events[i].code >> 8);
+            const Uint8 sc = (Uint8)(events[i].code & 0xFF);
+            if (events[i].type != SDLop_EV_KEY || vk != cases[k].want_vk || sc != cases[k].want_scan) {
                 continue;
             }
             if (events[i].value) {
@@ -180,13 +191,28 @@ int main(void)
                 released = events[i].code;
             }
         }
-        CHECK(pressed == cases[k].want,
-              "%s (scan 0x%02x, extended %d): press published evdev %u, want %u -- "
-              "left and right are not being distinguished",
-              cases[k].name, cases[k].scan, cases[k].extended, pressed, cases[k].want);
-        CHECK(released == cases[k].want,
-              "%s: release published evdev %u, want %u",
-              cases[k].name, released, cases[k].want);
+        CHECK(pressed != 0,
+              "%s (scan 0x%02x, extended %d): no press published as (VK << 8) | scan "
+              "= 0x%04x",
+              cases[k].name, cases[k].scan, cases[k].extended,
+              ((unsigned)cases[k].want_vk << 8) | cases[k].want_scan);
+        CHECK(released != 0,
+              "%s: no release published as (VK << 8) | scan = 0x%04x",
+              cases[k].name, ((unsigned)cases[k].want_vk << 8) | cases[k].want_scan);
+        /* the encoding itself: a bare evdev code has no VK and reaches the
+         * core as SDLK_UNKNOWN */
+        CHECK((pressed >> 8) != 0, "%s: published code 0x%04x carries no VK",
+              cases[k].name, pressed);
+        /* Left and right must stay distinct in the published stream: compare
+         * the "left" case of each pair against its "right" counterpart. */
+        if ((k & 1) == 1) {
+            CHECK(pressed != (Uint16)seen_left,
+                  "%s and %s published the same code 0x%04x -- left and right "
+                  "are not being distinguished",
+                  cases[k - 1].name, cases[k].name, pressed);
+        } else {
+            seen_left = pressed;
+        }
     }
 
     SDL_DestroyWindow(window);

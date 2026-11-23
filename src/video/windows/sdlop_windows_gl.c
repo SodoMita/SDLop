@@ -257,8 +257,13 @@ void *SDLOP_Win32GLCreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         DescribePixelFormat(hdc, existing, sizeof(pfd), &pfd);
     }
 
+    /* Default to 2.1 only when nothing was requested. A requested minor of 0
+     * is legitimate and must be passed through verbatim: `minor > 0 ? minor : 1`
+     * turned GL 3.0 into "3.1" and GL 4.0 into "4.1", and asked
+     * WGL_EXT_create_context_es2_profile for a non-existent OpenGL ES 2.1
+     * (ERROR_INVALID_VERSION_ARB) when the app asked for ES 2.0. */
     const int major = sdlop_glattrs.major_version > 0 ? sdlop_glattrs.major_version : 2;
-    const int minor = sdlop_glattrs.minor_version > 0 ? sdlop_glattrs.minor_version : 1;
+    const int minor = sdlop_glattrs.major_version > 0 ? sdlop_glattrs.minor_version : 1;
     const int profile = sdlop_glattrs.profile_mask;
     const bool debug = (sdlop_glattrs.flags & SDL_GL_CONTEXT_DEBUG_FLAG) != 0;
     const bool forward = (sdlop_glattrs.flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) != 0;
@@ -372,6 +377,10 @@ bool SDLOP_Win32GLMakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, voi
         ReleaseDC(data->hwnd, hdc);
         return SDL_SetError("wglMakeCurrent() failed: %lu", (unsigned long)GetLastError());
     }
+    /* The context keeps using the DC it was made current on, but the acquired
+     * HDC itself must be released or every MakeCurrent leaks a DC. Render
+     * calls re-acquire with GetCurrentDC(). */
+    ReleaseDC(data->hwnd, hdc);
     return true;
 }
 

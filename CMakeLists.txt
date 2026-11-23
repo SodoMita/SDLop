@@ -696,7 +696,7 @@ if(SDLop_BUILD_TESTS)
     # These inject input or drive global OS state (clipboard, foreground
     # window, system-wide button mask), so they must not run beside anything.
     foreach(t test_win32_cursor test_win32_hittest test_win32_shape
-              test_win32_close test_win32_windowsize
+              test_win32_close test_win32_windowsize test_win32_fileops
               test_win32_raw_keyboard_e2e test_win32_raw_mouse_e2e
               test_win32_gl test_win32_vulkan test_win32_clipboard)
       add_executable(${t} tests/${t}.c)
@@ -1216,7 +1216,9 @@ if(SDLop_BUILD_TESTS)
   # stock SDL3 headers (-DSDL3_REFERENCE_INCLUDE=/path/to/SDL3/include) and
   # diffs every size/offset/enum value. Skipped when no reference is provided.
   if (SDL3_REFERENCE_INCLUDE AND NOT EMSCRIPTEN)
-    add_test(NAME abi_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
+    # Invoked through `sh` so a lost exec bit cannot turn the gate into a
+    # CTest failure (or worse, a vacuous pass); the mode is preserved too.
+    add_test(NAME abi_check COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_abi_check.sh ${SDL3_REFERENCE_INCLUDE})
   endif()
 
   # Developer tools (not CTests). SDLop_BUILD_TOOLS=OFF skips them; the
@@ -1253,14 +1255,14 @@ if(SDLop_BUILD_TESTS)
 
   # Options gate: SDLOP_* options are read through hints (settable from code)
   if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
-    add_test(NAME options_check COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/options_check.sh ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME options_check COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/options_check.sh ${CMAKE_CURRENT_SOURCE_DIR})
   endif()
 
   # Export gate: every function declared in include/SDL3 is exported by the
   # shared library and nothing undeclared is exported.
   if (SDLop_BUILD_TESTS AND NOT EMSCRIPTEN)
     add_test(NAME api_exports_check
-             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_exports_check.sh
+             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_exports_check.sh
                      $<TARGET_FILE:sdlop_shared> ${CMAKE_CURRENT_SOURCE_DIR}/include)
   endif()
 
@@ -1291,7 +1293,7 @@ if(SDLop_BUILD_TESTS)
   # by stock SDL3 (strict-subset property). Skipped when no reference .so given.
   if (SDL3_REFERENCE_LIB AND NOT EMSCRIPTEN)
     add_test(NAME api_subset_check
-             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_subset_check.sh
+             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/api_subset_check.sh
                      $<TARGET_FILE:sdlop_shared> ${SDL3_REFERENCE_LIB})
   endif()
 

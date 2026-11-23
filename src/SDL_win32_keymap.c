@@ -309,8 +309,12 @@ Uint32 SDLOP_Win32CharFromVK(Uint32 vk, bool shifted)
 
 SDL_Keycode SDLOP_Win32KeyFromVK(Uint32 vk, SDL_Keymod modstate)
 {
-    const bool shifted = (modstate & (SDL_KMOD_SHIFT | SDL_KMOD_CAPS)) == SDL_KMOD_SHIFT ||
-                         (modstate & (SDL_KMOD_SHIFT | SDL_KMOD_CAPS)) == SDL_KMOD_CAPS;
+    /* Any Shift key (`SDL_KMOD_SHIFT` is L|R, so mask with it) XOR CapsLock.
+     * Comparing the masked pair against SDL_KMOD_SHIFT tested for *both*
+     * shifts held, so a single LSHIFT/RSHIFT read as unshifted. */
+    const bool shift_down = (modstate & SDL_KMOD_SHIFT) != 0;
+    const bool caps_down = (modstate & SDL_KMOD_CAPS) != 0;
+    const bool shifted = shift_down != caps_down;
     switch (vk) {
     case 0: return SDLK_UNKNOWN;
     case VK_CANCEL: return SDLK_CANCEL;

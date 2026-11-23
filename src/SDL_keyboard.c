@@ -760,13 +760,29 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
         text_utf8[0] = '\0';
     }
     if (repeats_out) {
-        *repeats_out = true; /* Win32 auto-repeats keys itself */
+        /* Win32 auto-repeats held keys itself, but only character keys: SDL3
+         * never repeats a modifier or a lock, and the software repeat used on
+         * the raw-input path would otherwise emit repeating KEY_DOWNs for
+         * LSHIFT/LCTRL/LALT/CAPSLOCK while any packet kept arriving. */
+        const Uint32 rvk = SDLOP_WIN32_VK(rawcode);
+        const bool modifier_or_lock = (rvk >= VK_SHIFT && rvk <= VK_MENU) || /* SHIFT, CONTROL, MENU(ALT) */
+                                      rvk == VK_LSHIFT || rvk == VK_RSHIFT ||
+                                      rvk == VK_LCONTROL || rvk == VK_RCONTROL ||
+                                      rvk == VK_LMENU || rvk == VK_RMENU ||
+                                      rvk == VK_CAPITAL || rvk == VK_NUMLOCK || rvk == VK_SCROLL;
+        *repeats_out = (rvk != 0) && !modifier_or_lock;
     }
     const Uint32 vk = SDLOP_WIN32_VK(rawcode);
     if (!vk) {
         return SDLK_UNKNOWN;
     }
-    return SDLOP_Win32KeyFromVK(vk, key_event ? SDL_GetModState() : SDL_KMOD_NONE);
+    /* `key_event == true` means the keycode goes into an SDL_EVENT_KEY_*'s
+     * `.key` field, and SDL3 explicitly ignores modifiers there so that a
+     * letter key is always SDLK_A..SDLK_Z (i.e. 'a'..'z') regardless of Shift
+     * or CapsLock; the shifted form belongs in `.text`. Passing the modifiers
+     * through produced 'A' (0x41) -- not a valid SDLK_* letter constant -- and
+     * only on the paths that had a lock held. */
+    return SDLOP_Win32KeyFromVK(vk, key_event ? SDL_KMOD_NONE : SDL_GetModState());
 #else
     if (text_utf8 && text_size) {
         text_utf8[0] = '\0';

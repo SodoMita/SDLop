@@ -96,7 +96,7 @@ typedef struct SDLOP_WinRawState
     volatile LONG running;
     volatile LONG stop_requested;
     HANDLE thread;
-    DWORD thread_id;
+    DWORD thread_id; /* the worker, so Quit can post to it */
     HWND hwnd; /* message-only window, created on the worker thread */
 
     /* rings: single producer (worker), single consumer (main thread) */
@@ -128,6 +128,13 @@ typedef struct SDLOP_WinRawState
      * not by scan code (0..255). Sized from the table so it cannot drift. */
     Uint8 key_down[SDLOP_EVDEV_KEY_MAX + 1]; /* 1 = held; suppresses repeats */
 } SDLOP_WinRawState;
+
+/* Distinct from the keyboard path's window class in sdlop_windows.c: both used
+ * to be L"SDLopRawInput", and whichever registered first won. RegisterClassW's
+ * ERROR_CLASS_ALREADY_EXISTS was tolerated, so if the keyboard path won the
+ * worker's window silently inherited DefWindowProcW and every WM_INPUT was
+ * dropped -- raw input stopped working with no error anywhere. */
+#define SDLOP_RAWINPUT_WORKER_CLASS L"SDLopRawInputWorker"
 
 static SDLOP_WinRawState winraw;
 
@@ -222,6 +229,12 @@ static void publish(Uint32 device, Uint16 type, Uint16 code, Sint32 value, Uint6
     SDLOP_RingPush(&winraw.poll_ring, &ev);
     dispatch_callbacks(&ev);
     atomic_fetch_add_explicit(&winraw.event_count, 1, memory_order_relaxed);
+    /* Wake SDL_WaitEvent on the main thread. Without this it sleeps out its
+     * full 10 ms wait even though input is already sitting in the ring, so
+     * every raw event was delivered one poll interval late. */
+    if (sdlop.wake_handle) {
+        SetEvent((HANDLE)sdlop.wake_handle);
+    }
 }
 
 /* QueryPerformanceCounter -> the SDLOP_MonotonicNS() origin */
@@ -355,7 +368,57 @@ static void handle_keyboard(const RAWKEYBOARD *raw, Uint32 device, Uint64 ts)
     }
     winraw.key_down[evdev] = (Uint8)down;
 
-    publish(device, SDLop_EV_KEY, evdev, down, ts);
+    /* Publish the Win32 raw code, not the evdev code: on Windows the core's
+     * keyboard translator expects the driver's (VK << 8) | scan pair and
+     * derives the keycode from the VK, so a bare evdev code (1..248) carries
+     * no VK and every key would arrive as SDLK_UNKNOWN. The evdev code stays
+     * as the dedup key above, where it is only ever compared with itself.
+     *
+     * The VK has to come from the *extended* scan code. A RAWKEYBOARD carries
+     * VKey == VK_CONTROL for both Ctrl keys, and MapVirtualKeyW on the plain
+     * scan code returns VK_CONTROL for both too, which is exactly how left and
+     * right stopped being distinguishable. The E0 prefix must be folded in
+     * first, the way the window-message path does it. */
+    {
+        UINT vk = raw->VKey;
+        if (raw->Flags & RI_KEY_E0) {
+            /* The E0 prefix is what separates the right-hand Control/Alt from
+             * the left-hand ones, and the raw packet's own VKey does not carry
+             * it (VK_CONTROL for both). MapVirtualKeyW(MAPVK_VSC_TO_VK_EX) is
+             * the documented way to expand it, but Wine ignores the 0xE000
+             * prefix and answers VK_LCONTROL for both forms (measured), so the
+             * E0 set is mapped explicitly and MapVirtualKeyW is only the
+             * fallback for keys not in it. */
+            const Uint8 base = (Uint8)(scan & 0xFF);
+            switch (base) {
+            case 0x1D: vk = VK_RCONTROL; break;
+            case 0x38: vk = VK_RMENU; break;    /* right Alt */
+            case 0x35: vk = VK_DIVIDE; break;
+            case 0x47: vk = VK_HOME; break;
+            case 0x48: vk = VK_UP; break;
+            case 0x49: vk = VK_PRIOR; break;
+            case 0x4B: vk = VK_LEFT; break;
+            case 0x4D: vk = VK_RIGHT; break;
+            case 0x4F: vk = VK_END; break;
+            case 0x50: vk = VK_DOWN; break;
+            case 0x51: vk = VK_NEXT; break;
+            case 0x52: vk = VK_INSERT; break;
+            case 0x53: vk = VK_DELETE; break;
+            default: {
+                const UINT ext = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX);
+                if (ext) {
+                    vk = ext;
+                }
+                break;
+            }
+            }
+        }
+        if (!vk) {
+            /* no VK from the device: derive one so the key is not lost */
+            vk = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX);
+        }
+        publish(device, SDLop_EV_KEY, SDLOP_WIN32_RAWCODE(vk, make & 0xFF), down, ts);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -423,7 +486,7 @@ static DWORD WINAPI raw_win_thread(LPVOID param)
     SDL_zero(wc);
     wc.lpfnWndProc = raw_win_proc;
     wc.hInstance = GetModuleHandleW(NULL);
-    wc.lpszClassName = L"SDLopRawInput";
+    wc.lpszClassName = SDLOP_RAWINPUT_WORKER_CLASS;
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         return 1;
     }
@@ -439,7 +502,7 @@ static DWORD WINAPI raw_win_thread(LPVOID param)
      * and RIDEV_INPUTSINK makes it receive input whether or not it has
      * focus, so being hidden costs nothing. */
     winraw.hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-                                  L"SDLopRawInput", L"SDLopRawInput", WS_POPUP,
+                                  SDLOP_RAWINPUT_WORKER_CLASS, L"SDLopRawInput", WS_POPUP,
                                   -32000, -32000, 64, 64,
                                   NULL, NULL, GetModuleHandleW(NULL), NULL);
     if (!winraw.hwnd) {
@@ -470,6 +533,7 @@ static DWORD WINAPI raw_win_thread(LPVOID param)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     InterlockedExchange(&winraw.running, 1);
+    winraw.thread_id = GetCurrentThreadId();
 
     while (!InterlockedCompareExchange(&winraw.stop_requested, 0, 0)) {
         const DWORD got = MsgWaitForMultipleObjects(0, NULL, FALSE, 100, QS_RAWINPUT);
@@ -503,7 +567,7 @@ static DWORD WINAPI raw_win_thread(LPVOID param)
     }
     DestroyWindow(winraw.hwnd);
     winraw.hwnd = NULL;
-    UnregisterClassW(L"SDLopRawInput", GetModuleHandleW(NULL));
+    UnregisterClassW(SDLOP_RAWINPUT_WORKER_CLASS, GetModuleHandleW(NULL));
 
     return 0;
 }
@@ -564,6 +628,12 @@ void SDLOP_RawInputQuit(void)
         return;
     }
     InterlockedExchange(&winraw.stop_requested, 1);
+    /* The worker blocks in MsgWaitForMultipleObjects(..., 100, ...); post it a
+     * null message so it re-checks stop_requested immediately instead of
+     * making SDL_Quit wait out the rest of that interval. */
+    if (winraw.thread_id) {
+        PostThreadMessageW(winraw.thread_id, WM_NULL, 0, 0);
+    }
     WaitForSingleObject(winraw.thread, INFINITE);
     CloseHandle(winraw.thread);
     winraw.thread = NULL;
@@ -686,9 +756,11 @@ void SDLOP_RawInputPump(void)
             break;
         }
     }
-    if (n) {
-        SDLOP_KeyboardProcessRepeats();
-    }
+    /* Unconditional: repeats are driven by the clock, not by packet arrival.
+     * The worker dedups held keys, so a held key with a stationary mouse
+     * produces n == 0 and repeats would never fire. The core applies them to
+     * the keys that repeat, so an empty pass is cheap. */
+    SDLOP_KeyboardProcessRepeats();
 }
 
 bool SDLOP_RawInputIsSource(void)
