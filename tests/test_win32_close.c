@@ -118,6 +118,58 @@ int main(void)
         CHECK(w > 0 && h > 0, "window unusable after a refused close (%dx%d)", w, h);
     }
 
+    /* Closing the last visible window also raises SDL_EVENT_QUIT, which is
+     * what most SDL3 applications wait on: they never look at
+     * SDL_EVENT_WINDOW_CLOSE_REQUESTED, so without it the title-bar X does
+     * nothing at all. The check lives in the core (SDLOP_SendWindowEvent), but
+     * it is the Win32 driver that has to deliver the close request for it to
+     * fire, so it is pinned from here too. */
+    PostMessageW(self, WM_CLOSE, 0, 0);
+    {
+        bool got_close = false, got_quit = false;
+        SDL_Event event;
+        for (int i = 0; i < 200 && !(got_close && got_quit); i++) {
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                    event.window.windowID == SDL_GetWindowID(window)) {
+                    got_close = true;
+                } else if (event.type == SDL_EVENT_QUIT) {
+                    got_quit = true;
+                }
+            }
+            if (!(got_close && got_quit)) {
+                SDL_Delay(5);
+            }
+        }
+        CHECK(got_close, "the last visible window produced no close request");
+        CHECK(got_quit, "closing the last visible window produced no SDL_EVENT_QUIT");
+    }
+
+    /* SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE turns the quit off, leaving only the
+     * close request for the application to act on. */
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+    PostMessageW(self, WM_CLOSE, 0, 0);
+    {
+        bool got_close = false, got_quit = false;
+        SDL_Event event;
+        for (int i = 0; i < 200 && !got_close; i++) {
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                    event.window.windowID == SDL_GetWindowID(window)) {
+                    got_close = true;
+                } else if (event.type == SDL_EVENT_QUIT) {
+                    got_quit = true;
+                }
+            }
+            if (!got_close) {
+                SDL_Delay(5);
+            }
+        }
+        CHECK(got_close, "close request lost when the quit hint is off");
+        CHECK(!got_quit, "SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE=0 still sent SDL_EVENT_QUIT");
+    }
+    SDL_ResetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE);
+
     /* A hidden window reports the request too. */
     SDL_HideWindow(window);
     SDL_PumpEvents();
