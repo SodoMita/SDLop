@@ -565,7 +565,28 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
         event.window.data1 -= window->parent->x;
         event.window.data2 -= window->parent->y;
     }
+    /* An event watcher may destroy the window while the event is pushed, so
+     * cache what the quit check below needs first (as SDL_SendWindowEvent). */
+    const bool close_toplevel = window && type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && !window->parent;
     SDLOP_PushEventInternal(&event);
+
+    /* SDL_SendWindowEvent: a close request on the last visible toplevel window
+     * also sends SDL_EVENT_QUIT (SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, default
+     * on). Most SDL3 apps only handle SDL_EVENT_QUIT, so without this the
+     * window manager's close button does nothing. SDLop has no tray icons,
+     * the other thing that suppresses it in SDL3. */
+    if (close_toplevel) {
+        int count = 0;
+        for (SDL_Window *n = sdlop.windows; n; n = n->next) {
+            if (!n->parent && !(n->flags & SDL_WINDOW_HIDDEN)) {
+                ++count;
+            }
+        }
+        if (count <= 1 && SDL_GetHintBoolean(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, true)) {
+            SDLOP_SendQuitEvent();
+        }
+        return;
+    }
 
     /* a window move may change which display the window lives on */
     if (window && type == SDL_EVENT_WINDOW_MOVED) {
