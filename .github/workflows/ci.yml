@@ -111,16 +111,21 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build mingw-w64 wine64 wine \
-            xvfb xauth
+          # `wine` (the metapackage) pulls in the wine32/WoW64 path, whose
+          # package configuration prompts interactively and hangs a
+          # non-interactive runner. wine64 alone runs these 64-bit test exes.
+          sudo -E apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+            wine64 xvfb xauth
 
       - name: Build SDL 3.4.20 reference DLL (api_subset_check)
         run: |
-          sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+          echo "mingw toolchain present: $(x86_64-w64-mingw32-gcc --version | head -1)"
+          echo "wine present: $(wine --version 2>/dev/null || echo MISSING)"
           git clone -q --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL /tmp/sdl3-ref-win
           off=""
           for o in TEST_LIBRARY TESTS EXAMPLES AUDIO X11 WAYLAND KMSDRM OPENGL OPENGLES VULKAN GPU RENDER \
