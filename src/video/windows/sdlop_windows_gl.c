@@ -30,6 +30,7 @@ typedef HGLRC (WINAPI *PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC, HGLRC, const int 
 typedef BOOL (WINAPI *PFNWGLSWAPINTERVALEXTPROC)(int);
 typedef int (WINAPI *PFNWGLGETSWAPINTERVALEXTPROC)(void);
 typedef BOOL (WINAPI *PFNWGLCHOOSEPIXELFORMATARBPROC)(HDC, const int *, const FLOAT *, UINT, int *, UINT *);
+typedef const char *(WINAPI *PFNWGLGETEXTENSIONSSTRINGARBPROC)(HDC);
 
 #define WGL_CONTEXT_MAJOR_VERSION_ARB 0x2091
 #define WGL_CONTEXT_MINOR_VERSION_ARB 0x2092
@@ -52,6 +53,8 @@ static struct
     PFNWGLCREATECONTEXTATTRIBSARBPROC create_context_attribs;
     PFNWGLSWAPINTERVALEXTPROC swap_interval;
     PFNWGLGETSWAPINTERVALEXTPROC get_swap_interval;
+    PFNWGLGETEXTENSIONSSTRINGARBPROC get_extensions_string;
+    bool has_swap_control_tear;
     int current_interval;
 } wgl;
 
@@ -98,7 +101,18 @@ static void win32_gl_init_extensions(void)
     wgl.create_context_attribs = (PFNWGLCREATECONTEXTATTRIBSARBPROC)win32_gl_get_proc("wglCreateContextAttribsARB");
     wgl.swap_interval = (PFNWGLSWAPINTERVALEXTPROC)win32_gl_get_proc("wglSwapIntervalEXT");
     wgl.get_swap_interval = (PFNWGLGETSWAPINTERVALEXTPROC)win32_gl_get_proc("wglGetSwapIntervalEXT");
+    wgl.get_extensions_string = (PFNWGLGETEXTENSIONSSTRINGARBPROC)win32_gl_get_proc("wglGetExtensionsStringARB");
     wgl.current_interval = 1;
+    /* Adaptive vsync (SDL_GL_SetSwapInterval(-1)) is only legal on a context
+     * whose pixel format was created with
+     * WGL_EXT_swap_control_tear present and wglSwapIntervalEXT(-1) accepted;
+     * asking anyway returns FALSE and, on some drivers, silently pins the
+     * interval at 0. Record whether the extension exists so -1 can be
+     * rejected for the right reason instead of as a generic bad argument. */
+    {
+        const char *exts = wgl.get_extensions_string ? wgl.get_extensions_string(NULL) : NULL;
+        wgl.has_swap_control_tear = (exts && SDL_strstr(exts, "WGL_EXT_swap_control_tear")) ? true : false;
+    }
     wgl.initialized = true;
 }
 
@@ -453,7 +467,10 @@ SDL_FunctionPointer SDLOP_Win32GLGetProcAddress(SDLop_VideoDevice *device, const
 bool SDLOP_Win32GLSetSwapInterval(SDLop_VideoDevice *device, int interval)
 {
     (void)device;
-    if (interval < 0) {
+    /* -1 is adaptive vsync, and it is legal only where the driver advertises
+     * WGL_EXT_swap_control_tear; anything else negative is a caller error.
+     * Stock SDL3 accepts -1 and lets wglSwapIntervalEXT reject it. */
+    if (interval < -1) {
         return SDL_SetError("Negative swap interval");
     }
     if (!wgl.swap_interval) {
@@ -463,6 +480,12 @@ bool SDLOP_Win32GLSetSwapInterval(SDLop_VideoDevice *device, int interval)
         /* WGL_EXT_swap_control is not there: report the failure the way
          * SDL3 does rather than pretending it worked */
         return SDL_SetError("Setting the swap interval is not supported");
+    }
+    if (interval == -1 && !wgl.has_swap_control_tear) {
+        /* don't hand -1 to a driver that never advertised tearing support:
+         * several of them answer TRUE and quietly leave the interval at 0,
+         * which is not adaptive vsync and cannot be detected afterwards */
+        return SDL_SetError("Adaptive vsync (interval -1) needs WGL_EXT_swap_control_tear, which this driver does not support");
     }
     if (!wgl.swap_interval(interval)) {
         return SDL_SetError("wglSwapIntervalEXT() failed");
