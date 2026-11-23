@@ -159,8 +159,11 @@ jobs:
           WINEDEBUG: '-all'
           WINEDLLOVERRIDES: 'mscoree,mshtml='
         run: |
-          export WINEPREFIX=/tmp/wineprefix
-          export XDG_RUNTIME_DIR=/tmp/xdgrt
+          # NOT under /tmp: it is root-owned on the runner, and wine refuses
+          # to create a prefix whose parent it does not own ("'/tmp' is not
+          # owned by you"), which failed all 29 tests in 0.00 sec.
+          export WINEPREFIX="$RUNNER_TEMP/wineprefix"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdgrt"
           mkdir -p -m 700 "$XDG_RUNTIME_DIR"
           # The mingw toolchain file finds wine via find_program(NAMES wine
           # wine64) and bakes the absolute path into every add_test() call, so
