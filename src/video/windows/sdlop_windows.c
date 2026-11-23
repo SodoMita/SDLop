@@ -1402,6 +1402,19 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     SetPropW(hwnd, L"SDLopWindow", (HANDLE)window);
     sdlop_win32.window_count++;
 
+    /* SDL3 window properties. The X11 and Wayland drivers publish their
+     * native handles this way, so applications (and SDL3's own tests) reach
+     * the HWND/HDC/HINSTANCE through SDL_GetWindowProperties(); the Win32
+     * driver published none of them, so the group was always empty. */
+    if (!window->props) {
+        window->props = SDL_CreateProperties();
+    }
+    if (window->props) {
+        SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, (void *)hwnd);
+        SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HDC_POINTER, (void *)data->dc);
+        SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, (void *)GetModuleHandleW(NULL));
+    }
+
     if (!(window->flags & SDL_WINDOW_HIDDEN)) {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
