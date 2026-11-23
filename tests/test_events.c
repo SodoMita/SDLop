@@ -409,9 +409,45 @@ int main(void)
     SDL_FlushEvent(SDL_EVENT_MOUSE_BUTTON_UP);
 
     /* --- window close request + quit event --- */
+    SDL_FlushEvent(SDL_EVENT_QUIT);
     SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
     assert(SDL_HasEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED));
     SDL_FlushEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED);
+    /* SDL3: closing the last visible toplevel also sends SDL_EVENT_QUIT -- the
+     * WM close button must work for apps that only handle SDL_EVENT_QUIT */
+    assert(SDL_HasEvent(SDL_EVENT_QUIT));
+    SDL_FlushEvent(SDL_EVENT_QUIT);
+    {
+        /* ...unless SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE is off */
+        SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+        SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
+        assert(SDL_HasEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED) && !SDL_HasEvent(SDL_EVENT_QUIT));
+        SDL_FlushEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED);
+        SDL_ResetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE);
+
+        /* ...or another visible toplevel is still open */
+        SDL_Window *w2 = SDL_CreateWindow("second", 64, 64, 0);
+        assert(w2);
+        SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
+        assert(!SDL_HasEvent(SDL_EVENT_QUIT));
+        SDL_FlushEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED);
+        /* a hidden one does not count */
+        assert(SDL_HideWindow(w2));
+        SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
+        assert(SDL_HasEvent(SDL_EVENT_QUIT));
+        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+        SDL_DestroyWindow(w2);
+
+        /* closing a child window never quits */
+        SDL_Window *child = SDL_CreatePopupWindow(w, 0, 0, 32, 32, SDL_WINDOW_POPUP_MENU);
+        if (child) {
+            SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+            SDLOP_SendWindowEvent(child, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
+            assert(SDL_HasEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED) && !SDL_HasEvent(SDL_EVENT_QUIT));
+            SDL_DestroyWindow(child);
+        }
+        SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+    }
 
     SDL_Event quit;
     SDL_zero(quit);

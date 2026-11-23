@@ -563,6 +563,9 @@ int main(void)
         drain();
         send_client_message(xid, atom("WM_PROTOCOLS"), atom("WM_DELETE_WINDOW"), XCB_CURRENT_TIME, 0);
         CHECK(wait_type(SDL_EVENT_WINDOW_CLOSE_REQUESTED, 500, NULL), "WM_DELETE_WINDOW -> CLOSE_REQUESTED");
+        /* the only toplevel: the WM close button must also quit apps that
+         * only handle SDL_EVENT_QUIT (SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE) */
+        CHECK(wait_type(SDL_EVENT_QUIT, 500, NULL), "WM_DELETE_WINDOW on the last window -> SDL_EVENT_QUIT");
 
         /* _NET_WM_PING must come back to the root window */
         uint32_t mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
