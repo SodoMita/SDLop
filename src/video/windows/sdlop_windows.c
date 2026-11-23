@@ -1414,6 +1414,9 @@ static void win32_Quit(SDLop_VideoDevice *device)
     /* Leave no process-global registration behind for the next SDL_Init(). */
     sdlop_win32.raw_keyboard_enabled = false;
     win32_register_raw_keyboard();
+    /* the GL bootstrap window belongs to the class unregistered just below,
+     * so it has to go first */
+    SDLOP_Win32GLQuit();
     if (sdlop_win32.class_registered) {
         UnregisterClassW(SDLOP_WIN32_CLASS, GetModuleHandleW(NULL));
         sdlop_win32.class_registered = false;

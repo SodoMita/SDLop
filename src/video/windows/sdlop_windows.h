@@ -104,6 +104,9 @@ void SDLOP_Win32GLDeleteContext(SDLop_VideoDevice *device, void *context);
 SDL_FunctionPointer SDLOP_Win32GLGetProcAddress(SDLop_VideoDevice *device, const char *proc);
 bool SDLOP_Win32GLSetSwapInterval(SDLop_VideoDevice *device, int interval);
 bool SDLOP_Win32GLGetSwapInterval(SDLop_VideoDevice *device, int *interval);
+/* Releases the process-lifetime bootstrap context that wglGetProcAddress
+ * needs. Called from win32_Quit, before the window class is unregistered. */
+void SDLOP_Win32GLQuit(void);
 
 /* sdlop_windows_vulkan.c */
 bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *window,

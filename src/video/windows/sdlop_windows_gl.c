@@ -59,6 +59,7 @@ static struct
  * thread that has a current context. */
 static HGLRC bootstrap_context;
 static HDC bootstrap_dc;
+static HWND bootstrap_hwnd;
 
 static void *win32_gl_load(const char *name)
 {
@@ -138,9 +139,34 @@ static bool win32_gl_ensure_bootstrap(void)
         DestroyWindow(hwnd);
         return false;
     }
-    /* the window is leaked deliberately with the context: it lives for the
-     * process, and wglGetProcAddress needs a current context, not a window */
+    /* The window has to outlive the context -- wglGetProcAddress needs a
+     * current context tied to a live DC -- so it is kept for the process, and
+     * released by SDLOP_Win32GLQuit() from SDL_Quit rather than never. */
+    bootstrap_hwnd = hwnd;
     return true;
+}
+
+/* Release the bootstrap context and its window. Only called from SDL_Quit,
+ * where no application context can be current any more. */
+void SDLOP_Win32GLQuit(void)
+{
+    if (bootstrap_context) {
+        /* leave nothing current on this thread before releasing the DC */
+        if (wglGetCurrentContext() == bootstrap_context) {
+            wglMakeCurrent(NULL, NULL);
+        }
+        wglDeleteContext(bootstrap_context);
+    }
+    bootstrap_context = NULL;
+    if (bootstrap_hwnd) {
+        if (bootstrap_dc) {
+            ReleaseDC(bootstrap_hwnd, bootstrap_dc);
+        }
+        DestroyWindow(bootstrap_hwnd);
+        bootstrap_hwnd = NULL;
+    }
+    bootstrap_dc = NULL;
+    wgl.initialized = false;
 }
 
 /* Create it without disturbing an application's current context. */
