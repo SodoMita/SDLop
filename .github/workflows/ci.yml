@@ -118,9 +118,13 @@ jobs:
           # `wine` (the metapackage) pulls in the wine32/WoW64 path, whose
           # package configuration prompts interactively and hangs a
           # non-interactive runner. wine64 alone runs these 64-bit test exes.
+          # xkb-data: without it wine has no keyboard layout at all, so
+          # every raw-input packet arrives with VKey 0 and the keyboard tests
+          # cannot see a single key. libgl1-mesa-dri/mesa-vulkan are the GL and
+          # Vulkan implementations for wine's own rendering.
           sudo -E apt-get install -y --no-install-recommends \
             cmake ninja-build gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
-            wine64 xvfb xauth
+            wine64 xvfb xauth xkb-data libgl1-mesa-dri mesa-vulkan-drivers
 
       - name: Build SDL 3.4.20 reference DLL (api_subset_check)
         run: |

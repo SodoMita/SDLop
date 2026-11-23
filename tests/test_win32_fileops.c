@@ -95,10 +95,31 @@ int main(int argc, char *argv[])
             CHECK(SDL_CreateDirectory(deep), "SDL_CreateDirectory(\"a/b/c\") failed: %s", SDL_GetError());
             CHECK(file_exists(deep), "nested directory was not created: %s", deep);
             CHECK(SDL_CreateDirectory(deep), "SDL_CreateDirectory on an existing directory must succeed");
+            /* SDL_RemovePath must refuse a *non-empty* directory and leave it
+             * in place. This used to point at base + "a", a directory nothing
+             * ever created, so the call legitimately succeeded on a missing
+             * path and the check was asserting the wrong thing -- invisible
+             * on a prefix where a stray "a" happened to exist. Build the
+             * directory here instead of assuming one. */
             {
-                char ab[1024];
-                SDL_snprintf(ab, sizeof(ab), "%sa", base);
-                CHECK(!SDL_RemovePath(ab), "SDL_RemovePath of a non-empty directory should fail");
+                char nd[1024], inner[1024];
+                SDL_snprintf(nd, sizeof(nd), "%snotempty_%lu", base, (unsigned long)GetTickCount());
+                CHECK(SDL_CreateDirectory(nd), "SDL_CreateDirectory(%s): %s", nd, SDL_GetError());
+                SDL_snprintf(inner, sizeof(inner), "%s/inside.txt", nd);
+                {
+                    FILE *f = fopen(inner, "wb");
+                    CHECK(f != NULL, "could not create %s", inner);
+                    if (f) {
+                        fputs("x", f);
+                        fclose(f);
+                    }
+                }
+                CHECK(!SDL_RemovePath(nd), "SDL_RemovePath of a non-empty directory should fail");
+                CHECK(file_exists(nd), "a refused removal must leave the directory alone: %s", nd);
+                /* delete the contents, then the now-empty directory itself */
+                CHECK(SDL_RemovePath(inner), "SDL_RemovePath(%s): %s", inner, SDL_GetError());
+                CHECK(SDL_RemovePath(nd), "SDL_RemovePath of an empty directory should succeed: %s", SDL_GetError());
+                CHECK(!file_exists(nd), "empty directory still exists after SDL_RemovePath");
             }
         }
         SDL_free(base);

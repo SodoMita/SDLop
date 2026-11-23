@@ -381,6 +381,14 @@ static void handle_keyboard(const RAWKEYBOARD *raw, Uint32 device, Uint64 ts)
      * first, the way the window-message path does it. */
     {
         UINT vk = raw->VKey;
+        if (!vk) {
+            /* A raw packet's VKey is resolved through the *active keyboard
+             * layout*, and with no layout loaded (a bare Wine prefix without
+             * xkb-data) it comes back 0 for every key -- the packet arrives
+             * with a correct scan code and no VK at all. Derive it from the
+             * scan code rather than publishing a code that carries no VK. */
+            vk = MapVirtualKeyW(scan & 0xFF, MAPVK_VSC_TO_VK);
+        }
         if (raw->Flags & RI_KEY_E0) {
             /* The E0 prefix is what separates the right-hand Control/Alt from
              * the left-hand ones, and the raw packet's own VKey does not carry
