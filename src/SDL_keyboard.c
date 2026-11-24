@@ -1076,9 +1076,20 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
         return SDLK_UNKNOWN;
     }
 #ifdef _WIN32
-    /* No layout keymap to consult: SDL3's built-in table is the Windows
-     * mapping for a US layout, and key events ignore modifiers. */
-    return default_key_from_scancode(scancode, key_event ? SDL_KMOD_NONE : modstate);
+    /* The current keyboard layout decides what a physical key produces; the
+     * scancode table alone is a US answer. Key events ignore modifiers (SDL3
+     * keeps .key at the unshifted key), which is the SDL_KMOD_NONE level here;
+     * everything the layout does not type (F-keys, navigation, modifiers)
+     * falls through to the scancode table. */
+    {
+        const Uint32 c = SDLOP_Win32LayoutCharForScancode(scancode, false);
+        if (c) {
+            /* SDL3 keeps .key at the key the layout puts there, unshifted;
+             * the shifted form is in .text */
+            return (SDL_Keycode)c;
+        }
+        return default_key_from_scancode(scancode, key_event ? SDL_KMOD_NONE : modstate);
+    }
 #else
     if (key_event) {
         return event_keycode(scancode);

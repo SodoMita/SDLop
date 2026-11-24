@@ -1191,6 +1191,24 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         return 0;
 
+    case WM_INPUTLANGCHANGE:
+        /* The user switched keyboard layout (Alt+Shift, the language bar, a
+         * remote session). Every keycode SDL reports from here on depends on
+         * it, so the character table has to be rebuilt; stock SDL3 does the
+         * same in its WM_INPUTLANGCHANGE handler (WIN_UpdateKeymap(true)).
+         * SDL_EVENT_KEYMAP_CHANGED tells the application, which is what SDL3
+         * sends for this so that cached SDL_GetKeyName results can be
+         * refreshed. */
+        SDLOP_Win32UpdateKeyboardLayout();
+        if (window) {
+            SDL_Event event;
+            SDL_zero(event);
+            event.type = SDL_EVENT_KEYMAP_CHANGED;
+            event.common.timestamp = SDLOP_Win32Timestamp();
+            SDL_PushEvent(&event);
+        }
+        return 1;
+
     case WM_INPUT:
     {
         /* One WM_INPUT carries one packet; its header says which kind. The
@@ -1389,6 +1407,8 @@ static bool win32_Init(SDLop_VideoDevice *device)
         return false;
     }
     win32_add_displays(device);
+    /* the character each key produces depends on the layout installed now */
+    SDLOP_Win32UpdateKeyboardLayout();
     sdlop_win32.window_count = 0;
     /* Baseline for external clipboard change detection: anything that changes
      * this number afterwards belongs to another application. */
