@@ -154,6 +154,73 @@ static void test_focusable_and_flash(SDL_Window *window)
           "SDL_FlashWindow(UNTIL_FOCUSED): %s", SDL_GetError());
 }
 
+/* --- window state flags ------------------------------------------------- */
+
+/* SDL_GetWindowFlags is what applications branch on, so a driver that changes
+ * the OS state without updating the flag (or the other way round) makes an app
+ * draw the wrong thing forever. Each of these pairs an operation with the flag
+ * it is supposed to move. */
+static void test_state_flags(void)
+{
+    SDL_Window *w = SDL_CreateWindow("sdlop state flags", 400, 300, 0);
+    CHECK(w != NULL, "SDL_CreateWindow: %s", SDL_GetError());
+    if (!w) {
+        return;
+    }
+
+    CHECK(SDL_ShowWindow(w), "ShowWindow: %s", SDL_GetError());
+    CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_HIDDEN), "HIDDEN still set after SDL_ShowWindow");
+
+    SDL_MaximizeWindow(w);
+    CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_MAXIMIZED, "MAXIMIZED not set after SDL_MaximizeWindow");
+    SDL_RestoreWindow(w);
+    CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_MAXIMIZED), "MAXIMIZED still set after SDL_RestoreWindow");
+
+    SDL_MinimizeWindow(w);
+    CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_MINIMIZED, "MINIMIZED not set after SDL_MinimizeWindow");
+    SDL_RestoreWindow(w);
+    CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_MINIMIZED), "MINIMIZED still set after SDL_RestoreWindow");
+
+    /* SDL_WINDOW_BORDERLESS means "no decorations", so it is set by
+     * SDL_SetWindowBordered(false) -- the inverted reading is easy to write
+     * and matches what stock SDL3 does in SDL_video.c. */
+    CHECK(SDL_SetWindowBordered(w, false), "SetWindowBordered(false): %s", SDL_GetError());
+    CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_BORDERLESS, "BORDERLESS not set after SetWindowBordered(false)");
+    CHECK(SDL_SetWindowBordered(w, true), "SetWindowBordered(true): %s", SDL_GetError());
+    CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_BORDERLESS), "BORDERLESS still set after SetWindowBordered(true)");
+
+    CHECK(SDL_SetWindowResizable(w, false), "SetWindowResizable(false): %s", SDL_GetError());
+    CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_RESIZABLE), "RESIZABLE still set after SetWindowResizable(false)");
+    CHECK(SDL_SetWindowResizable(w, true), "SetWindowResizable(true): %s", SDL_GetError());
+    CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_RESIZABLE, "RESIZABLE not set after SetWindowResizable(true)");
+
+    CHECK(SDL_SetWindowAlwaysOnTop(w, true), "SetWindowAlwaysOnTop: %s", SDL_GetError());
+    CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_ALWAYS_ON_TOP, "ALWAYS_ON_TOP not set");
+    CHECK(SDL_SetWindowAlwaysOnTop(w, false), "SetWindowAlwaysOnTop(false): %s", SDL_GetError());
+    CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_ALWAYS_ON_TOP), "ALWAYS_ON_TOP still set");
+
+    /* A fullscreen round trip must return to the same windowed geometry;
+     * losing it leaves the application's layout wrong after every alt-tab. */
+    {
+        int bw = 0, bh = 0, aw = 0, ah = 0;
+        SDL_GetWindowSize(w, &bw, &bh);
+        if (SDL_SetWindowFullscreen(w, true)) {
+            CHECK(SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN, "FULLSCREEN not set");
+            CHECK(SDL_SetWindowFullscreen(w, false), "leave fullscreen: %s", SDL_GetError());
+            CHECK(!(SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN), "FULLSCREEN still set");
+            SDL_GetWindowSize(w, &aw, &ah);
+            CHECK(bw == aw && bh == ah,
+                  "windowed size changed across a fullscreen round trip: %dx%d -> %dx%d",
+                  bw, bh, aw, ah);
+        } else {
+            /* no fullscreen available (a bare Wine desktop, for instance) */
+            SDL_Log("fullscreen unavailable, skipping the round trip: %s", SDL_GetError());
+        }
+    }
+
+    SDL_DestroyWindow(w);
+}
+
 /* --- size constraints --------------------------------------------------- */
 
 static void test_size_constraints(SDL_Window *window)
@@ -244,6 +311,7 @@ int main(void)
         test_modal_survives_hide_show(parent, child);
     }
     test_modal_destroy_reenables_parent();
+    test_state_flags();
     if (parent) {
         test_opacity(parent);
         test_focusable_and_flash(parent);
