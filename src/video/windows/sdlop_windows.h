@@ -108,6 +108,10 @@ bool SDLOP_Win32GLGetSwapInterval(SDLop_VideoDevice *device, int *interval);
  * needs. Called from win32_Quit, before the window class is unregistered. */
 void SDLOP_Win32GLQuit(void);
 
+/* sdlop_windows_ime.c: composition events. Returns true when the message was
+ * an IME message and has been handled (the window procedure should stop). */
+bool SDLOP_Win32IMEHandleMessage(SDL_Window *window, UINT msg, WPARAM wparam, LPARAM lparam);
+
 /* sdlop_windows_vulkan.c */
 bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *window,
                                    void *instance, const void *allocator, Uint64 *surface);

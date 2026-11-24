@@ -450,6 +450,7 @@ if(WIN32)
     src/SDL_win32_keymap.c
     src/video/windows/sdlop_windows.c
     src/video/windows/sdlop_windows_gl.c
+    src/video/windows/sdlop_windows_ime.c
     src/video/windows/sdlop_windows_vulkan.c
     src/video/sdlop_gl_offload_win32.c
     src/video/sdlop_vk_offload_win32.c
@@ -699,7 +700,8 @@ if(SDLop_BUILD_TESTS)
               test_win32_close test_win32_windowsize test_win32_windowmgmt
               test_win32_fileops
               test_win32_raw_keyboard_e2e test_win32_raw_mouse_e2e
-              test_win32_gl test_win32_vulkan test_win32_clipboard)
+              test_win32_gl test_win32_vulkan test_win32_clipboard
+              test_win32_ime)
       add_executable(${t} tests/${t}.c)
       target_link_libraries(${t} PRIVATE sdlop)
       target_include_directories(${t} PRIVATE src)
@@ -709,6 +711,7 @@ if(SDLop_BUILD_TESTS)
     endforeach()
     target_link_libraries(test_win32_shape PRIVATE gdi32)
     target_link_libraries(test_win32_gl PRIVATE opengl32)
+    target_link_libraries(test_win32_ime PRIVATE imm32)
     set_tests_properties(test_win32_gl test_win32_vulkan PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 

@@ -1191,6 +1191,17 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         return 0;
 
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_COMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+    case WM_IME_NOTIFY:
+        /* Handled or not, these must not reach DefWindowProcW: it consumes the
+         * composition itself, which showed up as every composition event
+         * arriving twice (4 editing events for 2 messages). An IME message we
+         * do not act on is simply one we ignore. */
+        SDLOP_Win32IMEHandleMessage(window, m.message, m.wParam, m.lParam);
+        return 0;
+
     case WM_INPUTLANGCHANGE:
         /* The user switched keyboard layout (Alt+Shift, the language bar, a
          * remote session). Every keycode SDL reports from here on depends on
