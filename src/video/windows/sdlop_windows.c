@@ -2952,9 +2952,30 @@ static bool win32_SetWindowParent(SDLop_VideoDevice *device, SDL_Window *window,
 static bool win32_SetWindowModal(SDLop_VideoDevice *device, SDL_Window *window, bool modal)
 {
     (void)device;
-    (void)window;
-    (void)modal;
-    return true; /* parenting covers SDL3's use; modality is the app's job */
+    /* Modality in Win32 is the parent being *disabled*: with the owner window
+     * blocked, clicks and input go nowhere, which is what "modal" means to the
+     * user. Returning true without touching it -- as this did -- made
+     * SDL_SetWindowModal a no-op that reported success, while stock SDL3
+     * (WIN_SetWindowModal) disables the parent. Re-enable on the way out,
+     * unless the window is hidden: SDL hides a modal window before clearing
+     * the flag, and re-enabling there would leave the parent live with no
+     * dialog on screen. */
+    if (!window->parent || !window->parent->driverdata || !window->driverdata) {
+        return true;
+    }
+    {
+        SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+        SDLop_Win32WindowData *pdata = (SDLop_Win32WindowData *)window->parent->driverdata;
+        if (!data->hwnd || !pdata->hwnd) {
+            return true;
+        }
+        if (modal) {
+            EnableWindow(pdata->hwnd, FALSE);
+        } else if (!(window->flags & SDL_WINDOW_HIDDEN)) {
+            EnableWindow(pdata->hwnd, TRUE);
+        }
+    }
+    return true;
 }
 
 static bool win32_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon)
