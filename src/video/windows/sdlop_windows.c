@@ -2918,33 +2918,19 @@ static bool win32_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL
         break;
     case SDL_FLASH_BRIEFLY:
         fi.dwFlags = FLASHW_TRAY;
-        fi.uCount = 2;
+        fi.uCount = 1;
         break;
     case SDL_FLASH_UNTIL_FOCUSED:
-        fi.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG;
+        fi.dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG;
         break;
     default:
         return SDL_Unsupported();
     }
-    if (!FlashWindowEx(&fi)) {
-        return SDL_SetError("FlashWindowEx() failed");
-    }
-    return true;
-}
-
-static bool win32_SyncWindow(SDLop_VideoDevice *device, SDL_Window *window)
-{
-    (void)device;
-    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
-    if (!data || !data->hwnd) {
-        return true;
-    }
-    /* True once the window has no pending messages; SDL3 returns true when
-     * there is nothing left to do. */
-    MSG msg;
-    if (PeekMessageW(&msg, data->hwnd, 0, 0, PM_NOREMOVE)) {
-        return false;
-    }
+    /* FlashWindowEx() returns the window's *previous* active state, not a
+     * success flag. Treating FALSE as failure reported an error for every
+     * flash of a window that did not have focus -- which is the whole point of
+     * flashing -- and left SDL_GetError() describing a flash that worked. */
+    FlashWindowEx(&fi);
     return true;
 }
 
@@ -3578,7 +3564,11 @@ SDLop_VideoDevice SDLop_windows_device = {
     .WarpMouseGlobal = win32_WarpMouseGlobal,
     .GetGlobalMouseState = win32_GetGlobalMouseState,
     .FlashWindow = win32_FlashWindow,
-    .SyncWindow = win32_SyncWindow,
+    /* No .SyncWindow: window state on Win32 is applied synchronously by
+     * SetWindowPos/ShowWindow, and the core returns true when a driver does
+     * not implement it. A first attempt implemented it as "false while the
+     * window has queued messages", which made SDL_SyncWindow() report failure
+     * for any unrelated pending message -- an ordinary WM_NULL was enough. */
     .SetWindowFocusable = win32_SetWindowFocusable,
     .SetWindowParent = win32_SetWindowParent,
     .SetWindowModal = win32_SetWindowModal,
