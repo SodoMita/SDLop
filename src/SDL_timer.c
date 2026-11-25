@@ -12,22 +12,38 @@
 
 #include "internal/sdlop_internal.h"
 #include <errno.h>
+#include <stdatomic.h>
 #include <time.h>
 #ifndef _WIN32
 #include <sched.h>
 #include <signal.h>
 #endif
 
-/* CLOCK_MONOTONIC origin captured at first use (~library load). */
+/* CLOCK_MONOTONIC origin. It must be fixed before any timer callback or input
+ * worker can push an event: the old lazy `static int inited` initialization
+ * was racy, and a timer thread that got there first saw now == origin and
+ * pushed its event with timestamp 0 (measured on Win7, test_core flaky). */
+static Uint64 timer_origin;
+static atomic_int timer_origin_state; /* 0 = unset, 1 = setting, 2 = ready */
+
 static Uint64 timer_origin_ns(void)
 {
-    static Uint64 origin;
-    static int inited;
-    if (!inited) {
-        origin = SDLOP_MonotonicNowNS();
-        inited = 1;
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&timer_origin_state, &expected, 1,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+        timer_origin = SDLOP_MonotonicNowNS();
+        atomic_store_explicit(&timer_origin_state, 2, memory_order_release);
+    } else {
+        while (atomic_load_explicit(&timer_origin_state, memory_order_acquire) != 2) {
+            SDLOP_YIELD();
+        }
     }
-    return origin;
+    return timer_origin;
+}
+
+void SDLOP_InitTicks(void)
+{
+    (void)timer_origin_ns();
 }
 
 Uint64 SDL_GetPerformanceCounter(void)

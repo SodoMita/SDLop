@@ -226,4 +226,77 @@ int isatty(int fd)
     return _isatty(fd);
 }
 
+/* SetThreadDescription is Windows 10 1607+; Win7 has no such export. Resolve
+ * it lazily from kernel32 so the same binary keeps the nicer debugger thread
+ * names on newer systems and silently no-ops on older ones. SDL3 does the
+ * same dynamic lookup for this API. */
+HRESULT SDLOP_SetThreadDescription(HANDLE thread, const wchar_t *name)
+{
+    typedef HRESULT (WINAPI *SetThreadDescriptionFn)(HANDLE, PCWSTR);
+    union { FARPROC raw; SetThreadDescriptionFn fn; } resolved_fn;
+    static SetThreadDescriptionFn set_description = NULL;
+    static BOOL resolved = FALSE;
+    if (!resolved) {
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        resolved_fn.raw = kernel32 ? GetProcAddress(kernel32, "SetThreadDescription") : NULL;
+        set_description = resolved_fn.fn;
+        resolved = TRUE;
+    }
+    if (set_description) {
+        return set_description(thread, name);
+    }
+    return E_NOTIMPL;
+}
+
+/* Per-monitor DPI support is absent on Windows 7. Resolving these from
+ * user32.dll avoids a hard import that would stop SDLop.dll from loading at
+ * all there; callers already handle a 0 DPI / FALSE result. */
+UINT SDLOP_GetDpiForWindow(HWND hwnd)
+{
+    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+    union { FARPROC raw; GetDpiForWindowFn fn; } resolved_fn;
+    static GetDpiForWindowFn fn = NULL;
+    static BOOL resolved = FALSE;
+    if (!resolved) {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        resolved_fn.raw = user32 ? GetProcAddress(user32, "GetDpiForWindow") : NULL;
+        fn = resolved_fn.fn;
+        resolved = TRUE;
+    }
+    return fn ? fn(hwnd) : 0;
+}
+
+UINT SDLOP_GetDpiForSystem(void)
+{
+    typedef UINT (WINAPI *GetDpiForSystemFn)(void);
+    union { FARPROC raw; GetDpiForSystemFn fn; } resolved_fn;
+    static GetDpiForSystemFn fn = NULL;
+    static BOOL resolved = FALSE;
+    if (!resolved) {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        resolved_fn.raw = user32 ? GetProcAddress(user32, "GetDpiForSystem") : NULL;
+        fn = resolved_fn.fn;
+        resolved = TRUE;
+    }
+    return fn ? fn() : 0;
+}
+
+BOOL SDLOP_AdjustWindowRectExForDpi(LPRECT rect, DWORD style, BOOL menu, DWORD exstyle, UINT dpi)
+{
+    typedef BOOL (WINAPI *AdjustWindowRectExForDpiFn)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    union { FARPROC raw; AdjustWindowRectExForDpiFn fn; } resolved_fn;
+    static AdjustWindowRectExForDpiFn fn = NULL;
+    static BOOL resolved = FALSE;
+    if (!resolved) {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        resolved_fn.raw = user32 ? GetProcAddress(user32, "AdjustWindowRectExForDpi") : NULL;
+        fn = resolved_fn.fn;
+        resolved = TRUE;
+    }
+    if (fn) {
+        return fn(rect, style, menu, exstyle, dpi);
+    }
+    return AdjustWindowRectEx(rect, style, menu, exstyle);
+}
+
 #endif /* _WIN32 */

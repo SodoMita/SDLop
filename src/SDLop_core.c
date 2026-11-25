@@ -249,6 +249,7 @@ bool SDL_Init(SDL_InitFlags flags)
     SDLOP_InitMainThread();
     if (!sdlop.init_done) {
         sdlop.init_monotonic_ns = SDLOP_MonotonicNS();
+        SDLOP_InitTicks();
         sdlop.next_window_id = 0;
         sdlop.next_user_event = SDL_EVENT_USER;
         sdlop.repeat_delay_ms = 500;

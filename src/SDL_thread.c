@@ -859,7 +859,7 @@ run_thread(void *arg)
     if (thread->name) {
         wchar_t wname[64];
         if (MultiByteToWideChar(CP_UTF8, 0, thread->name, -1, wname, (int)SDL_arraysize(wname)) > 0) {
-            SetThreadDescription(GetCurrentThread(), wname);
+            SDLOP_SetThreadDescription(GetCurrentThread(), wname);
         }
     }
 #endif

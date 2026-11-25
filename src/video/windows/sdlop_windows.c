@@ -74,10 +74,10 @@ static UINT win32_frame_dpi(SDL_Window *window)
     SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
     UINT dpi = 0;
     if (data && data->hwnd) {
-        dpi = GetDpiForWindow(data->hwnd);
+        dpi = SDLOP_GetDpiForWindow(data->hwnd);
     }
     if (!dpi) {
-        dpi = GetDpiForSystem();
+        dpi = SDLOP_GetDpiForSystem();
     }
     return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
 }
@@ -94,7 +94,7 @@ static void win32_adjust_window_rect_for_style(SDL_Window *window, DWORD style, 
         (window->flags & (SDL_WINDOW_POPUP_MENU | SDL_WINDOW_TOOLTIP))) {
         return;
     }
-    if (!AdjustWindowRectExForDpi(rc, style, FALSE, exstyle, win32_frame_dpi(window))) {
+    if (!SDLOP_AdjustWindowRectExForDpi(rc, style, FALSE, exstyle, win32_frame_dpi(window))) {
         AdjustWindowRectEx(rc, style, FALSE, exstyle);
     }
 }
@@ -1288,7 +1288,7 @@ static bool win32_register_class(void)
  * logical size is the one GetSystemMetrics() reports with DPI awareness on. */
 static UINT win32_system_dpi(void)
 {
-    const UINT dpi = GetDpiForSystem();
+    const UINT dpi = SDLOP_GetDpiForSystem();
     return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
 }
 
@@ -1589,7 +1589,7 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
      * scale stays at the 1.0 the core sets until the user drags the window to
      * a different monitor (WM_DPICHANGED), and every size in points on a
      * scaled display is reported unscaled. */
-    win32_update_display_scale(window, GetDpiForWindow(hwnd));
+    win32_update_display_scale(window, SDLOP_GetDpiForWindow(hwnd));
     update_metrics(window);
     return true;
 }
