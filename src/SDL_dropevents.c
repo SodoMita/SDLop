@@ -15,7 +15,12 @@
 #include "internal/sdlop_internal.h"
 
 #include <string.h>
-#include <unistd.h>
+#ifdef _WIN32
+  #include <winsock2.h>   /* gethostname */
+  #include <windows.h>
+#else
+  #include <unistd.h>
+#endif
 
 static bool app_is_dropping = false;
 static float last_drop_x = 0;

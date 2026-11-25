@@ -4166,6 +4166,7 @@ static void x11_dispatch(xcb_generic_event_t *ev)
             /* another client (WM move/menu, ...) grabbed the pointer: the
                server sends us nothing until it ends, nor may raw input */
             sdlop.pointer_grabbed_elsewhere = true;
+            SDLOP_RawInputResetPointerFrame();
         }
         /* grabs (WM moves, our relative grab) and moves into child
          * windows are not real leaves (SDL3 filter) */
@@ -4179,6 +4180,7 @@ static void x11_dispatch(xcb_generic_event_t *ev)
         if (sdlop.mouse_focus == window) {
             window->flags &= ~SDL_WINDOW_MOUSE_FOCUS;
             sdlop.mouse_focus = NULL;
+            SDLOP_RawInputResetPointerFrame();
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOUSE_LEAVE, 0, 0);
         }
         break;
@@ -4192,6 +4194,7 @@ static void x11_dispatch(xcb_generic_event_t *ev)
                WM switcher) - key events go there, raw ones must too.
                FocusIn(Grab): the grab is on one of our windows (ours). */
             sdlop.keyboard_grabbed_elsewhere = (type == XCB_FOCUS_OUT) && !x11.keyboard_grab_window;
+            if (sdlop.keyboard_grabbed_elsewhere) { sdlop.repeat_active = false; }
         } else if (window && fe->mode == XCB_NOTIFY_MODE_UNGRAB) {
             sdlop.keyboard_grabbed_elsewhere = false;
         } else if (window && type == XCB_FOCUS_IN) {

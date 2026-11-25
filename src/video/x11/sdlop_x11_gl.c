@@ -249,9 +249,13 @@ static void *egl_CreateContext(xcb_visualid_t visual)
     if (!ensure_egl_display()) {
         return NULL;
     }
+    /* GLES has no 2.1: a 2.1 (or higher) request without an ES profile means
+     * desktop GL, like SDL2. Only bare 2.0 stays GLES. */
     bool want_desktop_gl =
         (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) != 0 ||
-        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3);
+        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 &&
+         (sdlop_glattrs.major_version > 2 ||
+          (sdlop_glattrs.major_version == 2 && sdlop_glattrs.minor_version > 0)));
     EGLenum api = want_desktop_gl ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
     if (!SDLOP_EGL_eglBindAPI(api)) {
         SDL_SetError("eglBindAPI failed: 0x%x", SDLOP_EGL_eglGetError());

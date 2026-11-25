@@ -11,12 +11,16 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDLop.h>
 #include <stdatomic.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* win32.h has to come before windows.h users and defines nothing on POSIX */
+#include "sdlop_win32.h"
+/* mutex / rwlock / condition / semaphore / clock primitives */
+#include "sdlop_platform.h"
 
 /* ------------------------------------------------------------------ */
 /* Window internal                                                     */
@@ -268,6 +272,7 @@ int SDLOP_URIToLocal(const char *src, char *dst); /* file: URI -> path (in place
 const void *SDLCALL SDLOP_ClipboardTextCallback(void *userdata, const char *mime_type, size_t *size);
 
 /* Provided by backends */
+extern SDLop_VideoDevice SDLop_windows_device;
 extern SDLop_VideoDevice SDLop_emscripten_device;
 extern SDLop_VideoDevice SDLop_wayland_device;
 extern SDLop_VideoDevice SDLop_x11_device;
@@ -325,6 +330,7 @@ typedef struct SDLop_Globals
     SDL_Scancode repeat_scancode;
     Uint16 repeat_rawcode;
     bool repeat_active;
+    bool suppress_input_events; /* main-thread-only compound key delivery */
     Uint64 repeat_next_ns;      /* absolute CLOCK_MONOTONIC deadline */
     Uint32 repeat_delay_ms;
     Uint32 repeat_interval_ms;
@@ -340,6 +346,7 @@ typedef struct SDLop_Globals
 
     /* event queue wakeup (raw input worker -> main thread) */
     int wake_fd;                /* eventfd, read to reset */
+    void *wake_handle;          /* Win32: auto-reset event, waited on and set */
 
     /* KMSDRM VT-switch signals owned by the driver's signalfd; helper
      * threads (raw evdev worker) block these so the signals are always
@@ -355,6 +362,10 @@ extern SDLop_Globals sdlop;
 
 /* Push an event into the SDL event queue (main thread only). */
 bool SDLOP_PushEventInternal(SDL_Event *event);
+/* Input event: caller has updated state; drop quietly if it cannot be queued. */
+bool SDLOP_PushInputEvent(SDL_Event *event);
+/* Main-thread-only queue headroom for input event delivery. */
+Uint32 SDLOP_EventQueueFree(void);
 
 /* Post a window event (RESIZED, FOCUS_*, CLOSE_REQUESTED, ...). */
 void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1, Sint32 data2);
@@ -463,6 +474,7 @@ void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locke
                                   Uint32 base_group, Uint32 latched_group, Uint32 locked_group); /* x11/wayland */
 bool SDLOP_KeyboardKeyRepeats(SDL_Scancode sc);
 void SDLOP_KeyboardProcessRepeats(void);
+void SDLOP_KeyboardClearComposition(void);
 void SDLOP_KeyboardQuit(void);
 /* Resolve scancode (evdev raw code) -> SDL_Keycode + text using xkb.
  * Returns the keycode; fills text_utf8 (may write "") when non-NULL. */
@@ -485,6 +497,8 @@ bool SDLOP_RawInputIsSource(void);
    DetachConsole as soon as it is given back. */
 void SDLOP_RawInputAttachConsole(int console_fd);
 void SDLOP_RawInputDetachConsole(void);
+void SDLOP_RawInputResetPointerFrame(void); /* focus/grab transition, main thread */
+bool SDLOP_RawInputKeyboardAllowed(void); /* main-thread repeat ownership */
 void SDLOP_RawInputPump(void);      /* drain raw ring -> SDL events (main thread) */
 void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms);
 void SDLOP_RawInputTestFeed(const SDLop_RawEvent *ev, bool winsys); /* tests only */
@@ -504,6 +518,10 @@ SDL_DisplayID SDLOP_AddDisplay(const char *name, int w, int h, int refresh_mhz,
                                SDL_DisplayOrientation natural_orientation,
                                void *internal, bool send_event);
 void SDLOP_DelDisplay(SDL_DisplayID displayID, bool send_event);
+/* Set a display's pixel density after AddDisplay (the mode list is built
+ * from the logical size, so a backend on a scaled desktop reports density
+ * here rather than growing AddDisplay's signature for every backend). */
+void SDLOP_SetDisplayPixelDensity(SDL_DisplayID displayID, float pixel_density);
 void SDLOP_SendDisplayEvent(SDL_DisplayID displayID, SDL_EventType type, Sint32 data1, Sint32 data2);
 bool SDLOP_GetDisplayBoundsById(SDL_DisplayID displayID, SDL_Rect *rect);
 int SDLOP_GetDisplayIndexById(SDL_DisplayID displayID); /* -1 when absent */
@@ -554,6 +572,10 @@ bool SDLOP_Vulkan_CanCreateWindow(void);
 
 /* Surface helpers (SDL_surface.c) */
 int SDLOP_BytesPerPixel(SDL_PixelFormat format);
+
+/* Haptics (SDL_haptic.c, SDL_haptic_dummy.c) */
+bool SDLOP_InitHaptics(void);                       /* SDL_INIT_HAPTIC */
+void SDLOP_QuitHaptics(void);                       /* SDL_QuitSubSystem() hook */
 
 /* Threads (SDL_thread.c) */
 void SDLOP_ThreadsQuit(void);                       /* SDL_Quit() hook: TLS teardown */

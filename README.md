@@ -25,8 +25,9 @@ int main(void) {
   - raw input: **~5–9 µs** kernel-timestamp → your code, via a dedicated
     worker thread (asyncinput-style)
 - **Lean**: windowing + input only. No audio, renderer, GPU, HID, camera,
-  iostream, … (the joystick/gamepad API is exported but reports no devices,
-  so unmodified SDL3 apps still link and run; ~39k lines of C including the X11,
+  iostream, … (Linux evdev joysticks/gamepads are supported; with none attached
+  the API behaves like stock SDL3, so unmodified apps still link and run;
+  ~39k lines of C including the X11,
   Wayland, KMSDRM and web drivers; the SDL surface/blit code is ported).
 - **Low-latency input like asyncinput**: a background thread reads
   `/dev/input/event*` directly with `epoll`, publishes into lock-free SPSC
@@ -95,7 +96,14 @@ either all from evdev (`/dev/input`) or all from the window system.
   keys/buttons SDL reported down always pass, and a drag that started in our
   window keeps its motion. All or nothing: if the worker cannot read both a
   keyboard and a pointer, SDLop logs why and uses window-system input for
-  both. Touch stays with the window system.
+  both. Raw pointers may use REL_X/Y or single-contact ABS_X/Y with valid
+  ranges and mouse/pen buttons; absolute coordinates scale to the focused
+  window. Direct touchscreens, touchpads and multitouch stay with the window
+  system. See [input report fixes and verification](docs/input-report-fixes.md).
+  Terminal device removal releases its held SDL state. If a required device
+  class is lost, both SDL input classes fall back together to the window system;
+  native raw observers can continue on surviving devices. New devices require
+  video reinitialization. See [input lifecycle fixes/tests](docs/input-lifecycle-fixes.md).
 - **fbdev / kmsdrm use evdev by default** (`SDLOP_RAW_INPUT=0` turns that
   off). SDL keyboard events use evdev only while SDLop owns `K_OFF` on the
   foreground VT. A working raw keyboard is required before disabling the
@@ -111,7 +119,10 @@ either all from evdev (`/dev/input`) or all from the window system.
   expose global device events, including keys, regardless of window/VT focus.
   Applications using this API must implement their own focus/security policy;
   do not treat it as a focus-filtered SDL event queue. `SDLop_RawInputAvailable`
-  reports the worker; on X11/Wayland true also means evdev is the SDL source.
+  reports worker availability, not current SDL source ownership: X11/Wayland
+  initially use evdev for both keyboard and mouse, but can fall back to the
+  window system after a required device class is lost while the worker remains
+  available for callbacks/polling on surviving devices.
 - **Timestamp provenance follows the source.** Raw-derived SDL events convert
   kernel times to SDL's tick epoch; window-system events use the native
   handler's receipt time. The raw-input benchmark below measures the evdev path.
@@ -243,18 +254,64 @@ mostly from mapping and filling a full-size buffer during the configure
 handshake. The clear colour is now a 1×1 buffer scaled by `wp_viewporter`.
 
 Reproduce: `cmake --build build && ./build/bench_events && ./build/bench_events_sdl3`
-and `sudo ./build/bench_raw_latency` (needs `/dev/uinput`), and
+and `./build/bench_raw_latency` (needs `/dev/uinput` access; sudo only if necessary), and
 `SDL_VIDEODRIVER=x11|wayland ./build/bench_render` for the rendering numbers.
+The raw-input benchmark reports kernel-timestamp → callback, raw polling,
+SDL polling and SDL waiting distributions (including p99/max). Use `--stress`
+for burst injection concurrent with main-thread draining.
+**No root or input devices are needed for API overhead:** run
+`./build/bench_raw_latency_pipe --api-overhead`. The same pipe-backed executable
+without that flag (or with `--stress`) exercises the real worker and consumers
+using userspace timestamps, not kernel evdev/hardware timing. See the
+[baseline methodology, measured rootless results and validation status](docs/input-latency-baseline.md)
+for modes, prerequisites and regression-gate instructions.
+
+For sustained input, use e.g.
+`./build/bench_raw_latency_pipe --reports 1000000 --rate 16000 --axes 2`.
+The default is 160,000 reports at 16 kHz per mode; report count, mean rate,
+burst size and axis count are configurable. Reports are not native events:
+X + Y + SYN at 16 kHz is 48,000 native records/s. The
+[pre-fix million-report load results](docs/input-load-sustained.md) include the
+losses observed at higher rates, not just short-run latency percentiles.
+The subsequent [input loss reduction report](docs/input-loss-reduction.md)
+describes queue backpressure, larger bounded buffers, bulk raw polling, and
+repeated before/after results—including memory/latency tradeoffs and the
+unavailable kernel-uinput validation. The follow-up
+[worker wakeup and clock-selection report](docs/input-worker-wakeup-clock.md)
+covers the forced wakeup-race regression, EVIOCSCLOCKID setup/fallback, and
+remaining callback-tail acceptance limits.
+
+`SDLop_GetRawInputStats` reports independent SDL/raw-poll ring drop counts.
+The SDL adapter now handles `SYN_DROPPED` and SDL raw-ring overflow by querying
+current key/button state; raw callbacks remain native and unfiltered by recovery.
+This restores current supported state, not missing motion or event history.
+See [state recovery and counters](docs/input-state-recovery.md) for fault tests,
+limitations, and the **currently uncleared callback performance gate**.
+The [self-audit and pinned SDL3 comparison](docs/input-audit-sdl3.md) documents
+reentrant-pump and continuous-device fixes, checked benchmark transport,
+identical-source rootless measurements, and deferred gaps (including wheel
+selection, frame aggregation, hot-add/reopen discovery and focus/VT snapshots).
+The [dispatch optimization follow-up](docs/input-dispatch-optimization.md)
+measures single-writer counter publication and SPSC index caching, with retained
+counter-only experiments, a rootless CPU-work proxy (`bench_raw_dispatch`) and
+explicit latency/throughput tradeoffs. The full callback gate remains uncleared.
+The [regression follow-up](docs/input-regression-followup.md) adds TSan and queue
+boundary coverage, removes absent-unregister allocations, reclaims callback
+snapshots after worker join, and records rejected native-path experiments. The
+retained raw trial, test, and sanitizer logs are indexed in
+[docs/benchmarks/README.md](docs/benchmarks/README.md); their historical results
+do not clear the current callback performance gate.
 
 ## API surface (SDL3-compatible)
 
-741 SDL3 functions; every one is declared in `include/SDL3/` (generated from
+770 SDL3 functions; every one is declared in `include/SDL3/` (generated from
 the SDL 3.4.20 headers by `tools/gen_headers.py`), exported by `libSDLop.so`
 with the same signature as SDL3, and checked by the `api_exports` test.
 
 | Area | Coverage |
 |---|---|
-| Init / hints / properties / log / error / timers / stdlib | `SDL_Init*`, `SDL_*Hint*`, `SDL_*Property*`, `SDL_Log*`, `SDL_GetTicks*`, `SDL_AddTimer`, `SDL_malloc`…`SDL_vsnprintf`, `SDL_iconv*`, atomics, `SDL_main` + main callbacks (`SDL_AppInit`/`AppIterate`/`AppEvent`/`AppQuit`) |
+| Init / hints / properties / log / error / timers / stdlib | `SDL_Init*`, `SDL_*Hint*`, `SDL_*Property*`, `SDL_Log*`, `SDL_GetTicks*`, `SDL_AddTimer`, `SDL_malloc`…`SDL_vsnprintf`, `SDL_iconv*`, atomics, thread priority (`SDL_SetCurrentThreadPriority`, `SDL_SetLinuxThreadPriority*`, no RealtimeKit), `SDL_main` + main callbacks (`SDL_AppInit`/`AppIterate`/`AppEvent`/`AppQuit`) |
+| Haptics | SDL3's haptic core + dummy backend (`SDL_haptic.c`, `SDL_haptic_dummy.c`): effect validation, rumble state and SDL3 errors; no haptic devices are exposed and joystick rumble remains unsupported |
 | Video | displays + modes, content scale, window create (incl. `WithProperties`), popups/tooltips (parent-relative), min/max size, aspect ratio, bordered / resizable / always-on-top / focusable / modal / parent, opacity, icon, borders size, flash, sync, safe area, fullscreen modes, `SDL_GetWindows`, screensaver |
 | Grabs & mouse | relative mode, mouse/keyboard grab, mouse rect, `SDL_CaptureMouse`, warp (window + global), global mouse state, cursors (`SDL_CreateCursor`, color + animated cursors, system cursors from the XCursor theme, show/hide), device lists (`SDL_GetMice`/`GetKeyboards`/`GetTouchDevices` + names) |
 | Events | queue, `SDL_PeepEvents`, filters + watches, `SDL_WaitEvent*`, user events, `SDL_GetEventDescription` |
@@ -262,13 +319,12 @@ with the same signature as SDL3, and checked by the `api_exports` test.
 | Surfaces | create/convert/duplicate/scale/flip/rotate, palettes, colorspaces, blend modes, color keys, `SDL_BlitSurface*` incl. scaled/tiled/9-grid, float/HDR (PQ, 10-bit) conversions, premultiplied alpha, rects |
 | OpenGL / Vulkan | GLX (X11 desktop GL) and EGL contexts (`SDL_GL_*`, `SDL_GL_ExtensionSupported`), `SDL_EGL_*` (current display/config/surface, attribute callbacks; NULL for GLX contexts, as stock), Vulkan WSI (`SDL_Vulkan_*`) |
 | Filesystem | `SDL_GetBasePath`, `SDL_GetPrefPath`, `SDL_GetUserFolder` (XDG), `SDL_CreateDirectory`, `SDL_EnumerateDirectory`, `SDL_GetPathInfo`, `SDL_CopyFile`, `SDL_RenamePath`, `SDL_RemovePath`, `SDL_GetCurrentDirectory` (no `SDL_GlobDirectory`) |
-| Joystick / gamepad | the whole `SDL_joystick.h` / `SDL_gamepad.h` API, behaving like stock SDL3 with no controller attached: empty device lists, opens fail with an error, NULL handles are harmless, string/label helpers work |
-| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings, system theme (settings portal, `SDL_EVENT_SYSTEM_THEME_CHANGED`) and window progress (Unity launcher API) over a built-in D-Bus client (no libdbus; `SDLOP_NO_DBUS=1` turns it off), file dialogs (`SDL_Show*FileDialog`, `SDL_ShowOpenFolderDialog`: xdg-desktop-portal, else zenity; `SDL_HINT_FILE_DIALOG_DRIVER`; modal to the parent window on X11 and, through xdg-foreign, on Wayland) |
+| Joystick / gamepad | Linux evdev backend (`SDL_joystick_evdev.c`): `/dev/input/event*` enumeration + hotplug (inotify with an mtime-gated fallback, like SDL3), axes/buttons/hats, device events and a generic gamepad mapping; no new dependencies. On Windows the dummy backend is used. With no controller attached the whole `SDL_joystick.h` / `SDL_gamepad.h` API behaves like stock SDL3: empty lists, failing opens, harmless NULL handles, working string/label helpers (`tests/test_evdev_joystick.c` uses uinput) |
+| Misc | assertions (`SDL_assert` handler/report, `SDL_ASSERT` hint), message boxes (zenity, like SDL3 on Wayland), `SDL_OpenURL` (xdg-open), `SDL_GetPowerInfo` (sysfs), GUID strings, system theme (settings portal, `SDL_EVENT_SYSTEM_THEME_CHANGED`) and window progress (Unity launcher API) over a built-in D-Bus client (no libdbus; `SDLOP_NO_DBUS=1` turns it off), file dialogs (`SDL_Show*FileDialog`, `SDL_ShowOpenFolderDialog`: xdg-desktop-portal, else zenity; `SDL_HINT_FILE_DIALOG_DRIVER`; modal to the parent window on X11 and, through xdg-foreign, on Wayland). D-Bus, portals and the zenity dialogs are POSIX-only; Windows builds neither |
 
 Unsupported with an SDL error (like a stock SDL3 build without that feature):
 FOURCC/YUV surfaces, RLE acceleration, BMP/PNG I/O (needs `SDL_IOStream`).
-Out of scope by design: audio, renderer, GPU, haptics, sensors, camera,
-iostream, and real game controller support.
+Out of scope by design: audio, renderer, GPU, sensors, camera and iostream.
 
 `struct`/enum/constant ABI is byte-identical to SDL3 3.4.20 (verified by an
 offset/value harness compiled against both header sets), and SDLop's exported
@@ -294,7 +350,7 @@ SDLop_RegisterRawEventCallback(on_raw, NULL);  /* like ni_register_callback */
 SDLop_RawEvent raws[64];
 int n = SDLop_PollRawEvents(raws, 64);         /* like ni_poll */
 
-SDLop_RawInputAvailable();     /* is the evdev worker running? */
+SDLop_RawInputAvailable();     /* raw callback/poll worker is running? */
 SDLop_GetRawEventCount();
 SDLop_SetWindowClearColor(w, 0x30, 0xA0, 0x40);  /* no renderer needed */
 ```
@@ -402,8 +458,9 @@ Both load without the "no version information available" warning. Things
 stock SDL3 apps rely on that SDLop now matches: `SDL_CreateWindow` without
 `SDL_Init` initializes video + events (`SDL_WasInit` = `0x4020`), init flag
 dependencies (`GAMEPAD` → `JOYSTICK` → `EVENTS`), GLX contexts on X11, the
-gamepad/joystick API (no devices) and the `SDL_filesystem.h` helpers
-(`tests/test_dropin_compat.c`, `tests/test_glx.c`). An app that calls an
+gamepad/joystick API (real evdev devices when present, no-device behaviour
+otherwise) and the `SDL_filesystem.h` helpers (`tests/test_dropin_compat.c`,
+`tests/test_evdev_joystick.c`, `tests/test_glx.c`). An app that calls an
 SDL3 function outside SDLop's subset still fails to load with "undefined
 symbol": run it with `LD_BIND_NOW=1` to see all of them at once.
 
@@ -547,10 +604,12 @@ Highlights:
   non-Latin layouts (ru, el, ...) keep the US-QWERTY letter keycodes, and
   AZERTY keeps `SDLK_1`... on the number row while
   `SDL_GetKeyFromScancode(..., false)` reports the layout's symbol
-  (`й`, `&`, `é`...). Dead keys and the Compose key are composed into text via
-  xkbcommon's compose tables (locale from `LC_ALL`, `LC_CTYPE`, `LANG`, else
-  `C`; needs libxkbcommon >= 0.5 and the X11 Compose data, otherwise text is
-  emitted uncomposed). No IME (XIM / text-input-v3) yet.
+  (`й`, `&`, `é`...). Call `SDL_StartTextInput(window)` to receive text: text
+  delivery and dead-key/Compose processing are inactive by default, and stopping
+  text input ends that compose session. Composition uses xkbcommon's compose
+  tables (locale from `LC_ALL`, `LC_CTYPE`, `LANG`, else `C`; needs
+  libxkbcommon >= 0.5 and the X11 Compose data, otherwise text is emitted
+  uncomposed). No IME (XIM / text-input-v3) yet.
 - Touch: `wl_touch` on Wayland and XInput 2.2 multitouch on X11 deliver
   `SDL_EVENT_FINGER_*` (x/y/dx/dy normalized to the window, pressure 1 while
   down; on X11 touchID = source device, fingerID = touch id). Like SDL3, the

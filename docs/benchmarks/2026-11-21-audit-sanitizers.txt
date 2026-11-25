@@ -1,0 +1,209 @@
+
+=== test_core ===
+test_core: all checks passed
+
+=== test_dropin_compat ===
+test_dropin_compat: PASS
+
+=== test_events ===
+test_events: PASS
+
+=== test_fbdev ===
+  ok: signal-mask fixture initialized
+  ok: video driver is fbdev (got fbdev)
+-- displays --
+  ok: SDL_GetDisplays returns a list
+  ok: at least one display (got 1)
+  ok: display bounds
+  ok: bounds positive (320x240)
+  display 1: 320x240
+  ok: desktop mode
+  ok: desktop mode matches bounds (320x240)
+  ok: at least one fullscreen mode (got 1)
+  ok: closest fullscreen mode
+-- software scanout path --
+  ok: get size
+  ok: window snapped to fb mode (got 320x240, want 320x240)
+  ok: window surface
+  ok: surface format XRGB8888 (got 0x16161804)
+  ok: surface matches the fb mode (320x240)
+  ok: pitch valid (1280)
+  ok: surface has RAM pixels
+  ok: top band is red (got c0 00 00)
+  ok: middle band is green (got 00 c0 00)
+  ok: update window surface (present)
+  ok: second present
+  ok: third present (bands again)
+  ok: second window
+  ok: windows have distinct shadow buffers
+  ok: creating and painting another surface preserves the first window
+  ok: destroying another surface preserves the first window
+-- resize request snaps back to fb mode --
+  ok: SetWindowSize snaps to the fb mode (got 320x240)
+-- fullscreen display mode request --
+  ok: display has fullscreen modes
+  ok: set window fullscreen mode 320x240
+  ok: window reports the exclusive fullscreen mode
+  ok: exclusive mode matches request (320x240)
+  ok: clear fullscreen mode
+  ok: exclusive mode cleared
+-- OpenGL availability --
+  ok: GL window rejected without a usable GPU offload target (OpenGL support is either not configured in SDL or not available in current SDL video driver (fbdev) or platform)
+-- software cursor --
+  ok: shared console cursor bitmap is available
+  ok: shared cursor has opaque pixels to compare
+  ok: fbdev cursor uses the shared bitmap (0/94 pixels differ)
+  ok: cursor is drawn on the scanout
+  ok: dirty-rect present after cursor move
+  ok: old cursor position has no stale pixels after dirty-rect present (got 0)
+  ok: app pixels untouched by the cursor (got 00c000, want 00c000)
+  ok: surface repaint restores the pixels under the cursor (got 00c000)
+  ok: SDL_HideCursor takes effect
+  ok: present a small rect
+  ok: the patched rect reached the screen (got ffff00)
+  ok: the rest of the screen was left alone (got 00c000)
+-- dumped frame verification --
+  ok: dumped top (red) band is rgb(192,0,0)
+  ok: dumped middle (green) band is rgb(0,192,0)
+  ok: dumped bottom (blue) band is rgb(0,0,192)
+  ok: application changed unrelated signal-mask bits
+  ok: quit restores owned VT signal bits without clobbering application mask edits
+test_fbdev: PASS
+
+=== test_fbdev_device ===
+PASS: channel wider than 8 bits
+  fbdev: unusable pixel layout (bpp 32, R20/10 G10/10 B0/10): channel wider than 8 bits
+PASS: requires a packed true-colour visual
+  fbdev: unusable pixel layout (bpp 32, R16/8 G8/8 B0/8): requires a packed true-colour visual
+PASS: nonstandard or greyscale mode
+  fbdev: unusable pixel layout (bpp 32, R16/8 G8/8 B0/8): nonstandard or greyscale mode
+PASS: empty RGB channel
+  fbdev: unusable pixel layout (bpp 32, R16/0 G8/8 B0/8): empty RGB channel
+PASS: reversed channel bit order
+  fbdev: unusable pixel layout (bpp 32, R16/8 G8/8 B0/8): reversed channel bit order
+PASS: channel extends beyond the pixel
+  fbdev: unusable pixel layout (bpp 32, R30/8 G8/8 B0/8): channel extends beyond the pixel
+PASS: overlapping colour channels
+  fbdev: overlapping colour channels
+PASS: panning offset is out of range
+  fbdev: visible framebuffer or panning offset is out of range
+PASS: valid packed true-colour mode initializes
+PASS: RAM surface created
+PASS: present into panned framebuffer
+PASS: green packed at initial x/y offset
+PASS: rows and pixels before visible pan remain untouched
+  exercised 16 bpp
+PASS: valid packed true-colour mode initializes
+PASS: RAM surface created
+PASS: present into panned framebuffer
+PASS: green packed at initial x/y offset
+PASS: rows and pixels before visible pan remain untouched
+  exercised 24 bpp
+PASS: valid packed true-colour mode initializes
+PASS: RAM surface created
+PASS: present into panned framebuffer
+PASS: green packed at initial x/y offset
+PASS: rows and pixels before visible pan remain untouched
+  exercised 32 bpp
+
+=== test_keycodes ===
+test_keycodes: keymap built-in US table (no libxkbcommon)
+test_keycodes: PASS
+
+=== test_layouts ===
+test_layouts: SKIP (libxkbcommon disabled)
+
+=== test_main_callbacks ===
+test_main_callbacks: PASS (result=1 iterations=10 user_events=3 elapsed=50.3ms)
+
+=== test_misc ===
+WARNING:
+
+Assertion failure at test_assert (test_misc.c:106), triggered 1 time:
+  'always_false'
+
+test_misc: OK
+
+=== test_options ===
+test_options: X11 part SKIP (no DISPLAY)
+test_options: OK
+
+=== test_ring ===
+test_ring: PASS (4000000 single + 4000000 batch events, wrap/empty/overflow OK)
+
+=== test_scancode ===
+test_scancode: PASS (768 evdev codes mapped)
+
+=== test_surface ===
+test_surface: PASS
+
+=== test_threads ===
+test_threads: OK
+
+=== test_vt_mask ===
+VT mask: owned blocks removed, existing block and application edits preserved
+
+=== test_web ===
+test_web: environment = nodetest_web: PASS
+=== test_window_api ===
+test_window_api: driver dummy
+test_window_api (dummy): OK
+
+=== test_evdev_backpressure ===
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+burst: raw=1804/1804 SDL motions=1200/1200 buttons=2/2
+test_evdev_backpressure: PASS (0 failures)
+
+=== test_evdev_syn_dropped ===
+SYN_DROPPED: stuck_button=0 damaged_motions=0 recovery_releases=1 state_queries=1 raw=4/4 callbacks=4/4
+test_evdev_syn_dropped: PASS
+
+=== test_evdev_recovery ===
+PASS: nested SDL_PumpEvents cannot reorder a pending motion ahead of its button
+PASS: SYN_DROPPED discard, key/button diff, partial-wheel reset, native raw stream
+PASS: per-device recovery preserves another keyboard's held key
+PASS: focus-filtered keys do not hide another keyboard's fresh press
+PASS: failed query preserves state and retries on later pumps
+PASS: full SDL queue and incremental snapshot application retain every transition
+PASS: exact independent ring-drop counts (7236 each) and lost-release recovery
+PASS: poll-only overflow does not trigger SDL recovery
+PASS: SDL-only overflow recovers; callbacks remain per native event
+PASS: counters survive quit and reset on worker reinitialization
+test_evdev_recovery: PASS
+
+=== test_evdev_worker wake ===
+forced mid-batch drain: eventfd wakes=100/100 SDL_WaitEvent avg=42.5us max=118.1us
+test_evdev_worker wake: PASS
+
+=== test_evdev_worker busy ===
+continuously readable fd: notification_before_EAGAIN=yes
+test_evdev_worker busy: PASS
+
+=== test_evdev_worker monotonic ===
+clock mode=monotonic setup_requests=1 callback/poll_stamp=6398500313000 timestamp_ok=yes
+test_evdev_worker monotonic: PASS
+
+=== test_evdev_worker negotiated-authoritative ===
+clock mode=negotiated-authoritative setup_requests=1 callback/poll_stamp=1795305799511302000 timestamp_ok=yes
+test_evdev_worker negotiated-authoritative: PASS
+
+=== test_evdev_worker fallback-monotonic ===
+clock mode=fallback-monotonic setup_requests=1 callback/poll_stamp=6398531720000 timestamp_ok=yes
+test_evdev_worker fallback-monotonic: PASS
+
+=== test_evdev_worker fallback-realtime ===
+clock mode=fallback-realtime setup_requests=1 callback/poll_stamp=6398548088426 timestamp_ok=yes
+test_evdev_worker fallback-realtime: PASS
+
+=== test_input_transport ===
+test_input_transport: PASS (writes, EINTR, backpressure, timeout, short/error, spurious readiness)
+
+=== test_raw_latency_bench ===
+input transport failed after 0 complete reports: Invalid argument
+empty                          n=0/2000 missing=2000 invalid=0  no samples
+partial                        n=1/2000 missing=1997 invalid=2  min=0.0us avg=0.0us p50=0.0us p95=0.0us p99=0.0us max=0.0us
+complete                       n=2000/2000 missing=0 invalid=0  min=0.0us avg=999.5us p50=1000.0us p95=1900.0us p99=1980.0us max=1999.0us
+invalid clock                  n=1999/2000 missing=0 invalid=1  min=0.0us avg=0.0us p50=0.0us p95=0.0us p99=0.0us max=0.0us
+test_raw_latency_bench: PASS
+C++ ok: version 3004020, surface 0x60c000000040, revision SDLop-0.2.0 (SDL 3.4.20 API)
+ALL AUDIT TESTS PASS

@@ -1,0 +1,68 @@
+$ pre-followup unplug
+unplug: reads_returning_ENODEV_in_50ms=66041 held_A=1 held_left=1 raw_source=1
+unplug: REPRODUCED
+exit=1
+$ pre-followup repeat-grab
+repeat-grab: keyboard_grabbed_elsewhere=1 repeated_keys=1 text_events=1
+repeat-grab: REPRODUCED
+exit=1
+$ pre-followup wheel
+wheel: wheel_events=2 total_y=2.00 focus_present=1
+wheel: REPRODUCED
+exit=1
+$ pre-followup wheel-focus
+wheel-focus: wheel_events=1 total_y=0.50 focus_present=0
+wheel-focus: REPRODUCED
+exit=1
+$ pre-followup key-alias
+key-alias: KEY_PRINT_still_down=1 SDL_PRINTSCREEN_down=0 premature_keyups=1
+key-alias: REPRODUCED
+exit=1
+$ pre-followup compose
+compose: dead_key_while_disabled_then_start_E='é' (wanted 'e')
+compose: dead_key_then_stop_start_E='é' (wanted 'e')
+compose: dead_key_then_ClearComposition_E='é' (wanted 'e')
+compose: REPRODUCED
+exit=1
+$ pre-followup repeat-info
+repeat-info: rate0_repeats=1 rate20_delay0_stored_delay=500 interval=33 (wanted 0/50)
+repeat-info: REPRODUCED
+exit=1
+$ pre-followup enter-held
+enter-held: focus_gained=1 advertised_held_shift=1 SDL_LSHIFT_down=0
+enter-held: REPRODUCED
+exit=1
+$ headless unplug
+unplug: reads_returning_ENODEV_in_50ms=1 held_A=0 held_left=0 raw_source=0
+unplug: not reproduced
+exit=0
+$ headless repeat-grab
+repeat-grab: keyboard_grabbed_elsewhere=1 repeated_keys=0 text_events=0
+repeat-grab: not reproduced
+exit=0
+$ headless wheel
+wheel: wheel_events=1 total_y=1.00 focus_present=1
+wheel: not reproduced
+exit=0
+$ headless wheel-focus
+wheel-focus: wheel_events=0 total_y=0.00 focus_present=0
+wheel-focus: not reproduced
+exit=0
+$ headless key-alias
+key-alias: KEY_PRINT_still_down=1 SDL_PRINTSCREEN_down=1 premature_keyups=0
+key-alias: not reproduced
+exit=0
+$ headless compose
+compose: dead_key_while_disabled_then_start_E='e' (wanted 'e')
+compose: dead_key_then_stop_start_E='e' (wanted 'e')
+compose: dead_key_then_ClearComposition_E='e' (wanted 'e')
+compose: not reproduced
+exit=0
+$ headless repeat-info
+repeat-info: rate0_repeats=0 rate20_delay0_stored_delay=0 interval=50 (wanted 0/50)
+repeat-info: not reproduced
+exit=0
+$ headless enter-held
+enter-held: focus_gained=1 advertised_held_shift=1 SDL_LSHIFT_down=1
+enter-held: not reproduced
+exit=0

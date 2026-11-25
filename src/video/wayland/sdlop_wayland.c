@@ -13,6 +13,7 @@
 #include "internal/sdlop_internal.h"
 #include "internal/scancode_evdev.h"
 #include "sdlop_wayland_internal.h"
+#include "sdlop_wayland_scroll.h"
 
 /* dlopen-ed libwayland-client (SDL3-style); must precede every
  * *-client-protocol.h include (their inlines compile against the
@@ -1135,7 +1136,6 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys)
 {
     (void)keyboard;
-    (void)keys;
     WaylandDeviceData *d = (WaylandDeviceData *)data;
     SDL_Window *window = NULL;
     for (SDL_Window *w = sdlop.windows; w; w = w->next) {
@@ -1154,6 +1154,28 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
         sdlop.keyboard_focus = window;
         window->flags |= SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_GAINED, 0, 0);
+        /* Restore only held modifiers, never action keys/text/repeats, and
+         * never mix seat keyboard events into a running raw source. */
+        if (!SDLOP_RawInputIsSource()) {
+            uint32_t *key;
+            wl_array_for_each(key, keys) {
+                if (*key > SDLOP_EVDEV_KEY_MAX) { continue; }
+                SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[*key];
+                switch (sc) {
+                case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_RSHIFT:
+                case SDL_SCANCODE_LCTRL: case SDL_SCANCODE_RCTRL:
+                case SDL_SCANCODE_LALT: case SDL_SCANCODE_RALT:
+                case SDL_SCANCODE_LGUI: case SDL_SCANCODE_RGUI:
+                case SDL_SCANCODE_MODE:
+                    if (!sdlop.keystate[sc]) {
+                        SDLOP_SendKeyboardKey(true, false, sc, (Uint16)*key, 0);
+                    }
+                    break;
+                default: break;
+                }
+            }
+            sdlop.repeat_active = false;
+        }
     }
     SDLOP_Wayland_TextInput_Update();
 }
@@ -1631,6 +1653,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
         return;
     }
     d->pointer_serial = serial;
+    d->axis_x_acc = d->axis_y_acc = 0.0f; /* drop a half-accumulated frame */
     d->pointer_focus = window;
     sdlop.mouse_focus = window;
     window->flags |= SDL_WINDOW_MOUSE_FOCUS;
@@ -1751,6 +1774,8 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     (void)surface;
     SDL_Window *window = d->pointer_focus;
     d->pointer_focus = NULL;
+    SDLOP_RawInputResetPointerFrame();
+    d->axis_x_acc = d->axis_y_acc = 0.0f; /* drop a half-accumulated frame */
     sdlop.mouse_has_position = false;
     if (sdlop.mouse_focus == window) {
         sdlop.mouse_focus = NULL;
@@ -2393,6 +2418,7 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
         }
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
+        d->axis_x_acc = d->axis_y_acc = 0.0f; /* drop a half-accumulated frame */
         send_mouse_device_event(false, d->pointer_id);
         d->pointer_id = 0;
     }

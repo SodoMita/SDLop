@@ -1,0 +1,8 @@
+Pre-audit library, same reentrant recovery test (expected assertion failure):
+test_evdev_recovery: tests/test_evdev_recovery.c:235: main: Assertion `!saw_reordered_motion' failed.
+/bin/bash: line 5: 13422 Aborted                 timeout 10 build-validation/pre-audit/test_evdev_recovery
+exit=134
+Pre-audit library, continuous-read worker test (expected notification failure):
+continuously readable fd: notification_before_EAGAIN=no
+test_evdev_worker busy: FAIL
+exit=1

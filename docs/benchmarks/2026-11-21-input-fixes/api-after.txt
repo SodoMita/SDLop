@@ -1,0 +1,8 @@
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    1.4 p95=    2.3 p99=    2.5 max=   54.8
+SDL_PollEvent (empty)            p50=   12.3 p95=   14.9 p99=   43.6 max=   99.0
+SDL_WaitEventTimeout (empty, 0)  p50=   56.4 p95=   71.0 p99=   82.2 max=   99.0
+SDL_PushEvent + SDL_PollEvent    p50=    8.6 p95=    9.2 p99=   34.8 max=   49.0

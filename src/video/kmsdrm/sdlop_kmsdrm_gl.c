@@ -622,8 +622,12 @@ static bool kmsdrm_gl_create_surfaces(SDLop_VideoDevice *device, SDL_Window *win
             config = config_for_context((KMSDRMGLContext *)current);
         }
         if (!config) {
+            /* GLES has no 2.1: a 2.1 (or higher) request without an ES profile
+             * means desktop GL, like SDL2. Only bare 2.0 stays GLES. */
             uint32_t api = (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) ||
-                           ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3)
+                           ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 &&
+                            (sdlop_glattrs.major_version > 2 ||
+                             (sdlop_glattrs.major_version == 2 && sdlop_glattrs.minor_version > 0)))
                                ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
             if (!pick_config(&config, api)) {
                 SDLOP_GBM_gbm_surface_destroy(windata->gs);
@@ -802,9 +806,13 @@ void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         return NULL;
     }
 
+    /* GLES has no 2.1: a 2.1 (or higher) request without an ES profile means
+     * desktop GL, like SDL2. Only bare 2.0 stays GLES. */
     bool want_desktop_gl =
         (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) != 0 ||
-        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3);
+        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 &&
+         (sdlop_glattrs.major_version > 2 ||
+          (sdlop_glattrs.major_version == 2 && sdlop_glattrs.minor_version > 0)));
     uint32_t api = want_desktop_gl ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
 
     SDLOP_GLOffload_SetPreferGBM(true);

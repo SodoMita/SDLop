@@ -1,0 +1,73 @@
+Same harness, rootless API-only block-average timings; three alternating-order trials/build, not callback/device latency.
+
+=== trial 1 pre-opt ===
+$ build-validation/pre-opt/bench_raw_latency_pipe --api-overhead
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    2.1 p95=    2.1 p99=    2.2 max=   18.2
+SDL_PollEvent (empty)            p50=   14.5 p95=   27.3 p99=   44.8 max=  117.4
+SDL_WaitEventTimeout (empty, 0)  p50=   59.9 p95=   93.6 p99=  110.5 max=  127.8
+SDL_PushEvent + SDL_PollEvent    p50=   11.9 p95=   14.1 p99=   38.9 max=   60.5
+
+=== trial 1 headless ===
+$ build-validation/headless/bench_raw_latency_pipe --api-overhead
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    2.2 p95=    3.4 p99=    5.7 max=   58.5
+SDL_PollEvent (empty)            p50=   15.3 p95=   19.7 p99=   31.7 max=   90.3
+SDL_WaitEventTimeout (empty, 0)  p50=   59.8 p95=   74.6 p99=   89.3 max=  162.4
+SDL_PushEvent + SDL_PollEvent    p50=   12.1 p95=   19.7 p99=   42.1 max=   63.7
+
+=== trial 2 headless ===
+$ build-validation/headless/bench_raw_latency_pipe --api-overhead
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    1.9 p95=    5.5 p99=    7.5 max=   70.3
+SDL_PollEvent (empty)            p50=   16.3 p95=   24.9 p99=   33.6 max=  100.9
+SDL_WaitEventTimeout (empty, 0)  p50=   60.4 p95=   74.2 p99=   85.4 max=  130.3
+SDL_PushEvent + SDL_PollEvent    p50=   12.0 p95=   14.8 p99=   39.6 max=  120.5
+
+=== trial 2 pre-opt ===
+$ build-validation/pre-opt/bench_raw_latency_pipe --api-overhead
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    2.1 p95=    2.1 p99=    3.0 max=   36.7
+SDL_PollEvent (empty)            p50=   14.5 p95=   25.3 p99=   37.6 max=  101.9
+SDL_WaitEventTimeout (empty, 0)  p50=   60.0 p95=  110.7 p99=  132.4 max=  192.4
+SDL_PushEvent + SDL_PollEvent    p50=   26.3 p95=   33.2 p99=   57.3 max=   97.5
+
+=== trial 3 pre-opt ===
+$ build-validation/pre-opt/bench_raw_latency_pipe --api-overhead
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    4.9 p95=    5.5 p99=   10.2 max=   75.8
+SDL_PollEvent (empty)            p50=   29.8 p95=   34.2 p99=   50.3 max=   84.2
+SDL_WaitEventTimeout (empty, 0)  p50=  106.4 p95=  126.8 p99=  145.1 max=  207.5
+SDL_PushEvent + SDL_PollEvent    p50=   11.8 p95=   13.7 p99=   37.1 max=   97.4
+
+=== trial 3 headless ===
+$ build-validation/headless/bench_raw_latency_pipe --api-overhead
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+
+Direct API overhead: ns/call (percentiles of 1000 block averages, 1000 calls/block).
+Includes loop/check costs; timer costs amortized, no baseline subtracted.
+SDLop_PollRawEvents (empty)      p50=    1.8 p95=    1.8 p99=    1.9 max=   16.7
+SDL_PollEvent (empty)            p50=   15.3 p95=   19.7 p99=   33.6 max=   70.9
+SDL_WaitEventTimeout (empty, 0)  p50=   93.3 p95=  115.8 p99=  145.9 max=  239.9
+SDL_PushEvent + SDL_PollEvent    p50=   11.9 p95=   18.6 p99=   38.3 max=   59.3

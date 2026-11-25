@@ -19,7 +19,6 @@
 */
 
 #include <SDL3/SDL.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -311,7 +310,7 @@ static void SDLCALL main_cb(void *userdata)
     main_cb_ran = SDL_IsMainThread() ? 1 : -1;
 }
 
-static void *thread_main(void *arg)
+static int SDLCALL thread_main(void *arg)
 {
     (void)arg;
     SDL_Event e;
@@ -319,7 +318,7 @@ static void *thread_main(void *arg)
     e.type = SDL_EVENT_USER + 3;
     SDL_PushEvent(&e);
     SDL_RunOnMainThread(main_cb, NULL, true);
-    return NULL;
+    return 0;
 }
 
 static void test_events(void)
@@ -374,10 +373,10 @@ static void test_events(void)
     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
 
     /* cross-thread push + RunOnMainThread */
-    pthread_t th;
+    SDL_Thread *th;
     main_cb_ran = 0;
     CHECK(!SDL_IsMainThread() == false, "this is the main thread");
-    pthread_create(&th, NULL, thread_main, NULL);
+    th = SDL_CreateThread(thread_main, "core-push", NULL);
     bool got = false;
     for (int i = 0; i < 200 && (!got || !main_cb_ran); i++) {
         while (SDL_PollEvent(&e)) {
@@ -387,7 +386,7 @@ static void test_events(void)
         }
         SDL_Delay(5);
     }
-    pthread_join(th, NULL);
+    SDL_WaitThread(th, NULL);
     CHECK(got, "threaded push");
     CHECK(main_cb_ran == 1, "RunOnMainThread on main thread: %d", main_cb_ran);
 
@@ -594,11 +593,21 @@ static void test_misc(void)
     CHECK(SDL_GetVersion() == SDL_VERSION, "version");
     CHECK(SDL_VERSIONNUM_MAJOR(SDL_GetVersion()) == 3 && SDL_VERSIONNUM_MINOR(SDL_GetVersion()) == 4, "3.4");
     CHECK(SDL_GetRevision() && *SDL_GetRevision(), "revision");
+#ifdef _WIN32
+    CHECK(strcmp(SDL_GetPlatform(), "Windows") == 0, "platform");
+#else
     CHECK(strcmp(SDL_GetPlatform(), "Linux") == 0, "platform");
+#endif
     CHECK(!set_error_v("err %d", 5) && strcmp(SDL_GetError(), "err 5") == 0, "SetErrorV");
 
     CHECK(strcmp(SDL_GetAppMetadataProperty(SDL_PROP_APP_METADATA_TYPE_STRING), "application") == 0, "type default");
+#ifdef _WIN32
+    /* Windows reports the full executable file name, extension included */
+    CHECK(strcmp(SDL_GetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING), "test_core.exe") == 0,
+          "exe name default: '%s'", SDL_GetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING));
+#else
     CHECK(strcmp(SDL_GetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING), "test_core") == 0, "exe name default");
+#endif
     CHECK(SDL_SetAppMetadata("Core", "1.0", "org.sdlop.core"), "set metadata");
     CHECK(strcmp(SDL_GetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING), "Core") == 0, "name");
     SDL_SetHint(SDL_HINT_APP_NAME, "Hinted");

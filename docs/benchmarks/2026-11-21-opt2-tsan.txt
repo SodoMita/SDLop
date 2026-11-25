@@ -1,0 +1,57 @@
+GCC12.2 TSan -O1 -g -no-pie, real 37-TU dummy/fbdev library; SDLOP_LIB_XKB=none.
+
+=== test_ring  ===
+exit=0
+test_ring: PASS (4000000 single + 4000000 mixed/batch events, 30 capacity/record layouts, cached limits, 64-bit wrap/empty/overflow OK)
+
+=== test_evdev_recovery  ===
+exit=0
+PASS: nested SDL_PumpEvents cannot reorder a pending motion ahead of its button
+PASS: SYN_DROPPED discard, key/button diff, partial-wheel reset, native raw stream
+PASS: per-device recovery preserves another keyboard's held key
+PASS: focus-filtered keys do not hide another keyboard's fresh press
+PASS: failed query preserves state and retries on later pumps
+PASS: full SDL queue and incremental snapshot application retain every transition
+PASS: exact independent ring-drop counts (7236 each) and lost-release recovery
+PASS: poll-only overflow does not trigger SDL recovery
+PASS: SDL-only overflow recovers; callbacks remain per native event
+PASS: counters survive quit and reset on worker reinitialization
+test_evdev_recovery: PASS
+
+=== test_evdev_worker wake ===
+exit=0
+forced mid-batch drain: eventfd wakes=100/100 SDL_WaitEvent avg=62.0us max=180.4us
+test_evdev_worker wake: PASS
+
+=== test_evdev_worker busy ===
+exit=0
+continuously readable fd: notification_before_EAGAIN=yes
+test_evdev_worker busy: PASS
+
+=== test_evdev_worker monotonic ===
+exit=0
+clock mode=monotonic setup_requests=1 callback/poll_stamp=1875250505000 timestamp_ok=yes
+test_evdev_worker monotonic: PASS
+
+=== test_evdev_worker negotiated-authoritative ===
+exit=0
+clock mode=negotiated-authoritative setup_requests=1 callback/poll_stamp=1795340855601273000 timestamp_ok=yes
+test_evdev_worker negotiated-authoritative: PASS
+
+=== test_evdev_worker fallback-monotonic ===
+exit=0
+clock mode=fallback-monotonic setup_requests=1 callback/poll_stamp=1875287806000 timestamp_ok=yes
+test_evdev_worker fallback-monotonic: PASS
+
+=== test_evdev_worker fallback-realtime ===
+exit=0
+clock mode=fallback-realtime setup_requests=1 callback/poll_stamp=1875307416018 timestamp_ok=yes
+test_evdev_worker fallback-realtime: PASS
+
+=== test_evdev_callbacks  ===
+exit=0
+absent unregister: allocations=0/10000, thread-CPU block-average p50=259.3 p95=424.1 ns/call
+callback snapshots: allocated=1018 freed_after_join=1018; empty_unregister_allocations=0; native delivery=501/501
+test_evdev_callbacks: PASS (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)
+
+ALL SELECTED TSAN CONTRACTS PASS

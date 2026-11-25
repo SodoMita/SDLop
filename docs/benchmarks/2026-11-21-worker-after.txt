@@ -1,0 +1,26 @@
+Real-worker contracts after; GCC12.2 -O2 -g; forced scheduling is test-only. EINTR retry injected once in wake test.
+
+$ build-validation/headless/test_evdev_worker wake
+exit=0
+forced mid-batch drain: eventfd wakes=100/100 SDL_WaitEvent avg=38.5us max=123.6us
+test_evdev_worker wake: PASS
+
+$ build-validation/headless/test_evdev_worker monotonic
+exit=0
+clock mode=monotonic setup_requests=1 callback/poll_stamp=3686664639000 timestamp_ok=yes
+test_evdev_worker monotonic: PASS
+
+$ build-validation/headless/test_evdev_worker negotiated-authoritative
+exit=0
+clock mode=negotiated-authoritative setup_requests=1 callback/poll_stamp=1795302520308785000 timestamp_ok=yes
+test_evdev_worker negotiated-authoritative: PASS
+
+$ build-validation/headless/test_evdev_worker fallback-monotonic
+exit=0
+clock mode=fallback-monotonic setup_requests=1 callback/poll_stamp=3686670532000 timestamp_ok=yes
+test_evdev_worker fallback-monotonic: PASS
+
+$ build-validation/headless/test_evdev_worker fallback-realtime
+exit=0
+clock mode=fallback-realtime setup_requests=1 callback/poll_stamp=3686673866302 timestamp_ok=yes
+test_evdev_worker fallback-realtime: PASS

@@ -1,0 +1,95 @@
+Real production drain_device_events code, fake reads, immediate simulated consumer reclamation.
+GCC12.2 -O2 -g; CLOCK_THREAD_CPUTIME_ID, no concurrent consumer/contention/syscalls inside event loop.
+Two boundary clock calls/block amortized, no baseline subtracted. Not hardware latency or the concurrent callback gate.
+Five alternating-order trials/variant; 20.48M native records/trial; ns/event block-average CPU-time percentiles.
+pre-opt = 0e60878; count-only = counter RMW removal; headless = counter + index caches.
+
+=== trial 1 pre-opt ===
+$ build-validation/pre-opt/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=16.89 p95=23.91 p99=30.90 max=42.84
+
+=== trial 1 count-only ===
+$ build-validation/count-only/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=11.12 p95=19.40 p99=24.88 max=38.77
+
+=== trial 1 headless ===
+$ build-validation/headless/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=16.15 p95=21.99 p99=26.80 max=30.19
+
+=== trial 2 headless ===
+$ build-validation/headless/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=16.29 p95=24.57 p99=35.74 max=48.70
+
+=== trial 2 count-only ===
+$ build-validation/count-only/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=16.41 p95=23.75 p99=27.05 max=36.46
+
+=== trial 2 pre-opt ===
+$ build-validation/pre-opt/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=16.98 p95=23.12 p99=29.12 max=33.82
+
+=== trial 3 pre-opt ===
+$ build-validation/pre-opt/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=17.14 p95=19.82 p99=24.47 max=32.65
+
+=== trial 3 count-only ===
+$ build-validation/count-only/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=10.73 p95=19.56 p99=22.78 max=31.56
+
+=== trial 3 headless ===
+$ build-validation/headless/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=13.23 p95=21.88 p99=24.95 max=31.45
+
+=== trial 4 headless ===
+$ build-validation/headless/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=10.29 p95=14.09 p99=19.67 max=26.30
+
+=== trial 4 count-only ===
+$ build-validation/count-only/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=10.53 p95=14.04 p99=18.57 max=24.85
+
+=== trial 4 pre-opt ===
+$ build-validation/pre-opt/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=17.92 p95=26.36 p99=33.56 max=48.13
+
+=== trial 5 pre-opt ===
+$ build-validation/pre-opt/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=18.16 p95=28.37 p99=32.22 max=38.56
+
+=== trial 5 count-only ===
+$ build-validation/count-only/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=9.87 p95=19.83 p99=23.79 max=39.20
+
+=== trial 5 headless ===
+$ build-validation/headless/bench_raw_dispatch
+exit=0
+Native publication + callback CPU-work proxy, 20480000 events, no drops
+ns/event, percentiles of 20480-event block averages: p50=10.39 p95=17.30 p99=21.79 max=28.39

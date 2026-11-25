@@ -18,7 +18,17 @@ ref=${2:-}
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
-SDL_VIDEO_DRIVER=dummy "$probe" > "$out/sdlop.txt"
+# A .exe probe (MinGW cross build) runs through Wine, like ctest's own
+# CMAKE_CROSSCOMPILING_EMULATOR runs this script's binaries.
+run_probe() {
+    case "$1" in
+        *.exe|*.EXE|*.EXE) wine "$1" ;;
+        *)                 "$1" ;;
+    esac
+}
+
+# A Windows probe writes CRLF; normalise so the line checks and the diff work.
+SDL_VIDEO_DRIVER=dummy run_probe "$probe" | tr -d '\r' > "$out/sdlop.txt"
 rc=$?
 if [ $rc -ne 0 ] || [ "$(tail -n 1 "$out/sdlop.txt")" != done ]; then
     echo "FAIL: SDLop probe exited with $rc before finishing"
@@ -32,7 +42,7 @@ if [ -z "$ref" ]; then
     exit 0
 fi
 
-SDL_VIDEO_DRIVER=dummy SDL_CPU_FEATURE_MASK=-all "$ref" > "$out/ref.txt"
+SDL_VIDEO_DRIVER=dummy SDL_CPU_FEATURE_MASK=-all run_probe "$ref" | tr -d '\r' > "$out/ref.txt"
 rc=$?
 if [ $rc -ne 0 ]; then
     echo "FAIL: reference probe exited with $rc"

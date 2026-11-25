@@ -726,7 +726,7 @@ typedef struct DetailsNode
 } DetailsNode;
 
 static DetailsNode *_Atomic details_list;
-static pthread_mutex_t details_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDLOP_STATIC_MUTEX(details_lock);
 
 const SDL_PixelFormatDetails *SDL_GetPixelFormatDetails(SDL_PixelFormat format)
 {
@@ -735,26 +735,26 @@ const SDL_PixelFormatDetails *SDL_GetPixelFormatDetails(SDL_PixelFormat format)
             return &n->details;
         }
     }
-    pthread_mutex_lock(&details_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&details_lock));
     for (DetailsNode *n = details_list; n; n = n->next) {
         if (n->details.format == format) {
-            pthread_mutex_unlock(&details_lock);
+            SDLOP_MUTEX_UNLOCK(SDLOP_SM(&details_lock));
             return &n->details;
         }
     }
     DetailsNode *node = (DetailsNode *)SDL_malloc(sizeof(*node));
     if (!node) {
-        pthread_mutex_unlock(&details_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&details_lock));
         return NULL;
     }
     if (!SDL_InitPixelFormatDetails(&node->details, format)) {
-        pthread_mutex_unlock(&details_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&details_lock));
         SDL_free(node);
         return NULL;
     }
     node->next = details_list;
     details_list = node; /* publish after initialization */
-    pthread_mutex_unlock(&details_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&details_lock));
     return &node->details;
 }
 
