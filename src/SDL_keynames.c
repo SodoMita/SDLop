@@ -44,6 +44,9 @@ bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID props
         }
     }
     const bool was_active = window->text_input_active;
+    if (!was_active && sdlop.keyboard_focus == window) {
+        SDLOP_KeyboardClearComposition();
+    }
     window->text_input_active = true;
     /* stock: (re)starting applies the new properties */
     if (sdlop.video && sdlop.video->StartTextInput &&
@@ -102,6 +105,7 @@ bool SDL_StopTextInput(SDL_Window *window)
             sdlop.video->StopTextInput(sdlop.video, window);
         }
     }
+    if (sdlop.keyboard_focus == window) { SDLOP_KeyboardClearComposition(); }
     return true;
 }
 
@@ -144,9 +148,11 @@ bool SDL_ClearComposition(SDL_Window *window)
     CHECK_WINDOW(window, false);
     /* compose sequences are resolved per key press; an IME may hold a
      * composition */
-    if (sdlop.video && sdlop.video->ClearComposition) {
-        return sdlop.video->ClearComposition(sdlop.video, window);
+    if (sdlop.video && sdlop.video->ClearComposition &&
+        !sdlop.video->ClearComposition(sdlop.video, window)) {
+        return false;
     }
+    if (sdlop.keyboard_focus == window) { SDLOP_KeyboardClearComposition(); }
     return true;
 }
 
@@ -169,6 +175,13 @@ void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
     /* stock SDL3: TEXT_INPUT is never delivered unless text input was
      * enabled via SDL_StartTextInput() - it is disabled by default */
     if (!sdlop.keyboard_focus || !sdlop.keyboard_focus->text_input_active) {
+        return;
+    }
+
+    /* stock SDL3: no TEXT_INPUT event for unprintable characters. The
+     * Windows driver feeds WM_CHAR and friends through here, so without this
+     * a bare Ctrl+C arrives as a text event carrying byte 0x03. */
+    if (SDL_iscntrl((unsigned char)utf8[0])) {
         return;
     }
     /* the queue stores up to 63 bytes per event: longer text (IME commits)
@@ -195,7 +208,7 @@ void SDLOP_SendKeyboardText(const char *utf8, Uint64 timestamp_ns)
         event.text.timestamp = timestamp_ns ? SDLOP_MonoToSDLTicks(timestamp_ns) : SDL_GetTicksNS();
         event.text.windowID = SDLOP_FocusWindowID();
         event.text.text = chunk; /* copied into slot storage by the queue */
-        SDLOP_PushEventInternal(&event);
+        SDLOP_PushInputEvent(&event);
     }
 }
 

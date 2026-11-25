@@ -100,3 +100,116 @@ jobs:
             echo "::error title=ctest failures::$(cat /tmp/annot)"
             exit 1
           fi
+
+  windows:
+    # The Win32 driver is only ever exercised here: without this job the
+    # 28 Windows tests and the PE export/subset gates run nowhere, which is
+    # how three filesystem bugs and a clipboard bug survived a full audit.
+    name: Windows (MinGW-w64 + Wine)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          # `wine` (the metapackage) pulls in the wine32/WoW64 path, whose
+          # package configuration prompts interactively and hangs a
+          # non-interactive runner. wine64 alone runs these 64-bit test exes.
+          # xkb-data: without it wine has no keyboard layout at all, so
+          # every raw-input packet arrives with VKey 0 and the keyboard tests
+          # cannot see a single key. libgl1-mesa-dri/mesa-vulkan are the GL and
+          # Vulkan implementations for wine's own rendering.
+          sudo -E apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+            wine64 xvfb xauth xkb-data libgl1-mesa-dri mesa-vulkan-drivers
+
+      - name: Build SDL 3.4.20 reference DLL (api_subset_check)
+        run: |
+          echo "mingw toolchain present: $(x86_64-w64-mingw32-gcc --version | head -1)"
+          echo "wine present: $(wine --version 2>/dev/null || echo MISSING)"
+          git clone -q --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL /tmp/sdl3-ref-win
+          off=""
+          for o in TEST_LIBRARY TESTS EXAMPLES AUDIO X11 WAYLAND KMSDRM OPENGL OPENGLES VULKAN GPU RENDER \
+                   CAMERA JOYSTICK HAPTIC HIDAPI SENSOR POWER DIALOG TRAY DBUS IBUS PIPEWIRE PULSEAUDIO \
+                   ALSA JACK SNDIO LIBUDEV; do
+            off="$off -DSDL_$o=OFF"
+          done
+          cmake -S /tmp/sdl3-ref-win -B /tmp/sdl3-ref-win-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/mingw-w64.cmake" \
+            -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF $off > /tmp/ref-win.log \
+            || { tail -n 40 /tmp/ref-win.log; exit 1; }
+          cmake --build /tmp/sdl3-ref-win-build -j"$(nproc)"
+
+      - name: Configure
+        run: |
+          # see the Test step: wine64's binaries are not on PATH by default
+          for d in /usr/lib/wine /usr/lib/x86_64-linux-gnu/wine /usr/libexec/wine; do
+            [ -d "$d" ] && export PATH="$d:$PATH"
+          done
+          ls -l /usr/bin/wine* 2>/dev/null || true
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSDL3_REFERENCE_LIB=/tmp/sdl3-ref-win-build/libSDL3.dll
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test (Wine)
+        env:
+          WINEDEBUG: '-all'
+          WINEDLLOVERRIDES: 'mscoree,mshtml='
+        run: |
+          # NOT under /tmp: it is root-owned on the runner, and wine refuses
+          # to create a prefix whose parent it does not own ("'/tmp' is not
+          # owned by you"), which failed all 29 tests in 0.00 sec.
+          export WINEPREFIX="$RUNNER_TEMP/wineprefix"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdgrt"
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          # The mingw toolchain file finds wine via find_program(NAMES wine
+          # wine64) and bakes the absolute path into every add_test() call, so
+          # the binary has to resolve at *configure* time. ubuntu-24.04's
+          # wine64 package ships wine64 and wineserver but not the `wine`
+          # wrapper; without this the emulator is silently dropped and every
+          # test tries to exec the .exe directly.
+          for d in /usr/lib/wine /usr/lib/x86_64-linux-gnu/wine /usr/libexec/wine; do
+            [ -d "$d" ] && export PATH="$d:$PATH"
+          done
+          command -v wine64 >/dev/null || { echo "no wine64" >&2; exit 1; }
+          # a fresh prefix: a poisoned one (a hung test holding the desktop
+          # lock) makes every windowed test fail to create a window
+          wineboot -i >/dev/null 2>&1 || true
+          wineserver -w
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp &
+          export DISPLAY=:99
+          for i in $(seq 100); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
+          # Binaries are written flat into the build dir, and the PE loader
+          # looks in the executable's own directory first. Copy the DLL next to
+          # them (and its MinGW runtime from the toolchain) rather than assuming
+          # a tests/ subdirectory, which is why the first run of this job failed
+          # every single test with a loader error rather than a test failure.
+          cp -v build/libSDLop.dll build/ 2>/dev/null || true
+          for dll in $(x86_64-w64-mingw32-gcc -print-file-name=libgcc_s_seh-1.dll) \
+                     $(find /usr -name 'libwinpthread-1.dll' 2>/dev/null | head -1); do
+            [ -f "$dll" ] && cp -v "$dll" build/ || true
+          done
+          export PATH="$PWD/build:$PATH"
+          cd build
+          # Fail loudly if configure did not pick up wine: ctest would then try
+          # to exec the .exe files directly and every test would report a
+          # failure that has nothing to do with the code under test.
+          if ! grep -q wine CTestTestfile.cmake; then
+            echo "::error title=no wine emulator::CTestTestfile.cmake has no wine command; CMAKE_CROSSCOMPILING_EMULATOR was not set at configure time"
+            exit 1
+          fi
+          if ! ctest --output-on-failure --timeout 180 -j1; then
+            {
+              echo "failed: $(cut -d: -f2 Testing/Temporary/LastTestsFailed.log | tr '\n' ' ')"
+              grep -hE 'FAIL|Assertion|timeout' Testing/Temporary/LastTest.log | head -30
+            } | sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}' > /tmp/annot
+            echo "::error title=Windows test failures::$(cat /tmp/annot)"
+            exit 1
+          fi

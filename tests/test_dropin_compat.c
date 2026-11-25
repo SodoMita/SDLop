@@ -8,6 +8,8 @@
     - init flag dependencies: GAMEPAD -> JOYSTICK -> EVENTS
     - joystick / gamepad API with no devices (Dear ImGui's SDL3 backend):
       empty lists, failing opens, harmless NULL handles, string helpers
+    - haptic API with no devices: SDL3's core + dummy backend, empty lists,
+      failing opens, invalid-handle errors (used by SDL2-compat)
     - SDL_GetPrefPath / SDL_GetBasePath / SDL_GetUserFolder and the
       filesystem helpers of SDL_filesystem.h (cottonpaper sdl3dviewer)
 
@@ -82,22 +84,27 @@ static void test_gamepad(void)
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
     CHECK(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD), "SDL_Init(VIDEO|GAMEPAD)");
 
+    /* Real evdev devices may be attached, so only require a valid,
+     * zero-terminated list and consistency with the Has* predicates. */
     int count = -1;
     SDL_JoystickID *pads = SDL_GetGamepads(&count);
-    CHECK(pads != NULL && count == 0 && pads[0] == 0, "SDL_GetGamepads: empty, 0-terminated (count %d)", count);
+    CHECK(pads != NULL && count >= 0 && pads[count] == 0, "SDL_GetGamepads: 0-terminated (count %d)", count);
+    int pad_count = count;
     SDL_free(pads);
     pads = SDL_GetGamepads(NULL);
     CHECK(pads != NULL, "NULL count accepted");
     SDL_free(pads);
     count = -1;
     SDL_JoystickID *sticks = SDL_GetJoysticks(&count);
-    CHECK(sticks != NULL && count == 0, "SDL_GetJoysticks: empty (count %d)", count);
+    CHECK(sticks != NULL && count >= 0 && sticks[count] == 0, "SDL_GetJoysticks: 0-terminated (count %d)", count);
+    int stick_count = count;
     SDL_free(sticks);
-    CHECK(!SDL_HasGamepad() && !SDL_HasJoystick(), "no devices");
+    CHECK(SDL_HasGamepad() == (pad_count > 0) && SDL_HasJoystick() == (stick_count > 0),
+          "Has* predicates match the device lists");
 
-    /* "no controllers" queries succeed quietly: the neutral value and no
-     * error string (apps check SDL_GetError() after them) */
-    static const SDL_JoystickID ids[] = { 0, 1, 1234 };
+    /* Queries for an ID that cannot exist succeed quietly: the neutral
+     * value and no error string (apps check SDL_GetError() after them). */
+    const SDL_JoystickID ids[] = { 0, 0x7fffffffu };
     for (size_t i = 0; i < SDL_arraysize(ids); i++) {
         const SDL_JoystickID id = ids[i];
         SDL_ClearError();
@@ -120,15 +127,16 @@ static void test_gamepad(void)
                   SDL_GetRealGamepadTypeForID(id) == SDL_GAMEPAD_TYPE_UNKNOWN, "gamepad type %u", id);
         CHECK(SDL_GetGamepadMappingForID(id) == NULL, "gamepad mapping %u", id);
         CHECK(SDL_GetGamepadFromID(id) == NULL, "gamepad from id %u", id);
-        CHECK(SDL_GetJoystickFromPlayerIndex((int)i) == NULL && SDL_GetGamepadFromPlayerIndex((int)i) == NULL,
-              "from player index %d", (int)i);
+        CHECK(SDL_GetJoystickFromPlayerIndex(1000000) == NULL &&
+                  SDL_GetGamepadFromPlayerIndex(1000000) == NULL,
+              "from invalid player index");
         CHECK(SDL_GetError()[0] == '\0', "per-ID queries for %u leave no error, got '%s'", id, SDL_GetError());
     }
 
     SDL_ClearError();
-    SDL_Gamepad *pad = SDL_OpenGamepad(1);
+    SDL_Gamepad *pad = SDL_OpenGamepad(0x7fffffffu);
     CHECK(pad == NULL && SDL_GetError()[0] != '\0', "SDL_OpenGamepad fails with an error");
-    CHECK(SDL_OpenJoystick(1) == NULL, "SDL_OpenJoystick fails");
+    CHECK(SDL_OpenJoystick(0x7fffffffu) == NULL, "SDL_OpenJoystick fails");
     /* what ImGui does with the (NULL) result: must not crash */
     CHECK(SDL_GetGamepadAxis(NULL, SDL_GAMEPAD_AXIS_LEFTX) == 0, "axis of NULL pad");
     CHECK(!SDL_GetGamepadButton(NULL, SDL_GAMEPAD_BUTTON_SOUTH), "button of NULL pad");
@@ -325,11 +333,67 @@ static void test_filesystem(void)
     SDL_Quit();
 }
 
+static void test_haptic(void)
+{
+    CHECK(SDL_Init(SDL_INIT_HAPTIC), "SDL_Init(HAPTIC)");
+    CHECK(SDL_WasInit(SDL_INIT_HAPTIC) != 0, "HAPTIC flag is set");
+
+    int count = -1;
+    SDL_HapticID *ids = SDL_GetHaptics(&count);
+    CHECK(ids != NULL && count == 0 && ids[0] == 0, "SDL_GetHaptics: empty, 0-terminated (count %d)", count);
+    SDL_free(ids);
+    ids = SDL_GetHaptics(NULL);
+    CHECK(ids != NULL && ids[0] == 0, "SDL_GetHaptics accepts NULL count");
+    SDL_free(ids);
+
+    static const SDL_HapticID bad_ids[] = { 0, 1, 1234 };
+    for (size_t i = 0; i < SDL_arraysize(bad_ids); i++) {
+        const SDL_HapticID id = bad_ids[i];
+        CHECK(SDL_GetHapticNameForID(id) == NULL, "haptic name for %u", (unsigned)id);
+        CHECK(SDL_GetHapticFromID(id) == NULL, "haptic from %u", (unsigned)id);
+        CHECK(SDL_OpenHaptic(id) == NULL, "open haptic %u", (unsigned)id);
+    }
+    CHECK(!SDL_IsMouseHaptic(), "no haptic mouse");
+    CHECK(SDL_OpenHapticFromMouse() == NULL, "open haptic from mouse fails");
+    CHECK(!SDL_IsJoystickHaptic(NULL), "no haptic joystick");
+    CHECK(SDL_OpenHapticFromJoystick(NULL) == NULL, "open haptic from joystick fails");
+
+    SDL_HapticEffect effect;
+    SDL_zero(effect);
+    effect.type = SDL_HAPTIC_SINE;
+    CHECK(SDL_GetHapticID(NULL) == 0, "haptic ID of NULL");
+    CHECK(SDL_GetHapticName(NULL) == NULL, "haptic name of NULL");
+    CHECK(SDL_GetMaxHapticEffects(NULL) == -1, "max effects of NULL");
+    CHECK(SDL_GetMaxHapticEffectsPlaying(NULL) == -1, "max playing of NULL");
+    CHECK(SDL_GetHapticFeatures(NULL) == 0, "features of NULL");
+    CHECK(SDL_GetNumHapticAxes(NULL) == -1, "axes of NULL");
+    CHECK(!SDL_HapticEffectSupported(NULL, &effect), "effect supported on NULL");
+    CHECK(SDL_CreateHapticEffect(NULL, &effect) == -1, "create effect on NULL");
+    CHECK(!SDL_UpdateHapticEffect(NULL, 0, &effect), "update effect on NULL");
+    CHECK(!SDL_RunHapticEffect(NULL, 0, 1), "run effect on NULL");
+    CHECK(!SDL_StopHapticEffect(NULL, 0), "stop effect on NULL");
+    SDL_DestroyHapticEffect(NULL, 0);
+    CHECK(!SDL_GetHapticEffectStatus(NULL, 0), "effect status on NULL");
+    CHECK(!SDL_SetHapticGain(NULL, 100), "set gain on NULL");
+    CHECK(!SDL_SetHapticAutocenter(NULL, 0), "set autocenter on NULL");
+    CHECK(!SDL_PauseHaptic(NULL), "pause NULL");
+    CHECK(!SDL_ResumeHaptic(NULL), "resume NULL");
+    CHECK(!SDL_StopHapticEffects(NULL), "stop effects on NULL");
+    CHECK(!SDL_HapticRumbleSupported(NULL), "rumble supported on NULL");
+    CHECK(!SDL_InitHapticRumble(NULL), "init rumble on NULL");
+    CHECK(!SDL_PlayHapticRumble(NULL, 1.0f, 1000), "play rumble on NULL");
+    CHECK(!SDL_StopHapticRumble(NULL), "stop rumble on NULL");
+    SDL_CloseHaptic(NULL);
+    CHECK(strstr(SDL_GetError(), "haptic") != NULL, "invalid haptic handle sets an error: %s", SDL_GetError());
+    SDL_Quit();
+}
+
 int main(void)
 {
     test_implicit_init();
     test_init_dependencies();
     test_gamepad();
+    test_haptic();
     test_filesystem();
     if (failures) {
         printf("test_dropin_compat: FAIL (%d)\n", failures);

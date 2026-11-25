@@ -1,0 +1,382 @@
+/*
+  SDLop - the threading and clock primitives the core needs, in one place.
+
+  SDLop is a POSIX program: mutexes are recursive, condition variables and
+  semaphores wait on CLOCK_MONOTONIC deadlines, timestamps are monotonic
+  nanoseconds. Windows supplies none of that, but it does supply close
+  equivalents:
+
+      recursive mutex      -> CRITICAL_SECTION   (always recursive)
+      read/write lock      -> SRWLOCK
+      condition variable   -> CONDITION_VARIABLE (+ SleepConditionVariableCS)
+      counting semaphore   -> Win32 semaphore used inverted (see below)
+      once                 -> INIT_ONCE
+      thread-local with
+      destructors          -> Fiber Local Storage
+      monotonic clock      -> QueryPerformanceCounter
+
+  Everything below is a macro or a small function so the call sites read the
+  same on both platforms and there is exactly one place where the semantics
+  are pinned down.
+
+  Semaphores: SDL3's SDL_Semaphore counts *up* (SDL_SignalSemaphore increments
+  SDL_GetSemaphoreValue). A Win32 semaphore counts *down* from its maximum, so
+  SDLOP_SEM_T stores both: the Win32 handle it waits on and the count it
+  reports. Keeping the count here rather than reading it from the handle
+  avoids racing the waiters.
+
+  This software is provided 'as-is', without any express or implied
+  warranty (zlib license, see LICENSE).
+*/
+
+#ifndef sdlop_platform_h_
+#define sdlop_platform_h_
+
+#include <SDL3/SDL.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <time.h>
+
+#ifndef _WIN32
+
+/* ------------------------------------------------------------------ */
+/* POSIX                                                               */
+/* ------------------------------------------------------------------ */
+
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <semaphore.h>
+#if !defined(__GLIBC__) && !defined(__ANDROID__)
+#include <stdatomic.h>
+#endif
+
+/* The sleep path owns a kernel timer on Windows and nothing here; SDL_Quit
+ * calls this unconditionally. */
+static inline void SDLOP_ReleaseTimerHandles(void) { }
+
+/* --- mutex ------------------------------------------------------- */
+
+typedef pthread_mutex_t SDLOP_MUTEX_T;
+
+#define SDLOP_MUTEX_INIT_ONCE(m) do {                                    \
+        pthread_mutexattr_t _a;                                          \
+        pthread_mutexattr_init(&_a);                                     \
+        pthread_mutexattr_settype(&_a, PTHREAD_MUTEX_RECURSIVE);         \
+        pthread_mutex_init((m), &_a);                                    \
+        pthread_mutexattr_destroy(&_a);                                  \
+    } while (0)
+#define SDLOP_MUTEX_DESTROY(m) pthread_mutex_destroy(m)
+#define SDLOP_MUTEX_LOCK(m)    pthread_mutex_lock(m)
+#define SDLOP_MUTEX_UNLOCK(m)  pthread_mutex_unlock(m)
+
+/* Non-recursive is available too, for the few locks that never nest. */
+#define SDLOP_MUTEX_INIT_PLAIN(m) pthread_mutex_init((m), NULL)
+#define SDLOP_MUTEX_INIT_RECURSIVE(m) SDLOP_MUTEX_INIT_ONCE(m)
+
+/* A mutex with static storage duration. Both platforms spell this the same
+ * way at the call site; only the expansion differs.
+ *
+ * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP is a glibc extension, and the plain
+ * PTHREAD_MUTEX_INITIALIZER it would replace is NOT recursive. Win32's
+ * CRITICAL_SECTION always is, so static-initialising POSIX mutexes the plain
+ * way made the two platforms differ in exactly the property SDL3 code relies
+ * on: SDL_OpenHapticFromJoystick() holds the joystick lock and calls
+ * SDL_IsJoystickHaptic(), which takes it again. On Linux that nested lock
+ * would deadlock. Hence the GNU initialiser where it exists, and the same
+ * once-initialised fallback everywhere else. */
+typedef struct SDLOP_StaticMutex
+{
+    pthread_mutex_t id;
+#if !defined(__GLIBC__) && !defined(__ANDROID__)
+    /* 0 = uninitialised, 1 = initialising, 2 = ready. Only the fallback path
+     * needs it: the glibc spelling above is ready from the start. */
+    _Atomic int state;
+#endif
+} SDLOP_StaticMutex;
+
+/* Both branches have to yield a lock that is usable without any explicit init
+ * call, because SDLOP_SM() is the only thing the call sites do.
+ * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP is the glibc spelling of exactly
+ * that, and needs no work at all. Elsewhere (musl, *BSD, macOS) the only
+ * portable initialiser is PTHREAD_MUTEX_INITIALIZER, which is neither
+ * recursive nor able to carry a type, so the lock is built on first use --
+ * recursively, as CRITICAL_SECTION is on Windows -- and published through an
+ * atomic state in the object itself.
+ * The previous fallback defined a name##_ensure() helper that nothing ever
+ * called, so every lock went to pthread_mutex_lock on a mutex that had never
+ * been initialised. */
+#if defined(__GLIBC__) || defined(__ANDROID__)
+#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP }
+#define SDLOP_SM(m) (&(m)->id)
+#else
+#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER, 0 }
+
+static inline SDLOP_MUTEX_T *SDLOP_StaticMutexGet(SDLOP_StaticMutex *m)
+{
+    int state = atomic_load_explicit(&m->state, memory_order_acquire);
+    if (state != 2) {
+        if (atomic_compare_exchange_strong_explicit(&m->state, &(int){ 0 }, 1,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            SDLOP_MUTEX_INIT_RECURSIVE(&m->id);
+            atomic_store_explicit(&m->state, 2, memory_order_release);
+        } else {
+            /* another thread is building it; it is ready when state hits 2 */
+            while (atomic_load_explicit(&m->state, memory_order_acquire) != 2) {
+                sched_yield();
+            }
+        }
+    }
+    return &m->id;
+}
+#define SDLOP_SM(m) SDLOP_StaticMutexGet(m)
+#endif
+
+/* --- once -------------------------------------------------------- */
+
+typedef pthread_once_t SDLOP_ONCE_T;
+#define SDLOP_ONCE_INIT        PTHREAD_ONCE_INIT
+#define SDLOP_ONCE(once, fn)   pthread_once((once), (fn))
+
+/* --- read/write lock --------------------------------------------- */
+
+typedef pthread_rwlock_t SDLOP_RWLOCK_T;
+#define SDLOP_RWLOCK_INIT_ONCE(r) pthread_rwlock_init((r), NULL)
+#define SDLOP_RWLOCK_DESTROY(r)   pthread_rwlock_destroy(r)
+#define SDLOP_RWLOCK_RDLOCK(r)    pthread_rwlock_rdlock(r)
+#define SDLOP_RWLOCK_WRLOCK(r)    pthread_rwlock_wrlock(r)
+#define SDLOP_RWLOCK_RDLOCK_TRY(r) (pthread_rwlock_tryrdlock(r) == 0)
+#define SDLOP_RWLOCK_WRLOCK_TRY(r) (pthread_rwlock_trywrlock(r) == 0)
+#define SDLOP_RWLOCK_UNLOCK(r)    pthread_rwlock_unlock(r)
+
+/* --- condition variable ------------------------------------------ */
+
+typedef pthread_cond_t SDLOP_COND_T;
+
+/* Timed waits take an absolute CLOCK_MONOTONIC deadline, so the wait does not
+ * move if the wall clock is adjusted. */
+#define SDLOP_COND_INIT(c) do {                                          \
+        pthread_condattr_t _a;                                           \
+        pthread_condattr_init(&_a);                                      \
+        pthread_condattr_setclock(&_a, CLOCK_MONOTONIC);                 \
+        pthread_cond_init((c), &_a);                                     \
+        pthread_condattr_destroy(&_a);                                   \
+    } while (0)
+#define SDLOP_COND_DESTROY(c)   pthread_cond_destroy(c)
+#define SDLOP_COND_SIGNAL(c)    pthread_cond_signal(c)
+#define SDLOP_COND_BROADCAST(c) pthread_cond_broadcast(c)
+#define SDLOP_COND_WAIT(c, m)         pthread_cond_wait((c), (m))
+#define SDLOP_COND_WAIT_UNTIL(c, m, ts) pthread_cond_timedwait((c), (m), (ts))
+#define SDLOP_COND_TIMEDOUT     ETIMEDOUT
+
+/* --- semaphore --------------------------------------------------- */
+
+typedef sem_t SDLOP_SEM_T;
+#define SDLOP_SEM_INIT(s, v)  (sem_init((s), 0, (unsigned)(v)) == 0)
+#define SDLOP_SEM_DESTROY(s)  sem_destroy(s)
+#define SDLOP_SEM_POST(s)     sem_post(s)
+#define SDLOP_SEM_TRYWAIT(s)  (sem_trywait(s) == 0)
+
+/* Absolute CLOCK_MONOTONIC deadline; restarted after a signal. */
+static inline bool SDLOP_SemWaitUntil(sem_t *sem, const struct timespec *deadline)
+{
+    int rc;
+    do {
+        rc = sem_clockwait(sem, CLOCK_MONOTONIC, deadline);
+    } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+}
+
+static inline Uint32 SDLOP_SemValue(sem_t *sem)
+{
+    int v = 0;
+    sem_getvalue(sem, &v);
+    return v < 0 ? 0u : (Uint32)v;
+}
+
+/* --- sleep / yield ----------------------------------------------- */
+
+/* Relative sleep, restarted after a signal. */
+#define SDLOP_SLEEP_NS(ns) do {                                          \
+        struct timespec _r, _rem;                                        \
+        _r.tv_sec = (time_t)((ns) / 1000000000ull);                      \
+        _r.tv_nsec = (long)((ns) % 1000000000ull);                       \
+        while (nanosleep(&_r, &_rem) != 0 && errno == EINTR) {           \
+            _r = _rem;                                                   \
+        }                                                                \
+    } while (0)
+
+/* Sleep until an absolute CLOCK_MONOTONIC deadline. */
+#define SDLOP_SLEEP_UNTIL_NS(abs_ns) do {                                \
+        struct timespec _ts;                                             \
+        _ts.tv_sec = (time_t)((abs_ns) / 1000000000ull);                 \
+        _ts.tv_nsec = (long)((abs_ns) % 1000000000ull);                  \
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &_ts,     \
+                               NULL) == EINTR) {                         \
+        }                                                                \
+    } while (0)
+
+#define SDLOP_YIELD() sched_yield()
+
+/* --- thread id from a handle ------------------------------------- */
+
+/* Only used to notice "the caller IS the timer thread" before joining it, and
+ * pthread_t compares equal to itself, so this identity mapping is enough. */
+#define SDLOP_ThreadIDOfHandle(h) ((SDL_ThreadID)(h))
+
+#else /* _WIN32 */
+
+/* ------------------------------------------------------------------ */
+/* Windows                                                             */
+/* ------------------------------------------------------------------ */
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601 /* Windows 7: SRW locks, condition variables */
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+
+/* --- mutex ------------------------------------------------------- */
+
+typedef CRITICAL_SECTION SDLOP_MUTEX_T;
+
+/* CRITICAL_SECTION is recursive, which is what SDL_LockMutex needs. */
+#define SDLOP_MUTEX_INIT_ONCE(m) do { (void)0; InitializeCriticalSection(m); } while (0)
+#define SDLOP_MUTEX_DESTROY(m)   ((void)0, DeleteCriticalSection(m))
+#define SDLOP_MUTEX_LOCK(m)      EnterCriticalSection(m)
+#define SDLOP_MUTEX_UNLOCK(m)    LeaveCriticalSection(m)
+
+#define SDLOP_MUTEX_INIT_PLAIN(m)     SDLOP_MUTEX_INIT_ONCE(m)
+#define SDLOP_MUTEX_INIT_RECURSIVE(m) SDLOP_MUTEX_INIT_ONCE(m)
+
+BOOL CALLBACK SDLOP_OnceTrampoline(PINIT_ONCE once, PVOID param, PVOID *ctx);
+
+typedef struct SDLOP_StaticMutex
+{
+    CRITICAL_SECTION id;
+    INIT_ONCE once;
+} SDLOP_StaticMutex;
+
+BOOL CALLBACK SDLOP_StaticMutexInitTrampoline(PINIT_ONCE once, PVOID param, PVOID *ctx);
+
+#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { { 0 }, INIT_ONCE_STATIC_INIT }
+
+/* Releases the one waitable timer the sleep path allocates, from SDL_Quit. */
+void SDLOP_ReleaseTimerHandles(void);
+
+static inline SDLOP_MUTEX_T *SDLOP_StaticMutexGet(SDLOP_StaticMutex *m)
+{
+    InitOnceExecuteOnce(&m->once, SDLOP_StaticMutexInitTrampoline, m, NULL);
+    return &m->id;
+}
+#define SDLOP_SM(m) SDLOP_StaticMutexGet(m)
+
+/* --- once -------------------------------------------------------- */
+
+typedef INIT_ONCE SDLOP_ONCE_T;
+#define SDLOP_ONCE_INIT        INIT_ONCE_STATIC_INIT
+#define SDLOP_ONCE(once, fn)   do {                                      \
+        InitOnceExecuteOnce((once), SDLOP_OnceTrampoline, (PVOID)(fn), NULL); \
+    } while (0)
+
+/* --- read/write lock --------------------------------------------- */
+
+/* SRWLOCK releases shared and exclusive locks through different calls, while
+ * SDL exposes one SDL_UnlockRWLock(); SDL_RWLock remembers which it took. */
+typedef SRWLOCK SDLOP_RWLOCK_T;
+#define SDLOP_RWLOCK_INIT_ONCE(r)  ((void)InitializeSRWLock(r))
+#define SDLOP_RWLOCK_DESTROY(r)    ((void)(r))
+#define SDLOP_RWLOCK_RDLOCK(r)     AcquireSRWLockShared(r)
+#define SDLOP_RWLOCK_WRLOCK(r)     AcquireSRWLockExclusive(r)
+#define SDLOP_RWLOCK_RDLOCK_TRY(r) (TryAcquireSRWLockShared(r) != 0)
+#define SDLOP_RWLOCK_WRLOCK_TRY(r) (TryAcquireSRWLockExclusive(r) != 0)
+#define SDLOP_RWLOCK_RUNLOCK(r)    ReleaseSRWLockShared(r)
+#define SDLOP_RWLOCK_WUNLOCK(r)    ReleaseSRWLockExclusive(r)
+
+/* --- condition variable ------------------------------------------ */
+
+typedef CONDITION_VARIABLE SDLOP_COND_T;
+
+#define SDLOP_COND_INIT(c)      ((void)InitializeConditionVariable(c))
+#define SDLOP_COND_DESTROY(c)   ((void)(c))
+#define SDLOP_COND_SIGNAL(c)    WakeConditionVariable(c)
+#define SDLOP_COND_BROADCAST(c) WakeAllConditionVariable(c)
+#define SDLOP_COND_WAIT(c, m)   (SleepConditionVariableCS((c), (m), INFINITE) ? 0 : (int)GetLastError())
+
+/* Absolute CLOCK_MONOTONIC deadline, converted to a relative wait; see
+ * SDLOP_CondWaitUntilImpl. */
+int SDLOP_CondWaitUntilImpl(CONDITION_VARIABLE *cond, CRITICAL_SECTION *mutex,
+                            const struct timespec *deadline);
+#define SDLOP_COND_WAIT_UNTIL(c, m, ts) SDLOP_CondWaitUntilImpl((c), (m), (ts))
+#define SDLOP_COND_TIMEDOUT    ((int)ERROR_TIMEOUT)
+
+/* --- semaphore --------------------------------------------------- */
+
+/* The Win32 handle's count is the SDL-side count (see SDLOP_SemInit);
+ * `count` mirrors it for SDL_GetSemaphoreValue() so polling never has to
+ * disturb a waiter. */
+typedef struct SDLOP_SEM_T
+{
+    HANDLE handle;
+    volatile LONG count;
+} SDLOP_SEM_T;
+
+#define SDLOP_SEM_MAX 0x7fffffff
+
+bool SDLOP_SemInit(SDLOP_SEM_T *sem, Uint32 initial_value);
+void SDLOP_SemDestroy(SDLOP_SEM_T *sem);
+void SDLOP_SemPost(SDLOP_SEM_T *sem);
+bool SDLOP_SemTryWait(SDLOP_SEM_T *sem);
+Uint32 SDLOP_SemValue(SDLOP_SEM_T *sem);
+bool SDLOP_SemWaitUntil(SDLOP_SEM_T *sem, const struct timespec *deadline);
+
+#define SDLOP_SEM_INIT(s, v)     SDLOP_SemInit((s), (Uint32)(v))
+#define SDLOP_SEM_DESTROY(s)     SDLOP_SemDestroy(s)
+#define SDLOP_SEM_POST(s)        SDLOP_SemPost(s)
+#define SDLOP_SEM_TRYWAIT(s)     SDLOP_SemTryWait(s)
+
+/* --- sleep / yield ----------------------------------------------- */
+
+/* Sleep() is millisecond-granular and, at the default timer resolution,
+ * rounds up to the 15.6 ms tick: SDL_Delay(1) sleeps 15.6 ms and any frame
+ * limiter built on it runs at ~64 Hz. Stock SDL3 sleeps on a high-resolution
+ * waitable timer, so do the same, with Sleep() as the fallback for systems
+ * without CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+ has it).
+ * SDLOP_SleepNS() owns the timer; see sdlop_platform.c. */
+#define SDLOP_SLEEP_NS(ns) SDLOP_SleepNS((Sint64)(ns))
+
+/* Absolute CLOCK_MONOTONIC deadline: sleep the difference, leave the last
+ * 200 us to the caller's spin loop. */
+#define SDLOP_SLEEP_UNTIL_NS(abs_ns) SDLOP_SleepUntilNS((Sint64)(abs_ns))
+
+void SDLOP_SleepUntilNS(Sint64 abs_ns);
+void SDLOP_SleepNS(Sint64 ns);
+
+#define SDLOP_YIELD() SwitchToThread()
+
+/* --- thread id from a handle ------------------------------------- */
+
+Uint32 SDLOP_ThreadIDOfHandle(HANDLE h);
+
+#endif /* _WIN32 */
+
+/* ------------------------------------------------------------------ */
+/* Shared                                                              */
+/* ------------------------------------------------------------------ */
+
+/* Monotonic nanoseconds; the same clock SDL_GetPerformanceCounter() reports.
+ * Implemented in sdlop_platform.c on both platforms. */
+Sint64 SDLOP_MonotonicNowNS(void);
+
+/* Split a monotonic deadline into a struct timespec (the absolute-deadline
+ * form the condition/semaphore waits take). */
+void SDLOP_DeadlineFromNS(struct timespec *ts, Sint64 deadline_ns);
+
+#endif /* sdlop_platform_h_ */

@@ -22,7 +22,9 @@
 
 #include <ctype.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <iconv.h>
+#endif
 #include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -34,7 +36,12 @@
 #undef SDL_memmove
 #undef SDL_memset
 
+#ifndef _WIN32
+/* MinGW defines `environ` as a macro over its CRT's __imp_environ, so
+ * declaring it here trips clang's -Winconsistent-dllimport. The Win32
+ * environment is read through the CRT instead (see SDLOP_EnvironmentQuit). */
 extern char **environ;
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Memory                                                              */
@@ -1214,8 +1221,391 @@ Uint32 SDL_murmur3_32(const void *data, size_t len, Uint32 seed)
 }
 
 /* ------------------------------------------------------------------ */
-/* iconv (glibc's, through the SDL3 API)                               */
+/* iconv                                                               */
+/*                                                                     */
+/* POSIX: glibc's iconv, directly.                                     */
+/* Windows: there is no iconv in the C runtime, and MinGW does not ship */
+/* one, so the conversions SDL3's helpers actually ask for are built   */
+/* from the Win32 Unicode entry points (WideCharToMultiByte).          */
 /* ------------------------------------------------------------------ */
+
+#ifdef _WIN32
+
+/* Which of the handful of encodings SDL names is in play. Everything SDL's
+ * own helpers use - UTF-8, UTF-16/32 and the ANSI/wide code pages - has a
+ * Win32 equivalent. */
+typedef enum SDLOP_IconvKind
+{
+    SDLOP_ICONV_UTF8,
+    SDLOP_ICONV_UTF16LE,
+    SDLOP_ICONV_UTF16BE,
+    SDLOP_ICONV_UTF32LE,
+    SDLOP_ICONV_UTF32BE,
+    SDLOP_ICONV_UCS2,
+    SDLOP_ICONV_8859_1,  /* ASCII / ISO-8859-1: byte == code point */
+    SDLOP_ICONV_ACP,     /* "" or "ANSI" */
+    SDLOP_ICONV_UNSUPPORTED
+} SDLOP_IconvKind;
+
+typedef struct SDLOP_Iconv
+{
+    SDLOP_IconvKind from;
+    SDLOP_IconvKind to;
+} SDLOP_Iconv;
+
+static SDLOP_IconvKind iconv_kind(const char *name)
+{
+    if (!name || !*name) {
+        return SDLOP_ICONV_UTF8;
+    }
+    if (SDL_strcasecmp(name, "UTF-8") == 0) {
+        return SDLOP_ICONV_UTF8;
+    }
+    if (SDL_strcasecmp(name, "UTF-16") == 0 || SDL_strcasecmp(name, "UTF-16LE") == 0 ||
+        SDL_strcasecmp(name, "UNICODELITTLE") == 0 || SDL_strcasecmp(name, "WCHAR_T") == 0) {
+        return SDLOP_ICONV_UTF16LE;
+    }
+    if (SDL_strcasecmp(name, "UTF-16BE") == 0 || SDL_strcasecmp(name, "UNICODEBIG") == 0) {
+        return SDLOP_ICONV_UTF16BE;
+    }
+    if (SDL_strcasecmp(name, "UTF-32") == 0 || SDL_strcasecmp(name, "UTF-32LE") == 0 ||
+        SDL_strcasecmp(name, "UCS-4") == 0 || SDL_strcasecmp(name, "UCS-4LE") == 0 ||
+        SDL_strcasecmp(name, "UCS4") == 0) {
+        /* stock maps UCS-4 to UTF-32; SDL_iconv_utf8_ucs4() needs this name */
+        return SDLOP_ICONV_UTF32LE;
+    }
+    if (SDL_strcasecmp(name, "UTF-32BE") == 0 || SDL_strcasecmp(name, "UCS-4BE") == 0) {
+        return SDLOP_ICONV_UTF32BE;
+    }
+    if (SDL_strcasecmp(name, "UCS-2") == 0) {
+        return SDLOP_ICONV_UCS2;
+    }
+    if (SDL_strcasecmp(name, "UCS-2LE") == 0) {
+        return SDLOP_ICONV_UTF16LE; /* a fixed 16-bit little-endian encoding */
+    }
+    if (SDL_strcasecmp(name, "UTF8") == 0) {
+        return SDLOP_ICONV_UTF8;    /* glibc accepts the dashless spelling */
+    }
+    if (SDL_strcasecmp(name, "ASCII") == 0 || SDL_strcasecmp(name, "US-ASCII") == 0 ||
+        SDL_strcasecmp(name, "ISO-8859-1") == 0 || SDL_strcasecmp(name, "LATIN1") == 0) {
+        /* single-byte, and every byte is a code point: the ANSI path is only
+         * right when the ANSI code page is 1252, so handle these directly */
+        return SDLOP_ICONV_8859_1;
+    }
+    /* the Windows ANSI code page: SDL3 spells it "ACP", and an empty or
+     * "ANSI" name means the same in the Win32 iconv world */
+    if (SDL_strcasecmp(name, "ACP") == 0 || SDL_strcasecmp(name, "ANSI") == 0 ||
+        SDL_strcasecmp(name, "CP_ACP") == 0) {
+        return SDLOP_ICONV_ACP;
+    }
+    return SDLOP_ICONV_UNSUPPORTED;
+}
+
+SDL_iconv_t SDL_iconv_open(const char *tocode, const char *fromcode)
+{
+    SDLOP_Iconv *cd = (SDLOP_Iconv *)SDL_calloc(1, sizeof(*cd));
+    if (!cd) {
+        return (SDL_iconv_t)-1;
+    }
+    cd->to = iconv_kind(tocode);
+    cd->from = iconv_kind(fromcode);
+    if (cd->to == SDLOP_ICONV_UNSUPPORTED || cd->from == SDLOP_ICONV_UNSUPPORTED) {
+        SDL_free(cd);
+        SDL_SetError("Unsupported iconv conversion: %s -> %s", fromcode, tocode);
+        return (SDL_iconv_t)-1;
+    }
+    return (SDL_iconv_t)cd;
+}
+
+int SDL_iconv_close(SDL_iconv_t cd)
+{
+    if (cd == (SDL_iconv_t)-1) {
+        return -1;
+    }
+    SDL_free((SDLOP_Iconv *)cd);
+    return 0;
+}
+
+/* Decode one code point from `from`; advances *in. Returns false on a
+ * truncated or malformed sequence (the caller then either skips a byte or
+ * stops, like iconv). */
+static bool iconv_next(const SDLOP_IconvKind from, const char **in, size_t *left, Uint32 *cp)
+{
+    const unsigned char *p = (const unsigned char *)*in;
+    switch (from) {
+    case SDLOP_ICONV_8859_1:
+        if (*left < 1) {
+            return false;
+        }
+        *cp = p[0];
+        *in += 1;
+        *left -= 1;
+        return true;
+    case SDLOP_ICONV_UTF8:
+        if (*left < 1) {
+            return false;
+        }
+        if (p[0] < 0x80) {
+            *cp = p[0];
+            *in += 1;
+            *left -= 1;
+            return true;
+        }
+        {
+            int extra = 0;
+            Uint32 v = 0;
+            Uint32 min = 0;
+            if ((p[0] & 0xE0) == 0xC0) { extra = 1; v = p[0] & 0x1F; min = 0x80; }
+            else if ((p[0] & 0xF0) == 0xE0) { extra = 2; v = p[0] & 0x0F; min = 0x800; }
+            else if ((p[0] & 0xF8) == 0xF0) { extra = 3; v = p[0] & 0x07; min = 0x10000; }
+            else { return false; }
+            if (*left < (size_t)(extra + 1)) {
+                return false;
+            }
+            for (int i = 1; i <= extra; i++) {
+                if ((p[i] & 0xC0) != 0x80) {
+                    return false;
+                }
+                v = (v << 6) | (p[i] & 0x3F);
+            }
+            if (v < min || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) {
+                return false;
+            }
+            *cp = v;
+            *in += extra + 1;
+            *left -= (size_t)(extra + 1);
+            return true;
+        }
+    case SDLOP_ICONV_UTF16LE:
+    case SDLOP_ICONV_UCS2:
+    case SDLOP_ICONV_UTF16BE: {
+        if (*left < 2) {
+            return false;
+        }
+        Uint32 u = (from == SDLOP_ICONV_UTF16BE) ? ((Uint32)p[0] << 8 | p[1])
+                                                 : ((Uint32)p[1] << 8 | p[0]);
+        *in += 2;
+        *left -= 2;
+        if (from != SDLOP_ICONV_UCS2 && u >= 0xD800 && u <= 0xDBFF) {
+            if (*left < 2) {
+                return false;
+            }
+            const unsigned char *q = (const unsigned char *)*in;
+            const Uint32 lo = (from == SDLOP_ICONV_UTF16BE) ? ((Uint32)q[0] << 8 | q[1])
+                                                            : ((Uint32)q[1] << 8 | q[0]);
+            if (lo < 0xDC00 || lo > 0xDFFF) {
+                return false;
+            }
+            *in += 2;
+            *left -= 2;
+            *cp = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+            return true;
+        }
+        if (u >= 0xDC00 && u <= 0xDFFF) {
+            return false;
+        }
+        *cp = u;
+        return true;
+    }
+    case SDLOP_ICONV_UTF32LE:
+    case SDLOP_ICONV_UTF32BE: {
+        if (*left < 4) {
+            return false;
+        }
+        Uint32 v = (from == SDLOP_ICONV_UTF32BE)
+                       ? ((Uint32)p[0] << 24 | (Uint32)p[1] << 16 | (Uint32)p[2] << 8 | p[3])
+                       : ((Uint32)p[3] << 24 | (Uint32)p[2] << 16 | (Uint32)p[1] << 8 | p[0]);
+        *in += 4;
+        *left -= 4;
+        if (v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) {
+            return false;
+        }
+        *cp = v;
+        return true;
+    }
+    case SDLOP_ICONV_ACP: {
+        if (*left < 1) {
+            return false;
+        }
+        /* The ANSI code page is not necessarily single-byte (and even CP1252
+         * differs from Latin-1 over 0x80..0x9F), so decode through UTF-16:
+         * a byte is one character unless it is a DBCS lead byte. */
+        wchar_t wbuf[2];
+        int used = 1;
+        int n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, (const char *)p, 1, wbuf, (int)SDL_arraysize(wbuf));
+        if (n == 0) {
+            if (*left < 2) {
+                return false; /* a lead byte at the end: incomplete */
+            }
+            used = 2;
+            n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, (const char *)p, 2, wbuf, (int)SDL_arraysize(wbuf));
+            if (n == 0) {
+                return false;
+            }
+        }
+        if (n == 2 && wbuf[0] >= 0xD800 && wbuf[0] <= 0xDBFF && wbuf[1] >= 0xDC00 && wbuf[1] <= 0xDFFF) {
+            *cp = 0x10000 + (((Uint32)wbuf[0] - 0xD800) << 10) + ((Uint32)wbuf[1] - 0xDC00);
+        } else {
+            *cp = (Uint32)wbuf[0];
+        }
+        *in += used;
+        *left -= (size_t)used;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char **outbuf, size_t *outbytesleft)
+{
+    SDLOP_Iconv *ctx = (SDLOP_Iconv *)cd;
+    if (cd == (SDL_iconv_t)-1) {
+        return SDL_ICONV_ERROR;
+    }
+    if (!inbuf || !*inbuf || !inbytesleft || *inbytesleft == 0) {
+        /* state reset: these encodings are stateless */
+        return 0;
+    }
+    if (!outbuf || !*outbuf || !outbytesleft) {
+        return SDL_ICONV_EINVAL;
+    }
+
+    /* Decode everything still buffered into code points, then encode. The
+     * Win32 path only supports the encodings above, all of which round-trip
+     * through UTF-16 for the ANSI case. */
+    while (*inbytesleft > 0) {
+        Uint32 cp = 0;
+        const char *before = *inbuf;
+        if (!iconv_next(ctx->from, inbuf, inbytesleft, &cp)) {
+            return (*inbytesleft < (size_t)(ctx->from == SDLOP_ICONV_UTF8 ? 1 : 4)) ? SDL_ICONV_EINVAL : SDL_ICONV_EILSEQ;
+        }
+        if (ctx->to == SDLOP_ICONV_ACP) {
+            /* code point -> the system ANSI code page, via UTF-16 */
+            wchar_t wbuf[2];
+            int wlen;
+            if (cp < 0x10000) {
+                wbuf[0] = (wchar_t)cp;
+                wlen = 1;
+            } else {
+                cp -= 0x10000;
+                wbuf[0] = (wchar_t)(0xD800 + (cp >> 10));
+                wbuf[1] = (wchar_t)(0xDC00 + (cp & 0x3FF));
+                wlen = 2;
+            }
+            char tmp[8];
+            const int n = WideCharToMultiByte(CP_ACP, 0, wbuf, wlen, tmp, (int)sizeof(tmp), "?", NULL);
+            if (n <= 0) {
+                /* iconv semantics on EILSEQ: *inbuf points at the offending
+                 * input, and *inbytesleft counts from there - so undo the
+                 * decode that iconv_next() already did. */
+                const size_t consumed = (size_t)(*inbuf - before);
+                *inbuf = before;
+                *inbytesleft += consumed;
+                return SDL_ICONV_EILSEQ;
+            }
+            if (*outbytesleft < (size_t)n) {
+                /* Same rewind as EILSEQ: the input code point was already
+                 * consumed above, and iconv semantics leave *inbuf at the
+                 * point it stopped, so the caller retries it. Returning
+                 * E2BIG without rewinding silently drops the character. */
+                const size_t consumed = (size_t)(*inbuf - before);
+                *inbuf = before;
+                *inbytesleft += consumed;
+                return SDL_ICONV_E2BIG;
+            }
+            SDL_memcpy(*outbuf, tmp, (size_t)n);
+            *outbuf += n;
+            *outbytesleft -= (size_t)n;
+            continue;
+        }
+        /* encode */
+        unsigned char enc[4];
+        size_t n = 0;
+        switch (ctx->to) {
+        case SDLOP_ICONV_UTF8:
+            if (cp < 0x80) {
+                enc[n++] = (unsigned char)cp;
+            } else if (cp < 0x800) {
+                enc[n++] = (unsigned char)(0xC0 | (cp >> 6));
+                enc[n++] = (unsigned char)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                enc[n++] = (unsigned char)(0xE0 | (cp >> 12));
+                enc[n++] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+                enc[n++] = (unsigned char)(0x80 | (cp & 0x3F));
+            } else {
+                enc[n++] = (unsigned char)(0xF0 | (cp >> 18));
+                enc[n++] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+                enc[n++] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+                enc[n++] = (unsigned char)(0x80 | (cp & 0x3F));
+            }
+            break;
+        case SDLOP_ICONV_8859_1:
+            if (cp > 0xFF) {
+                return SDL_ICONV_EILSEQ; /* not representable, like iconv */
+            }
+            enc[n++] = (unsigned char)cp;
+            break;
+        case SDLOP_ICONV_UTF16LE:
+        case SDLOP_ICONV_UCS2:
+        case SDLOP_ICONV_UTF16BE: {
+            Uint32 units[2];
+            const size_t count = (cp < 0x10000) ? 1 : 2;
+            if (count == 2) {
+                if (ctx->to == SDLOP_ICONV_UCS2) {
+                    return SDL_ICONV_EILSEQ;
+                }
+                const Uint32 v = cp - 0x10000;
+                units[0] = 0xD800 + (v >> 10);
+                units[1] = 0xDC00 + (v & 0x3FF);
+            } else {
+                units[0] = cp;
+            }
+            for (size_t i = 0; i < count; i++) {
+                const Uint32 u = units[i];
+                if (ctx->to == SDLOP_ICONV_UTF16BE) {
+                    enc[n++] = (unsigned char)(u >> 8);
+                    enc[n++] = (unsigned char)(u & 0xFF);
+                } else {
+                    enc[n++] = (unsigned char)(u & 0xFF);
+                    enc[n++] = (unsigned char)(u >> 8);
+                }
+            }
+            break;
+        }
+        case SDLOP_ICONV_UTF32LE:
+        case SDLOP_ICONV_UTF32BE:
+            if (ctx->to == SDLOP_ICONV_UTF32BE) {
+                enc[n++] = (unsigned char)(cp >> 24);
+                enc[n++] = (unsigned char)((cp >> 16) & 0xFF);
+                enc[n++] = (unsigned char)((cp >> 8) & 0xFF);
+                enc[n++] = (unsigned char)(cp & 0xFF);
+            } else {
+                enc[n++] = (unsigned char)(cp & 0xFF);
+                enc[n++] = (unsigned char)((cp >> 8) & 0xFF);
+                enc[n++] = (unsigned char)((cp >> 16) & 0xFF);
+                enc[n++] = (unsigned char)(cp >> 24);
+            }
+            break;
+        default:
+            return SDL_ICONV_ERROR;
+        }
+        if (*outbytesleft < n) {
+            /* see the ACP path: rewind so the caller's retry does not skip
+             * the code point this call already decoded */
+            const size_t consumed = (size_t)(*inbuf - before);
+            *inbuf = before;
+            *inbytesleft += consumed;
+            return SDL_ICONV_E2BIG;
+        }
+        SDL_memcpy(*outbuf, enc, n);
+        *outbuf += n;
+        *outbytesleft -= n;
+    }
+    return 0;
+}
+
+#else /* !_WIN32 */
 
 SDL_iconv_t SDL_iconv_open(const char *tocode, const char *fromcode)
 {
@@ -1256,6 +1646,10 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
     return r;
 }
 
+#endif /* _WIN32 */
+
+/* SDL_iconv_string is written against SDL_iconv_open/iconv/iconv_close only,
+ * so one implementation serves the native-iconv branch and the Windows one. */
 char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inbuf, size_t inbytesleft)
 {
     if (!tocode || !*tocode) {
@@ -1268,7 +1662,7 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
     if (cd == (SDL_iconv_t)-1) {
         return NULL;
     }
-    size_t stringsize = inbytesleft;
+    size_t stringsize = inbytesleft ? inbytesleft : 16;
     char *string = (char *)SDL_malloc(stringsize + sizeof(Uint32));
     if (!string) {
         SDL_iconv_close(cd);
@@ -1276,15 +1670,21 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
     }
     char *outbuf = string;
     size_t outbytesleft = stringsize;
-    memset(outbuf, 0, sizeof(Uint32));
+    SDL_memset(outbuf, 0, sizeof(Uint32));
 
     while (inbytesleft > 0) {
-        const size_t oldinbytesleft = inbytesleft;
-        size_t retCode = SDL_iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
+        size_t inbytesleft_save = inbytesleft;
+        size_t outbytesleft_save = outbytesleft;
+        /* SDL_iconv returns size_t and the sentinels are (size_t)-1..-4, so
+         * keeping this in an int truncates them (and draws -Wsign-compare). */
+        const size_t retCode = SDL_iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft);
         if (retCode == SDL_ICONV_E2BIG) {
             const ptrdiff_t diff = outbuf - string;
             char *oldstring = string;
             stringsize = stringsize ? stringsize * 2 : 16;
+            /* The output can be wider than the input (UTF-8 to UTF-16 is 2x,
+             * UTF-32 is 4x) and the conversion resumes where it stopped, so
+             * one doubling is enough as long as the buffer keeps growing. */
             string = (char *)SDL_realloc(string, stringsize + sizeof(Uint32));
             if (!string) {
                 SDL_free(oldstring);
@@ -1293,7 +1693,7 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
             }
             outbuf = string + diff;
             outbytesleft = stringsize - (size_t)diff;
-            memset(outbuf, 0, sizeof(Uint32));
+            SDL_memset(outbuf, 0, sizeof(Uint32));
             continue;
         } else if (retCode == SDL_ICONV_EILSEQ) {
             ++inbuf;
@@ -1301,11 +1701,11 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
         } else if (retCode == SDL_ICONV_EINVAL || retCode == SDL_ICONV_ERROR) {
             inbytesleft = 0;
         }
-        if (oldinbytesleft == inbytesleft) {
+        if (inbytesleft_save == inbytesleft && outbytesleft_save == outbytesleft) {
             break;
         }
     }
-    memset(outbuf, 0, sizeof(Uint32));
+    SDL_memset(outbuf, 0, sizeof(Uint32));
     SDL_iconv_close(cd);
     return string;
 }
@@ -1316,13 +1716,13 @@ char *SDL_iconv_string(const char *tocode, const char *fromcode, const char *inb
 
 struct SDL_Environment
 {
-    pthread_mutex_t lock;
+    SDLOP_MUTEX_T lock;
     char **vars;   /* "name=value", owned */
     int count, capacity;
 };
 
 static SDL_Environment *SDL_environment;
-static pthread_once_t env_once = PTHREAD_ONCE_INIT;
+static SDLOP_ONCE_T env_once = SDLOP_ONCE_INIT;
 
 static int env_find(SDL_Environment *env, const char *name, size_t namelen)
 {
@@ -1374,7 +1774,7 @@ SDL_Environment *SDL_CreateEnvironment(bool populated)
     if (!env) {
         return NULL;
     }
-    pthread_mutex_init(&env->lock, NULL);
+    SDLOP_MUTEX_INIT_PLAIN(&env->lock);
     if (populated && environ) {
         for (char **e = environ; *e; e++) {
             const char *eq = strchr(*e, '=');
@@ -1398,7 +1798,7 @@ static void env_init_once(void)
 
 SDL_Environment *SDL_GetEnvironment(void)
 {
-    pthread_once(&env_once, env_init_once);
+    SDLOP_ONCE(&env_once, env_init_once);
     return SDL_environment;
 }
 
@@ -1412,14 +1812,14 @@ const char *SDL_GetEnvironmentVariable(SDL_Environment *env, const char *name)
         return NULL;
     }
     const char *result = NULL;
-    pthread_mutex_lock(&env->lock);
+    SDLOP_MUTEX_LOCK(&env->lock);
     int idx = env_find(env, name, strlen(name));
     if (idx >= 0) {
         /* SDL3: valid until the variable changes (we keep the string alive
          * in a per-thread-unsafe way, same as SDL3's documented contract) */
         result = env->vars[idx] + strlen(name) + 1;
     }
-    pthread_mutex_unlock(&env->lock);
+    SDLOP_MUTEX_UNLOCK(&env->lock);
     return result;
 }
 
@@ -1429,7 +1829,7 @@ char **SDL_GetEnvironmentVariables(SDL_Environment *env)
         SDL_InvalidParamError("env");
         return NULL;
     }
-    pthread_mutex_lock(&env->lock);
+    SDLOP_MUTEX_LOCK(&env->lock);
     size_t size = (size_t)(env->count + 1) * sizeof(char *);
     for (int i = 0; i < env->count; i++) {
         size += strlen(env->vars[i]) + 1;
@@ -1445,7 +1845,7 @@ char **SDL_GetEnvironmentVariables(SDL_Environment *env)
         }
         result[env->count] = NULL;
     }
-    pthread_mutex_unlock(&env->lock);
+    SDLOP_MUTEX_UNLOCK(&env->lock);
     return result;
 }
 
@@ -1460,9 +1860,9 @@ bool SDL_SetEnvironmentVariable(SDL_Environment *env, const char *name, const ch
     if (!value) {
         return SDL_InvalidParamError("value");
     }
-    pthread_mutex_lock(&env->lock);
+    SDLOP_MUTEX_LOCK(&env->lock);
     bool ok = env_put(env, name, value, overwrite);
-    pthread_mutex_unlock(&env->lock);
+    SDLOP_MUTEX_UNLOCK(&env->lock);
     return ok;
 }
 
@@ -1474,13 +1874,13 @@ bool SDL_UnsetEnvironmentVariable(SDL_Environment *env, const char *name)
     if (!name || !*name || strchr(name, '=')) {
         return SDL_InvalidParamError("name");
     }
-    pthread_mutex_lock(&env->lock);
+    SDLOP_MUTEX_LOCK(&env->lock);
     int idx = env_find(env, name, strlen(name));
     if (idx >= 0) {
         SDL_free(env->vars[idx]);
         env->vars[idx] = env->vars[--env->count];
     }
-    pthread_mutex_unlock(&env->lock);
+    SDLOP_MUTEX_UNLOCK(&env->lock);
     return true;
 }
 
@@ -1493,7 +1893,7 @@ void SDL_DestroyEnvironment(SDL_Environment *env)
         SDL_free(env->vars[i]);
     }
     SDL_free(env->vars);
-    pthread_mutex_destroy(&env->lock);
+    SDLOP_MUTEX_DESTROY(&env->lock);
     SDL_free(env);
 }
 
@@ -1512,11 +1912,11 @@ void SDLOP_EnvironmentQuit(void)
             SDL_free(env->vars[i]);
         }
         SDL_free(env->vars);
-        pthread_mutex_destroy(&env->lock);
+        SDLOP_MUTEX_DESTROY(&env->lock);
         SDL_free(env);
     }
 
-    env_once = (pthread_once_t)PTHREAD_ONCE_INIT;
+    env_once = (SDLOP_ONCE_T)SDLOP_ONCE_INIT;
 }
 
 const char *SDL_getenv(const char *name)

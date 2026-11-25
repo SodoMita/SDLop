@@ -23,14 +23,24 @@ for h in "$INC"/SDL3/*.h; do
         | sed -E 's/.*SDLCALL +(SDL_[A-Za-z0-9_]+) *\(/\1/' || true
 done | sort -u > "$tmp/declared"
 
-nm -D --defined-only "$SO" | awk '$2=="T" || $2=="i" {sub(/@.*/,"",$3); print $3}' \
-    | grep -E '^SDL_' | sort -u > "$tmp/exported"
+# ELF (.so/.dylib) or PE (.dll): a Windows DLL has no dynamic symbol table
+# in the ELF sense, so ask objdump for its export directory instead.
+if file -b "$SO" | grep -qi 'PE32'; then
+    objdump -p "$SO" | awk '/^\[Ordinal\/Name Pointer\] Table/ {t=1; next}
+                                 t && /^$/ {exit}
+                                 t {print $NF}' | sort -u > "$tmp/exported"
+else
+    nm -D --defined-only "$SO" | awk '$2=="T" || $2=="i" {sub(/@.*/,"",$3); print $3}' \
+        | sort -u > "$tmp/exported"
+fi
+cp "$tmp/exported" "$tmp/all_exported"
+grep -E '^SDL_' "$tmp/exported" > "$tmp/exported.sdl" && mv "$tmp/exported.sdl" "$tmp/exported"
 
 # SDLop's own API (SDLop.h: "extern <type> SDLop_Name(") must be exported too
 tr '\n' ' ' < "$INC/SDL3/SDLop.h" | grep -oE 'extern [^;(]*[ *]SDLop_[A-Za-z0-9_]+ *\(' \
     | sed -E 's/.*(SDLop_[A-Za-z0-9_]+) *\(/\1/' | sort -u > "$tmp/sdlop_declared" || true
-nm -D --defined-only "$SO" | awk '{sub(/@.*/,"",$3); print $3}' \
-    | grep -E '^SDLop_' | sort -u > "$tmp/sdlop_exported" || true
+# the same export list as above, so a PE build checks SDLop_* too
+grep -E '^SDLop_' "$tmp/all_exported" | sort -u > "$tmp/sdlop_exported" || true
 sdlop_missing=$(comm -23 "$tmp/sdlop_declared" "$tmp/sdlop_exported")
 sdlop_extra=$(comm -13 "$tmp/sdlop_declared" "$tmp/sdlop_exported")
 

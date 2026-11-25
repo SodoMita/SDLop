@@ -1,0 +1,3 @@
+absent unregister: allocations=10000/10000, thread-CPU block-average p50=64.2 p95=259.2 ns/call
+callback snapshots: allocated=11014 freed_after_join=1; empty_unregister_allocations=1; native delivery=501/501
+test_evdev_callbacks: FAIL (no-op allocation, held reader, churn, max count, OOM, shutdown reclamation)

@@ -1,0 +1,228 @@
+Input loss comparison after — 2026-11-21
+Host Linux-6.1.158+-x86_64-with-glibc2.36, CPUs=2, uid=1001
+GCC 12.2.0 -O2 -g, same rootless harness, two axes, one million reports/mode, three repetitions/profile.
+No sanitizer timings; output includes losses and unsuccessful trials.
+
+=== repetition 1 profile 64k-single ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --rate 64000 --burst 1
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=64000 reports/s burst=1 axes=2
+injection: sent=1000000/1000000 duration=15.625063s achieved=63999.7 reports/s native_rate=191999.2 records/s
+pacing: late_batches=862233 max_lateness=9866.3us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.7us avg=13.8us p50=2.4us p95=21.6us p99=77.3us max=6445.2us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=16.0us p50=2.6us p95=23.1us p99=120.2us max=7080.5us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=16.3us p50=2.7us p95=23.8us p99=126.5us max=7095.3us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=64000 reports/s burst=1 axes=2
+injection: sent=1000000/1000000 duration=15.625077s achieved=63999.7 reports/s native_rate=191999.1 records/s
+pacing: late_batches=828240 max_lateness=2170.4us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=15.8us p50=13.0us p95=30.7us p99=41.7us max=2450.0us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=2.4us avg=31.7us p50=19.5us p95=53.2us p99=98.6us max=10311.6us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=3.4us avg=32.5us p50=20.0us p95=53.3us p99=100.0us max=10322.5us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 1 profile 256k-burst16 ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --rate 256000 --burst 16
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=256000 reports/s burst=16 axes=2
+injection: sent=1000000/1000000 duration=3.906321s achieved=255995.3 reports/s native_rate=767986.0 records/s
+pacing: late_batches=47739 max_lateness=5384.9us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.7us avg=52.5us p50=52.4us p95=91.3us p99=325.6us max=5431.1us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=57.0us p50=54.8us p95=97.4us p99=390.7us max=5433.2us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=61.3us p50=60.0us p95=104.7us p99=408.5us max=5435.9us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=256000 reports/s burst=16 axes=2
+injection: sent=1000000/1000000 duration=3.906320s achieved=255995.4 reports/s native_rate=767986.3 records/s
+pacing: late_batches=24194 max_lateness=1545.2us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.5us avg=7.5us p50=3.5us p95=27.2us p99=40.3us max=1058.4us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=2.4us avg=50.1us p50=41.9us p95=103.6us p99=212.0us max=1641.4us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=2.9us avg=52.7us p50=45.0us p95=105.8us p99=215.6us max=1644.5us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 1 profile saturation ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --stress
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=0 reports/s burst=64 axes=2
+injection: sent=1000000/1000000 duration=2.889638s achieved=346064.1 reports/s native_rate=1038192.4 records/s
+pacing: late_batches=0 max_lateness=0.0us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=1.5us avg=2322.9us p50=2670.0us p95=2882.0us p99=3260.6us max=6912.1us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=2331.0us p50=2672.1us p95=2886.2us p99=3291.2us max=6912.7us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=2339.4us p50=2672.9us p95=2887.2us p99=3295.8us max=6912.4us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=0 reports/s burst=64 axes=2
+injection: sent=1000000/1000000 duration=1.694813s achieved=590035.6 reports/s native_rate=1770106.7 records/s
+pacing: late_batches=0 max_lateness=0.0us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=9.8us p50=1.6us p95=42.6us p99=109.0us max=886.6us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=196.2us p50=126.7us p95=601.9us p99=1044.1us max=2727.9us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=2.7us avg=207.9us p50=137.5us p95=625.4us p99=1076.6us max=2750.8us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 2 profile 64k-single ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --rate 64000 --burst 1
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=64000 reports/s burst=1 axes=2
+injection: sent=1000000/1000000 duration=15.625071s achieved=63999.7 reports/s native_rate=191999.1 records/s
+pacing: late_batches=844310 max_lateness=5081.1us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=1.4us avg=3.7us p50=2.2us p95=4.9us p99=23.1us max=1637.5us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=4.2us p50=2.4us p95=6.0us p99=25.0us max=1789.9us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=4.4us p50=2.5us p95=6.1us p99=25.7us max=1807.1us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=64000 reports/s burst=1 axes=2
+injection: sent=1000000/1000000 duration=15.625040s achieved=63999.8 reports/s native_rate=191999.5 records/s
+pacing: late_batches=827294 max_lateness=17637.4us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=15.0us p50=12.2us p95=27.8us p99=38.9us max=17383.2us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=3.2us avg=25.8us p50=18.0us p95=50.8us p99=84.1us max=17778.0us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=3.2us avg=26.5us p50=18.5us p95=51.0us p99=86.8us max=17777.5us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 2 profile 256k-burst16 ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --rate 256000 --burst 16
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=256000 reports/s burst=16 axes=2
+injection: sent=1000000/1000000 duration=3.906382s achieved=255991.4 reports/s native_rate=767974.1 records/s
+pacing: late_batches=48300 max_lateness=6746.8us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=63.3us p50=52.1us p95=124.8us p99=566.1us max=4086.9us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=80.4us p50=57.1us p95=154.4us p99=817.6us max=4876.8us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=92.4us p50=63.1us p95=164.4us p99=989.7us max=4890.3us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=256000 reports/s burst=16 axes=2
+injection: sent=1000000/1000000 duration=3.906292s achieved=255997.3 reports/s native_rate=767991.8 records/s
+pacing: late_batches=23099 max_lateness=935.4us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=8.1us p50=2.2us p95=16.4us p99=30.3us max=2996.9us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=2.5us avg=49.8us p50=41.7us p95=95.0us p99=131.0us max=4797.8us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=2.7us avg=52.5us p50=45.0us p95=97.0us p99=133.5us max=4809.7us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 2 profile saturation ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --stress
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=0 reports/s burst=64 axes=2
+injection: sent=1000000/1000000 duration=2.604789s achieved=383908.3 reports/s native_rate=1151724.8 records/s
+pacing: late_batches=0 max_lateness=0.0us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.7us avg=523.0us p50=560.7us p95=874.6us p99=1296.8us max=2990.9us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=575.6us p50=625.1us p95=1022.4us p99=1327.8us max=2992.5us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=629.0us p50=712.6us p95=1071.2us p99=1374.8us max=2993.3us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=0 reports/s burst=64 axes=2
+injection: sent=1000000/1000000 duration=1.767433s achieved=565792.5 reports/s native_rate=1697377.4 records/s
+pacing: late_batches=0 max_lateness=0.0us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=16.1us p50=1.7us p95=52.9us p99=296.5us max=2010.7us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=2.6us avg=230.9us p50=159.2us p95=687.4us p99=1091.6us max=3171.2us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=2.8us avg=244.3us p50=172.8us p95=708.9us p99=1136.9us max=3184.3us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 3 profile 64k-single ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --rate 64000 --burst 1
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=64000 reports/s burst=1 axes=2
+injection: sent=1000000/1000000 duration=15.625075s achieved=63999.7 reports/s native_rate=191999.1 records/s
+pacing: late_batches=841534 max_lateness=9712.1us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.7us avg=6.9us p50=2.2us p95=5.0us p99=23.9us max=7211.1us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=7.7us p50=2.4us p95=8.0us p99=27.1us max=7997.0us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=7.8us p50=2.5us p95=8.3us p99=27.8us max=8005.1us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=64000 reports/s burst=1 axes=2
+injection: sent=1000000/1000000 duration=15.625041s achieved=63999.8 reports/s native_rate=191999.5 records/s
+pacing: late_batches=826880 max_lateness=1304.2us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=15.0us p50=12.5us p95=29.2us p99=40.4us max=1928.0us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=3.2us avg=38.0us p50=19.3us p95=54.1us p99=108.7us max=10267.5us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=3.6us avg=38.8us p50=19.9us p95=54.7us p99=110.5us max=10277.5us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 3 profile 256k-burst16 ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --rate 256000 --burst 16
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=256000 reports/s burst=16 axes=2
+injection: sent=1000000/1000000 duration=3.906257s achieved=255999.5 reports/s native_rate=767998.6 records/s
+pacing: late_batches=37371 max_lateness=6663.0us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=1825.4us p50=2063.0us p95=3486.0us p99=3599.7us max=7494.2us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=1835.6us p50=2069.9us p95=3488.2us p99=3602.9us max=9837.6us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=1838.8us p50=2073.2us p95=3488.6us p99=3603.5us max=9853.1us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=256000 reports/s burst=16 axes=2
+injection: sent=1000000/1000000 duration=3.906283s achieved=255997.8 reports/s native_rate=767993.5 records/s
+pacing: late_batches=24851 max_lateness=7518.2us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.5us avg=7.5us p50=2.5us p95=20.5us p99=42.7us max=1439.4us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=2.6us avg=54.8us p50=48.8us p95=108.1us p99=192.5us max=2354.7us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=2.8us avg=57.9us p50=52.2us p95=110.4us p99=204.8us max=2369.0us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+
+=== repetition 3 profile saturation ===
+$ ./build-validation/headless/bench_raw_latency_pipe --reports 1000000 --axes 2 --stress
+exit=0
+ROOTLESS userspace pipe transport: real SDLop worker/APIs, NO evdev or hardware timing.
+Latency in microseconds. Wait uses a 50ms timeout; raw polling there includes sleep.
+
+mode=poll reports=1000000 target_rate=0 reports/s burst=64 axes=2
+injection: sent=1000000/1000000 duration=2.316437s achieved=431697.4 reports/s native_rate=1295092.2 records/s
+pacing: late_batches=0 max_lateness=0.0us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=1.5us avg=529.7us p50=580.7us p95=799.9us p99=899.9us max=4441.6us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.6us avg=553.7us p50=615.8us p95=816.2us p99=954.9us max=4470.4us
+pipe stamp -> SDL_PollEvent    n=1000000/1000000 missing=0 invalid=0  min=1.7us avg=612.0us p50=708.9us p95=872.0us p99=1017.6us max=4471.8us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)
+
+mode=wait reports=1000000 target_rate=0 reports/s burst=64 axes=2
+injection: sent=1000000/1000000 duration=1.620474s achieved=617103.2 reports/s native_rate=1851309.7 records/s
+pacing: late_batches=0 max_lateness=0.0us (0 target_rate means saturation)
+native records: callback=3000000/3000000 raw_poll=3000000/3000000; SDL motions=2000000/2000000
+pipe stamp -> worker callback  n=1000000/1000000 missing=0 invalid=0  min=0.6us avg=23.5us p50=1.8us p95=113.5us p99=313.4us max=1172.1us
+pipe stamp -> SDLop_PollRawEvents n=1000000/1000000 missing=0 invalid=0  min=1.8us avg=378.7us p50=246.0us p95=1047.2us p99=2074.0us max=6776.6us
+pipe stamp -> SDL_WaitEventTimeout n=1000000/1000000 missing=0 invalid=0  min=2.7us avg=410.5us p50=270.8us p95=1093.8us p99=2251.3us max=6842.6us
+target_rate_met=yes (mean rate, 5% shortfall tolerance; see pacing jitter above)

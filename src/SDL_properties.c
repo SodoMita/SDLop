@@ -48,27 +48,23 @@ static SDLop_PropertySet *property_sets;
 static SDL_PropertiesID next_property_id;
 static SDL_PropertiesID global_properties;
 
-static pthread_mutex_t prop_lock;
-static pthread_once_t prop_once = PTHREAD_ONCE_INIT;
+static SDLOP_MUTEX_T prop_lock;
+static SDLOP_ONCE_T prop_once = SDLOP_ONCE_INIT;
 
 static void init_lock(void)
 {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&prop_lock, &attr);
-    pthread_mutexattr_destroy(&attr);
+    SDLOP_MUTEX_INIT_RECURSIVE(&prop_lock);
 }
 
 static void lock(void)
 {
-    pthread_once(&prop_once, init_lock);
-    pthread_mutex_lock(&prop_lock);
+    SDLOP_ONCE(&prop_once, init_lock);
+    SDLOP_MUTEX_LOCK(&prop_lock);
 }
 
 static void unlock(void)
 {
-    pthread_mutex_unlock(&prop_lock);
+    SDLOP_MUTEX_UNLOCK(&prop_lock);
 }
 
 static SDLop_PropertySet *property_set_by_id(SDL_PropertiesID id)

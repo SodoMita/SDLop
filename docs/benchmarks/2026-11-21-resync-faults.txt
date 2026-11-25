@@ -1,0 +1,8 @@
+Rootless pipe; mocked kernel state, real worker and SDL queue. GCC12.2 -O2 -g.
+before exit=1
+SYN_DROPPED: stuck_button=1 damaged_motions=1 recovery_releases=0 state_queries=0 raw=4/4 callbacks=4/4
+test_evdev_syn_dropped: FAIL
+
+after exit=0
+SYN_DROPPED: stuck_button=0 damaged_motions=0 recovery_releases=1 state_queries=1 raw=4/4 callbacks=4/4
+test_evdev_syn_dropped: PASS

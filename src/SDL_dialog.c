@@ -434,7 +434,7 @@ void SDLOP_Dialog_Quit(void)
 /* zenity                                                              */
 /* ------------------------------------------------------------------ */
 
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(_WIN32)
 typedef struct
 {
     SDL_DialogFileCallback callback;
@@ -607,7 +607,7 @@ static bool zenity_show(SDL_FileDialogType type, SDL_DialogFileCallback callback
     }
     return true;
 }
-#endif /* !__EMSCRIPTEN__ */
+#endif /* !__EMSCRIPTEN__ && !_WIN32 */
 
 /* ------------------------------------------------------------------ */
 /* public API                                                          */
@@ -651,9 +651,17 @@ void SDL_ShowFileDialogWithProperties(SDL_FileDialogType type, SDL_DialogFileCal
     if ((!driver || !*driver || strcmp(driver, "portal") == 0) && portal_show(type, callback, userdata, props)) {
         return;
     }
+#ifndef _WIN32
     if ((!driver || !*driver || strcmp(driver, "zenity") == 0) && zenity_show(type, callback, userdata, props)) {
         return;
     }
+#else
+    /* No portal and no zenity here: a native common-item dialog is not
+     * implemented yet, so report it rather than pretend. */
+    SDL_SetError("File dialogs are not implemented on this platform");
+    callback(userdata, NULL, -1);
+    return;
+#endif
     SDL_SetError("File dialog driver unsupported (supported values for SDL_HINT_FILE_DIALOG_DRIVER are 'zenity' and "
                  "'portal')");
     callback(userdata, NULL, -1);

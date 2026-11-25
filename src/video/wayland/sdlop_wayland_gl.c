@@ -184,9 +184,13 @@ static void *wayland_create_offload_context(SDLop_VideoDevice *device, SDL_Windo
 
 void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
 {
+    /* GLES has no 2.1: a 2.1 (or higher) request without an ES profile means
+     * desktop GL, like SDL2. Only bare 2.0 stays GLES. */
     bool want_desktop_gl =
         (sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_CORE) != 0 ||
-        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 && sdlop_glattrs.major_version >= 3);
+        ((sdlop_glattrs.profile_mask & SDL_GL_CONTEXT_PROFILE_ES) == 0 &&
+         (sdlop_glattrs.major_version > 2 ||
+          (sdlop_glattrs.major_version == 2 && sdlop_glattrs.minor_version > 0)));
     uint32_t api = want_desktop_gl ? EGL_OPENGL_API : EGL_OPENGL_ES_API;
 
     SDLOP_GLOffloadPolicy policy = SDLOP_GLOffload_GetPolicy();

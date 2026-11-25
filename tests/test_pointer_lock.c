@@ -55,6 +55,20 @@ static bool pump_until(event_pred pred, void *user, int timeout_ms)
     return false;
 }
 
+static bool pred_scroll(const SDL_Event *e, void *user)
+{
+    int *count = user;
+    if (e->type != SDL_EVENT_MOUSE_WHEEL) { return false; }
+    const float x[] = { 0, 0.5f, 0 };
+    const float y[] = { 1, 0, 0.5f };
+    CHECK(*count < 3, "unexpected extra wheel event");
+    if (*count < 3) {
+        CHECK(e->wheel.x == x[*count] && e->wheel.y == y[*count],
+              "wheel frame %d: (%f,%f)", *count, e->wheel.x, e->wheel.y);
+    }
+    return ++*count == 3;
+}
+
 static bool pred_mouse_enter(const SDL_Event *e, void *user)
 {
     (void)user;
@@ -108,6 +122,7 @@ int main(int argc, char *argv[])
     if (server == 0) {
         setenv("XDG_RUNTIME_DIR", xdg, 1);
         setenv("WAYLAND_DISPLAY", "wayland-mini", 1);
+        setenv("SDLOP_TEST_SCROLL", "1", 1);
         execl(argv[1], "mini_compositor", (char *)NULL);
         _exit(127);
     }
@@ -161,6 +176,9 @@ int main(int argc, char *argv[])
         SDL_GetMouseState(&mx, &my);
         CHECK(fabsf(mx - 100.0f) < 0.01f && fabsf(my - 100.0f) < 0.01f,
               "enter position (%f,%f) != (100,100)", mx, my);
+
+        int wheel_count = 0;
+        CHECK(pump_until(pred_scroll, &wheel_count, 3000), "missing scroll frames");
 
         /* step 2: arm the lock */
         CHECK(SDL_SetWindowRelativeMouseMode(w, true),

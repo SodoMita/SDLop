@@ -23,16 +23,105 @@
 
 #include <SDL3/SDL_filesystem.h>
 
+#ifndef _WIN32
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
-static pthread_mutex_t fs_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef _WIN32
+#include <shlobj.h> /* SHGetKnownFolderPath, SHCreateDirectoryExW */
+
+/* UTF-8 <-> UTF-16 for the Win32 wide-character file APIs */
+static wchar_t *fs_utf8_to_wide(const char *utf8)
+{
+    if (!utf8) {
+        return NULL;
+    }
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (n <= 0) {
+        return NULL;
+    }
+    wchar_t *wide = (wchar_t *)SDL_malloc((size_t)n * sizeof(wchar_t));
+    if (wide && MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, n) <= 0) {
+        SDL_free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static char *fs_wide_to_utf8(const wchar_t *wide)
+{
+    if (!wide) {
+        return NULL;
+    }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) {
+        return NULL;
+    }
+    char *utf8 = (char *)SDL_malloc((size_t)n);
+    if (utf8 && WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, n, NULL, NULL) <= 0) {
+        SDL_free(utf8);
+        return NULL;
+    }
+    return utf8;
+}
+
+/* stock SDL3 returns paths with '/' separators on every platform */
+static void fs_to_forward_slashes(char *path)
+{
+    for (; path && *path; path++) {
+        if (*path == '\\') {
+            *path = '/';
+        }
+    }
+}
+
+static Uint64 fs_filetime_to_ns(const FILETIME *ft)
+{
+    ULARGE_INTEGER u;
+    u.LowPart = ft->dwLowDateTime;
+    u.HighPart = ft->dwHighDateTime;
+    /* 100 ns ticks since 1601: SDL_Time counts from the Unix epoch */
+    const Uint64 ticks = (Uint64)u.QuadPart;
+    const Uint64 unix_ticks = ticks > 116444736000000000ULL ? ticks - 116444736000000000ULL : 0;
+    return unix_ticks * 100ULL;
+}
+
+/* an SDL directory path ("a/b/") as a Win32 glob ("a\b\*"): CREATE takes a
+ * directory, ENUMERATE takes everything inside it */
+static wchar_t *fs_utf8_dir_to_wide(const char *path)
+{
+    size_t len = strlen(path);
+    char *tmp = (char *)SDL_malloc(len + 3);
+    if (!tmp) {
+        return NULL;
+    }
+    memcpy(tmp, path, len + 1);
+    while (len > 0 && tmp[len - 1] == '/') {
+        tmp[--len] = '\0';
+    }
+    tmp[len] = '/';
+    tmp[len + 1] = '*';
+    tmp[len + 2] = '\0';
+    wchar_t *wide = fs_utf8_to_wide(tmp);
+    SDL_free(tmp);
+    if (wide) {
+        for (wchar_t *p = wide; *p; p++) {
+            if (*p == L'/') {
+                *p = L'\\';
+            }
+        }
+    }
+    return wide;
+}
+#endif
+
+static SDLOP_STATIC_MUTEX(fs_lock);
 static char *cached_base_path;
 static char *cached_user_folders[SDL_FOLDER_COUNT];
 
@@ -42,6 +131,34 @@ static char *cached_user_folders[SDL_FOLDER_COUNT];
 
 static char *read_exe_path(void)
 {
+#ifdef _WIN32
+    DWORD len = 256;
+    for (;;) {
+        wchar_t *wbuf = (wchar_t *)SDL_malloc((size_t)len * sizeof(wchar_t));
+        if (!wbuf) {
+            return NULL;
+        }
+        const DWORD n = GetModuleFileNameW(NULL, wbuf, len);
+        if (n == 0) {
+            SDL_free(wbuf);
+            SDL_SetError("Couldn't get the executable path: %lu", (unsigned long)GetLastError());
+            return NULL;
+        }
+        if (n < len - 1) {
+            char *utf8 = fs_wide_to_utf8(wbuf);
+            SDL_free(wbuf);
+            fs_to_forward_slashes(utf8);
+            return utf8;
+        }
+        /* truncated: the buffer is too small */
+        SDL_free(wbuf);
+        len *= 2;
+        if (len > 65536) {
+            SDL_SetError("Executable path too long");
+            return NULL;
+        }
+    }
+#else
     size_t len = 256;
     for (;;) {
         char *buf = (char *)SDL_malloc(len);
@@ -65,11 +182,12 @@ static char *read_exe_path(void)
             return NULL;
         }
     }
+#endif /* _WIN32 */
 }
 
 const char *SDL_GetBasePath(void)
 {
-    pthread_mutex_lock(&fs_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&fs_lock));
     if (!cached_base_path) {
         char *path = read_exe_path();
         if (path) {
@@ -84,7 +202,7 @@ const char *SDL_GetBasePath(void)
         }
     }
     const char *result = cached_base_path;
-    pthread_mutex_unlock(&fs_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&fs_lock));
     return result;
 }
 
@@ -98,6 +216,44 @@ char *SDL_GetPrefPath(const char *org, const char *app)
         org = "";
     }
 
+#ifdef _WIN32
+    /* SDL3 on Windows: %APPDATA%\org\app\ (FOLDERID_RoamingAppData) */
+    PWSTR roaming = NULL;
+    char *envr;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_CREATE, NULL, &roaming))) {
+        envr = fs_wide_to_utf8(roaming);
+        CoTaskMemFree(roaming);
+        if (!envr) {
+            SDL_OutOfMemory();
+            return NULL;
+        }
+    } else {
+        const char *appdata = SDL_getenv("APPDATA");
+        envr = appdata ? SDL_strdup(appdata) : NULL;
+        if (!envr) {
+            SDL_SetError("Couldn't find the Roaming AppData folder");
+            return NULL;
+        }
+    }
+    fs_to_forward_slashes(envr);
+    const size_t elen = strlen(envr);
+    const bool needs_slash = elen > 0 && envr[elen - 1] != '/';
+    const size_t len = elen + strlen(org) + strlen(app) + 8;
+    char *result = (char *)SDL_malloc(len);
+    if (result) {
+        if (*org) {
+            (void)SDL_snprintf(result, len, "%s%s%s/%s/", envr, needs_slash ? "/" : "", org, app);
+        } else {
+            (void)SDL_snprintf(result, len, "%s%s%s/", envr, needs_slash ? "/" : "", app);
+        }
+        if (!SDL_CreateDirectory(result)) {
+            SDL_free(result);
+            result = NULL;
+        }
+    }
+    SDL_free(envr);
+    return result;
+#else
     /* XDG base directory spec: $XDG_DATA_HOME/org/app/ or
      * $HOME/.local/share/org/app/ */
     const char *envr = SDL_getenv("XDG_DATA_HOME");
@@ -144,12 +300,14 @@ char *SDL_GetPrefPath(const char *org, const char *app)
         return NULL;
     }
     return result;
+#endif /* _WIN32 */
 }
 
 /* ------------------------------------------------------------------ */
 /* User folders (XDG user-dirs)                                        */
 /* ------------------------------------------------------------------ */
 
+#ifndef _WIN32
 static char *xdg_user_dir_from_config(const char *type)
 {
     const char *home = SDL_getenv("HOME");
@@ -237,7 +395,9 @@ static char *xdg_user_dir_from_config(const char *type)
     fclose(file);
     return user_dir;
 }
+#endif /* !_WIN32 */
 
+#ifndef _WIN32
 static char *xdg_user_dir_lookup(const char *type)
 {
     char *dir = xdg_user_dir_from_config(type);
@@ -256,12 +416,83 @@ static char *xdg_user_dir_lookup(const char *type)
     }
     return NULL;
 }
+#endif /* !_WIN32 */
 
 static char *lookup_user_folder(SDL_Folder folder)
 {
-    const char *param = NULL;
     char *result = NULL;
+#ifndef _WIN32
+    const char *param = NULL;
+#endif
 
+#ifdef _WIN32
+    /* Windows has no XDG: ask the Shell for the real folder. Before this the
+     * Win32 build fell through to the XDG code below, so every folder came
+     * from $HOME/.config/user-dirs.dirs (absent on Windows) and Saved
+     * Games / Screenshots reported "unavailable on XDG". */
+    {
+        static const struct {
+            SDL_Folder folder;
+            const GUID *id;
+        } known[] = {
+            { SDL_FOLDER_HOME,        &FOLDERID_Profile },
+            { SDL_FOLDER_DESKTOP,     &FOLDERID_Desktop },
+            { SDL_FOLDER_DOCUMENTS,   &FOLDERID_Documents },
+            { SDL_FOLDER_DOWNLOADS,   &FOLDERID_Downloads },
+            { SDL_FOLDER_MUSIC,       &FOLDERID_Music },
+            { SDL_FOLDER_PICTURES,    &FOLDERID_Pictures },
+            { SDL_FOLDER_PUBLICSHARE, &FOLDERID_Public },
+            { SDL_FOLDER_TEMPLATES,   &FOLDERID_Templates },
+            { SDL_FOLDER_VIDEOS,      &FOLDERID_Videos },
+            { SDL_FOLDER_SAVEDGAMES,  &FOLDERID_SavedGames },
+            { SDL_FOLDER_SCREENSHOTS, &FOLDERID_Screenshots },
+        };
+        for (size_t i = 0; i < SDL_arraysize(known); i++) {
+            if (known[i].folder != folder) {
+                continue;
+            }
+            PWSTR wide = NULL;
+            if (FAILED(SHGetKnownFolderPath(known[i].id, 0, NULL, &wide))) {
+                SDL_SetError("Couldn't find folder %d", (int)folder);
+                return NULL;
+            }
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+            if (bytes > 0) {
+                result = (char *)SDL_malloc((size_t)bytes + 1);
+                if (result) {
+                    if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, result, bytes, NULL, NULL) <= 0) {
+                        SDL_free(result);
+                        result = NULL;
+                    }
+                }
+            }
+            CoTaskMemFree(wide);
+            if (!result) {
+                return NULL;
+            }
+            /* SDL reports folders with a trailing separator */
+            for (char *p = result; *p; p++) {
+                if (*p == '\\') {
+                    *p = '/';
+                }
+            }
+            const size_t l = SDL_strlen(result);
+            if (l == 0 || result[l - 1] != '/') {
+                char *with_slash = (char *)SDL_realloc(result, l + 2);
+                if (!with_slash) {
+                    SDL_free(result);
+                    return NULL;
+                }
+                with_slash[l] = '/';
+                with_slash[l + 1] = '\0';
+                result = with_slash;
+            }
+            return result;
+        }
+        SDL_SetError("Invalid SDL_Folder: %d", (int)folder);
+        return NULL;
+    }
+#else
     switch (folder) {
     case SDL_FOLDER_HOME: {
         const char *home = SDL_getenv("HOME");
@@ -310,6 +541,7 @@ static char *lookup_user_folder(SDL_Folder folder)
     with_slash[l] = '/';
     with_slash[l + 1] = '\0';
     return with_slash;
+#endif /* !_WIN32 */
 }
 
 const char *SDL_GetUserFolder(SDL_Folder folder)
@@ -319,26 +551,26 @@ const char *SDL_GetUserFolder(SDL_Folder folder)
         SDL_InvalidParamError("folder");
         return NULL;
     }
-    pthread_mutex_lock(&fs_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&fs_lock));
     if (!cached_user_folders[idx]) {
         cached_user_folders[idx] = lookup_user_folder(folder);
     }
     const char *result = cached_user_folders[idx];
-    pthread_mutex_unlock(&fs_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&fs_lock));
     return result;
 }
 
 /* Called from SDL_Quit (stock frees its caches in SDL_QuitFilesystem). */
 void SDLOP_QuitFilesystem(void)
 {
-    pthread_mutex_lock(&fs_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&fs_lock));
     SDL_free(cached_base_path);
     cached_base_path = NULL;
     for (int i = 0; i < SDL_FOLDER_COUNT; i++) {
         SDL_free(cached_user_folders[i]);
         cached_user_folders[i] = NULL;
     }
-    pthread_mutex_unlock(&fs_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&fs_lock));
 }
 
 /* ------------------------------------------------------------------ */
@@ -350,6 +582,38 @@ bool SDL_CreateDirectory(const char *path)
     if (!path) {
         return SDL_InvalidParamError("path");
     }
+#ifdef _WIN32
+    /* SHCreateDirectoryExW creates every missing parent and, unlike
+     * CreateDirectoryW, succeeds when the directory already exists. It is a
+     * Shell API, though: it wants backslashes and a full path. SDL paths are
+     * forward-slashed and may be relative ("a/b"), which used to fail with
+     * ERROR_BAD_PATHNAME -- including every SDL_GetPrefPath() caller. */
+    wchar_t *wide = fs_utf8_to_wide(path);
+    if (!wide) {
+        return SDL_OutOfMemory();
+    }
+    for (wchar_t *w = wide; *w; w++) {
+        if (*w == L'/') {
+            *w = L'\\';
+        }
+    }
+    wchar_t full[32768]; /* Win32 long-path maximum */
+    DWORD full_len = GetFullPathNameW(wide, (DWORD)SDL_arraysize(full), full, NULL);
+    if (full_len > 0 && full_len < (DWORD)SDL_arraysize(full)) {
+        SDL_free(wide);
+        wide = (wchar_t *)SDL_malloc(((size_t)full_len + 1) * sizeof(wchar_t));
+        if (!wide) {
+            return SDL_OutOfMemory();
+        }
+        SDL_memcpy(wide, full, ((size_t)full_len + 1) * sizeof(wchar_t));
+    }
+    const int rc = SHCreateDirectoryExW(NULL, wide, NULL);
+    SDL_free(wide);
+    if (rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS || rc == ERROR_FILE_EXISTS) {
+        return true;
+    }
+    return SDL_SetError("Can't create directory: error %d", rc);
+#else
     /* stock SDL3 creates missing parents too */
     char *copy = SDL_strdup(path);
     if (!copy) {
@@ -376,6 +640,7 @@ bool SDL_CreateDirectory(const char *path)
         return SDL_SetError("Can't create directory: %s", strerror(err));
     }
     return true;
+#endif /* _WIN32 */
 }
 
 bool SDL_EnumerateDirectory(const char *path, SDL_EnumerateDirectoryCallback callback, void *userdata)
@@ -388,6 +653,55 @@ bool SDL_EnumerateDirectory(const char *path, SDL_EnumerateDirectoryCallback cal
     }
     /* the callback's dirname always ends with exactly one '/' */
     size_t len = strlen(path);
+#ifdef _WIN32
+    {
+        char *dirname = (char *)SDL_malloc(len + 2);
+        if (!dirname) {
+            return false;
+        }
+        memcpy(dirname, path, len + 1);
+        while (len > 0 && dirname[len - 1] == '/') {
+            dirname[--len] = '\0';
+        }
+        if (*path) {
+            dirname[len] = '/';
+            dirname[len + 1] = '\0';
+        }
+        wchar_t *glob = fs_utf8_dir_to_wide(path);
+        if (!glob) {
+            SDL_free(dirname);
+            return SDL_OutOfMemory();
+        }
+        WIN32_FIND_DATAW data;
+        HANDLE h = FindFirstFileW(glob, &data);
+        SDL_free(glob);
+        if (h == INVALID_HANDLE_VALUE) {
+            const DWORD err = GetLastError();
+            SDL_free(dirname);
+            if (err == ERROR_FILE_NOT_FOUND) {
+                return true; /* an empty directory: nothing to enumerate */
+            }
+            return SDL_SetError("Can't open directory: error %lu", (unsigned long)err);
+        }
+        SDL_EnumerationResult result = SDL_ENUM_CONTINUE;
+        do {
+            if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
+                continue;
+            }
+            char *name = fs_wide_to_utf8(data.cFileName);
+            if (!name) {
+                result = SDL_ENUM_FAILURE;
+                break;
+            }
+            result = callback(userdata, dirname, name);
+            SDL_free(name);
+        } while (result == SDL_ENUM_CONTINUE && FindNextFileW(h, &data));
+        FindClose(h);
+        SDL_free(dirname);
+        return result != SDL_ENUM_FAILURE;
+    }
+#endif
+#ifndef _WIN32
     char *dirname = (char *)SDL_malloc(len + 2);
     if (!dirname) {
         return false;
@@ -418,6 +732,7 @@ bool SDL_EnumerateDirectory(const char *path, SDL_EnumerateDirectoryCallback cal
     closedir(dir);
     SDL_free(dirname);
     return result != SDL_ENUM_FAILURE;
+#endif /* _WIN32 */
 }
 
 bool SDL_RemovePath(const char *path)
@@ -425,6 +740,42 @@ bool SDL_RemovePath(const char *path)
     if (!path) {
         return SDL_InvalidParamError("path");
     }
+#ifdef _WIN32
+    wchar_t *wide = fs_utf8_to_wide(path);
+    if (!wide) {
+        return SDL_OutOfMemory();
+    }
+    /* Decide by attribute, not by trial and error: RemoveDirectoryW on a
+     * regular file fails with ERROR_DIRECTORY (267), *not* ERROR_ACCESS_DENIED,
+     * so the old fallback never ran and SDL_RemovePath could not delete a
+     * file at all. Ask what the path is first, as stock SDL3's sysfsops does. */
+    DWORD attrs = GetFileAttributesW(wide);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        const DWORD aerr = GetLastError();
+        SDL_free(wide);
+        /* Only "already gone" counts as success; a missing parent directory is
+         * a genuine failure (the path never existed) and must not be masked. */
+        if (aerr == ERROR_FILE_NOT_FOUND) {
+            return true;
+        }
+        return SDL_SetError("Couldn't delete %s: error %lu", path, (unsigned long)aerr);
+    }
+    BOOL ok = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? RemoveDirectoryW(wide) : DeleteFileW(wide);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    SDL_free(wide);
+    if (!ok && err == ERROR_FILE_NOT_FOUND) {
+        return true; /* raced with someone else deleting it */
+    }
+    if (!ok) {
+        /* a non-empty directory surfaces as ERROR_DIR_NOT_EMPTY; deleting it
+         * recursively is what stock SDL3 does */
+        if (err == ERROR_DIR_NOT_EMPTY) {
+            return SDL_SetError("Can't remove path: directory not empty");
+        }
+        return SDL_SetError("Can't remove path: error %lu", (unsigned long)err);
+    }
+    return true;
+#else
     if (remove(path) < 0) {
         if (errno == ENOENT) {
             return true; /* already gone: success, as stock */
@@ -432,6 +783,7 @@ bool SDL_RemovePath(const char *path)
         return SDL_SetError("Can't remove path: %s", strerror(errno));
     }
     return true;
+#endif /* _WIN32 */
 }
 
 bool SDL_RenamePath(const char *oldpath, const char *newpath)
@@ -442,10 +794,28 @@ bool SDL_RenamePath(const char *oldpath, const char *newpath)
     if (!newpath) {
         return SDL_InvalidParamError("newpath");
     }
+#ifdef _WIN32
+    wchar_t *wold = fs_utf8_to_wide(oldpath);
+    wchar_t *wnew = fs_utf8_to_wide(newpath);
+    if (!wold || !wnew) {
+        SDL_free(wold);
+        SDL_free(wnew);
+        return SDL_OutOfMemory();
+    }
+    const BOOL ok = MoveFileExW(wold, wnew, MOVEFILE_REPLACE_EXISTING);
+    const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    SDL_free(wold);
+    SDL_free(wnew);
+    if (!ok) {
+        return SDL_SetError("Can't rename path: error %lu", (unsigned long)err);
+    }
+    return true;
+#else
     if (rename(oldpath, newpath) < 0) {
         return SDL_SetError("Can't rename path: %s", strerror(errno));
     }
     return true;
+#endif /* _WIN32 */
 }
 
 bool SDL_CopyFile(const char *oldpath, const char *newpath)
@@ -456,7 +826,24 @@ bool SDL_CopyFile(const char *oldpath, const char *newpath)
     if (!newpath) {
         return SDL_InvalidParamError("newpath");
     }
-    int in = open(oldpath, O_RDONLY | O_CLOEXEC);
+#ifdef _WIN32
+    wchar_t *wold = fs_utf8_to_wide(oldpath);
+    wchar_t *wnew = fs_utf8_to_wide(newpath);
+    if (!wold || !wnew) {
+        SDL_free(wold);
+        SDL_free(wnew);
+        return SDL_OutOfMemory();
+    }
+    const BOOL ok = CopyFileW(wold, wnew, FALSE /* overwrite, as stock SDL3 */);
+    const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    SDL_free(wold);
+    SDL_free(wnew);
+    if (!ok) {
+        return SDL_SetError("Can't copy file: error %lu", (unsigned long)err);
+    }
+    return true;
+#else
+int in = open(oldpath, O_RDONLY | O_CLOEXEC);
     if (in < 0) {
         return SDL_SetError("Couldn't open %s: %s", oldpath, strerror(errno));
     }
@@ -500,6 +887,7 @@ bool SDL_CopyFile(const char *oldpath, const char *newpath)
         ok = SDL_SetError("Error writing to datastream: %s", strerror(errno));
     }
     return ok;
+#endif /* _WIN32 */
 }
 
 bool SDL_GetPathInfo(const char *path, SDL_PathInfo *info)
@@ -512,6 +900,33 @@ bool SDL_GetPathInfo(const char *path, SDL_PathInfo *info)
     if (!path) {
         return SDL_InvalidParamError("path");
     }
+#ifdef _WIN32
+    wchar_t *wide = fs_utf8_to_wide(path);
+    if (!wide) {
+        return SDL_OutOfMemory();
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExW(wide, GetFileExInfoStandard, &data)) {
+        const DWORD err = GetLastError();
+        SDL_free(wide);
+        return SDL_SetError("Can't stat: error %lu", (unsigned long)err);
+    }
+    SDL_free(wide);
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        info->type = SDL_PATHTYPE_DIRECTORY;
+        info->size = 0;
+    } else if (data.dwFileAttributes & (FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_REPARSE_POINT)) {
+        info->type = SDL_PATHTYPE_OTHER;
+        info->size = ((Uint64)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+    } else {
+        info->type = SDL_PATHTYPE_FILE;
+        info->size = ((Uint64)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+    }
+    info->create_time = fs_filetime_to_ns(&data.ftCreationTime);
+    info->modify_time = fs_filetime_to_ns(&data.ftLastWriteTime);
+    info->access_time = fs_filetime_to_ns(&data.ftLastAccessTime);
+    return true;
+#else
     struct stat st;
     if (stat(path, &st) < 0) {
         return SDL_SetError("Can't stat: %s", strerror(errno));
@@ -530,10 +945,53 @@ bool SDL_GetPathInfo(const char *path, SDL_PathInfo *info)
     info->modify_time = (SDL_Time)SDL_SECONDS_TO_NS(st.st_mtim.tv_sec) + st.st_mtim.tv_nsec;
     info->access_time = (SDL_Time)SDL_SECONDS_TO_NS(st.st_atim.tv_sec) + st.st_atim.tv_nsec;
     return true;
+#endif /* _WIN32 */
 }
 
 char *SDL_GetCurrentDirectory(void)
 {
+#ifdef _WIN32
+    DWORD len = 64;
+    char *buf = NULL;
+    for (;;) {
+        wchar_t *wbuf = (wchar_t *)SDL_malloc((size_t)len * sizeof(wchar_t));
+        if (!wbuf) {
+            SDL_free(buf);
+            return NULL;
+        }
+        const DWORD n = GetCurrentDirectoryW(len, wbuf);
+        if (n > 0 && n < len - 1) {
+            char *utf8 = fs_wide_to_utf8(wbuf);
+            SDL_free(wbuf);
+            SDL_free(buf);
+            if (!utf8) {
+                return NULL;
+            }
+            fs_to_forward_slashes(utf8);
+            /* stock SDL3 returns the directory with a trailing '/' */
+            const size_t l = strlen(utf8);
+            if (l == 0 || utf8[l - 1] != '/') {
+                char *grown = (char *)SDL_realloc(utf8, l + 2);
+                if (!grown) {
+                    SDL_free(utf8);
+                    return NULL;
+                }
+                utf8 = grown;
+                utf8[l] = '/';
+                utf8[l + 1] = '\0';
+            }
+            return utf8;
+        }
+        SDL_free(wbuf);
+        SDL_free(buf);
+        buf = NULL;
+        if (n == 0) {
+            SDL_SetError("getcwd failed: error %lu", (unsigned long)GetLastError());
+            return NULL;
+        }
+        len = n + 1; /* GetCurrentDirectoryW reported the size it needs */
+    }
+#else
     size_t len = 64;
     char *buf = NULL;
     for (;;) {
@@ -560,4 +1018,5 @@ char *SDL_GetCurrentDirectory(void)
         buf[l + 1] = '\0';
     }
     return buf;
+#endif /* _WIN32 */
 }

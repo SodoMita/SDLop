@@ -38,6 +38,15 @@
 
 #include "internal/sdlop_internal.h"
 
+#ifdef _WIN32
+/* no session bus on Windows (sdlop_dbus_stub_win32.c): Windows has IMM */
+void SDLOP_IME_DBus_Update(void) {}
+void SDLOP_IME_DBus_UpdateArea(SDL_Window *window) { (void)window; }
+void SDLOP_IME_DBus_Reset(void) {}
+void SDLOP_IME_DBus_WindowDestroyed(SDL_Window *window) { (void)window; }
+void SDLOP_IME_DBus_Quit(void) {}
+#else
+
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
@@ -745,3 +754,5 @@ void SDLOP_IME_DBus_Quit(void)
     SDL_free(ime.preedit);
     SDL_zero(ime);
 }
+
+#endif /* !_WIN32 */

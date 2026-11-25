@@ -16,10 +16,17 @@ typedef struct UInputDevice UInputDevice;
 
 /* Returns NULL when /dev/uinput is unavailable (test should skip). */
 UInputDevice *uinput_synth_create(const char *name);
+/* Joystick with the given absolute axes and joystick-range buttons. */
+UInputDevice *uinput_synth_create_joystick(const char *name,
+                                           const uint16_t *axes, int num_axes,
+                                           const uint16_t *buttons, int num_buttons);
 void uinput_synth_destroy(UInputDevice *dev);
 
-void uinput_synth_key(UInputDevice *dev, uint16_t code, int32_t value);
-void uinput_synth_rel(UInputDevice *dev, uint16_t code, int32_t value);
-void uinput_synth_syn(UInputDevice *dev);
+/* True only when the complete native record was written. EINTR retries;
+ * backpressure waits are bounded. On failure false is returned with errno. */
+bool uinput_synth_key(UInputDevice *dev, uint16_t code, int32_t value);
+bool uinput_synth_abs(UInputDevice *dev, uint16_t code, int32_t value);
+bool uinput_synth_rel(UInputDevice *dev, uint16_t code, int32_t value);
+bool uinput_synth_syn(UInputDevice *dev);
 
 #endif /* uinput_synth_h_ */

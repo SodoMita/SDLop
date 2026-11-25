@@ -13,6 +13,9 @@ static SDLop_Display *display_by_id(SDL_DisplayID displayID);
 static void finalize_display_mode(SDL_DisplayMode *mode);
 
 static SDLop_VideoDevice *const video_drivers[] = {
+#if SDLop_VIDEO_WINDOWS
+    &SDLop_windows_device,
+#endif
 #if SDLop_VIDEO_EMSCRIPTEN
     &SDLop_emscripten_device,
 #endif
@@ -158,6 +161,7 @@ void SDLOP_RemoveWindow(SDL_Window *window)
     SDLOP_IME_DBus_WindowDestroyed(window); /* its input context focus goes */
     if (sdlop.mouse_focus == window) {
         sdlop.mouse_focus = NULL;
+        SDLOP_RawInputResetPointerFrame();
         sdlop.mouse_has_position = false;
     }
     if (sdlop.relative_mode_window == window) {
@@ -368,6 +372,19 @@ SDL_DisplayID SDLOP_AddDisplay(const char *name, int w, int h, int refresh_mhz,
         SDLOP_SendDisplayEvent(d->id, SDL_EVENT_DISPLAY_ADDED, 0, 0);
     }
     return d->id;
+}
+
+void SDLOP_SetDisplayPixelDensity(SDL_DisplayID displayID, float pixel_density)
+{
+    const int i = SDLOP_GetDisplayIndexById(displayID);
+    if (i < 0 || pixel_density <= 0.0f) {
+        return;
+    }
+    SDLop_Display *d = &sdlop.displays[i];
+    d->desktop_mode.pixel_density = pixel_density;
+    for (int m = 0; m < d->num_fullscreen_modes; m++) {
+        d->fullscreen_modes[m].pixel_density = pixel_density;
+    }
 }
 
 void SDLOP_DelDisplay(SDL_DisplayID displayID, bool send_event)

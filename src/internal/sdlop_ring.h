@@ -31,8 +31,10 @@
 typedef struct SDLOP_Ring
 {
     _Alignas(SDLOP_CACHELINE) atomic_uint_least64_t head; /* producer writes */
-    _Alignas(SDLOP_CACHELINE) atomic_uint_least64_t tail; /* consumer reads */
+    _Alignas(SDLOP_CACHELINE) atomic_uint_least64_t tail; /* consumer writes */
+    uint64_t cached_head; /* consumer-only acquired publication limit */
     _Alignas(SDLOP_CACHELINE) uint64_t dropped;           /* producer-side stats */
+    uint64_t cached_tail; /* producer-only acquired reclamation limit */
     uint32_t mask;
     uint32_t elem_size;
     unsigned char *data; /* capacity elements, capacity = mask + 1 */
@@ -44,6 +46,7 @@ static inline void SDLOP_RingInit(SDLOP_Ring *ring, void *storage, uint32_t capa
     atomic_store(&ring->head, 0);
     atomic_store(&ring->tail, 0);
     ring->dropped = 0;
+    ring->cached_head = ring->cached_tail = 0;
     ring->mask = capacity - 1;
     ring->elem_size = elem_size;
     ring->data = (unsigned char *)storage;
@@ -52,10 +55,14 @@ static inline void SDLOP_RingInit(SDLOP_Ring *ring, void *storage, uint32_t capa
 static inline bool SDLOP_RingPush(SDLOP_Ring *ring, const void *elem)
 {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
-    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
-    if (head - tail > ring->mask) { /* full */
-        ring->dropped++;
-        return false;
+    /* A stale tail only underestimates free space. Refresh before rejecting
+     * a write, never overwrite a slot the consumer has not released. */
+    if (head - ring->cached_tail > ring->mask) {
+        ring->cached_tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
+        if (head - ring->cached_tail > ring->mask) {
+            ring->dropped++;
+            return false;
+        }
     }
     memcpy(ring->data + (uint32_t)(head & ring->mask) * ring->elem_size, elem, ring->elem_size);
     atomic_store_explicit(&ring->head, head + 1, memory_order_release);
@@ -65,13 +72,48 @@ static inline bool SDLOP_RingPush(SDLOP_Ring *ring, const void *elem)
 static inline bool SDLOP_RingPop(SDLOP_Ring *ring, void *elem)
 {
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
-    if (tail == head) {
-        return false;
+    /* A cached head only hides newer records. Refresh at its boundary before
+     * reporting empty. The acquire protects all entries up to this head. */
+    if (tail == ring->cached_head) {
+        ring->cached_head = atomic_load_explicit(&ring->head, memory_order_acquire);
+        if (tail == ring->cached_head) {
+            return false;
+        }
     }
     memcpy(elem, ring->data + (uint32_t)(tail & ring->mask) * ring->elem_size, ring->elem_size);
     atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
     return true;
+}
+
+/* Consumer-only bulk pop: one acquire/release pair for the entire batch.
+ * The producer cannot reuse any copied slot until tail is published below.
+ * A snapshot of head bounds the read; newly arriving events wait for the
+ * next call. No allocation and no modification of published entries. */
+static inline uint32_t SDLOP_RingPopBatch(SDLOP_Ring *ring, void *elems, uint32_t max_elems)
+{
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+    /* Single and bulk pops may be mixed by the one consumer. Keep its cache
+     * at least as new as the batch, including zero-length calls. */
+    ring->cached_head = head;
+    uint64_t available = head - tail;
+    uint32_t count = available < max_elems ? (uint32_t)available : max_elems;
+    if (!count) {
+        return 0;
+    }
+    uint32_t index = (uint32_t)tail & ring->mask;
+    uint32_t first = ring->mask + 1 - index;
+    if (first > count) {
+        first = count;
+    }
+    size_t first_bytes = (size_t)first * ring->elem_size;
+    memcpy(elems, ring->data + (size_t)index * ring->elem_size, first_bytes);
+    if (first < count) {
+        memcpy((unsigned char *)elems + first_bytes, ring->data,
+               (size_t)(count - first) * ring->elem_size);
+    }
+    atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
+    return count;
 }
 
 static inline bool SDLOP_RingEmpty(SDLOP_Ring *ring)

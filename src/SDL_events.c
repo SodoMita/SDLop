@@ -24,8 +24,11 @@
 */
 
 #include "internal/sdlop_internal.h"
+#include "internal/sdlop_joystick_internal.h"
+#ifndef _WIN32
 #include <poll.h>
 #include <unistd.h>
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Temporary memory (SDL3): pointers carried by events (clipboard mime  */
@@ -126,7 +129,10 @@ static void give_memory_to_thread(TempMem *list)
 /* Queue storage                                                       */
 /* ------------------------------------------------------------------ */
 
-#define SDLOP_EVENT_QUEUE_SIZE 512 /* power of two */
+/* Enough room for high-rate input accumulated between application frames.
+ * Still bounded; input state translation continues when full, while input
+ * notifications that cannot fit are dropped. */
+#define SDLOP_EVENT_QUEUE_SIZE 8192 /* power of two */
 #define SDLOP_TEXT_SIZE 64
 
 typedef struct SDLOP_EventSlot
@@ -143,6 +149,11 @@ static Uint32 queue_tail; /* next read index */
 static inline Uint32 queue_count(void)
 {
     return queue_head - queue_tail;
+}
+
+Uint32 SDLOP_EventQueueFree(void)
+{
+    return SDLOP_EVENT_QUEUE_SIZE - queue_count();
 }
 
 static inline SDLOP_EventSlot *slot_at(Uint32 i)
@@ -218,7 +229,7 @@ typedef struct SideEvent
     TempMem *memory;
 } SideEvent;
 
-static pthread_mutex_t side_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDLOP_STATIC_MUTEX(side_lock);
 static SideEvent *side_queue;
 static int side_count, side_capacity;
 static _Atomic int side_pending;
@@ -229,20 +240,25 @@ static void wake_main_thread(void)
         uint64_t one = 1;
         (void)!write(sdlop.wake_fd, &one, sizeof(one));
     }
+#ifdef _WIN32
+    if (sdlop.wake_handle) {
+        SetEvent((HANDLE)sdlop.wake_handle);
+    }
+#endif
 }
 
 static bool side_push(const SDL_Event *event)
 {
-    pthread_mutex_lock(&side_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&side_lock));
     if (side_count >= SDLOP_SIDE_QUEUE_MAX) {
-        pthread_mutex_unlock(&side_lock);
+        SDLOP_MUTEX_UNLOCK(SDLOP_SM(&side_lock));
         return SDL_SetError("Event queue is full");
     }
     if (side_count == side_capacity) {
         int cap = side_capacity ? side_capacity * 2 : 64;
         SideEvent *q = (SideEvent *)realloc(side_queue, sizeof(SideEvent) * (size_t)cap);
         if (!q) {
-            pthread_mutex_unlock(&side_lock);
+            SDLOP_MUTEX_UNLOCK(SDLOP_SM(&side_lock));
             return SDL_OutOfMemory();
         }
         side_queue = q;
@@ -256,7 +272,7 @@ static bool side_push(const SDL_Event *event)
         se->event.text.text = se->text;
     }
     side_pending = side_count;
-    pthread_mutex_unlock(&side_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&side_lock));
     wake_main_thread();
     return true;
 }
@@ -267,7 +283,7 @@ static void merge_side_queue(void)
     if (!side_pending) {
         return;
     }
-    pthread_mutex_lock(&side_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&side_lock));
     int i = 0;
     for (; i < side_count; i++) {
         if (queue_count() >= SDLOP_EVENT_QUEUE_SIZE) {
@@ -285,7 +301,7 @@ static void merge_side_queue(void)
         }
     }
     side_pending = side_count;
-    pthread_mutex_unlock(&side_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&side_lock));
 }
 
 /* ------------------------------------------------------------------ */
@@ -299,8 +315,8 @@ typedef struct EventWatcher
     bool removed;
 } EventWatcher;
 
-static pthread_mutex_t watch_lock;
-static pthread_once_t watch_once = PTHREAD_ONCE_INIT;
+static SDLOP_MUTEX_T watch_lock;
+static SDLOP_ONCE_T watch_once = SDLOP_ONCE_INIT;
 static EventWatcher event_filter;
 static EventWatcher *watchers;
 static int num_watchers;
@@ -309,17 +325,13 @@ static bool watchers_dirty;
 
 static void init_watch_lock(void)
 {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&watch_lock, &attr);
-    pthread_mutexattr_destroy(&attr);
+    SDLOP_MUTEX_INIT_RECURSIVE(&watch_lock);
 }
 
 static void watch_lock_acquire(void)
 {
-    pthread_once(&watch_once, init_watch_lock);
-    pthread_mutex_lock(&watch_lock);
+    SDLOP_ONCE(&watch_once, init_watch_lock);
+    SDLOP_MUTEX_LOCK(&watch_lock);
 }
 
 static void compact_watchers(void)
@@ -355,7 +367,7 @@ static bool dispatch_watchers(SDL_Event *event)
             compact_watchers();
         }
     }
-    pthread_mutex_unlock(&watch_lock);
+    SDLOP_MUTEX_UNLOCK(&watch_lock);
     return keep;
 }
 
@@ -364,7 +376,7 @@ void SDL_SetEventFilter(SDL_EventFilter filter, void *userdata)
     watch_lock_acquire();
     event_filter.callback = filter;
     event_filter.userdata = userdata;
-    pthread_mutex_unlock(&watch_lock);
+    SDLOP_MUTEX_UNLOCK(&watch_lock);
     if (filter) {
         /* SDL3: cut currently queued events the new filter rejects */
         SDL_FilterEvents(filter, userdata);
@@ -376,7 +388,7 @@ bool SDL_GetEventFilter(SDL_EventFilter *filter, void **userdata)
     watch_lock_acquire();
     SDL_EventFilter f = event_filter.callback;
     void *u = event_filter.userdata;
-    pthread_mutex_unlock(&watch_lock);
+    SDLOP_MUTEX_UNLOCK(&watch_lock);
     if (filter) {
         *filter = f;
     }
@@ -394,7 +406,7 @@ bool SDL_AddEventWatch(SDL_EventFilter filter, void *userdata)
     watch_lock_acquire();
     EventWatcher *w = (EventWatcher *)SDL_realloc(watchers, sizeof(EventWatcher) * (size_t)(num_watchers + 1));
     if (!w) {
-        pthread_mutex_unlock(&watch_lock);
+        SDLOP_MUTEX_UNLOCK(&watch_lock);
         return false;
     }
     watchers = w;
@@ -402,7 +414,7 @@ bool SDL_AddEventWatch(SDL_EventFilter filter, void *userdata)
     watchers[num_watchers].userdata = userdata;
     watchers[num_watchers].removed = false;
     num_watchers++;
-    pthread_mutex_unlock(&watch_lock);
+    SDLOP_MUTEX_UNLOCK(&watch_lock);
     return true;
 }
 
@@ -419,7 +431,7 @@ void SDL_RemoveEventWatch(SDL_EventFilter filter, void *userdata)
     if (dispatch_depth == 0 && watchers_dirty) {
         compact_watchers();
     }
-    pthread_mutex_unlock(&watch_lock);
+    SDLOP_MUTEX_UNLOCK(&watch_lock);
 }
 
 void SDL_FilterEvents(SDL_EventFilter filter, void *userdata)
@@ -499,13 +511,19 @@ void SDL_SetEventEnabled(Uint32 type, bool enabled)
 /* Push paths                                                          */
 /* ------------------------------------------------------------------ */
 
-static bool push_any_thread(SDL_Event *event)
+static bool push_any_thread(SDL_Event *event, Uint32 reserve_slots, bool drop_input)
 {
     if (!dispatch_watchers(event)) {
         SDL_ClearError();
         return false;
     }
     if (SDLOP_IsMainThread()) {
+        /* Input state has already been updated by its caller. Preserve
+         * watchers/filters, but never turn queue pressure into a state freeze
+         * or a queue-full error for input notifications. */
+        if (drop_input || (reserve_slots && SDLOP_EventQueueFree() < reserve_slots)) {
+            return false;
+        }
         return queue_add(event);
     }
     return side_push(event);
@@ -517,7 +535,17 @@ bool SDLOP_PushEventInternal(SDL_Event *event)
     if (!SDL_EventEnabled(event->type)) {
         return false;
     }
-    return push_any_thread(event);
+    return push_any_thread(event, 0, false);
+}
+
+/* Input state is updated before this call. A compound key translation may
+ * suppress its whole notification sequence when there is insufficient room. */
+bool SDLOP_PushInputEvent(SDL_Event *event)
+{
+    if (!SDL_EventEnabled(event->type)) {
+        return false;
+    }
+    return push_any_thread(event, 1, sdlop.suppress_input_events);
 }
 
 bool SDL_PushEvent(SDL_Event *event)
@@ -528,7 +556,7 @@ bool SDL_PushEvent(SDL_Event *event)
     if (!event->common.timestamp) {
         event->common.timestamp = SDL_GetTicksNS();
     }
-    return push_any_thread(event);
+    return push_any_thread(event, 0, false);
 }
 
 /* stock SDL_ShouldMinimizeOnFocusLoss: "auto" minimizes a window that
@@ -659,11 +687,11 @@ typedef struct MainCallback
     void *userdata;
     bool wait;
     int state; /* 0 pending, 1 done, 2 canceled */
-    pthread_cond_t done;
+    SDLOP_COND_T done;
     struct MainCallback *next;
 } MainCallback;
 
-static pthread_mutex_t main_cb_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDLOP_STATIC_MUTEX(main_cb_lock);
 static MainCallback *main_cb_head, *main_cb_tail;
 static _Atomic int main_cb_pending;
 
@@ -684,9 +712,9 @@ bool SDL_RunOnMainThread(SDL_MainThreadCallback callback, void *userdata, bool w
     cb->userdata = userdata;
     cb->wait = wait_complete;
     if (wait_complete) {
-        pthread_cond_init(&cb->done, NULL);
+        SDLOP_COND_INIT(&cb->done);
     }
-    pthread_mutex_lock(&main_cb_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&main_cb_lock));
     if (main_cb_tail) {
         main_cb_tail->next = cb;
     } else {
@@ -694,19 +722,19 @@ bool SDL_RunOnMainThread(SDL_MainThreadCallback callback, void *userdata, bool w
     }
     main_cb_tail = cb;
     main_cb_pending = 1;
-    pthread_mutex_unlock(&main_cb_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&main_cb_lock));
     wake_main_thread();
 
     if (!wait_complete) {
         return true;
     }
-    pthread_mutex_lock(&main_cb_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&main_cb_lock));
     while (cb->state == 0) {
-        pthread_cond_wait(&cb->done, &main_cb_lock);
+        SDLOP_COND_WAIT(&cb->done, SDLOP_SM(&main_cb_lock));
     }
     int state = cb->state;
-    pthread_mutex_unlock(&main_cb_lock);
-    pthread_cond_destroy(&cb->done);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&main_cb_lock));
+    SDLOP_COND_DESTROY(&cb->done);
     SDL_free(cb);
     return state == 1 ? true : SDL_SetError("Callback canceled");
 }
@@ -716,11 +744,11 @@ static void run_main_callbacks(bool cancel)
     if (!main_cb_pending) {
         return;
     }
-    pthread_mutex_lock(&main_cb_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&main_cb_lock));
     MainCallback *list = main_cb_head;
     main_cb_head = main_cb_tail = NULL;
     main_cb_pending = 0;
-    pthread_mutex_unlock(&main_cb_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&main_cb_lock));
 
     while (list) {
         MainCallback *cb = list;
@@ -729,10 +757,10 @@ static void run_main_callbacks(bool cancel)
             cb->callback(cb->userdata);
         }
         if (cb->wait) {
-            pthread_mutex_lock(&main_cb_lock);
+            SDLOP_MUTEX_LOCK(SDLOP_SM(&main_cb_lock));
             cb->state = cancel ? 2 : 1;
-            pthread_cond_broadcast(&cb->done);
-            pthread_mutex_unlock(&main_cb_lock); /* waiter frees it */
+            SDLOP_COND_BROADCAST(&cb->done);
+            SDLOP_MUTEX_UNLOCK(SDLOP_SM(&main_cb_lock)); /* waiter frees it */
         } else {
             SDL_free(cb);
         }
@@ -747,7 +775,7 @@ void SDLOP_QuitEvents(void)
         release_slot(slot_at(i));
     }
     queue_head = queue_tail = 0;
-    pthread_mutex_lock(&side_lock);
+    SDLOP_MUTEX_LOCK(SDLOP_SM(&side_lock));
     for (int i = 0; i < side_count; i++) {
         free_temp_list(side_queue[i].memory);
     }
@@ -755,7 +783,7 @@ void SDLOP_QuitEvents(void)
     side_queue = NULL;
     side_count = side_capacity = 0;
     side_pending = 0;
-    pthread_mutex_unlock(&side_lock);
+    SDLOP_MUTEX_UNLOCK(SDLOP_SM(&side_lock));
     watch_lock_acquire();
     free(watchers);
     watchers = NULL;
@@ -763,7 +791,7 @@ void SDLOP_QuitEvents(void)
     watchers_dirty = false;
     event_filter.callback = NULL;
     event_filter.userdata = NULL;
-    pthread_mutex_unlock(&watch_lock);
+    SDLOP_MUTEX_UNLOCK(&watch_lock);
     for (int i = 0; i < 256; i++) {
         free(disabled_events[i]);
         disabled_events[i] = NULL;
@@ -780,21 +808,35 @@ void SDL_PumpEvents(void)
     if (!SDLOP_IsMainThread()) {
         return; /* SDL3: only the main thread pumps */
     }
+    /* Event watches can call public event APIs. Nested backend/raw pumping
+     * would reorder the outer event and can invalidate an in-progress input
+     * recovery snapshot. Only the outermost pump advances producers. */
+    static bool pumping;
+    if (pumping) {
+        return;
+    }
+    pumping = true;
     SDLOP_FreeTemporaryMemory(); /* memory of previously polled events */
     run_main_callbacks(false);
 
-    /* 1. drain raw input ring -> SDL events */
+    /* 1. drain raw input ring -> SDL events. The ring is fed by the evdev
+     * worker on Linux and by the Raw Input worker on Windows (both opt-in
+     * there); with neither running this is a no-op. */
     SDLOP_RawInputPump();
     SDLOP_DBus_Pump(); /* session bus signals (theme changes, portal replies) */
 
-    /* 2. drain window system (non-blocking) */
+    /* 2. poll evdev joysticks/gamepads for state changes and hotplug */
+    SDLOP_JoystickPump();
+
+    /* 3. drain window system (non-blocking) */
     if (sdlop.video) {
         sdlop.video->PumpEvents(sdlop.video, -1);
         SDLOP_UpdateCursorAnimation();
     }
 
-    /* 3. events pushed by other threads */
+    /* 4. events pushed by other threads */
     merge_side_queue();
+    pumping = false;
 }
 
 int SDL_PeepEvents(SDL_Event *events, int numevents, SDL_EventAction action, Uint32 minType, Uint32 maxType)
@@ -956,10 +998,29 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         }
 
         int video_fd = sdlop.video ? sdlop.video->GetEventFD(sdlop.video) : -1;
+#ifdef _WIN32
+        /* Win32 has no pollable fds, but it does have waitable objects: block
+         * on the wake event and on this thread's input queue. Sleep()ing here
+         * instead would wake 64-100 times a second while idle and pick input
+         * up a whole tick late. MWMO_INPUTAVAILABLE returns for messages
+         * already in the queue that PeekMessage would find, so this cannot
+         * miss input that arrived before the wait. A cross-thread
+         * SDL_PushEvent signals the same event, so it wakes the waiter
+         * immediately instead of after the sleep. */
+        (void)video_fd;
+        const HANDLE wake_handle = (HANDLE)sdlop.wake_handle;
+        MsgWaitForMultipleObjectsEx(wake_handle ? 1 : 0, &wake_handle, (DWORD)wait_ms,
+                                    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+#else
         const int dbus_fd = SDLOP_DBus_GetFD(); /* theme changes, portal replies */
-        struct pollfd pfds[3];
+        /* Device fds plus the evdev backend's inotify hotplug fd. */
+        int joy_fds[SDLOP_JOYSTICK_MAX_WAIT_FDS];
+        int num_joy = SDLOP_JoystickGetEventFDs(joy_fds, (int)SDL_arraysize(joy_fds));
+        struct pollfd pfds[SDLOP_JOYSTICK_MAX_WAIT_FDS + 3]; /* wake + video + dbus + joystick/hotplug fds */
         int nfds = 0;
+        int wake_index = -1;
         if (sdlop.wake_fd >= 0) {
+            wake_index = nfds;
             pfds[nfds].fd = sdlop.wake_fd;
             pfds[nfds].events = POLLIN;
             nfds++;
@@ -974,15 +1035,21 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
             pfds[nfds].events = POLLIN;
             nfds++;
         }
+        for (int i = 0; i < num_joy && nfds < (int)SDL_arraysize(pfds); ++i) {
+            pfds[nfds].fd = joy_fds[i];
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
         if (nfds > 0) {
             poll(pfds, (nfds_t)nfds, wait_ms);
-            if (sdlop.wake_fd >= 0 && (pfds[0].revents & POLLIN)) {
+            if (wake_index >= 0 && (pfds[wake_index].revents & POLLIN)) {
                 uint64_t val;
                 (void)!read(sdlop.wake_fd, &val, sizeof(val)); /* reset */
             }
         } else {
             SDL_Delay((Uint32)wait_ms);
         }
+#endif
     }
 }
 

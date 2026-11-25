@@ -123,6 +123,7 @@ struct mini
     struct wl_resource *xdg_surface;
     struct wl_resource *xdg_toplevel;
     struct wl_resource *pointer;
+    struct wl_resource *keyboard;
     struct wl_resource *touch;
     struct wl_resource *locked;
     struct wl_resource *relpointer;
@@ -694,6 +695,26 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
         wl_pointer_send_enter(M.pointer, serial, M.surface_res,
                               wl_fixed_from_double(100.0), wl_fixed_from_double(100.0));
         mini_pointer_frame();
+        if (getenv("SDLOP_TEST_SCROLL")) {
+            /* three frames, one wheel event each; the seat version decides
+             * which axis flavour carries the step */
+            wl_pointer_send_axis(M.pointer, 1, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(-1));
+            if (wl_resource_get_version(M.pointer) >= 8) {
+                wl_pointer_send_axis_value120(M.pointer, WL_POINTER_AXIS_VERTICAL_SCROLL, -120);
+            } else if (wl_resource_get_version(M.pointer) >= 5) {
+                wl_pointer_send_axis_discrete(M.pointer, WL_POINTER_AXIS_VERTICAL_SCROLL, -1);
+            }
+            mini_pointer_frame();
+            wl_pointer_send_axis(M.pointer, 2, WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_int(1));
+            if (wl_resource_get_version(M.pointer) >= 8) {
+                wl_pointer_send_axis_value120(M.pointer, WL_POINTER_AXIS_HORIZONTAL_SCROLL, 60);
+            } else if (wl_resource_get_version(M.pointer) >= 5) {
+                wl_pointer_send_axis_discrete(M.pointer, WL_POINTER_AXIS_HORIZONTAL_SCROLL, 2);
+            }
+            mini_pointer_frame();
+            wl_pointer_send_axis(M.pointer, 3, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(-5));
+            mini_pointer_frame();
+        }
         printf("mini: sent pointer enter\n");
         fflush(stdout);
         if (M.touch) {
