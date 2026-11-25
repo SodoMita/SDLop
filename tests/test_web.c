@@ -134,6 +134,20 @@ static void dispatch_js(const char *js)
     MAIN_THREAD_EM_ASM({ eval(UTF8ToString($0)); }, js);
 }
 
+static int close_requests;
+static int terminations;
+
+static bool SDLCALL close_watch(void *userdata, SDL_Event *e)
+{
+    (void)userdata;
+    if (e->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+        close_requests++;
+    } else if (e->type == SDL_EVENT_TERMINATING) {
+        terminations++;
+    }
+    return true;
+}
+
 static void test_browser_driver(void)
 {
     setenv("SDL_VIDEODRIVER", "emscripten", 1);
@@ -160,6 +174,17 @@ static void test_browser_driver(void)
         },
         &cw, &ch);
     CHECK(cw == 320 && ch == 240, "canvas sized to window (%dx%d)", cw, ch);
+
+    /* closing the browser tab/window is the web close button: it must send
+     * the same close request as the other backends, plus TERMINATING (the
+     * stock SDL3 event, delivered synchronously to watchers). */
+    close_requests = terminations = 0;
+    CHECK(SDL_AddEventWatch(close_watch, NULL), "event watch for close: %s", SDL_GetError());
+    dispatch_js("window.dispatchEvent(new Event('beforeunload', {cancelable:true}))");
+    SDL_PumpEvents();
+    CHECK(close_requests == 1, "beforeunload -> WINDOW_CLOSE_REQUESTED (%d)", close_requests);
+    CHECK(terminations == 1, "beforeunload -> TERMINATING (%d)", terminations);
+    SDL_RemoveEventWatch(close_watch, NULL);
 
     /* stock SDL3: TEXT_INPUT only flows after an explicit opt-in. Key state
      * events still work before text input is started. */

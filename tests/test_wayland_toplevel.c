@@ -21,6 +21,8 @@
       passed on, resize areas show resize cursors (cursor-shape), normal
       areas behave normally (pointer input via MINI_POINTER_CMD)
     - SDL_ShowWindowSystemMenu: xdg_toplevel show_window_menu
+    - the compositor's close button (MINI_POINTER_CMD "close") sends
+      xdg_toplevel.close, which SDLop turns into SDL_EVENT_WINDOW_CLOSE_REQUESTED
     - xdg-foreign: toplevels are exported, the handle is
       SDL_PROP_WINDOW_WAYLAND_XDG_TOPLEVEL_EXPORT_HANDLE_STRING, dropped
       when hidden, a new one when shown again
@@ -254,6 +256,35 @@ int main(int argc, char *argv[])
     }
     pump_for(100);
     CHECK(wait_handle(w, icons ? "mini-1" : NULL), "main window export handle");
+
+    /* the compositor's close button -> xdg_toplevel.close ->
+     * SDL_EVENT_WINDOW_CLOSE_REQUESTED (same event the other backends send) */
+    {
+        FILE *f = fopen(cmdpath, "w");
+        CHECK(f != NULL, "open pointer command file for close");
+        if (f) {
+            fputs("close\n", f);
+            fclose(f);
+        }
+        kill(server, SIGUSR2);
+        bool closed = false;
+        const Uint64 end = SDL_GetTicks() + 2000;
+        while (SDL_GetTicks() < end && !closed) {
+            SDL_PumpEvents();
+            SDL_Event e;
+            while (SDL_PollEvent(&e)) {
+                if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                    e.window.windowID == SDL_GetWindowID(w)) {
+                    closed = true;
+                }
+            }
+            if (!closed) {
+                SDL_Delay(5);
+            }
+        }
+        CHECK(closed, "compositor close button -> WINDOW_CLOSE_REQUESTED");
+    }
+
     if (icons) {
         char last[640];
         CHECK(wait_last("opaque=", "opaque=set"), "opaque window: opaque region");
