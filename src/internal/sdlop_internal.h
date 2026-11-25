@@ -40,6 +40,7 @@ struct SDL_Window
     Uint8 clear_r, clear_g, clear_b;
     float display_scale;    /* output scale the window currently sits on */
     SDL_Surface *surface;   /* software window surface (owned by window) */
+    bool gl_resize_pending; /* RESIZED seen: GL offload surface follows after the pump */
     void *driverdata;
     struct SDL_Window *next;
     SDL_DisplayID displayID;          /* display the window is currently on */
@@ -223,6 +224,14 @@ struct SDLop_VideoDevice
     bool (*StartTextInput)(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props);
     bool (*StopTextInput)(SDLop_VideoDevice *device, SDL_Window *window);
     bool (*ClearComposition)(SDLop_VideoDevice *device, SDL_Window *window);
+
+    /* software rendering: bring an existing window surface to the window's
+     * current size, in place (SDLop keeps the SDL_Surface pointer valid
+     * across resizes). Only called from SDL_GetWindowSurface and after
+     * SDL_UpdateWindowSurface(Rects), never from event handling, so a burst
+     * of resizes costs one reallocation. Returns true when nothing had to
+     * change. NULL = the driver keeps the surface sized itself. */
+    bool (*ResizeWindowFramebuffer)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *surface);
 };
 
 /* Cursor object (SDL_mouse.c) */
@@ -565,6 +574,11 @@ typedef struct SDLOP_GLAttributes
 extern SDLOP_GLAttributes sdlop_glattrs;
 SDL_GLContext SDLOP_GL_CurrentContext(void);
 void SDLOP_GL_NotifyWindowResized(SDL_Window *window);
+
+/* point a surface that wraps foreign pixels (SDL_CreateSurfaceFrom) at a
+ * new buffer, keeping the SDL_Surface itself: window surfaces across
+ * resizes. The clip rectangle is reset to the whole surface. */
+void SDLOP_SetSurfacePixels(SDL_Surface *surface, void *pixels, int w, int h, int pitch);
 void SDLOP_GL_NotifyWindowDestroyed(SDL_Window *window);
 void SDLOP_GL_Quit(void);
 bool SDLOP_GL_CanCreateWindow(void);

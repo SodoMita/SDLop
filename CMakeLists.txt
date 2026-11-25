@@ -1043,6 +1043,13 @@ if(SDLop_BUILD_TESTS)
       add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
       add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
 
+      # interactive resizes: configure throttling, lazy window surface resize
+      add_executable(test_wayland_resize tests/test_wayland_resize.c)
+      target_link_libraries(test_wayland_resize PRIVATE sdlop)
+      target_compile_options(test_wayland_resize PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_resize mini_compositor)
+      add_test(NAME test_wayland_resize COMMAND test_wayland_resize $<TARGET_FILE:mini_compositor>)
+
       # clipboard + primary selection between two SDL processes
       add_executable(test_wayland_clipboard tests/test_wayland_clipboard.c)
       target_link_libraries(test_wayland_clipboard PRIVATE sdlop)

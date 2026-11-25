@@ -670,6 +670,17 @@ Highlights:
 - `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
   content yet. If a window surface exists, it fills the surface and presents
   it (X11 and Wayland).
+- Window surfaces survive resizes. `SDL_GetWindowSurface` keeps returning
+  the same `SDL_Surface`, and the driver resizes it in place. Stock SDL3
+  instead invalidates the surface, and `SDL_UpdateWindowSurface` fails
+  until the surface is fetched again. The resize happens lazily: nothing
+  is reallocated while resize events are handled. `SDL_GetWindowSurface`
+  resizes the surface once. `SDL_UpdateWindowSurface` first presents the
+  frame drawn at the old size, then resizes the surface. New contents start
+  at the clear colour. The memory is reused when it fits: Wayland `wl_shm`
+  pools and X11 MIT-SHM segments are allocated with 25% headroom. While a
+  Wayland compositor reports an interactive resize, SDLop applies one
+  configure per frame callback, using the newest one (as stock does).
 - Web: the static keymap is US-layout only (browser text input events are
   not used yet); `SDL_GL_SHARE_WITH_CURRENT_CONTEXT` is ignored (WebGL has no
   cross-context object sharing);
