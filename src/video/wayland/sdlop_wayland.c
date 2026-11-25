@@ -56,9 +56,11 @@
 #define SDLOP_WL_SHM_MAX_BUFFERS 3
 typedef struct WaylandShmBuffer
 {
-    struct wl_buffer *buffer;
+    struct wl_buffer *buffer;   /* at the cycle's current size; NULL until needed */
+    struct wl_buffer *retired;  /* an older size the compositor still holds */
+    struct wl_shm_pool *pool;   /* the memory, kept across sizes */
     void *map;
-    size_t size;
+    size_t size;                /* capacity of map / pool */
     bool busy;      /* committed, wl_buffer.release not yet received */
     SDL_Rect stale; /* shadow region not yet copied into this buffer (w == 0: none) */
 } WaylandShmBuffer;
@@ -103,6 +105,17 @@ typedef struct WaylandWindowData
     struct wl_output *output; /* output the surface currently intersects */
     uint32_t toplevel_states;
     int pending_w, pending_h;
+
+    /* interactive resizes (stock): while the compositor reports the
+     * resizing state, a configure is applied (and acked) only once the
+     * frame callback of the last commit has fired - the newest one wins,
+     * so the client applies at most one size per presented frame */
+    bool resizing;
+    bool ack_pending;           /* a configure waits for the frame callback */
+    uint32_t ack_serial;
+    Uint64 ack_pending_since;   /* SDL_GetTicks(): safety valve */
+    struct wl_callback *frame_cb;
+    bool frame_inflight;        /* frame_cb went out with a commit */
 
     /* SDL 3.4 window management */
     struct zxdg_toplevel_decoration_v1 *decoration;
@@ -233,6 +246,11 @@ static void wayland_release_pointer_lock(void);
   - Release events go to a private event queue: looking for a free buffer
     never dispatches input or window events behind the application's back.
     Only when every buffer is held does a present wait for a release.
+  - Resizes keep the memory: each buffer of the cycle owns a wl_shm_pool
+    with some headroom, and a new size only costs a new wl_buffer on it
+    (made when the buffer is next used, once the compositor has released
+    the old one). Fresh memory is mapped only for growth beyond the
+    headroom, or to give memory back after a large shrink.
   - Until something is presented a window shows its clear colour: a 1x1
     buffer scaled to the window by wp_viewporter (no per-pixel fill when a
     window is created), or a filled full-size buffer without viewporter.
@@ -240,8 +258,12 @@ static void wayland_release_pointer_lock(void);
 
 static void shm_buffer_release(void *data, struct wl_buffer *buffer)
 {
-    (void)buffer;
-    ((WaylandShmBuffer *)data)->busy = false;
+    WaylandShmBuffer *b = (WaylandShmBuffer *)data;
+    if (buffer == b->retired) {
+        wl_buffer_destroy(buffer); /* of an older size: its memory is free again */
+        b->retired = NULL;
+    }
+    b->busy = false;
 }
 
 static const struct wl_buffer_listener shm_buffer_listener = {
@@ -353,8 +375,19 @@ static void shm_destroy_all(WaylandWindowData *wd)
     for (int i = 0; i < wd->num_shm; i++) {
         /* destroying a buffer the compositor still shows is allowed for
          * wl_shm (it keeps its own mapping); a late release is dropped */
-        wl_buffer_destroy(wd->shm[i].buffer);
-        munmap(wd->shm[i].map, wd->shm[i].size);
+        WaylandShmBuffer *b = &wd->shm[i];
+        if (b->buffer) {
+            wl_buffer_destroy(b->buffer);
+        }
+        if (b->retired) {
+            wl_buffer_destroy(b->retired);
+        }
+        if (b->pool) {
+            wl_shm_pool_destroy(b->pool);
+        }
+        if (b->map) {
+            munmap(b->map, b->size);
+        }
     }
     memset(wd->shm, 0, sizeof(wd->shm));
     wd->num_shm = 0;
@@ -362,30 +395,99 @@ static void shm_destroy_all(WaylandWindowData *wd)
     wd->offload_buf = NULL;
 }
 
-/* the cycle's buffers follow the window size; other sizes are dropped */
+/* the cycle's buffers follow the window size: a new size retires their
+ * wl_buffers (destroyed now, or on release when the compositor holds one)
+ * but keeps their memory */
 static void shm_set_size(WaylandWindowData *wd, int w, int h)
 {
-    if (wd->buffer_w != w || wd->buffer_h != h) {
-        shm_destroy_all(wd);
-        wd->buffer_w = w;
-        wd->buffer_h = h;
+    if (wd->buffer_w == w && wd->buffer_h == h) {
+        return;
     }
+    for (int i = 0; i < wd->num_shm; i++) {
+        WaylandShmBuffer *b = &wd->shm[i];
+        if (b->buffer) {
+            if (b->busy) {
+                b->retired = b->buffer; /* a busy buffer has no retired one yet */
+            } else {
+                wl_buffer_destroy(b->buffer);
+            }
+            b->buffer = NULL;
+        }
+        b->stale.x = b->stale.y = 0;
+        b->stale.w = w;
+        b->stale.h = h;
+    }
+    wd->front = NULL;
+    wd->offload_buf = NULL;
+    wd->buffer_w = w;
+    wd->buffer_h = h;
+}
+
+/* give b a wl_buffer of the cycle's size (b is not busy) */
+static bool shm_buffer_prepare(WaylandWindowData *wd, WaylandShmBuffer *b)
+{
+    if (b->buffer) {
+        return true;
+    }
+    const size_t stride = (size_t)wd->buffer_w * 4;
+    const size_t need = stride * (size_t)wd->buffer_h;
+    if (!b->pool || b->size < need || b->size / 4 > need) {
+        /* new memory: growth beyond the headroom, or a large shrink */
+        if (b->pool) {
+            wl_shm_pool_destroy(b->pool);
+            b->pool = NULL;
+        }
+        if (b->map) {
+            munmap(b->map, b->size);
+            b->map = NULL;
+        }
+        const size_t page = 4096;
+        const size_t size = ((need + need / 4) + page - 1) / page * page;
+        int fd = memfd_create("sdlop-shm", MFD_CLOEXEC);
+        if (fd < 0) {
+            return SDL_SetError("memfd_create failed: %s", strerror(errno));
+        }
+        if (ftruncate(fd, (off_t)size) < 0) {
+            close(fd);
+            return SDL_SetError("ftruncate failed: %s", strerror(errno));
+        }
+        /* written completely at least once: fault the pages in with one
+         * call instead of one fault per page */
+        void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+        if (map == MAP_FAILED) {
+            close(fd);
+            return SDL_SetError("mmap failed: %s", strerror(errno));
+        }
+        b->pool = wl_shm_create_pool(wl_data.shm, fd, (int32_t)size);
+        close(fd);
+        if (!b->pool) {
+            munmap(map, size);
+            return SDL_SetError("wl_shm pool creation failed");
+        }
+        b->map = map;
+        b->size = size;
+    }
+    b->buffer = wl_shm_pool_create_buffer(b->pool, 0, wd->buffer_w, wd->buffer_h, (int32_t)stride,
+                                          wd->transparent ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888);
+    if (!b->buffer) {
+        return SDL_SetError("wl_shm buffer creation failed");
+    }
+    wl_proxy_set_queue((struct wl_proxy *)b->buffer, wl_data.shm_queue);
+    wl_buffer_add_listener(b->buffer, &shm_buffer_listener, b);
+    b->stale.x = 0;
+    b->stale.y = 0;
+    b->stale.w = wd->buffer_w;
+    b->stale.h = wd->buffer_h;
+    return true;
 }
 
 static WaylandShmBuffer *shm_add_buffer(WaylandWindowData *wd)
 {
     WaylandShmBuffer *b = &wd->shm[wd->num_shm];
-    b->buffer = shm_create_wl_buffer(wd->buffer_w, wd->buffer_h, wd->transparent, true, &b->map, &b->size);
-    if (!b->buffer) {
+    memset(b, 0, sizeof(*b));
+    if (!shm_buffer_prepare(wd, b)) {
         return NULL;
     }
-    wl_proxy_set_queue((struct wl_proxy *)b->buffer, wl_data.shm_queue);
-    wl_buffer_add_listener(b->buffer, &shm_buffer_listener, b);
-    b->busy = false;
-    b->stale.x = 0;
-    b->stale.y = 0;
-    b->stale.w = wd->buffer_w;
-    b->stale.h = wd->buffer_h;
     wd->num_shm++;
     return b;
 }
@@ -412,22 +514,35 @@ static void shm_dispatch_releases(int timeout_ms)
 
 static WaylandShmBuffer *shm_pick_free(WaylandWindowData *wd)
 {
-    /* the free buffer that missed the least: smallest copy */
+    /* the free buffer that missed the least: smallest copy - after a
+     * resize preferably one whose memory already fits the new size */
+    const size_t need = (size_t)wd->buffer_w * 4 * (size_t)wd->buffer_h;
     WaylandShmBuffer *best = NULL;
-    Sint64 best_area = 0;
+    Sint64 best_score = 0;
     for (int i = 0; i < wd->num_shm; i++) {
         WaylandShmBuffer *b = &wd->shm[i];
-        const Sint64 area = (Sint64)b->stale.w * b->stale.h;
-        if (!b->busy && (!best || area < best_area)) {
+        if (b->busy) {
+            continue;
+        }
+        const bool fits = b->buffer || (b->pool && b->size >= need && b->size / 4 <= need);
+        const Sint64 score = (Sint64)b->stale.w * b->stale.h + (fits ? 0 : ((Sint64)1 << 40));
+        if (!best || score < best_score) {
             best = b;
-            best_area = area;
+            best_score = score;
         }
     }
     return best;
 }
 
 /* a buffer the compositor does not hold */
+static WaylandShmBuffer *shm_acquire_any(WaylandWindowData *wd);
 static WaylandShmBuffer *shm_acquire(WaylandWindowData *wd)
+{
+    WaylandShmBuffer *b = shm_acquire_any(wd);
+    return (b && shm_buffer_prepare(wd, b)) ? b : NULL;
+}
+
+static WaylandShmBuffer *shm_acquire_any(WaylandWindowData *wd)
 {
     WaylandShmBuffer *b = shm_pick_free(wd);
     if (b) {
@@ -619,31 +734,18 @@ static bool window_attach_clear(SDL_Window *window, WaylandWindowData *wd)
     return true;
 }
 
-/* window size changed: drop buffers of the old size, resize the shadow of
- * an existing window surface (SDL3: the surface survives resizes; its
- * contents restart at the clear colour) */
+/* window size changed. Nothing is reallocated here: the shm buffers
+ * follow the size of whatever is presented next, the window surface's
+ * shadow is resized by SDL_GetWindowSurface / after the next
+ * SDL_UpdateWindowSurface (wayland_ResizeWindowFramebuffer) and GL offload
+ * frames at the next swap, so a burst of configures costs nothing until
+ * the application draws. Native EGL windows are resized right away
+ * (wl_egl_window_resize only records the size for the next swap). */
 static bool window_resize_buffers(SDL_Window *window, int w, int h)
 {
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
     if (!wd) {
         return false;
-    }
-    shm_set_size(wd, w, h);
-    if (window->surface && wd->shadow && (wd->shadow_w != w || wd->shadow_h != h)) {
-        void *shadow = malloc((size_t)w * (size_t)h * 4);
-        if (!shadow) {
-            return SDL_OutOfMemory();
-        }
-        fill_xrgb(shadow, (size_t)w * (size_t)h, window_clear_xrgb(window));
-        free(wd->shadow);
-        wd->shadow = shadow;
-        wd->shadow_w = w;
-        wd->shadow_h = h;
-        window->surface->w = w;
-        window->surface->h = h;
-        window->surface->pitch = w * 4;
-        window->surface->pixels = shadow;
-        SDL_SetSurfaceClipRect(window->surface, NULL); /* the old clip may exceed the new size */
     }
     SDLOP_Wayland_GL_WindowResized(window);
     if (wd->gl_active && !wd->gl_offload_active) {
@@ -813,9 +915,12 @@ static bool wayland_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     if (!wd || !wd->configured || wd->gl_active) {
         return SDL_SetError("Window surface is not presentable");
     }
-    if (!wd->shadow || wd->shadow_w != wd->buffer_w || wd->shadow_h != wd->buffer_h) {
-        return SDL_SetError("Window surface is not valid (window resized?)");
+    if (!wd->shadow) {
+        return SDL_SetError("Window surface is not valid");
     }
+    /* drawn before a resize reached the surface: present it at the size it
+     * was drawn at (the core resizes the surface right after) */
+    shm_set_size(wd, wd->shadow_w, wd->shadow_h);
     const SDL_Rect all = { 0, 0, wd->buffer_w, wd->buffer_h };
     SDL_Rect damage = { 0, 0, 0, 0 };
     if (rects && numrects > 0) {
@@ -840,6 +945,34 @@ static bool wayland_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     }
     shm_copy_from_shadow(wd, b);
     shm_commit(wd, b, rects, numrects);
+    return true;
+}
+
+/* the window surface follows the window's pixel size, in place: a new
+ * shadow at the clear colour (presented frames stay on screen until the
+ * application presents at the new size) */
+static bool wayland_ResizeWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *surface)
+{
+    (void)device;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (!wd || !wd->shadow) {
+        return true;
+    }
+    int w, h;
+    SDLOP_Wayland_GetWindowPixelSize(window, &w, &h);
+    if (w <= 0 || h <= 0 || (wd->shadow_w == w && wd->shadow_h == h)) {
+        return true;
+    }
+    void *shadow = malloc((size_t)w * (size_t)h * 4);
+    if (!shadow) {
+        return SDL_OutOfMemory();
+    }
+    fill_xrgb(shadow, (size_t)w * (size_t)h, window_clear_xrgb(window));
+    free(wd->shadow);
+    wd->shadow = shadow;
+    wd->shadow_w = w;
+    wd->shadow_h = h;
+    SDLOP_SetSurfacePixels(surface, shadow, w, h, w * 4);
     return true;
 }
 
@@ -1011,17 +1144,103 @@ static const struct xdg_wm_base_listener wm_base_listener = {
     wm_base_ping,
 };
 
+/*
+  Interactive resizes (as stock SDL3): while the toplevel is in the
+  resizing state, compositors send a configure for every pointer motion,
+  far more than a client can draw. A configure is applied only once the
+  frame callback of the last applied one has fired - i.e. the compositor
+  has shown a frame of that size - and the newest configure replaces any
+  older one that is still waiting (acking the newest serial acks them all).
+  So at most one size per presented frame reaches the application, each
+  with RESIZED, PIXEL_SIZE_CHANGED and EXPOSED.
+
+  The commit that answers the ack is the application's next frame; only a
+  window without presented content gets the clear colour committed right
+  away. A configure kept waiting longer than SDLOP_WL_RESIZE_STALL_MS (an
+  application that stopped drawing, or a hidden output that sends no frame
+  callbacks) is applied and committed anyway. Outside interactive resizes
+  every configure is applied immediately.
+*/
+#define SDLOP_WL_RESIZE_STALL_MS 100
+
+static void window_apply_configure(SDL_Window *window, uint32_t serial, bool force_commit);
+
+static void window_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    SDL_Window *window = (SDL_Window *)data;
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    (void)time;
+    wl_callback_destroy(cb);
+    if (!wd || wd->frame_cb != cb) {
+        return;
+    }
+    wd->frame_cb = NULL;
+    if (wd->ack_pending && wd->xsurface) {
+        window_apply_configure(window, wd->ack_serial, false);
+    }
+}
+
+static const struct wl_callback_listener window_frame_listener = {
+    window_frame_done,
+};
+
+/* ask for a frame callback with the surface's next commit, whoever makes
+ * it (a software present, Mesa's eglSwapBuffers, the clear colour) */
+static void window_request_frame(SDL_Window *window, WaylandWindowData *wd)
+{
+    if (!wd->frame_cb) {
+        wd->frame_cb = wl_surface_frame(wd->surface);
+        wl_callback_add_listener(wd->frame_cb, &window_frame_listener, window);
+    }
+}
+
+static void window_cancel_frame(WaylandWindowData *wd)
+{
+    if (wd->frame_cb) {
+        wl_callback_destroy(wd->frame_cb);
+        wd->frame_cb = NULL;
+    }
+    wd->ack_pending = false;
+    wd->ack_pending_since = 0;
+    wd->resizing = false;
+}
+
 static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_t serial)
 {
     SDL_Window *window = (SDL_Window *)data;
     WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
-    xdg_surface_ack_configure(xsurface, serial);
+    (void)xsurface;
+    if (wd->configured && wd->resizing && wd->frame_cb) {
+        /* the last applied size is not on screen yet: keep the newest */
+        const Uint64 now = SDL_GetTicks();
+        if (!wd->ack_pending) {
+            wd->ack_pending_since = now;
+        }
+        wd->ack_pending = true;
+        wd->ack_serial = serial;
+        if (now - wd->ack_pending_since < SDLOP_WL_RESIZE_STALL_MS) {
+            return;
+        }
+        window_apply_configure(window, serial, true); /* stalled */
+        return;
+    }
+    window_apply_configure(window, serial, false);
+}
+
+static void window_apply_configure(SDL_Window *window, uint32_t serial, bool force_commit)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    wd->ack_pending = false;
+    wd->ack_pending_since = 0;
+    xdg_surface_ack_configure(wd->xsurface, serial);
     wd->configured = true;
+    bool resized = false;
 
     if (wd->pending_w > 0 && wd->pending_h > 0 &&
         (wd->pending_w != window->w || wd->pending_h != window->h)) {
         window->w = wd->pending_w;
         window->h = wd->pending_h;
+        resized = true;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
         window_update_pixel_size(window, true);
         /* Stock 3.2.10 sends SAFE_AREA_CHANGED with every size change on
@@ -1036,8 +1255,30 @@ static void xsurface_configure(void *data, struct xdg_surface *xsurface, uint32_
             SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_MOVED, 0, 0);
         }
     }
-    if (!(window->flags & SDL_WINDOW_HIDDEN)) {
-        window_commit(window);
+    if (window->flags & SDL_WINDOW_HIDDEN) {
+        return;
+    }
+    if (wd->resizing) {
+        window_request_frame(window, wd);
+        if (resized) {
+            /* redraw now: the application's frame answers the ack */
+            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+            if (!force_commit && (wd->front || wd->gl_active)) {
+                wl_display_flush(wl_data.display);
+                return;
+            }
+        }
+    }
+    window_commit(window);
+}
+
+/* a configure kept waiting by an interactive resize for too long */
+static void window_check_resize_stall(SDL_Window *window)
+{
+    WaylandWindowData *wd = (WaylandWindowData *)window->driverdata;
+    if (wd && wd->ack_pending && wd->xsurface &&
+        SDL_GetTicks() - wd->ack_pending_since >= SDLOP_WL_RESIZE_STALL_MS) {
+        window_apply_configure(window, wd->ack_serial, true);
     }
 }
 
@@ -1055,10 +1296,12 @@ static void toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_
     wd->pending_h = height;
 
     /* update maximized/fullscreen flags */
-    bool maximized = false, fullscreen = false, suspended = false;
+    bool maximized = false, fullscreen = false, suspended = false, resizing = false;
     const uint32_t *s;
     wl_array_for_each(s, states) {
-        if (*s == XDG_TOPLEVEL_STATE_MAXIMIZED) {
+        if (*s == XDG_TOPLEVEL_STATE_RESIZING) {
+            resizing = true;
+        } else if (*s == XDG_TOPLEVEL_STATE_MAXIMIZED) {
             maximized = true;
         } else if (*s == XDG_TOPLEVEL_STATE_FULLSCREEN) {
             fullscreen = true;
@@ -1081,6 +1324,7 @@ static void toplevel_configure(void *data, struct xdg_toplevel *toplevel, int32_
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_LEAVE_FULLSCREEN, 0, 0);
     }
     (void)suspended;
+    wd->resizing = resizing; /* for the xdg_surface.configure that follows */
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *toplevel)
@@ -2625,6 +2869,7 @@ static bool wayland_Init(SDLop_VideoDevice *device)
     device->StopTextInput = wayland_StopTextInput;
     device->UpdateTextInputArea = wayland_UpdateTextInputArea;
     device->ClearComposition = wayland_ClearComposition;
+    device->ResizeWindowFramebuffer = wayland_ResizeWindowFramebuffer;
     device->SetClipboardData = clip ? SDLOP_Wayland_SetClipboardData : NULL;
     device->GetClipboardData = clip ? SDLOP_Wayland_GetClipboardData : NULL;
     device->HasClipboardData = clip ? SDLOP_Wayland_HasClipboardData : NULL;
@@ -3198,6 +3443,7 @@ static void wayland_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (!wd) {
         return;
     }
+    window_cancel_frame(wd);
     if (wl_data.pointer_focus == window) {
         wl_data.pointer_focus = NULL;
     }
@@ -3277,6 +3523,7 @@ static void wayland_HideWindow(SDLop_VideoDevice *device, SDL_Window *window)
      * next buffer attach is a protocol error, and a bare commit alone will
      * not restart the configure handshake. */
     destroy_role_objects(wd);
+    window_cancel_frame(wd); /* an unmapped surface gets no frame callbacks */
     wayland_update_window_props(window);
     wl_surface_attach(wd->surface, NULL, 0, 0);
     wl_surface_commit(wd->surface);
@@ -3848,6 +4095,9 @@ static void wayland_PumpEvents(SDLop_VideoDevice *device, int timeout_ms)
     }
     wl_display_dispatch_pending(display);
 
+    for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+        window_check_resize_stall(w);
+    }
     SDLOP_KeyboardProcessRepeats();
 }
 

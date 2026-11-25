@@ -609,7 +609,18 @@ Highlights:
   text input ends that compose session. Composition uses xkbcommon's compose
   tables (locale from `LC_ALL`, `LC_CTYPE`, `LANG`, else `C`; needs
   libxkbcommon >= 0.5 and the X11 Compose data, otherwise text is emitted
-  uncomposed). No IME (XIM / text-input-v3) yet.
+  uncomposed).
+- Input methods (`SDL_StartTextInput`): X11 uses XIM (as stock SDL3).
+  Wayland uses `zwp_text_input_v3`; when the compositor doesn't offer it,
+  Fcitx 5 or IBus is used over D-Bus (their session-bus portals), as stock
+  SDL3 does. The choice follows stock's `SDL_IM_MODULE` (`fcitx`, `ibus`,
+  anything else turns it off), then `XMODIFIERS` / `GTK_IM_MODULE` /
+  `QT_IM_MODULE`; with none of those set, only an input method that is
+  already running is used. Nothing touches the bus until text input starts,
+  and keys go to the input method only while text input is active.
+  Committed text arrives as `SDL_EVENT_TEXT_INPUT` and the preedit as
+  `SDL_EVENT_TEXT_EDITING`. Key events are still delivered for keys the
+  input method takes, just without their own text.
 - Touch: `wl_touch` on Wayland and XInput 2.2 multitouch on X11 deliver
   `SDL_EVENT_FINGER_*` (x/y/dx/dy normalized to the window, pressure 1 while
   down; on X11 touchID = source device, fingerID = touch id). Like SDL3, the
@@ -659,6 +670,17 @@ Highlights:
 - `SDLop_SetWindowClearColor` tints a window that has no surface/GL/Vulkan
   content yet. If a window surface exists, it fills the surface and presents
   it (X11 and Wayland).
+- Window surfaces survive resizes. `SDL_GetWindowSurface` keeps returning
+  the same `SDL_Surface`, and the driver resizes it in place. Stock SDL3
+  instead invalidates the surface, and `SDL_UpdateWindowSurface` fails
+  until the surface is fetched again. The resize happens lazily: nothing
+  is reallocated while resize events are handled. `SDL_GetWindowSurface`
+  resizes the surface once. `SDL_UpdateWindowSurface` first presents the
+  frame drawn at the old size, then resizes the surface. New contents start
+  at the clear colour. The memory is reused when it fits: Wayland `wl_shm`
+  pools and X11 MIT-SHM segments are allocated with 25% headroom. While a
+  Wayland compositor reports an interactive resize, SDLop applies one
+  configure per frame callback, using the newest one (as stock does).
 - Web: the static keymap is US-layout only (browser text input events are
   not used yet); `SDL_GL_SHARE_WITH_CURRENT_CONTEXT` is ignored (WebGL has no
   cross-context object sharing);

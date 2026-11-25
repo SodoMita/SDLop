@@ -392,6 +392,7 @@ set(SDLop_SOURCES
   src/SDL_devices.c
   src/SDL_video.c
   src/SDL_dbus.c
+  src/SDL_ime_dbus.c
   src/SDL_desktop.c
   src/internal/sdlop_platform.c
   src/SDL_dialog.c
@@ -662,7 +663,7 @@ if(SDLop_BUILD_TESTS)
     set(SDLOP_PORTABLE_TESTS test_ring test_scancode test_events test_surface
         test_web test_keycodes test_layouts test_core test_main_callbacks
         test_misc test_threads test_vt_mask test_fbdev_device test_options
-        test_dropin_compat test_iconv test_raw_translate test_dbus test_ime_txn)
+        test_dropin_compat test_iconv test_raw_translate test_dbus test_ime_dbus test_ime_txn)
   endif()
   foreach(t ${SDLOP_PORTABLE_TESTS})
     add_executable(${t} tests/${t}.c)
@@ -1041,6 +1042,13 @@ if(SDLop_BUILD_TESTS)
       add_dependencies(test_wayland_buffers mini_compositor)
       add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
       add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
+
+      # interactive resizes: configure throttling, lazy window surface resize
+      add_executable(test_wayland_resize tests/test_wayland_resize.c)
+      target_link_libraries(test_wayland_resize PRIVATE sdlop)
+      target_compile_options(test_wayland_resize PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_resize mini_compositor)
+      add_test(NAME test_wayland_resize COMMAND test_wayland_resize $<TARGET_FILE:mini_compositor>)
 
       # clipboard + primary selection between two SDL processes
       add_executable(test_wayland_clipboard tests/test_wayland_clipboard.c)

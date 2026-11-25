@@ -1603,13 +1603,13 @@ static void destroy_dib(SDLop_Win32WindowData *data)
         SDL_DestroySurface(data->surface);
         data->surface = NULL;
     }
+    if (data->dc) {
+        DeleteDC(data->dc); /* first: a bitmap selected into a DC can't be deleted */
+        data->dc = NULL;
+    }
     if (data->bitmap) {
         DeleteObject(data->bitmap);
         data->bitmap = NULL;
-    }
-    if (data->dc) {
-        DeleteDC(data->dc);
-        data->dc = NULL;
     }
     data->surface_dirty = false;
 }
@@ -2079,6 +2079,40 @@ static int win32_GetEventFD(SDLop_VideoDevice *device)
 /* Software framebuffer                                                */
 /* ------------------------------------------------------------------ */
 
+/* a w x h top-down XRGB DIB section selected into a memory DC; on failure
+ * data is unchanged */
+static bool create_dib(SDLop_Win32WindowData *data, int w, int h)
+{
+    BITMAPINFO bmi;
+    SDL_zero(bmi);
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; /* top-down, like SDL surfaces */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void *pixels = NULL;
+    HDC screen = GetDC(data->hwnd);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &pixels, NULL, 0);
+    ReleaseDC(data->hwnd, screen);
+    if (!dc || !bitmap || !pixels) {
+        if (bitmap) {
+            DeleteObject(bitmap);
+        }
+        if (dc) {
+            DeleteDC(dc);
+        }
+        return SDL_SetError("Couldn't create DIB section");
+    }
+    SelectObject(dc, bitmap);
+    data->dc = dc;
+    data->bitmap = bitmap;
+    data->pixels = pixels;
+    return true;
+}
+
 static bool win32_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface)
 {
     (void)device;
@@ -2088,26 +2122,10 @@ static bool win32_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
     }
     SDLOP_MUTEX_LOCK(&data->surfacelock);
     destroy_dib(data);
-
-    BITMAPINFO bmi;
-    SDL_zero(bmi);
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = window->w;
-    bmi.bmiHeader.biHeight = -window->h; /* top-down, like SDL surfaces */
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    HDC screen = GetDC(data->hwnd);
-    data->dc = CreateCompatibleDC(screen);
-    data->bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &data->pixels, NULL, 0);
-    ReleaseDC(data->hwnd, screen);
-    if (!data->dc || !data->bitmap || !data->pixels) {
-        destroy_dib(data);
+    if (!create_dib(data, window->w, window->h)) {
         SDLOP_MUTEX_UNLOCK(&data->surfacelock);
-        return SDL_SetError("Couldn't create DIB section");
+        return false;
     }
-    SelectObject(data->dc, data->bitmap);
 
     SDL_Surface *s = SDL_CreateSurfaceFrom(window->w, window->h, SDL_PIXELFORMAT_XRGB8888,
                                            data->pixels, window->w * 4);
@@ -2131,17 +2149,9 @@ static bool win32_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
         return true;
     }
     SDLOP_MUTEX_LOCK(&data->surfacelock);
-    if (data->surface->w != window->w || data->surface->h != window->h) {
-        /* resized under us: the DIB must be rebuilt at the new size */
-        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
-        SDL_Surface *fresh = NULL;
-        if (!win32_CreateWindowFramebuffer(device, window, &fresh)) {
-            return false;
-        }
-        window->surface = fresh;
-        data = (SDLop_Win32WindowData *)window->driverdata;
-        SDLOP_MUTEX_LOCK(&data->surfacelock);
-    }
+    /* drawn before a resize reached the surface: shown at the size it was
+     * drawn at; the core resizes the surface right after
+     * (win32_ResizeWindowFramebuffer) */
     HDC hdc = GetDC(data->hwnd);
     if (hdc) {
         if (numrects > 0 && rects) {
@@ -2150,11 +2160,49 @@ static bool win32_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
                 BitBlt(hdc, rc.left, rc.top, rects[i].w, rects[i].h, data->dc, rc.left, rc.top, SRCCOPY);
             }
         } else {
-            BitBlt(hdc, 0, 0, window->w, window->h, data->dc, 0, 0, SRCCOPY);
+            BitBlt(hdc, 0, 0, data->surface->w, data->surface->h, data->dc, 0, 0, SRCCOPY);
         }
         ReleaseDC(data->hwnd, hdc);
     }
     data->surface_dirty = false;
+    SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+    return true;
+}
+
+/* the window surface follows the client size, in place: a new DIB behind
+ * the same SDL_Surface (SDLop keeps the pointer valid across resizes) */
+static bool win32_ResizeWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *surface)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data || !data->hwnd || data->surface != surface || window->w <= 0 || window->h <= 0) {
+        return true;
+    }
+    SDLOP_MUTEX_LOCK(&data->surfacelock);
+    if (surface->w == window->w && surface->h == window->h) {
+        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+        return true;
+    }
+    HDC old_dc = data->dc;
+    HBITMAP old_bitmap = data->bitmap;
+    if (!create_dib(data, window->w, window->h)) {
+        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+        return false;
+    }
+    if (old_dc) {
+        DeleteDC(old_dc); /* first: a bitmap selected into a DC can't be deleted */
+    }
+    if (old_bitmap) {
+        DeleteObject(old_bitmap);
+    }
+    /* new contents start at the clear colour, as on X11 / Wayland */
+    const Uint32 clear = ((Uint32)window->clear_r << 16) | ((Uint32)window->clear_g << 8) | window->clear_b;
+    Uint32 *px = (Uint32 *)data->pixels;
+    for (size_t i = 0, n = (size_t)window->w * (size_t)window->h; i < n; i++) {
+        px[i] = clear;
+    }
+    SDLOP_SetSurfacePixels(surface, data->pixels, window->w, window->h, window->w * 4);
+    data->surface_dirty = true;
     SDLOP_MUTEX_UNLOCK(&data->surfacelock);
     return true;
 }
@@ -3557,6 +3605,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .SetWindowHitTest = win32_SetWindowHitTest,
     .UpdateWindowShape = win32_UpdateWindowShape,
     .UpdateTextInputArea = win32_UpdateTextInputArea,
+    .ResizeWindowFramebuffer = win32_ResizeWindowFramebuffer,
     .GetWindowICCProfile = win32_GetWindowICCProfile,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,

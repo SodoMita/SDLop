@@ -621,7 +621,9 @@ void SDLOP_SendWindowEvent(SDL_Window *window, SDL_EventType type, Sint32 data1,
         SDLOP_UpdateWindowDisplay(window);
         SDLOP_OnWindowMoved(window);
     } else if (window && type == SDL_EVENT_WINDOW_RESIZED) {
-        SDLOP_GL_NotifyWindowResized(window);
+        /* the GL offload surface is resized once the pump is done: a burst
+         * of RESIZED in one pump reallocates once, before the next frame */
+        window->gl_resize_pending = true;
         /* SDL_OnWindowResized: the shape follows the window size */
         if ((window->flags & SDL_WINDOW_TRANSPARENT) && sdlop.video && sdlop.video->UpdateWindowShape) {
             SDL_Surface *shape =
@@ -832,6 +834,12 @@ void SDL_PumpEvents(void)
     if (sdlop.video) {
         sdlop.video->PumpEvents(sdlop.video, -1);
         SDLOP_UpdateCursorAnimation();
+        for (SDL_Window *w = sdlop.windows; w; w = w->next) {
+            if (w->gl_resize_pending) {
+                w->gl_resize_pending = false;
+                SDLOP_GL_NotifyWindowResized(w);
+            }
+        }
     }
 
     /* 4. events pushed by other threads */
