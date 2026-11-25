@@ -266,6 +266,24 @@ static EM_BOOL focus_cb(int event_type, const EmscriptenFocusEvent *e, void *use
     return EM_TRUE;
 }
 
+/* The browser tab/window close button fires beforeunload. There is no event
+ * pump after the page goes away, so this has to notify watchers synchronously
+ * (as stock SDL3 does with SDL_EVENT_TERMINATING). Deliver the same window
+ * close request the X11/Wayland/Win32 backends produce for their close button
+ * as well, so apps that only handle SDL_EVENT_WINDOW_CLOSE_REQUESTED see it. */
+static const char *beforeunload_cb(int event_type, const void *reserved, void *user_data)
+{
+    (void)event_type;
+    (void)reserved;
+    (void)user_data;
+    SDL_Window *w = sdlop.keyboard_focus ? sdlop.keyboard_focus : sdlop.windows;
+    if (w) {
+        SDLOP_SendWindowEvent(w, SDL_EVENT_WINDOW_CLOSE_REQUESTED, 0, 0);
+    }
+    SDLOP_SendSimpleEvent(SDL_EVENT_TERMINATING);
+    return ""; /* don't raise the browser's "leave site?" confirmation */
+}
+
 static void register_input_callbacks(const char *selector)
 {
     if (!input_callbacks_registered) {
@@ -275,6 +293,7 @@ static void register_input_callbacks(const char *selector)
         emscripten_set_pointerlockchange_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, NULL, EM_TRUE, pointerlock_cb);
         emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_TRUE, focus_cb);
         emscripten_set_focus_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_TRUE, focus_cb);
+        emscripten_set_beforeunload_callback(NULL, beforeunload_cb);
     }
     /* mouse/wheel are per-canvas; the selector string outlives the window
      * (callbacks are torn down with the document) */
@@ -313,6 +332,8 @@ static bool emscripten_Init(SDLop_VideoDevice *device)
 static void emscripten_Quit(SDLop_VideoDevice *device)
 {
     (void)device;
+    emscripten_set_beforeunload_callback(NULL, NULL);
+    input_callbacks_registered = false;
     while (sdlop.num_displays > 0) {
         SDLOP_DelDisplay(sdlop.displays[sdlop.num_displays - 1].id, false);
     }

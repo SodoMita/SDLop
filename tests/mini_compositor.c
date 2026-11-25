@@ -54,7 +54,8 @@
   log "move serial=ok|bad", "resize edge=E serial=ok|bad" and
   "menu X,Y serial=ok|bad" (ok: the serial of the latest button press).
   MINI_POINTER_CMD=<file>: on SIGUSR2 the lines of <file> are run as
-  pointer input on the window - "motion X Y", "press BTN", "release BTN"
+  pointer input on the window - "close" (the compositor's title-bar close
+  button: xdg_toplevel.close), "motion X Y", "press BTN", "release BTN"
   (linux button codes), "wheel AXIS STEPS120" (a mouse wheel: source,
   value120 for wl_pointer v8+ or discrete for v5-7, axis = 15 units per
   detent), "natural AXIS STEPS120" (the same with relative direction
@@ -2434,6 +2435,13 @@ static int P_signal_cb(int signal_number, void *data)
         double x, y;
         unsigned btn;
         if (TB_command(line) || GS_command(line) || RZ_command(line)) {
+            continue;
+        }
+        /* the compositor's close button: no pointer needed */
+        if (strncmp(line, "close", 5) == 0 && (line[5] == '\n' || line[5] == '\r' || line[5] == '\0')) {
+            if (M.xdg_toplevel) {
+                xdg_toplevel_send_close(M.xdg_toplevel);
+            }
             continue;
         }
         if (!M.pointer) {
