@@ -517,6 +517,7 @@ void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms);
 void SDLOP_RawInputTestFeed(const SDLop_RawEvent *ev, bool winsys); /* tests only */
 int SDLOP_RawInputTestAddDevice(bool keyboard, bool pointer, bool absolute, int min_x, int max_x, int min_y, int max_y,
                                 bool touch_is_left); /* tests only */
+void SDLOP_RawInputTestSetWheelHighRes(int index, bool x, bool y); /* tests only */
 
 /* Video core helpers (SDL_video.c) */
 bool SDLOP_VideoInit(void);

@@ -753,6 +753,14 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
     add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
 
+    # Report-frame ordering and wheel capability selection (fake devices, no
+    # uinput/kernel support required).
+    add_executable(test_evdev_frames tests/test_evdev_frames.c)
+    target_link_libraries(test_evdev_frames PRIVATE sdlop)
+    target_include_directories(test_evdev_frames PRIVATE src)
+    target_compile_options(test_evdev_frames PRIVATE -UNDEBUG)
+    add_test(NAME test_evdev_frames COMMAND test_evdev_frames)
+
     # End-to-end evdev joystick/gamepad backend through uinput.
     add_executable(test_evdev_joystick tests/test_evdev_joystick.c tests/uinput_synth.c)
     target_link_libraries(test_evdev_joystick PRIVATE sdlop)

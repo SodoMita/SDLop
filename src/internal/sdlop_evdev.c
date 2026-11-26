@@ -66,6 +66,11 @@ typedef struct SDLOP_RawDevice
     unsigned long keys[SDLOP_KEY_WORDS];
     float hi_res_x, hi_res_y;
     SDL_Window *wheel_focus; /* owner of a partial SDL wheel frame */
+    /* One SDL motion per SYN_REPORT frame, like SDL3's EVDEV poll: both axes
+     * together instead of one event per axis. */
+    float rel_x, rel_y;
+    SDL_Window *rel_focus;
+    bool rel_have;
     bool removal_done; /* main-thread state release completed */
     int abs_min[2], abs_max[2];
     int abs_range[2]; /* abs_max - abs_min, kept for the abs_motion scaling */
@@ -930,7 +935,39 @@ int SDLOP_RawInputTestAddDevice(bool keyboard, bool pointer, bool absolute, int 
     return (int)raw.num_devices++;
 }
 
+void SDLOP_RawInputTestSetWheelHighRes(int index, bool x, bool y)
+{
+    if (raw.running || index < 0 || (size_t)index >= raw.num_devices) {
+        return;
+    }
+    raw.devices[index].wheel_highres_x = x;
+    raw.devices[index].wheel_highres_y = y;
+}
+
 static void pump_event(const SDLop_RawEvent *ev, bool recovering);
+
+/* Publish one motion for the whole report frame. Absolute positions are still
+ * best-effort: they use the accumulated delta and the position at report time. */
+static void send_relative_frame(SDLOP_RawDevice *dev, Uint64 timestamp_ns)
+{
+    const float dx = dev->rel_x;
+    const float dy = dev->rel_y;
+    dev->rel_x = dev->rel_y = 0.0f;
+    dev->rel_have = false;
+    if (dx == 0.0f && dy == 0.0f) {
+        return;
+    }
+    float x = SDLOP_NO_POS, y = SDLOP_NO_POS;
+    SDL_Window *w = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.keyboard_focus;
+    if (w && !sdlop.relative_mode_window) {
+        x = SDL_clamp(sdlop.mouse_x + dx, 0.0f, (float)(w->w - 1));
+        y = SDL_clamp(sdlop.mouse_y + dy, 0.0f, (float)(w->h - 1));
+    } else if (w) {
+        x = sdlop.mouse_x + dx;
+        y = sdlop.mouse_y + dy;
+    }
+    SDLOP_SendMouseMotion(x, y, dx, dy, timestamp_ns);
+}
 
 static void pump_event(const SDLop_RawEvent *ev, bool recovering)
 {
@@ -998,19 +1035,19 @@ static void pump_event(const SDLop_RawEvent *ev, bool recovering)
         switch (ev->code) {
         case SDLop_REL_X:
         case SDLop_REL_Y: {
-            float dx = (ev->code == SDLop_REL_X) ? (float)ev->value : 0.0f;
-            float dy = (ev->code == SDLop_REL_Y) ? (float)ev->value : 0.0f;
-            /* absolute position best-effort: accumulate into window space */
-            float x = SDLOP_NO_POS, y = SDLOP_NO_POS;
-            SDL_Window *w = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.keyboard_focus;
-            if (w && !sdlop.relative_mode_window) {
-                x = SDL_clamp(sdlop.mouse_x + dx, 0.0f, (float)(w->w - 1));
-                y = SDL_clamp(sdlop.mouse_y + dy, 0.0f, (float)(w->h - 1));
-            } else if (w) {
-                x = sdlop.mouse_x + dx;
-                y = sdlop.mouse_y + dy;
+            SDL_Window *focus = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.relative_mode_window;
+            if (dev->rel_have && dev->rel_focus != focus) {
+                /* A focus change ends the previous frame: don't move a window
+                 * with deltas that arrived while another one was focused. */
+                send_relative_frame(dev, ev->timestamp_ns);
             }
-            SDLOP_SendMouseMotion(x, y, dx, dy, ev->timestamp_ns);
+            dev->rel_focus = focus;
+            dev->rel_have = true;
+            if (ev->code == SDLop_REL_X) {
+                dev->rel_x += (float)ev->value;
+            } else {
+                dev->rel_y += (float)ev->value;
+            }
             break;
         }
         case SDLop_REL_WHEEL:
@@ -1049,7 +1086,10 @@ static void pump_event(const SDLop_RawEvent *ev, bool recovering)
         }
         break;
     case SDLop_EV_SYN:
-        if (ev->code == SDLop_SYN_REPORT) { abs_motion(dev, ev->timestamp_ns, winsys); }
+        if (ev->code == SDLop_SYN_REPORT) {
+            send_relative_frame(dev, ev->timestamp_ns);
+            abs_motion(dev, ev->timestamp_ns, winsys);
+        }
         if (ev->code == SDLop_SYN_REPORT && (dev->hi_res_x != 0.0f || dev->hi_res_y != 0.0f)) {
             SDL_Window *focus = sdlop.mouse_focus ? sdlop.mouse_focus : sdlop.relative_mode_window;
             if (!winsys || (winsys_pointer_focus() && focus == dev->wheel_focus)) {
@@ -1145,6 +1185,8 @@ static void begin_sync(SDLOP_RawDevice *dev, bool wait_report)
     dev->sync_code = 0;
     dev->retry_ns = 0;
     dev->hi_res_x = dev->hi_res_y = 0.0f; /* damaged partial wheel frame */
+    dev->rel_x = dev->rel_y = 0.0f; /* damaged partial motion frame */
+    dev->rel_have = false;
     dev->abs_recovered = false;
     raw.have_sync = true;
     sdlop.repeat_active = false; /* don't repeat uncertain key state */
