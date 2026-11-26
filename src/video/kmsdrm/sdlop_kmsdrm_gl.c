@@ -560,7 +560,15 @@ static bool kmsdrm_gl_create_surfaces(SDLop_VideoDevice *device, SDL_Window *win
     (void)device;
     KMSDRM_DeviceData *dev = vid();
     KMSDRM_WindowData *windata = (KMSDRM_WindowData *)window->driverdata;
-    KMSDRM_DisplayData *dd = windata->display;
+    KMSDRM_DisplayData *dd = windata ? windata->display : NULL;
+    if (!windata || !dd) {
+        return SDL_SetError("KMSDRM: invalid window for GL surfaces");
+    }
+    /* GPU offload RenderNodes have no GBM scanout device: never call into
+     * libgbm with a NULL device (gbm_device_is_format_supported segfaults). */
+    if (!dev->gbm_dev) {
+        return SDL_SetError("KMSDRM: no GBM device for GL scanout surfaces");
+    }
     uint32_t w = dd->mode.hdisplay, h = dd->mode.vdisplay;
 
     const uint32_t scanout_flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
@@ -670,11 +678,15 @@ void KMSDRM_DestroyGLSurfaces(KMSDRM_WindowData *windata)
         SDLOP_GLOffload_DestroySurface((SDLOP_GLOffloadSurface *)windata->gl_offload_surface);
         windata->gl_offload_surface = NULL;
     }
-    windata->gl_offload_active = false;
+    /* The offload context belongs to the GL context, not to these surfaces:
+     * it must survive a VT switch / resize so the next swap can rebuild the
+     * offload surface and still recognise this as an offload window. */
     windata->gl_offload_prime = false;
-    windata->gl_offload_ctx = NULL;
 
-    if (egl_initialized) {
+    /* A native eglMakeCurrent(NO_CONTEXT) also unbinds an offload context from
+     * another EGLDisplay. Leave the offload context current across a surface
+     * teardown; SDL_GL_MakeCurrent() handles the native case. */
+    if (egl_initialized && !kmsdrm_use_offload) {
         SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
     if (windata->bo) {
