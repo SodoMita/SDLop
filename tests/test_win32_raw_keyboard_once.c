@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include "win32_testenv.h"
 
 static int failures = 0;
 
@@ -178,6 +179,10 @@ static int run_case(const char *label, int text_input)
 
 int main(void)
 {
+    if (!win32_test_interactive_desktop()) {
+        printf("skipped: no interactive desktop for input injection\n");
+        return 77;
+    }
     run_case("text input off", 0);
     run_case("text input on", 1);
 

@@ -21,6 +21,38 @@
 #include "internal/sdlop_win32_keymap.h"
 #include <stdio.h>
 #include <string.h>
+#include <windows.h>
+
+/* What Windows says the current layout produces for a scancode. The layout
+ * table is supposed to mirror this -- on a Russian layout the Y key is "н",
+ * not "y" -- so hardcoding US letters here made the test fail on a localized
+ * Windows even though the table was correct. */
+static Uint32 os_layout_char(UINT scan, bool shifted)
+{
+    BYTE state[256];
+    BYTE zero[256];
+    WCHAR chars[8] = { 0 };
+    WCHAR junk[8];
+    const UINT vk = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK);
+    int produced;
+
+    if (!vk) {
+        return 0;
+    }
+    memset(state, 0, sizeof(state));
+    if (shifted) {
+        state[VK_SHIFT] = 0x80;
+    }
+    state[vk] = 0x80;
+    produced = ToUnicodeEx(vk, scan, state, chars, (int)SDL_arraysize(chars), 0, GetKeyboardLayout(0));
+    /* ToUnicodeEx leaves dead keys pending; clear them so probing is repeatable */
+    memset(zero, 0, sizeof(zero));
+    ToUnicodeEx(vk, scan, zero, junk, (int)SDL_arraysize(junk), 0, GetKeyboardLayout(0));
+    if (produced <= 0 || chars[0] < 0x20) {
+        return 0;
+    }
+    return (Uint32)chars[0];
+}
 
 static int failures = 0;
 
@@ -188,10 +220,19 @@ int main(void)
          * layout, and that is precisely the bug this pins. */
         SDLOP_Win32UpdateKeyboardLayout();
         /* the layout table itself: characters present, non-keys absent */
-        CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == 'y',
-              "layout table has no character for Y");
-        CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, true) == 'Y',
-              "layout table has no shifted Y");
+        const Uint32 want_plain = os_layout_char((UINT)SDL_SCANCODE_Y, false);
+        const Uint32 want_shifted = os_layout_char((UINT)SDL_SCANCODE_Y, true);
+        if (want_plain && want_shifted) {
+            CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == want_plain,
+                  "layout table character for Y is 0x%x, Windows says 0x%x",
+                  SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false), want_plain);
+            CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, true) == want_shifted,
+                  "layout table shifted character for Y is 0x%x, Windows says 0x%x",
+                  SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, true), want_shifted);
+        } else {
+            printf("test_win32_keycodes: layout table character checks skipped "
+                   "(the current layout has no character for Y)\n");
+        }
         CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_F1, false) == 0,
               "F1 must not have a layout character");
         CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_LEFT, false) == 0,
@@ -207,8 +248,10 @@ int main(void)
         CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_BACKSPACE, SDL_KMOD_NONE, true) == SDLK_BACKSPACE, "BACKSPACE keycode");
         /* rebuilding is idempotent and must not lose the table */
         SDLOP_Win32UpdateKeyboardLayout();
-        CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == 'y',
-              "the layout table was lost on rebuild");
+        if (want_plain) {
+            CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == want_plain,
+                  "the layout table was lost on rebuild");
+        }
     }
 
     SDL_StopTextInput(w);

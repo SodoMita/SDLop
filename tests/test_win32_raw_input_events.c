@@ -26,6 +26,7 @@
 #include "internal/sdlop_internal.h"
 #include <windows.h>
 #include <stdio.h>
+#include "win32_testenv.h"
 
 static int failures = 0;
 
@@ -57,6 +58,10 @@ static void SDLCALL on_raw(const SDLop_RawEvent *event, void *userdata)
 int main(void)
 {
     SDL_Window *window;
+    if (!win32_test_interactive_desktop()) {
+        printf("skipped: no interactive desktop for input injection\n");
+        return 77;
+    }
     LONG before_motion, before_wheel;
     int queue_motion = 0;
     float queue_wheel = 0.0f;

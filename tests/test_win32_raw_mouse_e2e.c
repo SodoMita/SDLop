@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include "win32_testenv.h"
 
 /* evdev mouse button codes, as published in SDLop.h */
 #define BTN_LEFT   272
@@ -126,6 +127,10 @@ static void click(DWORD down, DWORD up, Uint16 want_code, const char *name)
 int main(void)
 {
     SDL_Window *window;
+    if (!win32_test_interactive_desktop()) {
+        printf("skipped: no interactive desktop for input injection\n");
+        return 77;
+    }
     struct tally t;
 
     SDL_SetHint(SDLOP_HINT_RAW_INPUT, "1");

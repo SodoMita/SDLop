@@ -52,7 +52,8 @@ int main(void) {
 | Linux / KMSDRM (dumb buffers, GBM/EGL, VK_KHR_display, hardware cursor) | ✅ done (no DRM device in CI; build-tested) |
 | `dummy` (offscreen) driver | ✅ done, used for headless CI (incl. RAM-framebuffer surfaces) |
 | Web (Emscripten): canvas windows, DOM input, WebGL1/2 | ✅ done, tested in node + headless Chromium 153 |
-| Windows / Win32, macOS / Cocoa | 🔜 after web |
+| Windows / Win32 (WGL, Vulkan, raw input, IME, file/clipboard, window management) | ✅ done, tested natively on Windows 7 SP1 x64 with MinGW-w64 (Win10-only APIs resolved dynamically; GPU/input tests skip when the driver/desktop is absent) |
+| macOS / Cocoa | 🔜 next platform |
 
 ## Architecture
 

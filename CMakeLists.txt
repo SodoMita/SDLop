@@ -688,6 +688,9 @@ if(SDLop_BUILD_TESTS)
       target_include_directories(${t} PRIVATE src)
       target_compile_options(${t} PRIVATE -UNDEBUG)
       add_test(NAME ${t} COMMAND ${t})
+      # Input-injection tests return 77 when there is no visible desktop
+      # (e.g. an SSH/service session on Windows), like the Vulkan skip.
+      set_tests_properties(${t} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
     set_tests_properties(test_win32_scancodes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
     # These two inject keyboard input through SendInput and assert exactly one
@@ -708,7 +711,7 @@ if(SDLop_BUILD_TESTS)
       target_include_directories(${t} PRIVATE src)
       target_compile_options(${t} PRIVATE -UNDEBUG)
       add_test(NAME ${t} COMMAND ${t})
-      set_tests_properties(${t} PROPERTIES RUN_SERIAL TRUE)
+      set_tests_properties(${t} PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
     endforeach()
     target_link_libraries(test_win32_shape PRIVATE gdi32)
     target_link_libraries(test_win32_gl PRIVATE opengl32)

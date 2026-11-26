@@ -36,6 +36,17 @@ static int failures = 0;
         }                                                       \
     } while (0)
 
+/* A machine with no IME that accepts a composition string (e.g. a plain Win7
+ * install with only a Russian layout) cannot exercise the Imm32 path at all.
+ * The composition plumbing is still exercised in CI where such an IME exists. */
+#define SKIP_NO_IME(msg)                                    \
+    do {                                                    \
+        printf("skipped: %s\n", msg);                       \
+        SDL_DestroyWindow(window);                          \
+        SDL_Quit();                                         \
+        return 77;                                          \
+    } while (0)
+
 static HWND hwnd_of(SDL_Window *window)
 {
     return (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window),
@@ -93,6 +104,19 @@ int main(void)
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 2;
+    }
+
+    {
+        HIMC probe = ImmGetContext(hwnd);
+        WCHAR text[] = { 0x3042, 0 };
+        BOOL set = FALSE;
+        if (probe) {
+            set = ImmSetCompositionStringW(probe, SCS_SETSTR, text, (DWORD)sizeof(text), NULL, 0);
+            ImmReleaseContext(hwnd, probe);
+        }
+        if (!set) {
+            SKIP_NO_IME("no IME context that accepts a composition string");
+        }
     }
 
     /* --- before text input is active, composition must be ignored ------- */
