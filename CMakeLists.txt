@@ -705,7 +705,7 @@ if(SDLop_BUILD_TESTS)
               test_win32_fileops
               test_win32_raw_keyboard_e2e test_win32_raw_mouse_e2e
               test_win32_gl test_win32_vulkan test_win32_clipboard
-              test_win32_ime test_win32_attention)
+              test_win32_ime test_win32_attention test_win32_dnd_exposed)
       add_executable(${t} tests/${t}.c)
       target_link_libraries(${t} PRIVATE sdlop)
       target_include_directories(${t} PRIVATE src)

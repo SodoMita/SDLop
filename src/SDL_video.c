@@ -1865,6 +1865,15 @@ bool SDL_SetWindowModal(SDL_Window *window, bool modal)
     return sdlop.video->SetWindowModal(sdlop.video, window, modal);
 }
 
+bool SDL_AcceptDragAndDrop(SDL_Window *window, bool accept)
+{
+    CHECK_WINDOW(window, false);
+    if (sdlop.video->AcceptDragAndDrop) {
+        sdlop.video->AcceptDragAndDrop(window, accept);
+    }
+    return true;
+}
+
 bool SDL_SetWindowFocusable(SDL_Window *window, bool focusable)
 {
     CHECK_WINDOW(window, false);

@@ -23,6 +23,7 @@
 
 #include <windowsx.h>
 #include <imm.h>
+#include <shellapi.h>
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
@@ -330,6 +331,15 @@ static void set_focus(SDL_Window *window, bool focused)
         sdlop.keyboard_focus = NULL;
         window->flags &= ~SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_LOST, 0, 0);
+        /* Keys/buttons released while another window has focus never reach
+         * us; without this resync they stay stuck down forever. SDL3's
+         * WIN_UpdateFocus does the same reset. */
+        SDL_ResetKeyboard();
+        for (Uint8 btn = 1; btn <= SDL_BUTTON_X2; btn++) {
+            if (sdlop.mouse_buttons & SDL_BUTTON_MASK(btn)) {
+                SDLOP_SendMouseButton(false, btn, SDLOP_NO_POS, SDLOP_NO_POS, 0);
+            }
+        }
         /* Never leave the pointer trapped in an inactive window (SDL3 does
          * the same in WIN_UpdateFocus). */
         if (data) {
@@ -1062,6 +1072,45 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             set_focus(window, false);
         }
         return 0;
+
+    case WM_PAINT:
+        if (window) {
+            PAINTSTRUCT paint;
+            BeginPaint(hwnd, &paint);
+            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+        break;
+
+    case WM_DROPFILES:
+        if (window) {
+            HDROP drop = (HDROP)wparam;
+            UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, NULL, 0);
+            for (UINT i = 0; i < count; i++) {
+                UINT len = DragQueryFileW(drop, i, NULL, 0);
+                if (len && len < 0x10000) {
+                    wchar_t *wide = (wchar_t *)SDL_malloc(((size_t)len + 1) * sizeof(wchar_t));
+                    if (wide) {
+                        if (DragQueryFileW(drop, i, wide, len + 1) == len) {
+                            const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                            if (bytes > 0) {
+                                char *file = (char *)SDL_malloc((size_t)bytes);
+                                if (file && WideCharToMultiByte(CP_UTF8, 0, wide, -1, file, bytes, NULL, NULL) == bytes) {
+                                    SDLOP_SendDropFile(window, NULL, file);
+                                }
+                                SDL_free(file);
+                            }
+                        }
+                        SDL_free(wide);
+                    }
+                }
+            }
+            SDLOP_SendDropComplete(window);
+            DragFinish(drop);
+            return 0;
+        }
+        break;
 
     case WM_SIZE:
         if (window) {
@@ -2982,6 +3031,14 @@ static bool win32_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL
     return true;
 }
 
+static void win32_AcceptDragAndDrop(SDL_Window *window, bool accept)
+{
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (data && data->hwnd) {
+        DragAcceptFiles(data->hwnd, accept ? TRUE : FALSE);
+    }
+}
+
 static bool win32_SetWindowFocusable(SDLop_VideoDevice *device, SDL_Window *window, bool focusable)
 {
     (void)device;
@@ -3618,6 +3675,7 @@ SDLop_VideoDevice SDLop_windows_device = {
      * not implement it. A first attempt implemented it as "false while the
      * window has queued messages", which made SDL_SyncWindow() report failure
      * for any unrelated pending message -- an ordinary WM_NULL was enough. */
+    .AcceptDragAndDrop = win32_AcceptDragAndDrop,
     .SetWindowFocusable = win32_SetWindowFocusable,
     .SetWindowParent = win32_SetWindowParent,
     .SetWindowModal = win32_SetWindowModal,
