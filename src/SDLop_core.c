@@ -7,17 +7,18 @@
 
 #include "internal/sdlop_internal.h"
 #include "internal/sdlop_joystick_internal.h"
-#ifndef __EMSCRIPTEN__
-#ifndef _WIN32
-#include <sys/eventfd.h>
-#endif
-#endif
+#include "internal/sdlop_portable.h"
 #include <time.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
 
-SDLop_Globals sdlop;
+SDLop_Globals sdlop = {
+    .wake_fd = -1,
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && (!defined(SDLOP_HAVE_EVENTFD) || !SDLOP_HAVE_EVENTFD)
+    .wake_write_fd = -1,
+#endif
+};
 bool sdlop_quitting;
 
 /* ------------------------------------------------------------------ */
@@ -71,12 +72,44 @@ const char *SDL_GetRevision(void)
 
 const char *SDL_GetPlatform(void)
 {
-#if defined(_WIN32)
-    return "Windows";
-#elif defined(__EMSCRIPTEN__)
+#if defined(SDL_PLATFORM_AIX)
+    return "AIX";
+#elif defined(SDL_PLATFORM_ANDROID)
+    return "Android";
+#elif defined(SDL_PLATFORM_BSDI)
+    return "BSDI";
+#elif defined(SDL_PLATFORM_EMSCRIPTEN)
     return "Emscripten";
-#else
+#elif defined(SDL_PLATFORM_FREEBSD)
+    return "FreeBSD";
+#elif defined(SDL_PLATFORM_HAIKU)
+    return "Haiku";
+#elif defined(SDL_PLATFORM_LINUX)
     return "Linux";
+#elif defined(SDL_PLATFORM_MACOS)
+    return "macOS";
+#elif defined(SDL_PLATFORM_NETBSD)
+    return "NetBSD";
+#elif defined(SDL_PLATFORM_OPENBSD)
+    return "OpenBSD";
+#elif defined(SDL_PLATFORM_QNXNTO)
+    return "QNX Neutrino";
+#elif defined(SDL_PLATFORM_SOLARIS)
+    return "Solaris";
+#elif defined(SDL_PLATFORM_WIN32)
+    return "Windows";
+#elif defined(SDL_PLATFORM_VISIONOS)
+    return "visionOS";
+#elif defined(SDL_PLATFORM_IOS)
+    return "iOS";
+#elif defined(SDL_PLATFORM_TVOS)
+    return "tvOS";
+#elif defined(SDL_PLATFORM_HURD)
+    return "GNU/Hurd";
+#elif defined(__DragonFly__)
+    return "DragonFly";
+#else
+    return "Unknown (see SDL_platform.h)";
 #endif
 }
 
@@ -118,21 +151,20 @@ const char *SDLOP_GetExeName(void)
 {
     static char name[256];
     if (!name[0]) {
-#if defined(_WIN32)
-        wchar_t wpath[1024];
-        char path[1024];
-        if (GetModuleFileNameW(NULL, wpath, (DWORD)SDL_arraysize(wpath)) > 0 &&
-            WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, (int)sizeof(path), NULL, NULL) > 0) {
-            const char *base = strrchr(path, '\\');
-            SDL_strlcpy(name, base ? base + 1 : path, sizeof(name));
-        }
-#elif !defined(__EMSCRIPTEN__)
-        char path[1024];
-        ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
-        if (n > 0) {
-            path[n] = '\0';
+#if !defined(__EMSCRIPTEN__)
+        char *path = SDLOP_ReadExePath();
+        if (path) {
             const char *base = strrchr(path, '/');
+#ifdef _WIN32
+            const char *bslash = strrchr(path, '\\');
+            if (bslash && (!base || bslash > base)) {
+                base = bslash;
+            }
+#endif
             SDL_strlcpy(name, base ? base + 1 : path, sizeof(name));
+            SDL_free(path);
+        } else {
+            SDL_ClearError();
         }
 #endif
     }
@@ -261,10 +293,11 @@ bool SDL_Init(SDL_InitFlags flags)
         sdlop.wake_handle = CreateEventW(NULL, FALSE, FALSE, NULL);
 #endif
 #else
-        sdlop.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (sdlop.wake_fd < 0) {
-            sdlop.wake_fd = -1;
-        }
+#if defined(SDLOP_HAVE_EVENTFD) && SDLOP_HAVE_EVENTFD
+        SDLOP_WakeFdCreate(&sdlop.wake_fd, NULL);
+#else
+        SDLOP_WakeFdCreate(&sdlop.wake_fd, &sdlop.wake_write_fd);
+#endif
 #endif
         sdlop.init_done = true;
     }
@@ -321,10 +354,13 @@ void SDL_Quit(void)
     SDLOP_QuitEvents();
     SDLOP_QuitClipboard();
     SDLOP_QuitFilesystem();
-    if (sdlop.wake_fd >= 0) {
-        close(sdlop.wake_fd);
-        sdlop.wake_fd = -1;
-    }
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if defined(SDLOP_HAVE_EVENTFD) && SDLOP_HAVE_EVENTFD
+    SDLOP_WakeFdClose(&sdlop.wake_fd, NULL);
+#else
+    SDLOP_WakeFdClose(&sdlop.wake_fd, &sdlop.wake_write_fd);
+#endif
+#endif
 #if defined(_WIN32)
     if (sdlop.wake_handle) {
         CloseHandle((HANDLE)sdlop.wake_handle);
@@ -336,6 +372,9 @@ void SDL_Quit(void)
     SDLOP_ReleaseTimerHandles();
     memset(&sdlop, 0, sizeof(sdlop));
     sdlop.wake_fd = -1;
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && (!defined(SDLOP_HAVE_EVENTFD) || !SDLOP_HAVE_EVENTFD)
+    sdlop.wake_write_fd = -1;
+#endif
     SDLOP_ResetTouchMouse();
     SDLOP_AssertionsQuit(); /* report uses the log */
     SDLOP_QuitLog();

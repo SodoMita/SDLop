@@ -35,7 +35,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#if defined(__linux__) || defined(__sun)
 #include <sys/sysmacros.h>
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Minimal Vulkan type definitions (no vulkan.h)                       */

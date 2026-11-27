@@ -42,7 +42,20 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __linux__
 #include <linux/input-event-codes.h>
+#endif
+/* Wayland's protocol defines wl_pointer.button codes as Linux
+ * input-event-codes regardless of OS (matching SDL3's SDL_waylandevents.c). */
+#ifndef BTN_LEFT
+#define BTN_LEFT    0x110
+#define BTN_RIGHT   0x111
+#define BTN_MIDDLE  0x112
+#define BTN_SIDE    0x113
+#define BTN_EXTRA   0x114
+#define BTN_FORWARD 0x115
+#define BTN_BACK    0x116
+#endif
 
 #include "xdg-shell-client-protocol.h"
 
@@ -334,19 +347,22 @@ static struct wl_buffer *shm_create_wl_buffer(int w, int h, bool alpha, bool pop
 {
     const size_t stride = (size_t)w * 4;
     const size_t size = stride * (size_t)h;
-    int fd = memfd_create("sdlop-shm", MFD_CLOEXEC);
+    int fd = SDLOP_ShmCreate("sdlop-shm", size);
     if (fd < 0) {
-        SDL_SetError("memfd_create failed: %s", strerror(errno));
-        return NULL;
-    }
-    if (ftruncate(fd, (off_t)size) < 0) {
-        close(fd);
-        SDL_SetError("ftruncate failed: %s", strerror(errno));
+        SDL_SetError("wl_shm backing store creation failed: %s", strerror(errno));
         return NULL;
     }
     /* buffers of the cycle are written completely at least once: fault
      * the pages in with one call instead of one fault per page */
-    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | (populate ? MAP_POPULATE : 0), fd, 0);
+    int mmap_flags = MAP_SHARED;
+#ifdef MAP_POPULATE
+    if (populate) {
+        mmap_flags |= MAP_POPULATE;
+    }
+#else
+    (void)populate;
+#endif
+    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, mmap_flags, fd, 0);
     if (map == MAP_FAILED) {
         close(fd);
         SDL_SetError("mmap failed: %s", strerror(errno));
@@ -443,17 +459,17 @@ static bool shm_buffer_prepare(WaylandWindowData *wd, WaylandShmBuffer *b)
         }
         const size_t page = 4096;
         const size_t size = ((need + need / 4) + page - 1) / page * page;
-        int fd = memfd_create("sdlop-shm", MFD_CLOEXEC);
+        int fd = SDLOP_ShmCreate("sdlop-shm", size);
         if (fd < 0) {
-            return SDL_SetError("memfd_create failed: %s", strerror(errno));
-        }
-        if (ftruncate(fd, (off_t)size) < 0) {
-            close(fd);
-            return SDL_SetError("ftruncate failed: %s", strerror(errno));
+            return SDL_SetError("wl_shm backing store creation failed: %s", strerror(errno));
         }
         /* written completely at least once: fault the pages in with one
          * call instead of one fault per page */
-        void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+        int mmap_flags = MAP_SHARED;
+#ifdef MAP_POPULATE
+        mmap_flags |= MAP_POPULATE;
+#endif
+        void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, mmap_flags, fd, 0);
         if (map == MAP_FAILED) {
             close(fd);
             return SDL_SetError("mmap failed: %s", strerror(errno));
@@ -1589,11 +1605,8 @@ static struct wl_buffer *create_shm_argb_buffer(const uint32_t *argb, int w, int
         return NULL;
     }
     const size_t size = (size_t)bw * (size_t)bh * 4;
-    int fd = memfd_create("sdlop-argb", MFD_CLOEXEC);
-    if (fd < 0 || ftruncate(fd, (off_t)size) < 0) {
-        if (fd >= 0) {
-            close(fd);
-        }
+    int fd = SDLOP_ShmCreate("sdlop-argb", size);
+    if (fd < 0) {
         return NULL;
     }
     void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

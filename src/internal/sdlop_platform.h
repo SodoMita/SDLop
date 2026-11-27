@@ -33,6 +33,7 @@
 #define sdlop_platform_h_
 
 #include <SDL3/SDL.h>
+#include "internal/sdlop_portable.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
@@ -46,9 +47,22 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#ifndef __APPLE__
 #include <semaphore.h>
-#if !defined(__GLIBC__) && !defined(__ANDROID__)
+#endif
+#if !defined(PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP) && !defined(PTHREAD_RECURSIVE_MUTEX_INITIALIZER)
 #include <stdatomic.h>
+#endif
+
+/* CLOCK_MONOTONIC is POSIX.1-2008 and present on every target SDLop
+ * supports now; fall back to CLOCK_REALTIME where a libc is too old
+ * to define it (the deadline arithmetic still works, it just moves
+ * with the wall clock). */
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC CLOCK_REALTIME
+#endif
+#ifndef TIMER_ABSTIME
+#define TIMER_ABSTIME 1
 #endif
 
 /* The sleep path owns a kernel timer on Windows and nothing here; SDL_Quit
@@ -77,39 +91,33 @@ typedef pthread_mutex_t SDLOP_MUTEX_T;
 /* A mutex with static storage duration. Both platforms spell this the same
  * way at the call site; only the expansion differs.
  *
- * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP is a glibc extension, and the plain
- * PTHREAD_MUTEX_INITIALIZER it would replace is NOT recursive. Win32's
- * CRITICAL_SECTION always is, so static-initialising POSIX mutexes the plain
- * way made the two platforms differ in exactly the property SDL3 code relies
- * on: SDL_OpenHapticFromJoystick() holds the joystick lock and calls
- * SDL_IsJoystickHaptic(), which takes it again. On Linux that nested lock
- * would deadlock. Hence the GNU initialiser where it exists, and the same
- * once-initialised fallback everywhere else. */
+ * PTHREAD_RECURSIVE_MUTEX_INITIALIZER(_NP) is non-standard, and the plain
+ * PTHREAD_MUTEX_INITIALIZER it would replace is NOT recursive. When the
+ * platform header exposes a static recursive initializer, expand directly to
+ * it with zero runtime cost; otherwise (BSDs/Solaris/Haiku/QNX/musl/strict
+ * POSIX) an atomic once-state initializes PTHREAD_MUTEX_RECURSIVE on first
+ * lock/unlock. */
+#if defined(PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP)
 typedef struct SDLOP_StaticMutex
 {
     pthread_mutex_t id;
-#if !defined(__GLIBC__) && !defined(__ANDROID__)
-    /* 0 = uninitialised, 1 = initialising, 2 = ready. Only the fallback path
-     * needs it: the glibc spelling above is ready from the start. */
-    _Atomic int state;
-#endif
 } SDLOP_StaticMutex;
-
-/* Both branches have to yield a lock that is usable without any explicit init
- * call, because SDLOP_SM() is the only thing the call sites do.
- * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP is the glibc spelling of exactly
- * that, and needs no work at all. Elsewhere (musl, *BSD, macOS) the only
- * portable initialiser is PTHREAD_MUTEX_INITIALIZER, which is neither
- * recursive nor able to carry a type, so the lock is built on first use --
- * recursively, as CRITICAL_SECTION is on Windows -- and published through an
- * atomic state in the object itself.
- * The previous fallback defined a name##_ensure() helper that nothing ever
- * called, so every lock went to pthread_mutex_lock on a mutex that had never
- * been initialised. */
-#if defined(__GLIBC__) || defined(__ANDROID__)
 #define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP }
-#define SDLOP_SM(m) (&(m)->id)
+#define SDLOP_SM(m)              (&(m)->id)
+#elif defined(PTHREAD_RECURSIVE_MUTEX_INITIALIZER)
+typedef struct SDLOP_StaticMutex
+{
+    pthread_mutex_t id;
+} SDLOP_StaticMutex;
+#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_RECURSIVE_MUTEX_INITIALIZER }
+#define SDLOP_SM(m)              (&(m)->id)
 #else
+typedef struct SDLOP_StaticMutex
+{
+    pthread_mutex_t id;
+    /* 0 = uninitialised, 1 = initialising, 2 = ready. */
+    _Atomic int state;
+} SDLOP_StaticMutex;
 #define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER, 0 }
 
 static inline SDLOP_MUTEX_T *SDLOP_StaticMutexGet(SDLOP_StaticMutex *m)
@@ -154,8 +162,10 @@ typedef pthread_rwlock_t SDLOP_RWLOCK_T;
 
 typedef pthread_cond_t SDLOP_COND_T;
 
-/* Timed waits take an absolute CLOCK_MONOTONIC deadline, so the wait does not
- * move if the wall clock is adjusted. */
+/* Match SDL3 (SDL_syscond.c): use CLOCK_MONOTONIC when
+ * pthread_condattr_setclock() is available, else CLOCK_REALTIME. */
+#if defined(SDLOP_HAVE_PTHREAD_CONDATTR_SETCLOCK) && SDLOP_HAVE_PTHREAD_CONDATTR_SETCLOCK
+#define SDLOP_COND_CLOCK CLOCK_MONOTONIC
 #define SDLOP_COND_INIT(c) do {                                          \
         pthread_condattr_t _a;                                           \
         pthread_condattr_init(&_a);                                      \
@@ -163,14 +173,128 @@ typedef pthread_cond_t SDLOP_COND_T;
         pthread_cond_init((c), &_a);                                     \
         pthread_condattr_destroy(&_a);                                   \
     } while (0)
-#define SDLOP_COND_DESTROY(c)   pthread_cond_destroy(c)
-#define SDLOP_COND_SIGNAL(c)    pthread_cond_signal(c)
-#define SDLOP_COND_BROADCAST(c) pthread_cond_broadcast(c)
-#define SDLOP_COND_WAIT(c, m)         pthread_cond_wait((c), (m))
+#else
+#define SDLOP_COND_CLOCK CLOCK_REALTIME
+#define SDLOP_COND_INIT(c) pthread_cond_init((c), NULL)
+#endif
+#define SDLOP_COND_DESTROY(c)          pthread_cond_destroy(c)
+#define SDLOP_COND_SIGNAL(c)           pthread_cond_signal(c)
+#define SDLOP_COND_BROADCAST(c)        pthread_cond_broadcast(c)
+#define SDLOP_COND_WAIT(c, m)          pthread_cond_wait((c), (m))
 #define SDLOP_COND_WAIT_UNTIL(c, m, ts) pthread_cond_timedwait((c), (m), (ts))
-#define SDLOP_COND_TIMEDOUT     ETIMEDOUT
+#define SDLOP_COND_TIMEDOUT            ETIMEDOUT
 
 /* --- semaphore --------------------------------------------------- */
+
+#ifdef __APPLE__
+/* macOS deprecates sem_init()/sem_destroy() and returns ENOSYS for
+ * sem_getvalue(). Match SDL3 (src/thread/pthread/SDL_syssem.c ->
+ * generic/SDL_syssem.c) with a mutex + condvar semaphore. */
+typedef struct SDLOP_SEM_T
+{
+    pthread_mutex_t count_lock;
+    pthread_cond_t count_nonzero;
+    Uint32 count;
+    Uint32 waiters_count;
+} SDLOP_SEM_T;
+
+#define SDLOP_SEM_CLOCK SDLOP_COND_CLOCK
+
+static inline bool SDLOP_SemInit(SDLOP_SEM_T *sem, Uint32 initial_value)
+{
+    if (pthread_mutex_init(&sem->count_lock, NULL) != 0) {
+        return false;
+    }
+    SDLOP_COND_INIT(&sem->count_nonzero);
+    sem->count = initial_value;
+    sem->waiters_count = 0;
+    return true;
+}
+
+static inline void SDLOP_SemDestroy(SDLOP_SEM_T *sem)
+{
+    sem->count = 0xFFFFFFFFu;
+    while (sem->waiters_count > 0) {
+        pthread_cond_signal(&sem->count_nonzero);
+        sched_yield();
+    }
+    pthread_cond_destroy(&sem->count_nonzero);
+    pthread_mutex_destroy(&sem->count_lock);
+}
+
+static inline void SDLOP_SemPost(SDLOP_SEM_T *sem)
+{
+    pthread_mutex_lock(&sem->count_lock);
+    if (sem->waiters_count > 0) {
+        pthread_cond_signal(&sem->count_nonzero);
+    }
+    ++sem->count;
+    pthread_mutex_unlock(&sem->count_lock);
+}
+
+static inline bool SDLOP_SemTryWait(SDLOP_SEM_T *sem)
+{
+    bool ok = false;
+    pthread_mutex_lock(&sem->count_lock);
+    if (sem->count > 0) {
+        --sem->count;
+        ok = true;
+    }
+    pthread_mutex_unlock(&sem->count_lock);
+    return ok;
+}
+
+static inline bool SDLOP_SemWait(SDLOP_SEM_T *sem)
+{
+    pthread_mutex_lock(&sem->count_lock);
+    ++sem->waiters_count;
+    while (sem->count == 0) {
+        pthread_cond_wait(&sem->count_nonzero, &sem->count_lock);
+    }
+    --sem->waiters_count;
+    --sem->count;
+    pthread_mutex_unlock(&sem->count_lock);
+    return true;
+}
+
+static inline bool SDLOP_SemWaitUntil(SDLOP_SEM_T *sem, const struct timespec *deadline)
+{
+    bool ok = false;
+    pthread_mutex_lock(&sem->count_lock);
+    ++sem->waiters_count;
+    while (sem->count == 0) {
+        int rc = pthread_cond_timedwait(&sem->count_nonzero, &sem->count_lock, deadline);
+        if (rc == EINTR) {
+            continue;
+        }
+        if (rc != 0) {
+            break;
+        }
+    }
+    --sem->waiters_count;
+    if (sem->count > 0) {
+        --sem->count;
+        ok = true;
+    }
+    pthread_mutex_unlock(&sem->count_lock);
+    return ok;
+}
+
+static inline Uint32 SDLOP_SemValue(SDLOP_SEM_T *sem)
+{
+    pthread_mutex_lock(&sem->count_lock);
+    const Uint32 v = sem->count;
+    pthread_mutex_unlock(&sem->count_lock);
+    return v;
+}
+
+#define SDLOP_SEM_INIT(s, v)  SDLOP_SemInit((s), (Uint32)(v))
+#define SDLOP_SEM_DESTROY(s)  SDLOP_SemDestroy(s)
+#define SDLOP_SEM_POST(s)     SDLOP_SemPost(s)
+#define SDLOP_SEM_TRYWAIT(s)  SDLOP_SemTryWait(s)
+#define SDLOP_SEM_WAIT(s)     SDLOP_SemWait(s)
+
+#else /* !__APPLE__ */
 
 typedef sem_t SDLOP_SEM_T;
 #define SDLOP_SEM_INIT(s, v)  (sem_init((s), 0, (unsigned)(v)) == 0)
@@ -178,7 +302,20 @@ typedef sem_t SDLOP_SEM_T;
 #define SDLOP_SEM_POST(s)     sem_post(s)
 #define SDLOP_SEM_TRYWAIT(s)  (sem_trywait(s) == 0)
 
-/* Absolute CLOCK_MONOTONIC deadline; restarted after a signal. */
+static inline bool SDLOP_SemWait(sem_t *sem)
+{
+    int rc;
+    do {
+        rc = sem_wait(sem);
+    } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+}
+#define SDLOP_SEM_WAIT(s) SDLOP_SemWait(s)
+
+/* Match SDL3 (SDL_syssem.c): CLOCK_MONOTONIC with sem_clockwait /
+ * sem_clockwait_np, else CLOCK_REALTIME with sem_timedwait. */
+#if defined(SDLOP_HAVE_SEM_CLOCKWAIT) && SDLOP_HAVE_SEM_CLOCKWAIT
+#define SDLOP_SEM_CLOCK CLOCK_MONOTONIC
 static inline bool SDLOP_SemWaitUntil(sem_t *sem, const struct timespec *deadline)
 {
     int rc;
@@ -187,6 +324,43 @@ static inline bool SDLOP_SemWaitUntil(sem_t *sem, const struct timespec *deadlin
     } while (rc != 0 && errno == EINTR);
     return rc == 0;
 }
+#elif defined(SDLOP_HAVE_SEM_CLOCKWAIT_NP) && SDLOP_HAVE_SEM_CLOCKWAIT_NP
+#define SDLOP_SEM_CLOCK CLOCK_MONOTONIC
+static inline bool SDLOP_SemWaitUntil(sem_t *sem, const struct timespec *deadline)
+{
+    int rc;
+    do {
+        rc = sem_clockwait_np(sem, CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL);
+    } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+}
+#elif defined(SDLOP_HAVE_SEM_TIMEDWAIT) && SDLOP_HAVE_SEM_TIMEDWAIT
+#define SDLOP_SEM_CLOCK CLOCK_REALTIME
+static inline bool SDLOP_SemWaitUntil(sem_t *sem, const struct timespec *deadline)
+{
+    int rc;
+    do {
+        rc = sem_timedwait(sem, deadline);
+    } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+}
+#else
+#define SDLOP_SEM_CLOCK CLOCK_MONOTONIC
+static inline bool SDLOP_SemWaitUntil(sem_t *sem, const struct timespec *deadline)
+{
+    const Sint64 stop_ns = (Sint64)deadline->tv_sec * 1000000000ll + (Sint64)deadline->tv_nsec;
+    struct timespec now;
+    while (sem_trywait(sem) != 0) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((Sint64)now.tv_sec * 1000000000ll + (Sint64)now.tv_nsec >= stop_ns) {
+            return false;
+        }
+        struct timespec req = { 0, 100000 };
+        nanosleep(&req, NULL);
+    }
+    return true;
+}
+#endif
 
 static inline Uint32 SDLOP_SemValue(sem_t *sem)
 {
@@ -194,6 +368,8 @@ static inline Uint32 SDLOP_SemValue(sem_t *sem)
     sem_getvalue(sem, &v);
     return v < 0 ? 0u : (Uint32)v;
 }
+
+#endif /* __APPLE__ */
 
 /* --- sleep / yield ----------------------------------------------- */
 
@@ -208,6 +384,7 @@ static inline Uint32 SDLOP_SemValue(sem_t *sem)
     } while (0)
 
 /* Sleep until an absolute CLOCK_MONOTONIC deadline. */
+#if defined(SDLOP_HAVE_CLOCK_NANOSLEEP) && SDLOP_HAVE_CLOCK_NANOSLEEP
 #define SDLOP_SLEEP_UNTIL_NS(abs_ns) do {                                \
         struct timespec _ts;                                             \
         _ts.tv_sec = (time_t)((abs_ns) / 1000000000ull);                 \
@@ -216,6 +393,18 @@ static inline Uint32 SDLOP_SemValue(sem_t *sem)
                                NULL) == EINTR) {                         \
         }                                                                \
     } while (0)
+#else
+#define SDLOP_SLEEP_UNTIL_NS(abs_ns) do {                                \
+        struct timespec _now_ts;                                         \
+        clock_gettime(CLOCK_MONOTONIC, &_now_ts);                        \
+        const Uint64 _now_ns = (Uint64)_now_ts.tv_sec * 1000000000ull +  \
+                               (Uint64)_now_ts.tv_nsec;                  \
+        if ((Uint64)(abs_ns) > _now_ns) {                                \
+            const Uint64 _delta = (Uint64)(abs_ns) - _now_ns;            \
+            SDLOP_SLEEP_NS(_delta);                                      \
+        }                                                                \
+    } while (0)
+#endif
 
 #define SDLOP_YIELD() sched_yield()
 
@@ -334,6 +523,7 @@ bool SDLOP_SemInit(SDLOP_SEM_T *sem, Uint32 initial_value);
 void SDLOP_SemDestroy(SDLOP_SEM_T *sem);
 void SDLOP_SemPost(SDLOP_SEM_T *sem);
 bool SDLOP_SemTryWait(SDLOP_SEM_T *sem);
+bool SDLOP_SemWait(SDLOP_SEM_T *sem);
 Uint32 SDLOP_SemValue(SDLOP_SEM_T *sem);
 bool SDLOP_SemWaitUntil(SDLOP_SEM_T *sem, const struct timespec *deadline);
 
@@ -341,6 +531,9 @@ bool SDLOP_SemWaitUntil(SDLOP_SEM_T *sem, const struct timespec *deadline);
 #define SDLOP_SEM_DESTROY(s)     SDLOP_SemDestroy(s)
 #define SDLOP_SEM_POST(s)        SDLOP_SemPost(s)
 #define SDLOP_SEM_TRYWAIT(s)     SDLOP_SemTryWait(s)
+#define SDLOP_SEM_WAIT(s)        SDLOP_SemWait(s)
+#define SDLOP_SEM_CLOCK          0
+#define SDLOP_COND_CLOCK         0
 
 /* --- sleep / yield ----------------------------------------------- */
 

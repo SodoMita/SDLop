@@ -8,6 +8,8 @@
 #include "internal/sdlop_internal.h"
 #include "internal/sdlop_xkb_dyn.h"
 
+#if SDLOP_HAVE_XKBCOMMON
+
 #include <dlfcn.h>
 #include <stdlib.h>
 
@@ -88,3 +90,21 @@ bool SDLOP_Xkb_HaveCompose(void)
            SDLOP_XKB_xkb_compose_state_feed && SDLOP_XKB_xkb_compose_state_reset &&
            SDLOP_XKB_xkb_compose_state_get_status && SDLOP_XKB_xkb_compose_state_get_utf8;
 }
+
+#else /* !SDLOP_HAVE_XKBCOMMON */
+
+bool SDLOP_Xkb_LoadSymbols(void)
+{
+    return SDL_SetError("xkbcommon support was not built in");
+}
+
+void SDLOP_Xkb_UnloadSymbols(void)
+{
+}
+
+bool SDLOP_Xkb_HaveCompose(void)
+{
+    return false;
+}
+
+#endif /* SDLOP_HAVE_XKBCOMMON */

@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
+#include "internal/sdlop_portable.h"
 #include "internal/sdlop_xkb_dyn.h"
 #include "wlr-virtual-pointer-client-protocol.h"
 #include "virtual-keyboard-client-protocol.h"
@@ -238,7 +239,7 @@ int main(void)
     struct xkb_keymap *xkm = SDLOP_XKB_xkb_keymap_new_from_names(xctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
     char *km_str = SDLOP_XKB_xkb_keymap_get_as_string(xkm, XKB_KEYMAP_FORMAT_TEXT_V1);
     size_t km_len = strlen(km_str) + 1;
-    int km_fd = memfd_create("keymap", MFD_CLOEXEC);
+    int km_fd = SDLOP_ShmCreate("keymap", km_len);
     if (km_fd < 0 || write(km_fd, km_str, km_len) != (ssize_t)km_len) {
         fprintf(stderr, "keymap memfd failed\n");
         return 1;

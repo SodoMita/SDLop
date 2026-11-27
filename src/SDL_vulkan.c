@@ -37,6 +37,17 @@ bool SDL_Vulkan_LoadLibrary(const char *path)
             break;
         }
     }
+#elif defined(__APPLE__)
+    const char *names[] = { path, "libvulkan.dylib", "libvulkan.1.dylib", "libMoltenVK.dylib" };
+    for (size_t i = 0; i < SDL_arraysize(names); i++) {
+        if (!names[i]) {
+            continue;
+        }
+        vulkan_handle = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+        if (vulkan_handle) {
+            break;
+        }
+    }
 #else
     const char *names[] = { path, "libvulkan.so.1", "libvulkan.so" };
     for (size_t i = 0; i < SDL_arraysize(names); i++) {

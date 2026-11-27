@@ -97,6 +97,19 @@ static void set_fbdev_hints(const char *dump)
 
 static void test_fbdev_options(const char *dump)
 {
+    bool have_fbdev = false;
+    for (int i = 0; i < SDL_GetNumVideoDrivers(); i++) {
+        const char *drv = SDL_GetVideoDriver(i);
+        if (drv && strcmp(drv, "fbdev") == 0) {
+            have_fbdev = true;
+            break;
+        }
+    }
+    if (!have_fbdev) {
+        printf("test_options: fbdev part SKIP (fbdev driver not built)\n");
+        return;
+    }
+
     SDL_unsetenv_unsafe("SDL_VIDEODRIVER");
     SDL_unsetenv_unsafe("SDLOP_FBDEV_DUMP");
     SDL_unsetenv_unsafe("SDLOP_FBDEV_SIZE");

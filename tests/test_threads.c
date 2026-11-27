@@ -6,6 +6,10 @@
   warranty (zlib license, see LICENSE).
 */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <SDL3/SDL.h>
 #include <assert.h>
 #include <stdio.h>

@@ -40,6 +40,8 @@ bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID props
             return false;
         }
         if (!SDL_CopyProperties(props, window->text_input_props)) {
+            SDL_DestroyProperties(window->text_input_props);
+            window->text_input_props = 0;
             return false;
         }
     }

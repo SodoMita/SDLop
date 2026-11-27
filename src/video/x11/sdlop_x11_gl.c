@@ -81,9 +81,11 @@ typedef enum X11GLBackend
 typedef struct X11GLContext
 {
     X11GLBackend backend;
+#if SDLOP_HAVE_EGL
     /* EGL */
     EGLContext ctx;
     EGLenum api; /* EGL_OPENGL_API or EGL_OPENGL_ES_API */
+#endif
     /* GLX */
     void *glx_ctx; /* GLXContext */
 } X11GLContext;
@@ -98,9 +100,13 @@ static void *xlib_handle;
 static XDisplay_ *xlib_display;
 static PFN_XCloseDisplay_ p_XCloseDisplay;
 
+#if SDLOP_HAVE_EGL
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
 static bool egl_initialized;
 static bool egl_loaded;
+#else
+static const bool egl_initialized = false;
+#endif
 static int swap_interval = 0;
 
 static bool has_extension(const char *list, const char *ext)
@@ -142,6 +148,8 @@ static XDisplay_ *open_private_xlib_display(void)
     }
     return xlib_display;
 }
+
+#if SDLOP_HAVE_EGL
 
 static bool ensure_egl_display(void)
 {
@@ -495,6 +503,56 @@ static void egl_Quit(void)
         egl_loaded = false;
     }
 }
+
+#else /* !SDLOP_HAVE_EGL */
+
+static void *egl_CreateContext(xcb_visualid_t visual)
+{
+    (void)visual;
+    SDL_SetError("EGL support was not built in");
+    return NULL;
+}
+
+static bool egl_MakeCurrent(SDL_Window *window, X11GLContext *glctx)
+{
+    (void)window;
+    (void)glctx;
+    return SDL_SetError("EGL support was not built in");
+}
+
+static bool egl_SwapBuffers(SDL_Window *window)
+{
+    (void)window;
+    return SDL_SetError("EGL support was not built in");
+}
+
+static void egl_DeleteContext(X11GLContext *glctx)
+{
+    free(glctx);
+}
+
+static void egl_WindowDestroyed(SDL_Window *window)
+{
+    (void)window;
+}
+
+static SDL_FunctionPointer egl_GetProcAddress(const char *proc)
+{
+    (void)proc;
+    return NULL;
+}
+
+static bool egl_SetSwapInterval(int interval)
+{
+    (void)interval;
+    return SDL_SetError("EGL support was not built in");
+}
+
+static void egl_Quit(void)
+{
+}
+
+#endif /* SDLOP_HAVE_EGL */
 
 /* ------------------------------------------------------------------ */
 /* GLX                                                                 */
@@ -1162,9 +1220,11 @@ bool SDLOP_X11_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, voi
         return ok;
     }
     if (glctx->backend == X11GL_BACKEND_GLX) {
+#if SDLOP_HAVE_EGL
         if (egl_initialized && SDLOP_EGL_eglGetCurrentContext() != EGL_NO_CONTEXT) {
             SDLOP_EGL_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         }
+#endif
         return glx_MakeCurrent(window, glctx);
     }
     if (glx.usable && glx.GetCurrentContext()) {

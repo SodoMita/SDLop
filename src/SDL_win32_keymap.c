@@ -464,21 +464,51 @@ static const Uint8 layout_scan_codes[] = {
     0x56, /* the extra key next to the left Shift on ISO layouts (VK_OEM_102) */
 };
 
+/* 8 SDL3 modifier levels, ordered least-modified first for reverse lookup. */
+enum {
+    WIN_MOD_NONE = 0,
+    WIN_MOD_SHIFT = 1,
+    WIN_MOD_CAPS = 2,
+    WIN_MOD_SHIFT_CAPS = 3,
+    WIN_MOD_MODE = 4,
+    WIN_MOD_MODE_SHIFT = 5,
+    WIN_MOD_MODE_CAPS = 6,
+    WIN_MOD_MODE_SHIFT_CAPS = 7,
+    WIN_MOD_LEVEL_COUNT = 8
+};
+
+static const SDL_Keymod win_mod_combos[WIN_MOD_LEVEL_COUNT] = {
+    SDL_KMOD_NONE,
+    SDL_KMOD_SHIFT,
+    SDL_KMOD_CAPS,
+    (SDL_KMOD_SHIFT | SDL_KMOD_CAPS),
+    SDL_KMOD_MODE,
+    (SDL_KMOD_MODE | SDL_KMOD_SHIFT),
+    (SDL_KMOD_MODE | SDL_KMOD_CAPS),
+    (SDL_KMOD_MODE | SDL_KMOD_SHIFT | SDL_KMOD_CAPS),
+};
+
 typedef struct SDLOP_Win32LayoutKey
 {
     SDL_Scancode scancode;
-    Uint32 plain;   /* character with no shift, 0 when none */
-    Uint32 shifted; /* character with Shift, 0 when none */
+    Uint32 chars[WIN_MOD_LEVEL_COUNT]; /* UTF-32 code point per level, 0 when none */
 } SDLOP_Win32LayoutKey;
 
-static SDLOP_Win32LayoutKey layout_keys[SDL_arraysize(layout_scan_codes)];
+typedef struct SDLOP_Win32LayoutCacheEntry
+{
+    HKL hkl;
+    SDLOP_Win32LayoutKey keys[SDL_arraysize(layout_scan_codes)];
+} SDLOP_Win32LayoutCacheEntry;
+
+static SDLOP_Win32LayoutCacheEntry layout_cache[4];
+static int layout_cache_size;
 static bool layout_valid;
 
 /* ToUnicodeEx() is destructive: a dead key stays pending in the kernel state
  * and the *next* call consumes it, which would corrupt every following probe.
  * Clearing the state after each probe keeps the probes independent -- the same
  * trick stock SDL3 uses (WIN_ResetDeadKeys). */
-static void layout_reset_dead_keys(void)
+static void layout_reset_dead_keys(HKL hkl)
 {
     BYTE zero_state[256];
     WCHAR junk[8];
@@ -486,62 +516,115 @@ static void layout_reset_dead_keys(void)
 
     SDL_zero(zero_state);
     for (i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
-        const UINT vk = MapVirtualKeyW(layout_scan_codes[i], MAPVK_VSC_TO_VK);
+        const UINT vk = MapVirtualKeyExW(layout_scan_codes[i], MAPVK_VSC_TO_VK, hkl);
         if (vk) {
             ToUnicodeEx(vk, layout_scan_codes[i], zero_state, junk,
-                        (int)SDL_arraysize(junk), 0, GetKeyboardLayout(0));
+                        (int)SDL_arraysize(junk), 0, hkl);
         }
     }
 }
 
+static Uint32 decode_tounicode_utf32(const WCHAR *chars, int count)
+{
+    if (count <= 0) {
+        return 0;
+    }
+    const WCHAR c0 = chars[0];
+    if (c0 < 0x20) {
+        return 0; /* control character */
+    }
+    if (c0 >= 0xD800 && c0 <= 0xDBFF) {
+        if (count >= 2 && chars[1] >= 0xDC00 && chars[1] <= 0xDFFF) {
+            if (count > 2) {
+                return 0xFFFD; /* ligature emitting multiple code points (SDL3) */
+            }
+            return 0x10000u + ((((Uint32)c0 - 0xD800u) << 10) | ((Uint32)chars[1] - 0xDC00u));
+        }
+        return 0;
+    }
+    if (c0 >= 0xDC00 && c0 <= 0xDFFF) {
+        return 0;
+    }
+    if (count > 1) {
+        return 0xFFFD; /* ligature emitting multiple code points (SDL3) */
+    }
+    return (Uint32)c0;
+}
+
 static void SDLOP_Win32BuildLayout(void)
 {
+    const HKL hkl = GetKeyboardLayout(0);
+    for (int i = 0; i < layout_cache_size; ++i) {
+        if (layout_cache[i].hkl == hkl) {
+            if (i != 0) {
+                SDLOP_Win32LayoutCacheEntry tmp = layout_cache[i];
+                SDL_memmove(&layout_cache[1], &layout_cache[0],
+                            (size_t)i * sizeof(SDLOP_Win32LayoutCacheEntry));
+                layout_cache[0] = tmp;
+            }
+            layout_valid = true;
+            return;
+        }
+    }
+
+    SDLOP_Win32LayoutCacheEntry entry;
+    SDL_zero(entry);
+    entry.hkl = hkl;
+
     BYTE keystate[256];
-    /* Shift is indexed by its *virtual* key (0x10), not by its scan code:
-     * stock SDL3 uses MapVirtualKey(VK_SHIFT, MAPVK_VK_TO_VSC) here, which is
-     * 0x2A, and measured under Wine that leaves the shifted level reading the
-     * unshifted character ('a' instead of 'A'). Indexing by VK_SHIFT gives the
-     * expected capital. */
-    const Uint32 vk_shift = VK_SHIFT;
-    Uint32 i;
-
     SDL_zero(keystate);
-    for (i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
-        const UINT vk = MapVirtualKeyW(layout_scan_codes[i], MAPVK_VSC_TO_VK);
-        int level;
+    layout_reset_dead_keys(hkl);
 
-        layout_keys[i].scancode = SDLOP_Win32ScancodeFromScan(layout_scan_codes[i]);
-        layout_keys[i].plain = 0;
-        layout_keys[i].shifted = 0;
+    for (Uint32 i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
+        const UINT sc = layout_scan_codes[i];
+        const UINT vk = MapVirtualKeyExW(sc, MAPVK_VSC_TO_VK, hkl);
+        entry.keys[i].scancode = SDLOP_Win32ScancodeFromScan((Uint16)sc);
         if (!vk) {
             continue;
         }
-        for (level = 0; level < 2; ++level) {
-            WCHAR chars[8];
+        for (int m = 0; m < WIN_MOD_LEVEL_COUNT; ++m) {
+            const SDL_Keymod combo = win_mod_combos[m];
+            WCHAR chars[16];
             int produced;
 
-            if (level) {
-                keystate[vk_shift] = 0x80;
-            }
-            keystate[vk] = 0x80;
+            keystate[VK_SHIFT]   = (combo & SDL_KMOD_SHIFT) ? 0x80 : 0x00;
+            keystate[VK_CAPITAL] = (combo & SDL_KMOD_CAPS)  ? 0x01 : 0x00;
+            keystate[VK_CONTROL] = (combo & SDL_KMOD_MODE)  ? 0x80 : 0x00;
+            keystate[VK_MENU]    = (combo & SDL_KMOD_MODE)  ? 0x80 : 0x00;
+            keystate[vk]         = 0x80;
+
             chars[0] = 0;
-            produced = ToUnicodeEx(vk, layout_scan_codes[i], keystate, chars,
-                                   (int)SDL_arraysize(chars), 0, GetKeyboardLayout(0));
-            keystate[vk] = 0;
-            if (level) {
-                keystate[vk_shift] = 0;
+            produced = ToUnicodeEx(vk, sc, keystate, chars,
+                                   (int)SDL_arraysize(chars), 0, hkl);
+
+            keystate[vk]         = 0x00;
+            keystate[VK_SHIFT]   = 0x00;
+            keystate[VK_CAPITAL] = 0x00;
+            keystate[VK_CONTROL] = 0x00;
+            keystate[VK_MENU]    = 0x00;
+
+            if (produced < 0) {
+                /* dead key: clear immediately so the next level isn't combined with it */
+                layout_reset_dead_keys(hkl);
+                continue;
             }
-            if (produced <= 0 || chars[0] < 0x20) {
-                continue; /* a dead key, a control character, or nothing */
-            }
-            if (level) {
-                layout_keys[i].shifted = (Uint32)chars[0];
-            } else {
-                layout_keys[i].plain = (Uint32)chars[0];
+            if (produced > 0) {
+                entry.keys[i].chars[m] = decode_tounicode_utf32(chars, produced);
             }
         }
     }
-    layout_reset_dead_keys();
+
+    const int move_count = (layout_cache_size < (int)SDL_arraysize(layout_cache))
+                         ? layout_cache_size
+                         : (int)SDL_arraysize(layout_cache) - 1;
+    if (move_count > 0) {
+        SDL_memmove(&layout_cache[1], &layout_cache[0],
+                    (size_t)move_count * sizeof(SDLOP_Win32LayoutCacheEntry));
+    }
+    layout_cache[0] = entry;
+    if (layout_cache_size < (int)SDL_arraysize(layout_cache)) {
+        layout_cache_size++;
+    }
     layout_valid = true;
 }
 
@@ -550,23 +633,82 @@ void SDLOP_Win32UpdateKeyboardLayout(void)
     SDLOP_Win32BuildLayout();
 }
 
+static int win_mod_index(SDL_Keymod modstate)
+{
+    int idx = WIN_MOD_NONE;
+    if (modstate & SDL_KMOD_SHIFT) {
+        idx |= WIN_MOD_SHIFT;
+    }
+    if (modstate & SDL_KMOD_CAPS) {
+        idx |= WIN_MOD_CAPS;
+    }
+    if (modstate & SDL_KMOD_MODE) {
+        idx |= WIN_MOD_MODE;
+    }
+    return idx;
+}
+
+Uint32 SDLOP_Win32LayoutCharForScancodeMods(SDL_Scancode scancode, SDL_Keymod modstate)
+{
+    if (!layout_valid || layout_cache_size <= 0 || scancode == SDL_SCANCODE_UNKNOWN) {
+        return 0;
+    }
+    const SDLOP_Win32LayoutKey *keys = layout_cache[0].keys;
+    for (Uint32 i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
+        if (keys[i].scancode == scancode) {
+            const int exact = win_mod_index(modstate);
+            if (keys[i].chars[exact]) {
+                return keys[i].chars[exact];
+            }
+            /* Fallback cascade matching SDL3's SDL_GetKeymapKeycode */
+            const int caps_bit = (modstate & SDL_KMOD_CAPS) ? WIN_MOD_CAPS : 0;
+            for (int pass = caps_bit ? 2 : 1; pass > 0; --pass) {
+                const int c = (pass == 2) ? WIN_MOD_CAPS : 0;
+                if ((modstate & (SDL_KMOD_MODE | SDL_KMOD_SHIFT)) == (SDL_KMOD_MODE | SDL_KMOD_SHIFT) &&
+                    keys[i].chars[WIN_MOD_MODE | WIN_MOD_SHIFT | c]) {
+                    return keys[i].chars[WIN_MOD_MODE | WIN_MOD_SHIFT | c];
+                }
+                if ((modstate & SDL_KMOD_MODE) && keys[i].chars[WIN_MOD_MODE | c]) {
+                    return keys[i].chars[WIN_MOD_MODE | c];
+                }
+                if ((modstate & SDL_KMOD_SHIFT) && keys[i].chars[WIN_MOD_SHIFT | c]) {
+                    return keys[i].chars[WIN_MOD_SHIFT | c];
+                }
+                if (keys[i].chars[c]) {
+                    return keys[i].chars[c];
+                }
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /* The layout character for an SDL scancode, or 0. `shifted` selects the level;
  * a key whose shifted level produces nothing falls back to its plain
  * character, as SDL3 does. */
 Uint32 SDLOP_Win32LayoutCharForScancode(SDL_Scancode scancode, bool shifted)
 {
-    Uint32 i;
+    return SDLOP_Win32LayoutCharForScancodeMods(scancode, shifted ? SDL_KMOD_SHIFT : SDL_KMOD_NONE);
+}
 
-    if (!layout_valid || scancode == SDL_SCANCODE_UNKNOWN) {
-        return 0;
+SDL_Scancode SDLOP_Win32ScancodeForLayoutChar(SDL_Keycode key, SDL_Keymod *modstate)
+{
+    if (!layout_valid || layout_cache_size <= 0 || key == SDLK_UNKNOWN || (key & SDLK_SCANCODE_MASK)) {
+        return SDL_SCANCODE_UNKNOWN;
     }
-    for (i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
-        if (layout_keys[i].scancode == scancode) {
-            return shifted && layout_keys[i].shifted ? layout_keys[i].shifted
-                                                     : layout_keys[i].plain;
+    const SDLOP_Win32LayoutKey *keys = layout_cache[0].keys;
+    for (int m = 0; m < WIN_MOD_LEVEL_COUNT; ++m) {
+        for (Uint32 i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
+            if (keys[i].chars[m] == (Uint32)key) {
+                if (modstate) {
+                    *modstate = win_mod_combos[m];
+                }
+                return keys[i].scancode;
+            }
         }
     }
-    return 0;
+    return SDL_SCANCODE_UNKNOWN;
 }
 
 #endif /* _WIN32 */

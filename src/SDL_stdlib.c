@@ -22,7 +22,22 @@
 
 #include <ctype.h>
 #include <errno.h>
-#ifndef _WIN32
+#ifndef SDLOP_HAVE_ICONV
+#  if !defined(_WIN32) && defined(__has_include)
+#    if __has_include(<iconv.h>)
+#      define SDLOP_HAVE_ICONV 1
+#    else
+#      define SDLOP_HAVE_ICONV 0
+#    endif
+#  else
+#    define SDLOP_HAVE_ICONV 0
+#  endif
+#endif
+#if !defined(_WIN32) && SDLOP_HAVE_ICONV
+#ifndef SDL_USE_LIBICONV
+/* FreeBSD: use base iconv rather than ports libiconv unless requested */
+#define LIBICONV_PLUG 1
+#endif
 #include <iconv.h>
 #endif
 #include <math.h>
@@ -1229,7 +1244,7 @@ Uint32 SDL_murmur3_32(const void *data, size_t len, Uint32 seed)
 /* from the Win32 Unicode entry points (WideCharToMultiByte).          */
 /* ------------------------------------------------------------------ */
 
-#ifdef _WIN32
+#if defined(_WIN32) || !SDLOP_HAVE_ICONV
 
 /* Which of the handful of encodings SDL names is in play. Everything SDL's
  * own helpers use - UTF-8, UTF-16/32 and the ANSI/wide code pages - has a
@@ -1292,12 +1307,14 @@ static SDLOP_IconvKind iconv_kind(const char *name)
          * right when the ANSI code page is 1252, so handle these directly */
         return SDLOP_ICONV_8859_1;
     }
+#ifdef _WIN32
     /* the Windows ANSI code page: SDL3 spells it "ACP", and an empty or
      * "ANSI" name means the same in the Win32 iconv world */
     if (SDL_strcasecmp(name, "ACP") == 0 || SDL_strcasecmp(name, "ANSI") == 0 ||
         SDL_strcasecmp(name, "CP_ACP") == 0) {
         return SDLOP_ICONV_ACP;
     }
+#endif
     return SDLOP_ICONV_UNSUPPORTED;
 }
 
@@ -1423,6 +1440,7 @@ static bool iconv_next(const SDLOP_IconvKind from, const char **in, size_t *left
         *cp = v;
         return true;
     }
+#ifdef _WIN32
     case SDLOP_ICONV_ACP: {
         if (*left < 1) {
             return false;
@@ -1452,6 +1470,7 @@ static bool iconv_next(const SDLOP_IconvKind from, const char **in, size_t *left
         *left -= (size_t)used;
         return true;
     }
+#endif /* _WIN32 */
     default:
         return false;
     }
@@ -1480,6 +1499,7 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
         if (!iconv_next(ctx->from, inbuf, inbytesleft, &cp)) {
             return (*inbytesleft < (size_t)(ctx->from == SDLOP_ICONV_UTF8 ? 1 : 4)) ? SDL_ICONV_EINVAL : SDL_ICONV_EILSEQ;
         }
+#ifdef _WIN32
         if (ctx->to == SDLOP_ICONV_ACP) {
             /* code point -> the system ANSI code page, via UTF-16 */
             wchar_t wbuf[2];
@@ -1519,6 +1539,7 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
             *outbytesleft -= (size_t)n;
             continue;
         }
+#endif /* _WIN32 */
         /* encode */
         unsigned char enc[4];
         size_t n = 0;
@@ -1605,7 +1626,7 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
     return 0;
 }
 
-#else /* !_WIN32 */
+#else /* !_WIN32 && SDLOP_HAVE_ICONV */
 
 SDL_iconv_t SDL_iconv_open(const char *tocode, const char *fromcode)
 {
@@ -1630,7 +1651,11 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
     if (cd == (SDL_iconv_t)-1) {
         return SDL_ICONV_ERROR;
     }
+#if defined(SDLOP_ICONV_CONST_INBUF) || defined(__NetBSD__)
+    size_t r = iconv((iconv_t)cd, inbuf, inbytesleft, outbuf, outbytesleft);
+#else
     size_t r = iconv((iconv_t)cd, (char **)inbuf, inbytesleft, outbuf, outbytesleft);
+#endif
     if (r == (size_t)-1) {
         switch (errno) {
         case E2BIG:
@@ -1646,7 +1671,7 @@ size_t SDL_iconv(SDL_iconv_t cd, const char **inbuf, size_t *inbytesleft, char *
     return r;
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || !SDLOP_HAVE_ICONV */
 
 /* SDL_iconv_string is written against SDL_iconv_open/iconv/iconv_close only,
  * so one implementation serves the native-iconv branch and the Windows one. */

@@ -97,6 +97,29 @@ static void ime_send_if_changed(const char *utf8, int caret)
     SDLOP_SendEditingText(utf8, caret, 0);
 }
 
+void SDLOP_Win32IMEForgetWindow(HWND hwnd)
+{
+    if (ime_last_hwnd == hwnd) {
+        ime_last_text[0] = '\0';
+        ime_last_caret = -1;
+    }
+}
+
+void SDLOP_Win32IMECancel(HWND hwnd)
+{
+    HIMC himc = hwnd ? ImmGetContext(hwnd) : NULL;
+    if (himc) {
+        ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+        ImmReleaseContext(hwnd, himc);
+    }
+    ime_forget_if_other_window(hwnd);
+    if (ime_last_text[0] != '\0') {
+        ime_last_text[0] = '\0';
+        ime_last_caret = -1;
+        SDLOP_SendEditingText("", 0, 0);
+    }
+}
+
 /* The composition string, plus where the caret sits inside it. The caret is in
  * UTF-16 code units from Imm32 and in UTF-8 bytes in the SDL event, so the part
  * before it is converted to measure it. */

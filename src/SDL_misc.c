@@ -41,10 +41,20 @@
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
+#include <emscripten/html5.h>
 #elif !defined(_WIN32)
 #include <spawn.h>
 #include <sys/wait.h>
+#ifdef __HAIKU__
+#include <drivers/Drivers.h>
+#include <sys/ioctl.h>
+#endif
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
 extern char **environ;
+#endif
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -171,7 +181,7 @@ int SDLOP_RunProcess(const char *const *argv, const char *const *extra_env, char
     posix_spawn_file_actions_init(&fa);
     if (output) {
         *output = NULL;
-        if (pipe2(pipefd, O_CLOEXEC) != 0) {
+        if (SDLOP_PipeCreate(pipefd, true, false) != 0) {
             posix_spawn_file_actions_destroy(&fa);
             SDL_SetError("pipe() failed: %s", strerror(errno));
             return -1;
@@ -541,8 +551,13 @@ bool SDL_OpenURL(const char *url)
     }
     return true;
 #else
-    if (!SDLOP_ProgramInPath("xdg-open")) {
-        return SDL_SetError("xdg-open is not installed");
+#ifdef __APPLE__
+    const char *opener = "open";
+#else
+    const char *opener = "xdg-open";
+#endif
+    if (!SDLOP_ProgramInPath(opener)) {
+        return SDL_SetError("%s is not installed", opener);
     }
     /* background process (stock: SDL_PROP_PROCESS_CREATE_BACKGROUND):
      * double fork so the browser is not our child and leaves no zombie */
@@ -559,8 +574,11 @@ bool SDL_OpenURL(const char *url)
                 close(devnull);
             }
             char **env = child_environment(NULL);
-            const char *argv[] = { "xdg-open", url, NULL };
-            execvpe(argv[0], (char *const *)argv, env ? env : environ);
+            const char *argv[] = { opener, url, NULL };
+            if (env) {
+                environ = env;
+            }
+            execvp(argv[0], (char *const *)argv);
             _exit(127);
         }
         _exit(0);
@@ -581,7 +599,7 @@ static bool read_power_file(const char *base, const char *node, const char *key,
 {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s/%s", base, node, key);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    int fd = open(path, O_RDONLY | SDLOP_O_CLOEXEC);
     if (fd < 0) {
         return false;
     }
@@ -594,12 +612,17 @@ static bool read_power_file(const char *base, const char *node, const char *key,
     return true;
 }
 
-/* /sys/class/power_supply, exactly like SDL3's Linux backend */
+/* /sys/class/power_supply, exactly like SDL3's Linux backend (and
+ * SDLOP_POWER_SUPPLY_PATH hint for tests on any POSIX target). */
 static bool power_sys_class(SDL_PowerState *state, int *seconds, int *percent)
 {
     const char *base = SDL_GetHint("SDLOP_POWER_SUPPLY_PATH"); /* tests */
     if (!base) {
+#ifdef __linux__
         base = "/sys/class/power_supply";
+#else
+        return false;
+#endif
     }
     DIR *dirp = opendir(base);
     if (!dirp) {
@@ -674,6 +697,77 @@ static bool power_sys_class(SDL_PowerState *state, int *seconds, int *percent)
     closedir(dirp);
     return true;
 }
+#ifdef __HAIKU__
+/* Ported from SDL 3.4.20 (src/power/haiku/SDL_syspower.c), zlib license. */
+static bool power_haiku(SDL_PowerState *state, int *seconds, int *percent)
+{
+    const int fd = open("/dev/misc/apm", O_RDONLY | SDLOP_O_CLOEXEC);
+    bool need_details = false;
+    uint16_t regs[6];
+    uint8_t ac_status;
+    uint8_t battery_status;
+    uint8_t battery_flags;
+    uint8_t battery_life;
+    uint32_t battery_time;
+
+    if (fd == -1) {
+        return false;
+    }
+    SDLOP_EnsureCloexec(fd);
+
+    SDL_zeroa(regs);
+    regs[0] = 0x5300 + 10; /* APM_FUNC_OFFSET + APM_FUNC_GET_POWER_STATUS */
+    regs[1] = 1;           /* APM_DEVICE_ALL */
+    int rc = ioctl(fd, B_DEVICE_OP_CODES_END + 3, regs);
+    close(fd);
+    if (rc < 0) {
+        return false;
+    }
+
+    ac_status = (uint8_t)(regs[1] >> 8);
+    battery_status = (uint8_t)(regs[1] & 0xFF);
+    battery_flags = (uint8_t)(regs[2] >> 8);
+    battery_life = (uint8_t)(regs[2] & 0xFF);
+    battery_time = (uint32_t)regs[3];
+
+    if (battery_flags == 0x00) {
+        battery_time = 0xFFFF;
+        battery_flags = (battery_status == 0xFF) ? 0xFF : (uint8_t)(1u << battery_status);
+    }
+    if ((battery_time != 0xFFFF) && (battery_time & (1u << 15))) {
+        battery_time = (battery_time & 0x7FFF) * 60;
+    }
+
+    if (battery_flags == 0xFF) {
+        *state = SDL_POWERSTATE_UNKNOWN;
+    } else if (battery_flags & (1u << 7)) {
+        *state = SDL_POWERSTATE_NO_BATTERY;
+    } else if (battery_flags & (1u << 3)) {
+        *state = SDL_POWERSTATE_CHARGING;
+        need_details = true;
+    } else if (ac_status == 1) {
+        *state = SDL_POWERSTATE_CHARGED;
+        need_details = true;
+    } else {
+        *state = SDL_POWERSTATE_ON_BATTERY;
+        need_details = true;
+    }
+
+    *percent = -1;
+    *seconds = -1;
+    if (need_details) {
+        const int pct = (int)battery_life;
+        const int secs = (int)battery_time;
+        if (pct != 255) {
+            *percent = (pct > 100) ? 100 : pct;
+        }
+        if (secs != 0xFFFF) {
+            *seconds = secs;
+        }
+    }
+    return true;
+}
+#endif /* __HAIKU__ */
 #endif
 
 SDL_PowerState SDL_GetPowerInfo(int *seconds, int *percent)
@@ -709,11 +803,33 @@ SDL_PowerState SDL_GetPowerInfo(int *seconds, int *percent)
         }
         return SDL_POWERSTATE_ON_BATTERY;
     }
-#elif !defined(__EMSCRIPTEN__)
+#elif defined(__EMSCRIPTEN__)
+    /* Ported from SDL 3.4.20 (src/power/emscripten/SDL_syspower.c). */
+    EmscriptenBatteryEvent batteryState;
+    if (emscripten_get_battery_status(&batteryState) != EMSCRIPTEN_RESULT_NOT_SUPPORTED) {
+        const int haveBattery = batteryState.level != 1.0 || !batteryState.charging || batteryState.chargingTime != 0.0;
+        if (!haveBattery) {
+            *seconds = -1;
+            *percent = -1;
+            return SDL_POWERSTATE_NO_BATTERY;
+        }
+        *seconds = (int)batteryState.dischargingTime;
+        *percent = (int)(batteryState.level * 100.0);
+        if (batteryState.charging) {
+            return batteryState.chargingTime == 0.0 ? SDL_POWERSTATE_CHARGED : SDL_POWERSTATE_CHARGING;
+        }
+        return SDL_POWERSTATE_ON_BATTERY;
+    }
+#else
     SDL_PowerState state;
     if (power_sys_class(&state, seconds, percent)) {
         return state;
     }
+#ifdef __HAIKU__
+    if (power_haiku(&state, seconds, percent)) {
+        return state;
+    }
+#endif
 #endif
     *seconds = -1;
     *percent = -1;

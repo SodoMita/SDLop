@@ -209,6 +209,16 @@ int main(void)
         SDLOP_Win32UpdateKeyboardLayout();
         CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == 'y',
               "the layout table was lost on rebuild");
+        /* After building the layout table: key_event=false must still apply
+         * modifiers while key_event=true stays unmodified. */
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_A, SDL_KMOD_SHIFT, false) == 'A',
+              "post-layout shift+a (key_event=false) -> 'A'");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_2, SDL_KMOD_LSHIFT, false) == SDLK_AT,
+              "post-layout shift+2 (key_event=false) -> '@'");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_A, SDL_KMOD_SHIFT, true) == SDLK_A,
+              "post-layout shift+a (key_event=true) stays unmodified");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_A, SDL_KMOD_CAPS, false) == 'A',
+              "post-layout caps+a (key_event=false) -> 'A'");
     }
 
     SDL_StopTextInput(w);

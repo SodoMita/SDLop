@@ -267,6 +267,18 @@ int main(void)
         r = collect();
         CHECK(r.keymap_changed == 1, "us,ru: back to us sends exactly one KEYMAP_CHANGED (%d)", r.keymap_changed);
         CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_Q, SDL_KMOD_NONE, false) == SDLK_Q, "us,ru: back to 'q'");
+
+        /* Compositor/OSK modifiers without physical key press: Shift (bit 0) +
+         * Alt (Mod1, bit 3) must reconcile into SDL_GetModState() and type 'Q'. */
+        SDLOP_KeyboardUpdateXkbState(1u << 0, 0, 0, 0, 0, 0);
+        CHECK((SDL_GetModState() & SDL_KMOD_SHIFT) != 0, "osk/xkb shift sets SDL_KMOD_SHIFT");
+        r = tap(SDL_SCANCODE_Q, KEY_Q_);
+        CHECK(r.key == SDLK_Q && strcmp(r.text, "Q") == 0, "osk/xkb shift+q -> key SDLK_Q, text 'Q' (got '%s')", r.text);
+        SDLOP_KeyboardUpdateXkbState(1u << 3, 0, 0, 0, 0, 0);
+        CHECK((SDL_GetModState() & SDL_KMOD_SHIFT) == 0 && (SDL_GetModState() & SDL_KMOD_ALT) != 0,
+              "osk/xkb alt clears shift and sets SDL_KMOD_ALT");
+        SDLOP_KeyboardUpdateXkbState(0, 0, 0, 0, 0, 0);
+        CHECK((SDL_GetModState() & (SDL_KMOD_SHIFT | SDL_KMOD_ALT)) == 0, "osk/xkb modifiers cleared");
         stop();
     }
 

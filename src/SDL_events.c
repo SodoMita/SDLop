@@ -236,11 +236,13 @@ static _Atomic int side_pending;
 
 static void wake_main_thread(void)
 {
-    if (sdlop.wake_fd >= 0) {
-        uint64_t one = 1;
-        (void)!write(sdlop.wake_fd, &one, sizeof(one));
-    }
-#ifdef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if defined(SDLOP_HAVE_EVENTFD) && SDLOP_HAVE_EVENTFD
+    SDLOP_WakeFdSignal(sdlop.wake_fd, -1);
+#else
+    SDLOP_WakeFdSignal(sdlop.wake_fd, sdlop.wake_write_fd);
+#endif
+#elif defined(_WIN32)
     if (sdlop.wake_handle) {
         SetEvent((HANDLE)sdlop.wake_handle);
     }
@@ -1051,8 +1053,7 @@ bool SDL_WaitEventTimeout(SDL_Event *event, Sint32 timeoutMS)
         if (nfds > 0) {
             poll(pfds, (nfds_t)nfds, wait_ms);
             if (wake_index >= 0 && (pfds[wake_index].revents & POLLIN)) {
-                uint64_t val;
-                (void)!read(sdlop.wake_fd, &val, sizeof(val)); /* reset */
+                SDLOP_WakeFdReset(sdlop.wake_fd);
             }
         } else {
             SDL_Delay((Uint32)wait_ms);

@@ -1009,7 +1009,10 @@ static int connect_address(const char *addresses)
                 kv += kvlen + (comma ? 1 : 0);
             }
             if (salen) {
-                int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                int fd = socket(AF_UNIX, SOCK_STREAM | SDLOP_SOCK_CLOEXEC, 0);
+                if (fd >= 0) {
+                    SDLOP_EnsureCloexec(fd);
+                }
                 if (fd >= 0 && connect(fd, (struct sockaddr *)&sa, salen) == 0) {
                     return fd;
                 }

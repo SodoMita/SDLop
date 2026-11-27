@@ -28,7 +28,7 @@ static SDLop_VideoDevice *const video_drivers[] = {
 #if SDLop_VIDEO_KMSDRM
     &SDLop_kmsdrm_device,
 #endif
-#if SDLop_VIDEO_FBDEV
+#if SDLop_VIDEO_FBDEV && defined(__linux__)
     &SDLop_fbdev_device,
 #endif
     &SDLop_dummy_device,

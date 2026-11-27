@@ -14,6 +14,7 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <imm.h>
 #include <stdint.h>
 
 /* Per-window Win32 state (SDL_Window::driverdata). */
@@ -45,6 +46,7 @@ typedef struct SDLop_Win32WindowData
     int maximum_w, maximum_h;
 
     HICON icon;
+    HIMC himc;          /* original IME context, associated only while text input is active */
 
     /* The clip rect we set, so we only release our own (SDL3 keeps the same
      * bookkeeping: cursor_clipped_rect). Zero means "not clipping". */
@@ -111,6 +113,8 @@ void SDLOP_Win32GLQuit(void);
 /* sdlop_windows_ime.c: composition events. Returns true when the message was
  * an IME message and has been handled (the window procedure should stop). */
 bool SDLOP_Win32IMEHandleMessage(SDL_Window *window, UINT msg, WPARAM wparam, LPARAM lparam);
+void SDLOP_Win32IMEForgetWindow(HWND hwnd);
+void SDLOP_Win32IMECancel(HWND hwnd);
 
 /* sdlop_windows_vulkan.c */
 bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *window,

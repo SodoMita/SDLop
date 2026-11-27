@@ -30,6 +30,7 @@
 */
 
 #include <SDL3/SDL.h>
+#include "internal/sdlop_portable.h"
 #include "internal/sdlop_internal.h"
 #include <errno.h>
 #include <stdarg.h>
@@ -459,7 +460,10 @@ int main(void)
     }
     char sock_path[108];
     snprintf(sock_path, sizeof(sock_path), "%s/bus", dir);
-    listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    listen_fd = socket(AF_UNIX, SOCK_STREAM | SDLOP_SOCK_CLOEXEC, 0);
+    if (listen_fd >= 0) {
+        SDLOP_EnsureCloexec(listen_fd);
+    }
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
     sa.sun_family = AF_UNIX;

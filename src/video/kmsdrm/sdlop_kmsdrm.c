@@ -69,17 +69,19 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/signalfd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#ifdef __linux__
+#include <sys/signalfd.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <linux/netlink.h>
-#include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <linux/major.h>
+#endif
 #include <unistd.h>
 #include <strings.h>
 #include <stdarg.h>
@@ -319,6 +321,8 @@ static void kmsdrm_blend_sw_cursor(KMSDRM_WindowData *windata);
 
 static void kmsdrm_cursor_dumb_free(KMSDRM_DisplayData *dd);
 static void kmsdrm_refresh_cursors(void);
+
+#ifdef __linux__
 
 /* number of the VT the user is looking at (0 when it cannot be read) */
 static int kmsdrm_vt_active_number(int fd)
@@ -826,6 +830,24 @@ static void kmsdrm_vt_check(void)
         }
     }
 }
+
+#else /* !__linux__ */
+
+static int kmsdrm_vt_signal_fd = -1;
+
+static void kmsdrm_vt_init(void)
+{
+}
+
+static void kmsdrm_vt_shutdown(void)
+{
+}
+
+static void kmsdrm_vt_check(void)
+{
+}
+
+#endif /* __linux__ */
 
 /* Arm deferred window notifications (swa pml_defer): the event is NOT sent
  * synchronously; KMSDRM_FlushDeferred() delivers it at the end of the
@@ -3419,6 +3441,7 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
         goto failed_close;
     }
 
+#ifdef __linux__
     /* connector hotplug uevents via a non-blocking netlink socket */
     {
         if (SDLOP_HintFlag("SDLOP_KMSDRM_HOTPLUG", true)) {
@@ -3437,6 +3460,7 @@ static bool kmsdrm_Init(SDLop_VideoDevice *device)
             }
         }
     }
+#endif
 
     uint64_t async_flip = 0;
     if (SDLOP_DRM_drmGetCap(vid->drm_fd, DRM_CAP_ASYNC_PAGE_FLIP, &async_flip) == 0) {

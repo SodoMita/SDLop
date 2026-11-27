@@ -1561,6 +1561,14 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     data->hwnd = hwnd;
     SetPropW(hwnd, L"SDLopWindow", (HANDLE)window);
     sdlop_win32.window_count++;
+    data->himc = ImmGetContext(hwnd);
+    if (data->himc) {
+        ImmReleaseContext(hwnd, data->himc);
+        if (!window->text_input_active) {
+            /* Match SDL3 IME_Init/IME_Disable: detach IME until SDL_StartTextInput() */
+            ImmAssociateContext(hwnd, (HIMC)0);
+        }
+    }
     /* The class is registered with CS_OWNDC, so this HDC is private to the
      * window and valid until it is destroyed. It is what SDL_PROP_WINDOW_WIN32_
      * HDC_POINTER must publish: the old value was data->dc, the memory DC used
@@ -1641,6 +1649,10 @@ static void win32_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
         if (data->icon) {
             DestroyIcon(data->icon);
             data->icon = NULL;
+        }
+        if (data->himc) {
+            ImmAssociateContext(data->hwnd, data->himc);
+            data->himc = NULL;
         }
         RemovePropW(data->hwnd, L"SDLopWindow");
         DestroyWindow(data->hwnd);
@@ -2523,6 +2535,45 @@ static bool win32_UpdateTextInputArea(SDLop_VideoDevice *device, SDL_Window *win
     }
 
     ImmReleaseContext(data->hwnd, himc);
+    return true;
+}
+
+static bool win32_StartTextInput(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props)
+{
+    (void)props;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    if (!data || !data->hwnd) {
+        return true;
+    }
+    if (data->himc) {
+        ImmAssociateContext(data->hwnd, data->himc);
+    }
+    SDLOP_Win32IMEForgetWindow(data->hwnd);
+    return win32_UpdateTextInputArea(device, window);
+}
+
+static bool win32_StopTextInput(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    if (!data || !data->hwnd) {
+        return true;
+    }
+    SDLOP_Win32IMECancel(data->hwnd);
+    if (data->himc) {
+        ImmAssociateContext(data->hwnd, (HIMC)0);
+    }
+    return true;
+}
+
+static bool win32_ClearComposition(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
+    if (!data || !data->hwnd) {
+        return true;
+    }
+    SDLOP_Win32IMECancel(data->hwnd);
     return true;
 }
 
@@ -3604,7 +3655,10 @@ SDLop_VideoDevice SDLop_windows_device = {
     .CaptureMouse = win32_CaptureMouse,
     .SetWindowHitTest = win32_SetWindowHitTest,
     .UpdateWindowShape = win32_UpdateWindowShape,
+    .StartTextInput = win32_StartTextInput,
+    .StopTextInput = win32_StopTextInput,
     .UpdateTextInputArea = win32_UpdateTextInputArea,
+    .ClearComposition = win32_ClearComposition,
     .ResizeWindowFramebuffer = win32_ResizeWindowFramebuffer,
     .GetWindowICCProfile = win32_GetWindowICCProfile,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
