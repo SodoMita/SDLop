@@ -215,7 +215,7 @@ static void *offer_receive(Offer *o, const char *mime, size_t *length)
      * file status flags: it must stay blocking (a source with a plain write
      * loop would hit EAGAIN and truncate). The ends are separate open file
      * descriptions, so only our read end becomes nonblocking. */
-    if (pipe2(fds, O_CLOEXEC) < 0) {
+    if (SDLOP_PipeCreate(fds, true, false) < 0) {
         SDL_SetError("Clipboard pipe: %s", strerror(errno));
         return NULL;
     }

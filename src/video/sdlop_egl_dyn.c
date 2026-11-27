@@ -8,6 +8,8 @@
 #include "internal/sdlop_internal.h"
 #include "sdlop_egl_dyn.h"
 
+#if SDLOP_HAVE_EGL
+
 #include <dlfcn.h>
 #include <stdlib.h>
 
@@ -206,3 +208,16 @@ int SDLOP_EGL_AppendESVersion(EGLDisplay display, EGLint *attribs, int n)
     }
     return n;
 }
+
+#else /* !SDLOP_HAVE_EGL */
+
+bool SDLOP_EGL_LoadSymbols(void)
+{
+    return SDL_SetError("EGL support was not built in");
+}
+
+void SDLOP_EGL_UnloadSymbols(void)
+{
+}
+
+#endif /* SDLOP_HAVE_EGL */

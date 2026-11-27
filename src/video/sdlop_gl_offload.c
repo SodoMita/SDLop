@@ -77,6 +77,12 @@
 #ifndef EGL_BUFFER_PRESERVED
 #define EGL_BUFFER_PRESERVED 0x3094
 #endif
+#ifndef EGL_OPENGL_API
+#define EGL_OPENGL_API 0x30A2
+#endif
+#ifndef EGL_CONTEXT_CLIENT_VERSION
+#define EGL_CONTEXT_CLIENT_VERSION 0x3098
+#endif
 
 #ifndef GBM_FORMAT_XRGB8888
 #define GBM_FORMAT_XRGB8888 0x34325258u
@@ -110,6 +116,7 @@
 #define GL_READ_FRAMEBUFFER_BINDING_   0x8CAAu
 #define GL_FRAMEBUFFER_                0x8D40u
 
+#if SDLOP_HAVE_EGL
 typedef void *SDLOP_EGLDeviceEXT;
 typedef EGLBoolean (*SDLOP_PFN_eglQueryDevicesEXT)(EGLint max_devices, SDLOP_EGLDeviceEXT *devices, EGLint *num_devices);
 typedef const char *(*SDLOP_PFN_eglQueryDeviceStringEXT)(SDLOP_EGLDeviceEXT device, EGLint name);
@@ -170,6 +177,7 @@ static struct
 } offload = {
     .render_fd = -1,
 };
+#endif /* SDLOP_HAVE_EGL */
 
 /* ------------------------------------------------------------------ */
 /* Policy + string helpers                                             */
@@ -240,6 +248,8 @@ bool SDLOP_GLOffload_IsSoftwareRenderer(const char *renderer)
     }
     return false;
 }
+
+#if SDLOP_HAVE_EGL
 
 static SDL_FunctionPointer lookup_gl_proc(const char *proc)
 {
@@ -810,6 +820,8 @@ const char *SDLOP_GLOffload_GetGPUDescription(void)
 /* Context and surface lifecycle                                       */
 /* ------------------------------------------------------------------ */
 
+#endif /* SDLOP_HAVE_EGL */
+
 int SDLOP_GLOffload_BuildContextAttribs(uint32_t egl_api,
                                         int major_version,
                                         int minor_version,
@@ -859,6 +871,8 @@ int SDLOP_GLOffload_BuildContextAttribs(uint32_t egl_api,
     }
     return n;
 }
+
+#if SDLOP_HAVE_EGL
 
 SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContext(uint32_t egl_api,
                                                       SDLOP_GLOffloadContext *share_ctx)
@@ -1259,6 +1273,8 @@ bool SDLOP_GLOffload_MakeCurrent(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSur
 /* Readback + top-down XRGB8888 copy                                   */
 /* ------------------------------------------------------------------ */
 
+#endif /* SDLOP_HAVE_EGL */
+
 static inline uint32_t rgba_word_to_xrgb(uint32_t v);
 static inline uint32_t rgb_bytes_to_xrgb(const uint8_t *p);
 
@@ -1421,6 +1437,8 @@ void SDLOP_GLOffload_FlipCopyToARGB8888(const uint8_t *src_bottom_up,
         }
     }
 }
+
+#if SDLOP_HAVE_EGL
 
 bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx,
                                     SDLOP_GLOffloadSurface *surf,
@@ -1665,3 +1683,137 @@ void SDLOP_GLOffload_Shutdown(void)
     offload.read_format = 0;
     offload.desc[0] = '\0';
 }
+
+#else /* !SDLOP_HAVE_EGL */
+
+void SDLOP_GLOffload_SetPreferGBM(bool prefer)
+{
+    (void)prefer;
+}
+
+bool SDLOP_GLOffload_HasGBM(void)
+{
+    return false;
+}
+
+const char *SDLOP_GLOffload_QueryCurrentRenderer(void)
+{
+    return NULL;
+}
+
+bool SDLOP_GLOffload_HasHardwareGPU(void)
+{
+    return false;
+}
+
+const char *SDLOP_GLOffload_GetGPUDescription(void)
+{
+    return NULL;
+}
+
+SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContext(uint32_t egl_api, SDLOP_GLOffloadContext *share_ctx)
+{
+    (void)egl_api;
+    (void)share_ctx;
+    SDL_SetError("GPU present offload is unavailable without EGL");
+    return NULL;
+}
+
+SDLOP_GLOffloadContext *SDLOP_GLOffload_CreateContextAuto(SDLOP_GLOffloadContext *share_ctx)
+{
+    (void)share_ctx;
+    SDL_SetError("GPU present offload is unavailable without EGL");
+    return NULL;
+}
+
+void SDLOP_GLOffload_DeleteContext(SDLOP_GLOffloadContext *ctx)
+{
+    (void)ctx;
+}
+
+SDLOP_GLOffloadSurface *SDLOP_GLOffload_CreateSurface(SDLOP_GLOffloadContext *ctx, int w, int h)
+{
+    (void)ctx; (void)w; (void)h;
+    SDL_SetError("GPU present offload is unavailable without EGL");
+    return NULL;
+}
+
+SDLOP_GLOffloadSurface *SDLOP_GLOffload_CreatePrimeSurface(SDLOP_GLOffloadContext *ctx, int w, int h)
+{
+    (void)ctx; (void)w; (void)h;
+    SDL_SetError("GPU present offload is unavailable without EGL");
+    return NULL;
+}
+
+bool SDLOP_GLOffload_ResizeSurface(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSurface **surf, int w, int h)
+{
+    (void)ctx; (void)surf; (void)w; (void)h;
+    return SDL_SetError("GPU present offload is unavailable without EGL");
+}
+
+void SDLOP_GLOffload_DestroySurface(SDLOP_GLOffloadSurface *surf)
+{
+    (void)surf;
+}
+
+void SDLOP_GLOffload_GetSurfaceSize(const SDLOP_GLOffloadSurface *surf, int *w, int *h)
+{
+    (void)surf;
+    if (w) {
+        *w = 0;
+    }
+    if (h) {
+        *h = 0;
+    }
+}
+
+bool SDLOP_GLOffload_IsPrimeSurface(const SDLOP_GLOffloadSurface *surf)
+{
+    (void)surf;
+    return false;
+}
+
+struct gbm_bo *SDLOP_GLOffload_SwapAndLockPrimeBO(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSurface *surf)
+{
+    (void)ctx; (void)surf;
+    return NULL;
+}
+
+void SDLOP_GLOffload_ReleasePrimeBO(SDLOP_GLOffloadSurface *surf, struct gbm_bo *bo)
+{
+    (void)surf; (void)bo;
+}
+
+bool SDLOP_GLOffload_MakeCurrent(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSurface *surf)
+{
+    if (!ctx && !surf) {
+        return true;
+    }
+    return SDL_SetError("GPU present offload is unavailable without EGL");
+}
+
+SDL_FunctionPointer SDLOP_GLOffload_GetProcAddress(const char *proc)
+{
+    (void)proc;
+    return NULL;
+}
+
+bool SDLOP_GLOffload_ReadToXRGB8888(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSurface *surf,
+                                    void *dst_pixels, int dst_pitch, int dst_w, int dst_h)
+{
+    (void)ctx; (void)surf; (void)dst_pixels; (void)dst_pitch; (void)dst_w; (void)dst_h;
+    return SDL_SetError("GL offload readback is unavailable without EGL");
+}
+
+bool SDLOP_GLOffload_ReadToARGB8888(SDLOP_GLOffloadContext *ctx, SDLOP_GLOffloadSurface *surf,
+                                    void *dst_pixels, int dst_pitch, int dst_w, int dst_h, bool keep_alpha)
+{
+    (void)ctx; (void)surf; (void)dst_pixels; (void)dst_pitch; (void)dst_w; (void)dst_h; (void)keep_alpha;
+    return SDL_SetError("GL offload readback is unavailable without EGL");
+}
+
+void SDLOP_GLOffload_Shutdown(void)
+{
+}
+
+#endif /* SDLOP_HAVE_EGL */

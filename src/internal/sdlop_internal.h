@@ -345,7 +345,10 @@ typedef struct SDLop_Globals
     Uint32 next_user_event;
 
     /* event queue wakeup (raw input worker -> main thread) */
-    int wake_fd;                /* eventfd, read to reset */
+    int wake_fd;                /* eventfd on Linux, pipe read end elsewhere */
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && (!defined(SDLOP_HAVE_EVENTFD) || !SDLOP_HAVE_EVENTFD)
+    int wake_write_fd;          /* self-pipe write end when eventfd is absent */
+#endif
     void *wake_handle;          /* Win32: auto-reset event, waited on and set */
 
     /* KMSDRM VT-switch signals owned by the driver's signalfd; helper
@@ -601,7 +604,8 @@ bool SDLOP_HintFlag(const char *name, bool default_value);
  * global one */
 const char *SDLOP_HintFirst(const char *const *names);
 void SDLOP_SendSimpleEvent(SDL_EventType type);  /* type + timestamp only */
-const char *SDLOP_GetExeName(void);  /* basename of /proc/self/exe or NULL */
+const char *SDLOP_GetExeName(void);  /* basename of executable or NULL */
+char *SDLOP_ReadExePath(void);       /* heap-allocated executable path or NULL */
 const char *SDLOP_GetAppID(void);    /* SDL3 SDL_GetAppID() for WM_CLASS / xdg app_id */
 
 /* SDL3 "temporary memory": freed at the next SDL_PumpEvents() on this

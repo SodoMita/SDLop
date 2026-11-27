@@ -26,8 +26,20 @@
 #ifndef _WIN32
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#if defined(SDLOP_PLATFORM_FREEBSD) || defined(SDLOP_PLATFORM_OPENBSD) || defined(SDLOP_PLATFORM_NETBSD)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
+#if defined(SDLOP_PLATFORM_HAIKU)
+#include <FindDirectory.h>
+#include <image.h>
+#endif
+#if defined(SDLOP_PLATFORM_APPLE)
+#include <mach-o/dyld.h>
+#endif
 #endif
 #include <errno.h>
 #include <stdio.h>
@@ -129,7 +141,68 @@ static char *cached_user_folders[SDL_FOLDER_COUNT];
 /* Base / pref path                                                    */
 /* ------------------------------------------------------------------ */
 
-static char *read_exe_path(void)
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+static char *fs_read_symlink(const char *path)
+{
+    size_t len = 256;
+    for (;;) {
+        char *buf = (char *)SDL_malloc(len);
+        if (!buf) {
+            return NULL;
+        }
+        ssize_t n = readlink(path, buf, len);
+        if (n < 0) {
+            SDL_free(buf);
+            return NULL;
+        }
+        if ((size_t)n < len) {
+            buf[n] = '\0';
+            return buf;
+        }
+        SDL_free(buf);
+        len *= 2;
+        if (len > 65536) {
+            SDL_SetError("Executable path too long");
+            return NULL;
+        }
+    }
+}
+
+#if defined(SDLOP_PLATFORM_OPENBSD)
+static char *fs_search_path_for_binary(const char *bin)
+{
+    const char *envr = getenv("PATH");
+    if (!envr || !*envr) {
+        return NULL;
+    }
+    const size_t bin_len = strlen(bin);
+    while (*envr) {
+        const char *sep = strchr(envr, ':');
+        const size_t dir_len = sep ? (size_t)(sep - envr) : strlen(envr);
+        if (dir_len > 0) {
+            char *candidate = (char *)SDL_malloc(dir_len + 1 + bin_len + 1);
+            if (!candidate) {
+                return NULL;
+            }
+            memcpy(candidate, envr, dir_len);
+            candidate[dir_len] = '/';
+            memcpy(candidate + dir_len + 1, bin, bin_len + 1);
+            if (access(candidate, X_OK) == 0) {
+                return candidate;
+            }
+            SDL_free(candidate);
+        }
+        if (!sep) {
+            break;
+        }
+        envr = sep + 1;
+    }
+    return NULL;
+}
+#endif
+#endif /* !_WIN32 && !__EMSCRIPTEN__ */
+
+char *SDLOP_ReadExePath(void)
 {
 #ifdef _WIN32
     DWORD len = 256;
@@ -158,30 +231,148 @@ static char *read_exe_path(void)
             return NULL;
         }
     }
+#elif defined(__EMSCRIPTEN__)
+    SDL_SetError("Executable path unavailable on Emscripten");
+    return NULL;
 #else
-    size_t len = 256;
-    for (;;) {
-        char *buf = (char *)SDL_malloc(len);
-        if (!buf) {
-            return NULL;
+    char *result = NULL;
+
+#if defined(SDLOP_PLATFORM_FREEBSD)
+    {
+#ifdef KERN_PROC_PATHNAME
+        char fullpath[PATH_MAX];
+        size_t buflen = sizeof(fullpath);
+        const int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+        if (sysctl(mib, (u_int)SDL_arraysize(mib), fullpath, &buflen, NULL, 0) != -1 && buflen > 0) {
+            result = SDL_strdup(fullpath);
         }
-        ssize_t n = readlink("/proc/self/exe", buf, len);
-        if (n < 0) {
-            SDL_free(buf);
-            SDL_SetError("Couldn't read /proc/self/exe: %s", strerror(errno));
-            return NULL;
-        }
-        if ((size_t)n < len) {
-            buf[n] = '\0';
-            return buf;
-        }
-        SDL_free(buf);
-        len *= 2;
-        if (len > 65536) {
-            SDL_SetError("Executable path too long");
-            return NULL;
+#endif
+    }
+#elif defined(SDLOP_PLATFORM_NETBSD) && defined(KERN_PROC_PATHNAME)
+    {
+        char fullpath[PATH_MAX];
+        size_t buflen = sizeof(fullpath);
+        const int mib[] = { CTL_KERN, KERN_PROC_ARGS, -1, KERN_PROC_PATHNAME };
+        if (sysctl(mib, (u_int)SDL_arraysize(mib), fullpath, &buflen, NULL, 0) != -1 && buflen > 0) {
+            result = SDL_strdup(fullpath);
         }
     }
+#elif defined(SDLOP_PLATFORM_OPENBSD)
+    {
+        size_t len = 0;
+        const int mib[] = { CTL_KERN, KERN_PROC_ARGS, getpid(), KERN_PROC_ARGV };
+        if (sysctl(mib, 4, NULL, &len, NULL, 0) != -1 && len >= sizeof(char *)) {
+            char **cmdline = (char **)SDL_malloc(len);
+            if (cmdline) {
+                if (sysctl(mib, 4, cmdline, &len, NULL, 0) != -1 && len >= sizeof(char *) && cmdline[0]) {
+                    char *exe = cmdline[0];
+                    char *pwddst = NULL;
+                    if (strchr(exe, '/') == NULL) {
+                        exe = fs_search_path_for_binary(cmdline[0]);
+                    } else if (exe[0] == '.') {
+                        const char *pwd = getenv("PWD");
+                        if (pwd && *pwd) {
+                            const size_t plen = strlen(pwd) + 1 + strlen(exe) + 1;
+                            pwddst = (char *)SDL_malloc(plen);
+                            if (pwddst) {
+                                snprintf(pwddst, plen, "%s/%s", pwd, exe);
+                            }
+                        }
+                    }
+                    if (exe) {
+                        char *rp = (char *)SDL_malloc(PATH_MAX + 1);
+                        if (rp) {
+                            if (realpath(pwddst ? pwddst : exe, rp) != NULL) {
+                                result = rp;
+                            } else {
+                                SDL_free(rp);
+                            }
+                        }
+                        if (exe != cmdline[0]) {
+                            SDL_free(exe);
+                        }
+                    }
+                    SDL_free(pwddst);
+                }
+                SDL_free(cmdline);
+            }
+        }
+    }
+#elif defined(SDLOP_PLATFORM_HAIKU)
+    {
+        char name[PATH_MAX];
+        if (find_path(B_APP_IMAGE_SYMBOL, B_FIND_PATH_IMAGE_PATH, NULL, name, sizeof(name)) == B_OK) {
+            result = SDL_strdup(name);
+        }
+    }
+#elif defined(SDLOP_PLATFORM_APPLE)
+    {
+        uint32_t sz = 0;
+        _NSGetExecutablePath(NULL, &sz);
+        if (sz > 0) {
+            char *raw = (char *)SDL_malloc(sz);
+            if (raw) {
+                if (_NSGetExecutablePath(raw, &sz) == 0) {
+                    char resolved[PATH_MAX];
+                    if (realpath(raw, resolved) != NULL) {
+                        result = SDL_strdup(resolved);
+                    } else {
+                        result = raw;
+                        raw = NULL;
+                    }
+                }
+                SDL_free(raw);
+            }
+        }
+    }
+#elif defined(SDLOP_PLATFORM_QNX)
+    {
+        int fd = open("/proc/self/exefile", O_RDONLY | SDLOP_O_CLOEXEC);
+        if (fd >= 0) {
+            char buf[PATH_MAX];
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\0')) {
+                    n--;
+                }
+                buf[n] = '\0';
+                result = SDL_strdup(buf);
+            }
+        }
+    }
+#endif
+
+    if (!result) {
+#if defined(SDLOP_PLATFORM_FREEBSD)
+        result = fs_read_symlink("/proc/curproc/file");
+#elif defined(SDLOP_PLATFORM_NETBSD)
+        result = fs_read_symlink("/proc/curproc/exe");
+#elif defined(SDLOP_PLATFORM_SOLARIS)
+        result = fs_read_symlink("/proc/self/path/a.out");
+#else
+        result = fs_read_symlink("/proc/self/exe");
+        if (!result) {
+            char path[64];
+            snprintf(path, sizeof(path), "/proc/%llu/exe", (unsigned long long)getpid());
+            result = fs_read_symlink(path);
+        }
+#endif
+    }
+
+#if defined(SDLOP_PLATFORM_SOLARIS)
+    if (!result) {
+        const char *execname = getexecname();
+        if (execname && execname[0] == '/') {
+            result = SDL_strdup(execname);
+        }
+    }
+#endif
+
+    if (!result) {
+        SDL_SetError("Couldn't determine executable path");
+    }
+    return result;
 #endif /* _WIN32 */
 }
 
@@ -189,7 +380,7 @@ const char *SDL_GetBasePath(void)
 {
     SDLOP_MUTEX_LOCK(SDLOP_SM(&fs_lock));
     if (!cached_base_path) {
-        char *path = read_exe_path();
+        char *path = SDLOP_ReadExePath();
         if (path) {
             char *slash = strrchr(path, '/');
             if (slash) {
@@ -745,16 +936,18 @@ bool SDL_CopyFile(const char *oldpath, const char *newpath)
     }
     return true;
 #else
-int in = open(oldpath, O_RDONLY | O_CLOEXEC);
+int in = open(oldpath, O_RDONLY | SDLOP_O_CLOEXEC);
     if (in < 0) {
         return SDL_SetError("Couldn't open %s: %s", oldpath, strerror(errno));
     }
-    int out = open(newpath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    SDLOP_EnsureCloexec(in);
+    int out = open(newpath, O_WRONLY | O_CREAT | O_TRUNC | SDLOP_O_CLOEXEC, 0666);
     if (out < 0) {
         const int err = errno;
         close(in);
         return SDL_SetError("Couldn't open %s: %s", newpath, strerror(err));
     }
+    SDLOP_EnsureCloexec(out);
     bool ok = true;
     char buf[16384];
     for (;;) {

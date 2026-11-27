@@ -17,8 +17,14 @@
 #include "internal/scancode_evdev.h"
 #ifndef _WIN32
 #include "internal/sdlop_xkb_dyn.h"
+#if SDLOP_HAVE_XKBCOMMON
+#define SDLOP_USE_XKB 1
+#else
+#define SDLOP_USE_XKB 0
+#endif
 #else
 #include "internal/sdlop_win32_keymap.h"
+#define SDLOP_USE_XKB 0
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -61,12 +67,12 @@ static Uint16 evdev_from_scancode(SDL_Scancode sc)
 /* shared by both platforms (see below) */
 static SDL_Keycode default_key_from_scancode(SDL_Scancode sc, SDL_Keymod mod);
 
-#ifdef _WIN32
-/* No compose table on Windows: the system IME hands over finished text. */
+#if !SDLOP_USE_XKB
+/* No compose table without xkbcommon (e.g. Win32 or minimal POSIX build). */
 static void compose_reset(void) { }
 #endif
 
-#ifndef _WIN32
+#if SDLOP_USE_XKB
 static struct xkb_context *xkb_ctx;
 static struct xkb_keymap *keymap;
 static struct xkb_state *xkb_st;
@@ -124,8 +130,6 @@ static bool revtab_get(SDL_Keycode key, SDL_Scancode *sc, SDL_Keymod *mod)
     }
     return false;
 }
-
-#ifndef _WIN32
 
 static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym);
 
@@ -472,12 +476,13 @@ void SDLOP_KeyboardUpdateXkbModifiers(Uint32 depressed, Uint32 latched, Uint32 l
     SDLOP_KeyboardUpdateXkbState(depressed, latched, locked, 0, 0, 0);
 }
 
-#endif /* !_WIN32 (xkb keymap layer) */
+#endif /* SDLOP_USE_XKB (xkb keymap layer) */
 
 /* ------------------------------------------------------------------ */
 /* keysym -> SDL_Keycode                                               */
 /* ------------------------------------------------------------------ */
 
+#if SDLOP_USE_XKB
 /* SDL3 SDL_GetKeyCodeFromKeySym: unicode for printable keysyms, the
  * spacing character for dead keys, a few extended keycodes, and
  * scancode-mask keycodes for everything else. Returns SDLK_UNKNOWN when the
@@ -612,24 +617,31 @@ static SDL_Keycode keysym_to_keycode(xkb_keysym_t sym)
     return SDLK_UNKNOWN;
 }
 
-#endif /* !_WIN32 (keysym mapping) */
+#endif /* SDLOP_USE_XKB (keysym mapping) */
 
-#ifdef _WIN32
+#if !SDLOP_USE_XKB
 
-/* Windows has no xkb keymap and no compositor-supplied one: keys arrive as
- * virtual-key codes (translated in src/SDL_win32_keymap.c) and text as
- * WM_CHAR/WM_UNICHAR from the driver, so everything above compiles away.
- * The stubs keep the internal contract (see sdlop_internal.h) intact. */
+/* Windows (and POSIX builds without xkbcommon) have no xkb keymap: Win32
+ * resolves VKs via sdlop_win32_keymap.c, and POSIX falls back to the built-in
+ * US table below. The stubs keep the internal contract intact. */
 
 bool SDLOP_KeyboardSetKeymapString(const char *keymap_string, size_t length)
 {
     (void)keymap_string; (void)length;
+#ifdef _WIN32
     return true; /* the system provides key translation; nothing to install */
+#else
+    return SDL_SetError("xkbcommon support was not built in");
+#endif
 }
 
 bool SDLOP_KeyboardSetDefaultKeymap(void)
 {
+#ifdef _WIN32
     return true;
+#else
+    return SDL_SetError("xkbcommon support was not built in");
+#endif
 }
 
 void SDLOP_KeyboardUpdateXkbState(Uint32 depressed, Uint32 latched, Uint32 locked,
@@ -652,7 +664,7 @@ void SDLOP_KeyboardClearComposition(void)
     compose_reset();
 }
 
-#endif /* _WIN32 */
+#endif /* !SDLOP_USE_XKB */
 
 
 /* SDL3's built-in US layout (SDL_GetDefaultKeyFromScancode): used when no
@@ -694,7 +706,7 @@ static SDL_Keycode default_key_from_scancode(SDL_Scancode sc, SDL_Keymod mod)
     return SDL_SCANCODE_TO_KEYCODE(sc);
 }
 
-#ifndef _WIN32
+#if SDLOP_USE_XKB
 /* SDL convention: no text for ctrl/alt combos (AltGr = MODE is fine), and
  * no control characters. POSIX-only: on Windows the text arrives finished
  * from WM_CHAR, where Win32 has already applied these rules. */
@@ -711,12 +723,12 @@ static void filter_text(char *text_utf8)
         text_utf8[0] = '\0';
     }
 }
-#endif /* !_WIN32 */
+#endif /* SDLOP_USE_XKB */
 
 /* Feed a key press to the compose state. Returns true when composition
  * consumed the key (text_utf8 then holds the composed text, or nothing
  * while a sequence is in progress / was cancelled). */
-#ifndef _WIN32
+#if SDLOP_USE_XKB
 
 static bool compose_key(xkb_keycode_t xk, char *text_utf8, size_t text_size)
 {
@@ -749,7 +761,7 @@ static bool compose_key(xkb_keycode_t xk, char *text_utf8, size_t text_size)
     }
 }
 
-#endif /* !_WIN32 */
+#endif /* SDLOP_USE_XKB */
 
 SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *text_utf8, size_t text_size, bool *repeats_out)
 {
@@ -778,7 +790,11 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
         return SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_UNKNOWN);
     }
     SDL_Scancode sc = (SDL_Scancode)sdlop_evdev_to_scancode[rawcode];
+#if SDLOP_USE_XKB
     if (!xkb_st) {
+#else
+    {
+#endif
         /* built-in US table: everything but modifiers and locks repeats
          * (xkb's default), printable keys type their character unless a
          * command modifier is held */
@@ -797,6 +813,7 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
         }
         return default_key_from_scancode(sc, SDL_KMOD_NONE);
     }
+#if SDLOP_USE_XKB
     xkb_keycode_t xk = (xkb_keycode_t)rawcode + 8; /* evdev -> xkb offset */
 
     /* resolved once for both text + key repeat bookkeeping */
@@ -831,6 +848,7 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
         }
     }
     return key;
+#endif /* SDLOP_USE_XKB */
 #endif /* _WIN32 */
 }
 
@@ -839,6 +857,11 @@ bool SDLOP_KeyboardKeyRepeats(SDL_Scancode sc)
 #ifdef _WIN32
     (void)sc;
     return true; /* every key auto-repeats on Windows */
+#elif !SDLOP_USE_XKB
+    const bool modifier_or_lock = (sc >= SDL_SCANCODE_LCTRL && sc <= SDL_SCANCODE_RGUI) ||
+                                  sc == SDL_SCANCODE_CAPSLOCK || sc == SDL_SCANCODE_NUMLOCKCLEAR ||
+                                  sc == SDL_SCANCODE_SCROLLLOCK || sc == SDL_SCANCODE_MODE;
+    return sc != SDL_SCANCODE_UNKNOWN && !modifier_or_lock;
 #else
     if (!keymap) {
         return false;
@@ -912,8 +935,8 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
      * track modifiers/locks; wayland additionally receives absolute masks
      * from the compositor, which simply re-assert this state). Repeats are
      * already reflected in the state from the initial press. */
-#ifdef _WIN32
-    /* No xkb state on Win32 at all: toggle the locks here. */
+#if !SDLOP_USE_XKB
+    /* No xkb state: toggle the locks here. */
     if (down && !repeat) {
 #else
     if (!xkb_st && down && !repeat) {
@@ -928,7 +951,7 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
         }
         sdlop.modstate = mod;
     }
-#ifndef _WIN32
+#if SDLOP_USE_XKB
     if (xkb_st && xkb_raw && !repeat) {
         SDLOP_XKB_xkb_state_update_key(xkb_st, (xkb_keycode_t)xkb_raw + 8,
                                        down ? XKB_KEY_DOWN : XKB_KEY_UP);
@@ -1059,8 +1082,8 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
     if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
         return SDLK_UNKNOWN;
     }
-#ifdef _WIN32
-    /* No layout keymap to consult: SDL3's built-in table is the Windows
+#if !SDLOP_USE_XKB
+    /* No layout keymap to consult: SDL3's built-in table is the default
      * mapping for a US layout, and key events ignore modifiers. */
     return default_key_from_scancode(scancode, key_event ? SDL_KMOD_NONE : modstate);
 #else
@@ -1077,7 +1100,7 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
  * symbols 0x80-0xBF, x and / are never shifted) */
 SDL_Keycode SDLOP_KeyboardKeyNameCapital(SDL_Keycode key)
 {
-#ifdef _WIN32
+#if !SDLOP_USE_XKB
     return (key >= 'a' && key <= 'z') ? key - ('a' - 'A') : key;
 #else
     if (!((key >= 'a' && key <= 'z') || (key > 0xBF && key != 0xD7 && key != 0xF7))) {
@@ -1127,7 +1150,7 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
      * searches keyboard->keymap, then the default keymap) */
     SDL_Scancode sc;
     SDL_Keymod found_mod;
-#ifndef _WIN32
+#if SDLOP_USE_XKB
     if (keymap && revtab_get(key, &sc, &found_mod)) {
         if (modstate) {
             *modstate = found_mod;
@@ -1160,7 +1183,7 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
 
 void SDLOP_KeyboardQuit(void)
 {
-#ifndef _WIN32
+#if SDLOP_USE_XKB
     if (compose_st) {
         SDLOP_XKB_xkb_compose_state_unref(compose_st);
         compose_st = NULL;
@@ -1189,6 +1212,6 @@ void SDLOP_KeyboardQuit(void)
         SDLOP_XKB_xkb_context_unref(xkb_ctx);
         xkb_ctx = NULL;
     }
-#endif /* !_WIN32 */
+#endif /* SDLOP_USE_XKB */
     sdlop.repeat_active = false;
 }

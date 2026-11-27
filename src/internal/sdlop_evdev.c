@@ -20,6 +20,8 @@
 #include "internal/sdlop_ring.h"
 #include "internal/scancode_evdev.h"
 
+#ifdef __linux__
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1432,3 +1434,115 @@ void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms)
         }
     }
 }
+
+#else /* !__linux__ */
+
+bool SDLOP_RawInputInit(void)
+{
+    return SDL_SetError("Linux evdev raw input is unavailable on this platform");
+}
+
+void SDLOP_RawInputQuit(void)
+{
+}
+
+bool SDLOP_RawInputHasKeyboard(void)
+{
+    return false;
+}
+
+bool SDLOP_RawInputIsSource(void)
+{
+    return false;
+}
+
+void SDLOP_RawInputAttachConsole(int console_fd)
+{
+    (void)console_fd;
+}
+
+void SDLOP_RawInputDetachConsole(void)
+{
+}
+
+void SDLOP_RawInputResetPointerFrame(void)
+{
+}
+
+bool SDLOP_RawInputKeyboardAllowed(void)
+{
+    return true;
+}
+
+void SDLOP_RawInputPump(void)
+{
+}
+
+void SDLOP_RawInputSetRepeatInfo(Uint32 delay_ms, Uint32 interval_ms)
+{
+    (void)delay_ms;
+    (void)interval_ms;
+}
+
+void SDLOP_RawInputTestFeed(const SDLop_RawEvent *ev, bool winsys)
+{
+    (void)ev;
+    (void)winsys;
+}
+
+int SDLOP_RawInputTestAddDevice(bool keyboard, bool pointer, bool absolute, int min_x, int max_x, int min_y, int max_y,
+                                bool touch_is_left)
+{
+    (void)keyboard;
+    (void)pointer;
+    (void)absolute;
+    (void)min_x;
+    (void)max_x;
+    (void)min_y;
+    (void)max_y;
+    (void)touch_is_left;
+    return -1;
+}
+
+bool SDLop_RegisterRawEventCallback(SDLop_RawEventCallback cb, void *userdata)
+{
+    (void)cb;
+    (void)userdata;
+    return SDL_SetError("Linux evdev raw input is unavailable on this platform");
+}
+
+void SDLop_UnregisterRawEventCallback(SDLop_RawEventCallback cb)
+{
+    (void)cb;
+}
+
+int SDLop_PollRawEvents(SDLop_RawEvent *events, int max_events)
+{
+    if (!events || max_events <= 0) {
+        return -1;
+    }
+    return 0;
+}
+
+bool SDLop_RawInputAvailable(void)
+{
+    return false;
+}
+
+Uint64 SDLop_GetRawEventCount(void)
+{
+    return 0;
+}
+
+bool SDLop_GetRawInputStats(SDLop_RawInputStats *stats)
+{
+    if (!stats) {
+        return SDL_InvalidParamError("stats");
+    }
+    SDL_zero(*stats);
+    stats->version = SDLOP_RAW_INPUT_STATS_VERSION;
+    stats->size = (Uint32)sizeof(*stats);
+    return true;
+}
+
+#endif /* __linux__ */

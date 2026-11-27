@@ -15,6 +15,8 @@
 #include "../sdlop_egl_dyn.h"
 #include "../sdlop_gl_offload.h"
 
+#if SDLOP_HAVE_EGL
+
 #include <errno.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -1543,3 +1545,82 @@ void *KMSDRM_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window)
     KMSDRM_WindowData *windata = window ? (KMSDRM_WindowData *)window->driverdata : NULL;
     return (windata && windata->egl_surface != EGL_NO_SURFACE) ? (void *)windata->egl_surface : NULL;
 }
+
+#else /* !SDLOP_HAVE_EGL */
+
+void KMSDRM_GL_Deinit(void)
+{
+}
+
+void *KMSDRM_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    SDL_SetError("EGL support was not built in");
+    return NULL;
+}
+
+bool KMSDRM_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, void *context)
+{
+    (void)device;
+    (void)window;
+    if (!context) {
+        return true;
+    }
+    return SDL_SetError("EGL support was not built in");
+}
+
+bool KMSDRM_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    return SDL_SetError("EGL support was not built in");
+}
+
+void KMSDRM_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
+{
+    (void)device;
+    (void)context;
+}
+
+SDL_FunctionPointer KMSDRM_GL_GetProcAddress(SDLop_VideoDevice *device, const char *proc)
+{
+    (void)device;
+    (void)proc;
+    return NULL;
+}
+
+bool KMSDRM_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval)
+{
+    (void)device;
+    (void)interval;
+    return SDL_SetError("EGL support was not built in");
+}
+
+bool KMSDRM_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval)
+{
+    (void)device;
+    *interval = 1;
+    return true;
+}
+
+void *KMSDRM_EGL_GetDisplay(SDLop_VideoDevice *device)
+{
+    (void)device;
+    return NULL;
+}
+
+void *KMSDRM_EGL_GetConfig(SDLop_VideoDevice *device)
+{
+    (void)device;
+    return NULL;
+}
+
+void *KMSDRM_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    return NULL;
+}
+
+#endif /* SDLOP_HAVE_EGL */

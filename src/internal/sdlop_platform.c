@@ -127,6 +127,18 @@ bool SDLOP_SemTryWait(SDLOP_SEM_T *sem)
     return true;
 }
 
+bool SDLOP_SemWait(SDLOP_SEM_T *sem)
+{
+    if (!sem || !sem->handle) {
+        return false;
+    }
+    if (WaitForSingleObject(sem->handle, INFINITE) != WAIT_OBJECT_0) {
+        return false;
+    }
+    InterlockedDecrement(&sem->count);
+    return true;
+}
+
 Uint32 SDLOP_SemValue(SDLOP_SEM_T *sem)
 {
     if (!sem) {

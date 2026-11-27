@@ -12,8 +12,23 @@
 #define sdlop_egl_dyn_h_
 
 #include <stdbool.h>
+
+#ifndef SDLOP_HAVE_EGL
+#  if defined(__has_include)
+#    if __has_include(<EGL/egl.h>) && __has_include(<EGL/eglext.h>)
+#      define SDLOP_HAVE_EGL 1
+#    else
+#      define SDLOP_HAVE_EGL 0
+#    endif
+#  else
+#    define SDLOP_HAVE_EGL 0
+#  endif
+#endif
+
+#if SDLOP_HAVE_EGL
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,6 +36,8 @@ extern "C" {
 
 extern bool SDLOP_EGL_LoadSymbols(void);
 extern void SDLOP_EGL_UnloadSymbols(void);
+
+#if SDLOP_HAVE_EGL
 
 typedef void (*SDLOP_EGLProc)(void);
 
@@ -48,6 +65,8 @@ extern int SDLOP_EGL_AppendUserAttribs(bool context, EGLDisplay display, EGLConf
  * error without it). AppendESVersion returns the new n, -1 on error (set). */
 extern EGLint SDLOP_EGL_ESRenderableType(EGLDisplay display);
 extern int SDLOP_EGL_AppendESVersion(EGLDisplay display, EGLint *attribs, int n);
+
+#endif /* SDLOP_HAVE_EGL */
 
 #ifdef __cplusplus
 }

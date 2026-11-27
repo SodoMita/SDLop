@@ -12,6 +12,9 @@
 
 #include "../sdlop_egl_dyn.h"
 #include "../sdlop_gl_offload.h"
+
+#if SDLOP_HAVE_EGL
+
 #include <dlfcn.h>
 #include <string.h>
 
@@ -668,3 +671,98 @@ void SDLOP_Wayland_GL_Deinit(void)
     wayland_use_offload = false;
     swap_interval = 0;
 }
+
+#else /* !SDLOP_HAVE_EGL */
+
+void *SDLOP_Wayland_GL_CreateContext(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    SDL_SetError("EGL support was not built in");
+    return NULL;
+}
+
+bool SDLOP_Wayland_GL_MakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, void *context)
+{
+    (void)device;
+    (void)window;
+    if (!context) {
+        return true;
+    }
+    return SDL_SetError("EGL support was not built in");
+}
+
+bool SDLOP_Wayland_GL_SwapBuffers(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    return SDL_SetError("EGL support was not built in");
+}
+
+void SDLOP_Wayland_GL_DeleteContext(SDLop_VideoDevice *device, void *context)
+{
+    (void)device;
+    (void)context;
+}
+
+void SDLOP_Wayland_GL_WindowDestroyed(SDL_Window *window)
+{
+    (void)window;
+}
+
+void SDLOP_Wayland_GL_WindowResized(SDL_Window *window)
+{
+    (void)window;
+}
+
+SDL_FunctionPointer SDLOP_Wayland_GL_GetProcAddress(const char *proc)
+{
+    (void)proc;
+    return NULL;
+}
+
+void *SDLOP_Wayland_EGL_GetDisplay(SDLop_VideoDevice *device)
+{
+    (void)device;
+    return NULL;
+}
+
+void *SDLOP_Wayland_EGL_GetConfig(SDLop_VideoDevice *device)
+{
+    (void)device;
+    return NULL;
+}
+
+void *SDLOP_Wayland_EGL_GetWindowSurface(SDLop_VideoDevice *device, SDL_Window *window)
+{
+    (void)device;
+    (void)window;
+    return NULL;
+}
+
+SDL_FunctionPointer SDLOP_Wayland_GL_GetProcAddressThunk(SDLop_VideoDevice *device, const char *proc)
+{
+    (void)device;
+    (void)proc;
+    return NULL;
+}
+
+bool SDLOP_Wayland_GL_SetSwapInterval(SDLop_VideoDevice *device, int interval)
+{
+    (void)device;
+    (void)interval;
+    return SDL_SetError("EGL support was not built in");
+}
+
+bool SDLOP_Wayland_GL_GetSwapInterval(SDLop_VideoDevice *device, int *interval)
+{
+    (void)device;
+    *interval = 0;
+    return true;
+}
+
+void SDLOP_Wayland_GL_Deinit(void)
+{
+}
+
+#endif /* SDLOP_HAVE_EGL */

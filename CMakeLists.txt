@@ -133,29 +133,188 @@ endif()
 # below.
 # ---------------------------------------------------------------------------
 if(NOT WIN32)
-  # Everything in this block needs pkg-config and POSIX system libraries; the
-  # Windows build links only Win32 system libraries (see the WIN32 block below).
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
-pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
-pkg_check_modules(EGL REQUIRED egl)
-pkg_check_modules(GBM REQUIRED gbm)
-pkg_check_modules(LIBDRM REQUIRED libdrm)
-option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
-if(SDLOP_VIDEO_X11)
-  pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
-  if(NOT X11_XCB_FOUND)
-    message(STATUS "xcb headers not found - building without the X11 driver")
+  # POSIX system/header probes and optional driver dependencies. The Windows
+  # build links only Win32 system libraries (see the WIN32 block below).
+  include(CheckIncludeFile)
+  include(CheckSymbolExists)
+  include(CheckLibraryExists)
+  include(CheckCSourceCompiles)
+  find_package(Threads REQUIRED)
+  find_package(PkgConfig QUIET)
+
+  set(SDLop_EXTRA_POSIX_LIBS)
+  set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+
+  check_symbol_exists(memfd_create "sys/mman.h" SDLOP_HAVE_MEMFD_CREATE)
+  check_symbol_exists(shm_open "sys/mman.h;fcntl.h" SDLOP_HAVE_SHM_OPEN)
+  if(NOT SDLOP_HAVE_SHM_OPEN)
+    check_library_exists(rt shm_open "" SDLOP_SHM_OPEN_IN_RT)
+    if(SDLOP_SHM_OPEN_IN_RT)
+      set(SDLOP_HAVE_SHM_OPEN 1)
+      list(APPEND SDLop_EXTRA_POSIX_LIBS rt)
+    endif()
+  endif()
+  check_symbol_exists(mkostemp "stdlib.h" SDLOP_HAVE_MKOSTEMP)
+  check_symbol_exists(pipe2 "unistd.h;fcntl.h" SDLOP_HAVE_PIPE2)
+  check_symbol_exists(eventfd "sys/eventfd.h" SDLOP_HAVE_EVENTFD)
+  check_symbol_exists(posix_fallocate "fcntl.h" SDLOP_HAVE_POSIX_FALLOCATE)
+  check_include_file(pthread_np.h SDLOP_HAVE_PTHREAD_NP_H)
+  set(_saved_req_libs "${CMAKE_REQUIRED_LIBRARIES}")
+  list(APPEND CMAKE_REQUIRED_LIBRARIES Threads::Threads)
+  check_symbol_exists(clock_nanosleep "time.h" SDLOP_HAVE_CLOCK_NANOSLEEP)
+  check_symbol_exists(sem_clockwait "semaphore.h;time.h" SDLOP_HAVE_SEM_CLOCKWAIT)
+  check_symbol_exists(sem_clockwait_np "semaphore.h;time.h" SDLOP_HAVE_SEM_CLOCKWAIT_NP)
+  check_symbol_exists(sem_timedwait "semaphore.h;time.h" SDLOP_HAVE_SEM_TIMEDWAIT)
+  check_symbol_exists(pthread_condattr_setclock "pthread.h;time.h" SDLOP_HAVE_PTHREAD_CONDATTR_SETCLOCK)
+  check_c_source_compiles("
+    #include <pthread.h>
+    int main(void) {
+      #ifdef __APPLE__
+      pthread_setname_np(\"\");
+      #elif defined(__NetBSD__)
+      pthread_setname_np(pthread_self(), \"%s\", \"\");
+      #else
+      pthread_setname_np(pthread_self(), \"\");
+      #endif
+      return 0;
+    }" SDLOP_HAVE_PTHREAD_SETNAME_NP)
+  if(SDLOP_HAVE_PTHREAD_NP_H)
+    check_symbol_exists(pthread_set_name_np "pthread.h;pthread_np.h" SDLOP_HAVE_PTHREAD_SET_NAME_NP)
+  else()
+    set(SDLOP_HAVE_PTHREAD_SET_NAME_NP 0)
+  endif()
+  set(CMAKE_REQUIRED_LIBRARIES "${_saved_req_libs}")
+
+  check_include_file(iconv.h SDLOP_HAVE_ICONV_H)
+  set(SDLOP_HAVE_ICONV 0)
+  set(SDLOP_ICONV_CONST_INBUF 0)
+  if(SDLOP_HAVE_ICONV_H)
+    check_symbol_exists(iconv_open "iconv.h" SDLOP_ICONV_IN_LIBC)
+    if(SDLOP_ICONV_IN_LIBC)
+      set(SDLOP_HAVE_ICONV 1)
+    else()
+      check_library_exists(iconv iconv_open "" SDLOP_ICONV_IN_LIBICONV)
+      if(SDLOP_ICONV_IN_LIBICONV)
+        set(SDLOP_HAVE_ICONV 1)
+        list(APPEND SDLop_EXTRA_POSIX_LIBS iconv)
+      endif()
+    endif()
+    if(SDLOP_HAVE_ICONV)
+      set(_saved_flags "${CMAKE_REQUIRED_FLAGS}")
+      set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
+      check_c_source_compiles("
+        #include <iconv.h>
+        int main(void) {
+          const char *in = 0; size_t il = 0; char *out = 0; size_t ol = 0;
+          return (int)iconv((iconv_t)0, &in, &il, &out, &ol);
+        }" SDLOP_ICONV_CONST_INBUF)
+      set(CMAKE_REQUIRED_FLAGS "${_saved_flags}")
+    endif()
+  endif()
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+
+  add_compile_definitions(SDLOP_CMAKE_PROBED=1)
+  foreach(_probe
+      SDLOP_HAVE_MEMFD_CREATE SDLOP_HAVE_SHM_OPEN SDLOP_HAVE_MKOSTEMP
+      SDLOP_HAVE_PIPE2 SDLOP_HAVE_EVENTFD SDLOP_HAVE_POSIX_FALLOCATE
+      SDLOP_HAVE_CLOCK_NANOSLEEP SDLOP_HAVE_SEM_CLOCKWAIT SDLOP_HAVE_SEM_CLOCKWAIT_NP
+      SDLOP_HAVE_SEM_TIMEDWAIT SDLOP_HAVE_PTHREAD_CONDATTR_SETCLOCK
+      SDLOP_HAVE_PTHREAD_NP_H SDLOP_HAVE_PTHREAD_SETNAME_NP SDLOP_HAVE_PTHREAD_SET_NAME_NP
+      SDLOP_HAVE_ICONV)
+    if(${_probe})
+      add_compile_definitions(${_probe}=1)
+    else()
+      add_compile_definitions(${_probe}=0)
+    endif()
+  endforeach()
+  if(SDLOP_ICONV_CONST_INBUF)
+    add_compile_definitions(SDLOP_ICONV_CONST_INBUF=1)
+  endif()
+
+  option(SDLOP_VIDEO_WAYLAND "Build the Wayland video driver" ON)
+  option(SDLOP_VIDEO_KMSDRM "Build the KMS/DRM video driver" ON)
+  option(SDLOP_VIDEO_FBDEV "Build the Linux fbdev video driver" ON)
+  option(SDLOP_VIDEO_X11 "Build the X11 video driver (needs xcb headers; libraries are dlopen'ed)" ON)
+
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(SDLOP_VIDEO_FBDEV OFF)
+  endif()
+
+  if(PkgConfig_FOUND)
+    if(SDLOP_VIDEO_WAYLAND)
+      pkg_check_modules(WAYLAND_CLIENT wayland-client)
+      pkg_check_modules(WAYLAND_PROTOCOLS wayland-protocols)
+    endif()
+    pkg_check_modules(XKBCOMMON xkbcommon)
+    pkg_check_modules(EGL egl)
+    if(SDLOP_VIDEO_KMSDRM)
+      pkg_check_modules(GBM gbm)
+      pkg_check_modules(LIBDRM libdrm)
+    endif()
+    if(SDLOP_VIDEO_X11)
+      pkg_check_modules(X11_XCB xcb xcb-shm xcb-xkb xcb-xinput xcb-randr xcb-render xkbcommon-x11)
+      if(NOT X11_XCB_FOUND)
+        message(STATUS "xcb headers not found - building without the X11 driver")
+        set(SDLOP_VIDEO_X11 OFF)
+      endif()
+    endif()
+    # GLES2 / wayland-server: optional, for tests/examples/benchmarks
+    pkg_check_modules(GLESV2 glesv2)
+    pkg_check_modules(WAYLAND_SERVER wayland-server)
+  else()
     set(SDLOP_VIDEO_X11 OFF)
   endif()
-endif()
-# GLES2 / Vulkan / wayland-server: optional, for tests/examples/benchmarks
-pkg_check_modules(GLESV2 glesv2)
-find_package(Vulkan QUIET)
-pkg_check_modules(WAYLAND_SERVER wayland-server)
+  find_package(Vulkan QUIET)
 
-find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
-pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
+  if(XKBCOMMON_FOUND)
+    set(SDLOP_HAVE_XKBCOMMON 1)
+  else()
+    check_include_file("xkbcommon/xkbcommon.h" SDLOP_HAVE_XKB_H)
+    check_include_file("xkbcommon/xkbcommon-compose.h" SDLOP_HAVE_XKB_COMPOSE_H)
+    if(SDLOP_HAVE_XKB_H AND SDLOP_HAVE_XKB_COMPOSE_H)
+      set(SDLOP_HAVE_XKBCOMMON 1)
+    else()
+      set(SDLOP_HAVE_XKBCOMMON 0)
+      message(STATUS "xkbcommon headers not found - building with built-in US keymap fallback")
+    endif()
+  endif()
+  add_compile_definitions(SDLOP_HAVE_XKBCOMMON=${SDLOP_HAVE_XKBCOMMON})
+
+  if(EGL_FOUND)
+    set(SDLOP_HAVE_EGL 1)
+  else()
+    check_include_file("EGL/egl.h" SDLOP_HAVE_EGL_H)
+    check_include_file("EGL/eglext.h" SDLOP_HAVE_EGLEXT_H)
+    if(SDLOP_HAVE_EGL_H AND SDLOP_HAVE_EGLEXT_H)
+      set(SDLOP_HAVE_EGL 1)
+    else()
+      set(SDLOP_HAVE_EGL 0)
+      message(STATUS "EGL headers not found - building without EGL/GL offload")
+    endif()
+  endif()
+  add_compile_definitions(SDLOP_HAVE_EGL=${SDLOP_HAVE_EGL})
+
+  if(SDLOP_VIDEO_KMSDRM)
+    if(NOT (GBM_FOUND AND LIBDRM_FOUND))
+      check_include_file("xf86drm.h" SDLOP_HAVE_XF86DRM_H)
+      check_include_file("xf86drmMode.h" SDLOP_HAVE_XF86DRM_MODE_H)
+      check_include_file("gbm.h" SDLOP_HAVE_GBM_H)
+      if(NOT (SDLOP_HAVE_XF86DRM_H AND SDLOP_HAVE_XF86DRM_MODE_H AND SDLOP_HAVE_GBM_H))
+        message(STATUS "libdrm/gbm headers not found - building without the KMSDRM driver")
+        set(SDLOP_VIDEO_KMSDRM OFF)
+      endif()
+    endif()
+  endif()
+
+  if(SDLOP_VIDEO_WAYLAND)
+    find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner)
+    if(NOT (WAYLAND_CLIENT_FOUND AND WAYLAND_PROTOCOLS_FOUND AND WAYLAND_SCANNER_EXECUTABLE))
+      message(STATUS "wayland-client/wayland-protocols/wayland-scanner not found - building without the Wayland driver")
+      set(SDLOP_VIDEO_WAYLAND OFF)
+    endif()
+  endif()
+
+if(SDLOP_VIDEO_WAYLAND)
 pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
 pkg_get_variable(WAYLAND_CLIENT_DIR wayland-client pkgdatadir)
 
@@ -354,6 +513,7 @@ add_custom_target(sdlop_wayland_protocols
           ${WL_GEN_DIR}/primary-selection-server-protocol.h
           ${WL_GEN_DIR}/primary-selection-server-protocol.c
           ${SDLOP_WL_EXTRA_OUTPUTS})
+endif()  # SDLOP_VIDEO_WAYLAND
 
 # ---------------------------------------------------------------------------
 # Library
@@ -403,21 +563,6 @@ set(SDLop_SOURCES
   src/video/sdlop_gl_offload.c
   src/video/sdlop_vk_offload.c
   src/video/sdlop_egl_dyn.c
-  src/video/wayland/sdlop_wayland.c
-  src/video/wayland/sdlop_wayland_clipboard.c
-  src/video/wayland/sdlop_wayland_textinput.c
-  src/video/wayland/sdlop_wayland_tablet.c
-  src/video/wayland/sdlop_wayland_dyn.c
-  src/video/wayland/sdlop_wayland_gl.c
-  src/video/wayland/sdlop_wayland_vulkan.c
-  src/video/wayland/sdlop_wayland_protos.c
-  src/video/kmsdrm/sdlop_kmsdrm.c
-  src/video/kmsdrm/sdlop_kmsdrm_atomic.c
-  src/video/kmsdrm/sdlop_kmsdrm_dyn.c
-  src/video/kmsdrm/sdlop_kmsdrm_gl.c
-  src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
-  src/video/sdlop_xcursor.c
-  src/video/fbdev/sdlop_fbdev.c
   src/video/dummy/sdlop_dummy.c
 )
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -426,19 +571,49 @@ else()
   list(APPEND SDLop_SOURCES src/SDL_joystick_dummy_backend.c)
 endif()
 
-set(SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1 SDLop_VIDEO_KMSDRM=1 SDLop_VIDEO_FBDEV=1)
-if(SDLOP_VIDEO_X11)
-  list(APPEND SDLop_SOURCES
-    src/video/x11/sdlop_x11.c
-    src/video/x11/sdlop_x11_dyn.c
-    src/video/x11/sdlop_x11_gl.c
-    src/video/x11/sdlop_x11_clipboard.c
-    src/video/x11/sdlop_x11_dnd.c
-    src/video/x11/sdlop_x11_xsettings.c
-    src/video/x11/sdlop_x11_pen.c
-    src/video/x11/sdlop_x11_xim.c
-    src/video/x11/sdlop_x11_vulkan.c)
-  list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+set(SDLop_VIDEO_DEFS)
+if(NOT WIN32)
+  if(SDLOP_VIDEO_WAYLAND)
+    list(APPEND SDLop_SOURCES
+      src/video/wayland/sdlop_wayland.c
+      src/video/wayland/sdlop_wayland_clipboard.c
+      src/video/wayland/sdlop_wayland_textinput.c
+      src/video/wayland/sdlop_wayland_tablet.c
+      src/video/wayland/sdlop_wayland_dyn.c
+      src/video/wayland/sdlop_wayland_gl.c
+      src/video/wayland/sdlop_wayland_vulkan.c
+      src/video/wayland/sdlop_wayland_protos.c)
+    list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_WAYLAND=1)
+  endif()
+  if(SDLOP_VIDEO_KMSDRM)
+    list(APPEND SDLop_SOURCES
+      src/video/kmsdrm/sdlop_kmsdrm.c
+      src/video/kmsdrm/sdlop_kmsdrm_atomic.c
+      src/video/kmsdrm/sdlop_kmsdrm_dyn.c
+      src/video/kmsdrm/sdlop_kmsdrm_gl.c
+      src/video/kmsdrm/sdlop_kmsdrm_vulkan.c)
+    list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_KMSDRM=1)
+  endif()
+  if(SDLOP_VIDEO_WAYLAND OR SDLOP_VIDEO_KMSDRM OR SDLOP_VIDEO_FBDEV)
+    list(APPEND SDLop_SOURCES src/video/sdlop_xcursor.c)
+  endif()
+  if(SDLOP_VIDEO_FBDEV)
+    list(APPEND SDLop_SOURCES src/video/fbdev/sdlop_fbdev.c)
+    list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_FBDEV=1)
+  endif()
+  if(SDLOP_VIDEO_X11)
+    list(APPEND SDLop_SOURCES
+      src/video/x11/sdlop_x11.c
+      src/video/x11/sdlop_x11_dyn.c
+      src/video/x11/sdlop_x11_gl.c
+      src/video/x11/sdlop_x11_clipboard.c
+      src/video/x11/sdlop_x11_dnd.c
+      src/video/x11/sdlop_x11_xsettings.c
+      src/video/x11/sdlop_x11_pen.c
+      src/video/x11/sdlop_x11_xim.c
+      src/video/x11/sdlop_x11_vulkan.c)
+    list(APPEND SDLop_VIDEO_DEFS SDLop_VIDEO_X11=1)
+  endif()
 endif()
 
 if(WIN32)
@@ -455,31 +630,6 @@ if(WIN32)
     src/video/sdlop_vk_offload_win32.c
     src/internal/sdlop_dbus_stub_win32.c)
   list(REMOVE_ITEM SDLop_SOURCES
-    src/video/wayland/sdlop_wayland.c
-    src/video/wayland/sdlop_wayland_dyn.c
-    src/video/wayland/sdlop_wayland_protos.c
-    src/video/wayland/sdlop_wayland_gl.c
-    src/video/wayland/sdlop_wayland_vulkan.c
-    src/video/wayland/sdlop_wayland_clipboard.c
-    src/video/wayland/sdlop_wayland_tablet.c
-    src/video/wayland/sdlop_wayland_textinput.c
-    src/video/kmsdrm/sdlop_kmsdrm.c
-    src/video/kmsdrm/sdlop_kmsdrm_atomic.c
-    src/video/kmsdrm/sdlop_kmsdrm_dyn.c
-    src/video/kmsdrm/sdlop_kmsdrm_gl.c
-    src/video/kmsdrm/sdlop_kmsdrm_vulkan.c
-    src/video/fbdev/sdlop_fbdev.c
-    src/video/x11/sdlop_x11.c
-    src/video/x11/sdlop_x11_dyn.c
-    src/video/x11/sdlop_x11_gl.c
-    src/video/x11/sdlop_x11_clipboard.c
-    src/video/x11/sdlop_x11_dnd.c
-    src/video/x11/sdlop_x11_xsettings.c
-    src/video/x11/sdlop_x11_pen.c
-    src/video/x11/sdlop_x11_xim.c
-    src/video/x11/sdlop_x11_vulkan.c
-    src/video/sdlop_evdev.c
-    src/video/sdlop_xcursor.c
     src/internal/sdlop_evdev.c
     src/sdlop_xkb_dyn.c
     src/video/sdlop_egl_dyn.c
@@ -510,8 +660,9 @@ if(WIN32)
     setupapi)
 else()
   set(SDLop_LIB_DEPS
-    pthread
-    dl
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+    ${SDLop_EXTRA_POSIX_LIBS}
     m)
 endif()
 # dlopen-ed at run time - the core targets link none of these libraries.
@@ -526,7 +677,7 @@ set(SDLop_LIB_INCS
 
 add_library(sdlop STATIC ${SDLop_SOURCES})
 add_library(SDLop::SDLop ALIAS sdlop)
-if(NOT WIN32)
+if(NOT WIN32 AND SDLOP_VIDEO_WAYLAND)
   add_dependencies(sdlop sdlop_wayland_protocols)
 endif()
 
@@ -542,7 +693,7 @@ target_link_libraries(sdlop PUBLIC ${SDLop_LIB_DEPS})
 target_compile_definitions(sdlop PUBLIC ${SDLop_VIDEO_DEFS})
 
 add_library(sdlop_shared SHARED ${SDLop_SOURCES})
-if(NOT WIN32)
+if(NOT WIN32 AND SDLOP_VIDEO_WAYLAND)
   add_dependencies(sdlop_shared sdlop_wayland_protocols)
 endif()
 set_target_properties(sdlop_shared PROPERTIES OUTPUT_NAME SDLop)
@@ -658,10 +809,16 @@ if(SDLop_BUILD_TESTS)
     set(SDLOP_PORTABLE_TESTS test_ring test_events test_layouts
         test_core test_main_callbacks test_threads test_iconv)
   else()
-    set(SDLOP_PORTABLE_TESTS test_ring test_scancode test_events test_surface
+    set(SDLOP_PORTABLE_TESTS test_ring test_events test_surface
         test_web test_keycodes test_layouts test_core test_main_callbacks
-        test_misc test_threads test_vt_mask test_fbdev_device test_options
-        test_dropin_compat test_iconv test_raw_translate test_dbus test_ime_txn)
+        test_misc test_threads test_vt_mask test_options
+        test_dropin_compat test_iconv test_dbus test_ime_txn)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      list(APPEND SDLOP_PORTABLE_TESTS test_scancode test_raw_translate)
+    endif()
+    if(SDLOP_VIDEO_FBDEV)
+      list(APPEND SDLOP_PORTABLE_TESTS test_fbdev_device)
+    endif()
   endif()
   foreach(t ${SDLOP_PORTABLE_TESTS})
     add_executable(${t} tests/${t}.c)
@@ -671,7 +828,7 @@ if(SDLop_BUILD_TESTS)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
   set_tests_properties(test_core PROPERTIES RUN_SERIAL TRUE)
-  if(NOT WIN32)
+  if(NOT WIN32 AND SDLOP_VIDEO_FBDEV)
     target_link_options(test_fbdev_device PRIVATE -Wl,--wrap=ioctl)
   endif()
 
@@ -718,14 +875,20 @@ if(SDLop_BUILD_TESTS)
     target_link_libraries(test_window_api PRIVATE sdlop)
     target_compile_options(test_window_api PRIVATE -UNDEBUG)
     add_test(NAME test_window_api COMMAND test_window_api dummy)
-    # Wayland run: needs a compositor (WAYLAND_DISPLAY), skips otherwise
-    add_test(NAME test_window_api_wayland COMMAND test_window_api wayland)
-    # SDL_EGL_* / SDL_GL_ExtensionSupported against Mesa (skips without a
-    # display server; the X11 run is registered with the X11 tests)
-    add_executable(test_egl_api tests/test_egl_api.c)
-    target_link_libraries(test_egl_api PRIVATE sdlop)
-    target_compile_options(test_egl_api PRIVATE -UNDEBUG)
-    add_test(NAME test_egl_api_wayland COMMAND test_egl_api wayland)
+    if(SDLOP_VIDEO_WAYLAND)
+      # Wayland run: needs a compositor (WAYLAND_DISPLAY), skips otherwise
+      add_test(NAME test_window_api_wayland COMMAND test_window_api wayland)
+    endif()
+    if((SDLOP_VIDEO_WAYLAND OR SDLOP_VIDEO_X11) AND SDLOP_HAVE_EGL)
+      # SDL_EGL_* / SDL_GL_ExtensionSupported against Mesa (skips without a
+      # display server; the X11 run is registered with the X11 tests)
+      add_executable(test_egl_api tests/test_egl_api.c)
+      target_link_libraries(test_egl_api PRIVATE sdlop)
+      target_compile_options(test_egl_api PRIVATE -UNDEBUG)
+      if(SDLOP_VIDEO_WAYLAND)
+        add_test(NAME test_egl_api_wayland COMMAND test_egl_api wayland)
+      endif()
+    endif()
     # the generated headers must be valid C++ with C linkage
     include(CheckLanguage)
     check_language(CXX)
@@ -741,26 +904,30 @@ if(SDLop_BUILD_TESTS)
     add_test(NAME test_keycodes_noxkb COMMAND test_keycodes)
     set_tests_properties(test_keycodes_noxkb PROPERTIES ENVIRONMENT "SDLOP_LIB_XKB=none")
 
-    # integration tests that need real subsystems (auto-skip when unavailable)
-    add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
-    target_link_libraries(test_evdev_uinput PRIVATE sdlop)
-    target_include_directories(test_evdev_uinput PRIVATE src tests)
-    target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
-    add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      # integration tests that need real subsystems (auto-skip when unavailable)
+      add_executable(test_evdev_uinput tests/test_evdev_uinput.c tests/uinput_synth.c)
+      target_link_libraries(test_evdev_uinput PRIVATE sdlop)
+      target_include_directories(test_evdev_uinput PRIVATE src tests)
+      target_compile_options(test_evdev_uinput PRIVATE -UNDEBUG)
+      add_test(NAME test_evdev_uinput COMMAND test_evdev_uinput)
 
-    # End-to-end evdev joystick/gamepad backend through uinput.
-    add_executable(test_evdev_joystick tests/test_evdev_joystick.c tests/uinput_synth.c)
-    target_link_libraries(test_evdev_joystick PRIVATE sdlop)
-    target_include_directories(test_evdev_joystick PRIVATE src tests)
-    target_compile_options(test_evdev_joystick PRIVATE -UNDEBUG)
-    add_test(NAME test_evdev_joystick COMMAND test_evdev_joystick)
-    set_tests_properties(test_evdev_joystick PROPERTIES TIMEOUT 20)
+      # End-to-end evdev joystick/gamepad backend through uinput.
+      add_executable(test_evdev_joystick tests/test_evdev_joystick.c tests/uinput_synth.c)
+      target_link_libraries(test_evdev_joystick PRIVATE sdlop)
+      target_include_directories(test_evdev_joystick PRIVATE src tests)
+      target_compile_options(test_evdev_joystick PRIVATE -UNDEBUG)
+      add_test(NAME test_evdev_joystick COMMAND test_evdev_joystick)
+      set_tests_properties(test_evdev_joystick PROPERTIES TIMEOUT 20)
+    endif()
 
-    add_executable(test_wayland tests/test_wayland.c)
-    target_link_libraries(test_wayland PRIVATE sdlop)
-    target_include_directories(test_wayland PRIVATE src)
-    target_compile_options(test_wayland PRIVATE -UNDEBUG)
-    add_test(NAME test_wayland COMMAND test_wayland)
+    if(SDLOP_VIDEO_WAYLAND)
+      add_executable(test_wayland tests/test_wayland.c)
+      target_link_libraries(test_wayland PRIVATE sdlop)
+      target_include_directories(test_wayland PRIVATE src)
+      target_compile_options(test_wayland PRIVATE -UNDEBUG)
+      add_test(NAME test_wayland COMMAND test_wayland)
+    endif()
 
     # X11 driver integration test (needs a running X server, e.g. xvfb-run;
     # skips without DISPLAY). Only the *test* links xcb/xcb-xtest - it drives
@@ -778,7 +945,9 @@ if(SDLop_BUILD_TESTS)
         target_include_directories(test_window_api PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
         add_test(NAME test_window_api_x11 COMMAND test_window_api x11)
         set_tests_properties(test_window_api_x11 PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-        add_test(NAME test_egl_api_x11 COMMAND test_egl_api x11)
+        if(SDLOP_HAVE_EGL)
+          add_test(NAME test_egl_api_x11 COMMAND test_egl_api x11)
+        endif()
         # same suite through the xcb_put_image fallback (no MIT-SHM)
         add_test(NAME test_x11_noshm COMMAND test_x11)
         # and with only libxcb itself: no SHM / XKB / XInput2 / RandR, i.e.
@@ -789,7 +958,7 @@ if(SDLop_BUILD_TESTS)
         # system clipboard / primary selection against other X clients (raw
         # xcb requestor + owner thread), with and without XFixes
         add_executable(test_x11_clipboard tests/test_x11_clipboard.c)
-        target_link_libraries(test_x11_clipboard PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} pthread)
+        target_link_libraries(test_x11_clipboard PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} Threads::Threads)
         target_include_directories(test_x11_clipboard PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
         target_compile_options(test_x11_clipboard PRIVATE -UNDEBUG)
         add_test(NAME test_x11_clipboard COMMAND test_x11_clipboard)
@@ -898,13 +1067,15 @@ if(SDLop_BUILD_TESTS)
         else()
           message(STATUS "xcb-imdkit not found: test_x11_xim not built")
         endif()
-        # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
-        add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
-        target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
-        target_include_directories(test_x11_raw_source PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
-        target_compile_options(test_x11_raw_source PRIVATE -UNDEBUG)
-        add_test(NAME test_x11_raw_source COMMAND test_x11_raw_source)
-        set_tests_properties(test_x11_raw_source PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+          # SDLOP_RAW_INPUT on X11: optional, never mixed (fake /dev/input in-process)
+          add_executable(test_x11_raw_source tests/test_x11_raw_source.c)
+          target_link_libraries(test_x11_raw_source PRIVATE sdlop ${X11_TEST_DEPS_LIBRARIES} ${CMAKE_DL_LIBS})
+          target_include_directories(test_x11_raw_source PRIVATE ${X11_TEST_DEPS_INCLUDE_DIRS})
+          target_compile_options(test_x11_raw_source PRIVATE -UNDEBUG)
+          add_test(NAME test_x11_raw_source COMMAND test_x11_raw_source)
+          set_tests_properties(test_x11_raw_source PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        endif()
         # desktop GL on X11 is GLX (GLEW & co. need glXGetCurrentDisplay);
         # GLES / SDL_VIDEO_FORCE_EGL use EGL. libGL is dlopen-ed at run time.
         add_executable(test_glx tests/test_glx.c)
@@ -932,14 +1103,14 @@ if(SDLop_BUILD_TESTS)
       pkg_check_modules(X11_TOUCH_DEPS xcb xcb-xinput)
       if(X11_TOUCH_DEPS_FOUND)
         add_executable(test_x11_touch tests/test_x11_touch.c)
-        target_link_libraries(test_x11_touch PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} pthread m)
+        target_link_libraries(test_x11_touch PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} Threads::Threads m)
         target_include_directories(test_x11_touch PRIVATE ${X11_TOUCH_DEPS_INCLUDE_DIRS})
         target_compile_options(test_x11_touch PRIVATE -UNDEBUG)
         add_test(NAME test_x11_touch COMMAND test_x11_touch)
         set_tests_properties(test_x11_touch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
         # XI2 pens: the same kind of proxy adds a fake tablet to XIQueryDevice
         add_executable(test_x11_pen tests/test_x11_pen.c)
-        target_link_libraries(test_x11_pen PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} pthread m)
+        target_link_libraries(test_x11_pen PRIVATE sdlop ${X11_TOUCH_DEPS_LIBRARIES} Threads::Threads m)
         target_include_directories(test_x11_pen PRIVATE ${X11_TOUCH_DEPS_INCLUDE_DIRS})
         target_compile_options(test_x11_pen PRIVATE -UNDEBUG)
         add_test(NAME test_x11_pen COMMAND test_x11_pen on)
@@ -948,22 +1119,26 @@ if(SDLop_BUILD_TESTS)
       endif()
     endif()
 
-    # framebuffer (fbdev) driver: needs no device - SDLOP_FBDEV_DUMP makes the
-    # driver render into RAM and dump each presented frame as a PPM we check
-    add_executable(test_fbdev tests/test_fbdev.c)
-    target_link_libraries(test_fbdev PRIVATE sdlop)
-    target_include_directories(test_fbdev PRIVATE src)
-    target_compile_options(test_fbdev PRIVATE -UNDEBUG)
-    add_test(NAME test_fbdev COMMAND test_fbdev)
-    set_tests_properties(test_fbdev PROPERTIES
-      ENVIRONMENT "SDLOP_DISABLE_RAW_INPUT=1;SDLOP_TEST_STRICT=1;SDLOP_FBDEV_SIZE=320x240;SDLOP_FBDEV_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test_fbdev_frame.ppm"
-      TIMEOUT 60)
+    if(SDLOP_VIDEO_FBDEV)
+      # framebuffer (fbdev) driver: needs no device - SDLOP_FBDEV_DUMP makes the
+      # driver render into RAM and dump each presented frame as a PPM we check
+      add_executable(test_fbdev tests/test_fbdev.c)
+      target_link_libraries(test_fbdev PRIVATE sdlop)
+      target_include_directories(test_fbdev PRIVATE src)
+      target_compile_options(test_fbdev PRIVATE -UNDEBUG)
+      add_test(NAME test_fbdev COMMAND test_fbdev)
+      set_tests_properties(test_fbdev PROPERTIES
+        ENVIRONMENT "SDLOP_DISABLE_RAW_INPUT=1;SDLOP_TEST_STRICT=1;SDLOP_FBDEV_SIZE=320x240;SDLOP_FBDEV_DUMP=${CMAKE_CURRENT_BINARY_DIR}/test_fbdev_frame.ppm"
+        TIMEOUT 60)
+    endif()
 
-    add_executable(test_kmsdrm tests/test_kmsdrm.c)
-    target_link_libraries(test_kmsdrm PRIVATE sdlop)
-    target_include_directories(test_kmsdrm PRIVATE src)
-    target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
-    add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
+    if(SDLOP_VIDEO_KMSDRM)
+      add_executable(test_kmsdrm tests/test_kmsdrm.c)
+      target_link_libraries(test_kmsdrm PRIVATE sdlop)
+      target_include_directories(test_kmsdrm PRIVATE src)
+      target_compile_options(test_kmsdrm PRIVATE -UNDEBUG)
+      add_test(NAME test_kmsdrm COMMAND test_kmsdrm)
+    endif()
 
     add_executable(test_gl_offload tests/test_gl_offload.c)
     target_link_libraries(test_gl_offload PRIVATE sdlop)
@@ -977,11 +1152,13 @@ if(SDLop_BUILD_TESTS)
     target_compile_options(test_vk_offload PRIVATE -UNDEBUG)
     add_test(NAME test_vk_offload COMMAND test_vk_offload)
 
-    # KMS present-path benchmark (not a ctest gate; skips without KMS)
-    add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
-    target_link_libraries(bench_kmsdrm PRIVATE sdlop)
-    target_include_directories(bench_kmsdrm PRIVATE src)
-    target_compile_options(bench_kmsdrm PRIVATE -UNDEBUG)
+    if(SDLOP_VIDEO_KMSDRM)
+      # KMS present-path benchmark (not a ctest gate; skips without KMS)
+      add_executable(bench_kmsdrm tests/bench_kmsdrm.c)
+      target_link_libraries(bench_kmsdrm PRIVATE sdlop)
+      target_include_directories(bench_kmsdrm PRIVATE src)
+      target_compile_options(bench_kmsdrm PRIVATE -UNDEBUG)
+    endif()
 
     if(GLESV2_FOUND)
       add_executable(test_gl tests/test_gl.c)
@@ -994,7 +1171,7 @@ if(SDLop_BUILD_TESTS)
     endif()
 
     # pointer lock integration test (runs against tests/mini_compositor.c)
-    if(WAYLAND_SERVER_FOUND)
+    if(SDLOP_VIDEO_WAYLAND AND WAYLAND_SERVER_FOUND)
       add_executable(mini_compositor tests/mini_compositor.c
         ${WL_GEN_DIR}/xdg-shell-server-protocol.c
         ${WL_GEN_DIR}/pointer-constraints-server-protocol.c
@@ -1171,7 +1348,7 @@ if(SDLop_BUILD_TESTS)
       message(STATUS "Vulkan not found - skipping test_vulkan, test_vulkan_compute, test_vk_offload_live")
     endif()
 
-    if(WAYLAND_CLIENT_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
+    if(SDLOP_VIDEO_WAYLAND AND WAYLAND_CLIENT_FOUND AND SDLOP_HAVE_XKBCOMMON AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
       add_executable(test_virtual_input tests/test_virtual_input.c
         ${WL_GEN_DIR}/wlr-virtual-pointer-protocol.c
         ${WL_GEN_DIR}/virtual-keyboard-protocol.c)
@@ -1180,7 +1357,7 @@ if(SDLop_BUILD_TESTS)
       target_compile_options(test_virtual_input PRIVATE -UNDEBUG)
       add_test(NAME test_virtual_input COMMAND test_virtual_input)
     else()
-      message(STATUS "wayland-client or the virtual-input protocol XMLs not found - skipping test_virtual_input")
+      message(STATUS "wayland-client, xkbcommon or the virtual-input protocol XMLs not found - skipping test_virtual_input")
     endif()
   endif()
 
@@ -1188,7 +1365,9 @@ if(SDLop_BUILD_TESTS)
   # Benchmarks (SDLop vs SDL3)
   # ---------------------------------------------------------------------------
   if(SDLop_BUILD_BENCHMARKS AND NOT WIN32)  # benchmarks diff against system SDL3
-    pkg_check_modules(SDL3 sdl3)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(SDL3 sdl3)
+    endif()
     add_executable(bench_events bench/bench_events.c)
     target_link_libraries(bench_events PRIVATE sdlop)
     if(SDL3_FOUND)
@@ -1207,9 +1386,11 @@ if(SDLop_BUILD_TESTS)
     else()
       message(STATUS "GLESv2 not found - skipping bench_render")
     endif()
-    add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
-    target_link_libraries(bench_raw_latency PRIVATE sdlop)
-    target_include_directories(bench_raw_latency PRIVATE src tests)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      add_executable(bench_raw_latency bench/bench_raw_latency.c tests/uinput_synth.c)
+      target_link_libraries(bench_raw_latency PRIVATE sdlop)
+      target_include_directories(bench_raw_latency PRIVATE src tests)
+    endif()
   endif()
 
   # ABI parity gate: builds tools/abi_probe.c against these headers and against
@@ -1229,7 +1410,7 @@ if(SDLop_BUILD_TESTS)
     target_link_libraries(behaviour_probe_wayland PRIVATE sdlop)
     target_include_directories(behaviour_probe_wayland PRIVATE src)
 
-    if (WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
+    if (SDLOP_VIDEO_WAYLAND AND WAYLAND_CLIENT_FOUND AND XKBCOMMON_FOUND AND SDLOP_WL_VIRTUAL_INPUT_PROTOCOLS)
       # Reference compositor-side driver for the probe: injects the scripted
       # pointer/key sequence once READY-INPUT appears.
       add_executable(behaviour_probe_inject tools/behaviour_probe_inject.c

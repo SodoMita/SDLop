@@ -361,7 +361,8 @@ int main(int argc, char *argv[])
 
     pid_t server = fork();
     if (server == 0) {
-        execl("/proc/self/exe", argv[0], "--server", logpath, (char *)NULL);
+        char *const server_argv[] = { argv[0], "--server", (char *)logpath, NULL };
+        execvp(argv[0], server_argv);
         _exit(127);
     }
     const Uint64 ready_end = SDL_GetTicks() + 5000;

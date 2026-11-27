@@ -14,8 +14,15 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <gbm.h>
-#include <EGL/egl.h>
+#include "../sdlop_egl_dyn.h"
 #include <SDL3/SDL.h>
+
+#if !SDLOP_HAVE_EGL
+typedef void *EGLSurface;
+#ifndef EGL_NO_SURFACE
+#define EGL_NO_SURFACE ((EGLSurface)0)
+#endif
+#endif
 
 #ifndef EGL_PLATFORM_GBM_MESA
 #define EGL_PLATFORM_GBM_MESA 0x31D7

@@ -30,11 +30,25 @@
 
 #ifndef _WIN32
 #include <pthread.h>
+#if defined(SDLOP_HAVE_PTHREAD_NP_H) && SDLOP_HAVE_PTHREAD_NP_H
+#include <pthread_np.h>
+#endif
+#if defined(__linux__) || defined(__ANDROID__) || defined(__APPLE__)
+#include <dlfcn.h>
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT NULL
+#endif
+#endif
+#ifdef __HAIKU__
+#include <kernel/OS.h>
+#endif
 #include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <sys/resource.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -325,9 +339,22 @@ void SDL_DestroySemaphore(SDL_Semaphore *sem)
 /* Absolute deadline `timeout_ns` from now, expressed on the platform's
  * monotonic clock (clock_gettime on POSIX, QueryPerformanceCounter on
  * Windows, which is why it goes through SDLOP_MonotonicNowNS()). */
-static void abs_timeout(Sint64 timeout_ns, struct timespec *ts)
+static void abs_timeout_clock(Sint64 timeout_ns, struct timespec *ts, int clk)
 {
+#ifdef _WIN32
+    (void)clk;
     SDLOP_DeadlineFromNS(ts, SDLOP_MonotonicNowNS() + timeout_ns);
+#else
+    if (clk == CLOCK_MONOTONIC) {
+        SDLOP_DeadlineFromNS(ts, SDLOP_MonotonicNowNS() + timeout_ns);
+        return;
+    }
+    struct timespec now;
+    clock_gettime(clk, &now);
+    Sint64 nsec = (Sint64)now.tv_nsec + (timeout_ns % 1000000000ll);
+    ts->tv_sec = now.tv_sec + (time_t)(timeout_ns / 1000000000ll) + (time_t)(nsec / 1000000000ll);
+    ts->tv_nsec = (long)(nsec % 1000000000ll);
+#endif
 }
 
 bool SDL_WaitSemaphoreTimeout(SDL_Semaphore *sem, Sint32 timeoutMS)
@@ -338,13 +365,11 @@ bool SDL_WaitSemaphoreTimeout(SDL_Semaphore *sem, Sint32 timeoutMS)
     if (timeoutMS == 0) {
         return SDLOP_SEM_TRYWAIT(&sem->sem);
     }
-    /* Absolute CLOCK_MONOTONIC deadline; a negative timeout is still an
-     * infinite wait, exactly like SDL3. */
-    const Sint64 deadline_ns = timeoutMS < 0
-                                   ? (Sint64)0x7fffffffffffffffull / 2
-                                   : SDLOP_MonotonicNowNS() + (Sint64)timeoutMS * 1000000ll;
+    if (timeoutMS < 0) {
+        return SDLOP_SEM_WAIT(&sem->sem);
+    }
     struct timespec ts;
-    SDLOP_DeadlineFromNS(&ts, deadline_ns);
+    abs_timeout_clock((Sint64)timeoutMS * 1000000ll, &ts, SDLOP_SEM_CLOCK);
     return SDLOP_SemWaitUntil(&sem->sem, &ts);
 }
 
@@ -411,7 +436,7 @@ bool SDL_WaitConditionTimeout(SDL_Condition *cond, SDL_Mutex *mutex, Sint32 time
         return SDLOP_COND_WAIT(&cond->cond, &mutex->id) == 0;
     }
     struct timespec ts;
-    abs_timeout((Sint64)timeoutMS * 1000000, &ts);
+    abs_timeout_clock((Sint64)timeoutMS * 1000000ll, &ts, SDLOP_COND_CLOCK);
     int rc;
     do {
         rc = SDLOP_COND_WAIT_UNTIL(&cond->cond, &mutex->id, &ts);
@@ -812,6 +837,50 @@ static void free_thread(SDL_Thread *thread)
     SDL_free(thread);
 }
 
+#ifndef _WIN32
+static void set_current_thread_name(const char *name)
+{
+    if (!name) {
+        return;
+    }
+#if defined(__APPLE__)
+    typedef int (*pfn_setname_apple)(const char *);
+    pfn_setname_apple fn = (pfn_setname_apple)dlsym(RTLD_DEFAULT, "pthread_setname_np");
+    if (fn) {
+        fn(name);
+    }
+#elif defined(__linux__) || defined(__ANDROID__)
+    typedef int (*pfn_setname_linux)(pthread_t, const char *);
+    pfn_setname_linux fn = (pfn_setname_linux)dlsym(RTLD_DEFAULT, "pthread_setname_np");
+    if (fn) {
+        if (fn(pthread_self(), name) == ERANGE) {
+            char namebuf[16];
+            SDL_strlcpy(namebuf, name, sizeof(namebuf));
+            fn(pthread_self(), namebuf);
+        }
+    }
+#elif defined(SDLOP_HAVE_PTHREAD_SETNAME_NP) && SDLOP_HAVE_PTHREAD_SETNAME_NP
+#if defined(__NetBSD__)
+    pthread_setname_np(pthread_self(), "%s", (void *)name);
+#else
+    if (pthread_setname_np(pthread_self(), name) == ERANGE) {
+        char namebuf[16];
+        SDL_strlcpy(namebuf, name, sizeof(namebuf));
+        pthread_setname_np(pthread_self(), namebuf);
+    }
+#endif
+#elif defined(SDLOP_HAVE_PTHREAD_SET_NAME_NP) && SDLOP_HAVE_PTHREAD_SET_NAME_NP
+    pthread_set_name_np(pthread_self(), name);
+#elif defined(__HAIKU__)
+    char namebuf[B_OS_NAME_LENGTH];
+    SDL_strlcpy(namebuf, name, sizeof(namebuf));
+    rename_thread(find_thread(NULL), namebuf);
+#else
+    (void)name;
+#endif
+}
+#endif
+
 static
 #ifdef _WIN32
 unsigned __stdcall
@@ -823,12 +892,7 @@ run_thread(void *arg)
     SDL_Thread *thread = (SDL_Thread *)arg;
 
 #ifndef _WIN32
-    /* Linux limits names to 15 chars + NUL; SDL3 truncates likewise */
-    if (thread->name) {
-        char name[16];
-        SDL_strlcpy(name, thread->name, sizeof(name));
-        pthread_setname_np(pthread_self(), name);
-    }
+    set_current_thread_name(thread->name);
     /* SDL3: SDL threads don't receive asynchronous signals */
     sigset_t mask;
     sigemptyset(&mask);
@@ -1091,7 +1155,7 @@ bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority priority)
         return true;
     }
     return SDL_SetError("SetThreadPriority() failed: %lu", (unsigned long)GetLastError());
-#else
+#elif defined(__linux__)
     const bool realtime = SDL_GetHintBoolean(SDL_HINT_THREAD_FORCE_REALTIME_TIME_CRITICAL, false);
     if (realtime && priority == SDL_THREAD_PRIORITY_TIME_CRITICAL) {
         struct sched_param sp;
@@ -1122,6 +1186,77 @@ bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority priority)
         return true;
     }
     return SDL_SetError("setpriority() failed");
+#else
+    /* Non-Linux POSIX (BSDs / Solaris / Haiku / QNX / macOS): match SDL3's
+     * SDL_systhread.c using pthread_setschedparam(). */
+    int policy = SCHED_OTHER;
+    int pri_policy;
+    struct sched_param sched;
+    SDL_zero(sched);
+    if (pthread_getschedparam(pthread_self(), &policy, &sched) != 0) {
+        return SDL_SetError("pthread_getschedparam() failed");
+    }
+    switch (priority) {
+    case SDL_THREAD_PRIORITY_LOW:
+    case SDL_THREAD_PRIORITY_NORMAL:
+        pri_policy = SCHED_OTHER;
+        break;
+    case SDL_THREAD_PRIORITY_HIGH:
+    case SDL_THREAD_PRIORITY_TIME_CRITICAL:
+#if defined(SDL_PLATFORM_MACOS) || defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_TVOS)
+        pri_policy = SCHED_RR;
+        break;
+#else
+        pri_policy = SCHED_OTHER;
+        break;
+#endif
+    default:
+        pri_policy = policy;
+        break;
+    }
+    const bool realtime = SDL_GetHintBoolean(SDL_HINT_THREAD_FORCE_REALTIME_TIME_CRITICAL, false);
+    if (realtime && priority == SDL_THREAD_PRIORITY_TIME_CRITICAL) {
+        pri_policy = SCHED_RR;
+    }
+    const char *policyhint = SDL_GetHint(SDL_HINT_THREAD_PRIORITY_POLICY);
+    if (policyhint) {
+        if (SDL_strcmp(policyhint, "current") == 0) {
+            /* keep current policy */
+        } else if (SDL_strcmp(policyhint, "other") == 0) {
+            policy = SCHED_OTHER;
+        } else if (SDL_strcmp(policyhint, "rr") == 0) {
+            policy = SCHED_RR;
+        } else if (SDL_strcmp(policyhint, "fifo") == 0) {
+            policy = SCHED_FIFO;
+        } else {
+            policy = pri_policy;
+        }
+    } else {
+        policy = pri_policy;
+    }
+    const int min_priority = sched_get_priority_min(policy);
+    const int max_priority = sched_get_priority_max(policy);
+    if (min_priority < 0 || max_priority < 0) {
+        return (priority == SDL_THREAD_PRIORITY_NORMAL) ? true : SDL_SetError("sched_get_priority_min/max() failed");
+    }
+    if (priority == SDL_THREAD_PRIORITY_LOW) {
+        sched.sched_priority = min_priority;
+    } else if (priority == SDL_THREAD_PRIORITY_TIME_CRITICAL) {
+        sched.sched_priority = max_priority;
+#if defined(SDL_PLATFORM_MACOS) || defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_TVOS)
+    } else if (min_priority == 15 && max_priority == 47) {
+        sched.sched_priority = (priority == SDL_THREAD_PRIORITY_HIGH) ? 45 : 37;
+#endif
+    } else {
+        sched.sched_priority = min_priority + (max_priority - min_priority) / 2;
+        if (priority == SDL_THREAD_PRIORITY_HIGH) {
+            sched.sched_priority += (max_priority - min_priority) / 4;
+        }
+    }
+    if (pthread_setschedparam(pthread_self(), policy, &sched) == 0) {
+        return true;
+    }
+    return SDL_SetError("pthread_setschedparam() failed");
 #endif
 }
 
@@ -1134,11 +1269,11 @@ bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority priority)
  * latter through RealtimeKit over D-Bus; SDLop has no D-Bus dependency,
  * so apply the policy directly with sched_setscheduler() (a Linux thread
  * ID is also a schedulable task ID). */
-#ifdef _WIN32
+#ifndef __linux__
 /* Stock SDL3 declares these only under SDL_PLATFORM_LINUX. SDLop's export
  * gate scans the headers textually and cannot see that #ifdef, so the symbols
- * must exist in the Windows DLL as well - as the honest "not this platform"
- * answer rather than a setpriority() call that cannot work here. */
+ * must exist on non-Linux platforms as well - as the honest "not this
+ * platform" answer rather than a setpriority() call that cannot work there. */
 bool SDL_SetLinuxThreadPriority(Sint64 threadID, int priority)
 {
     (void)threadID;
@@ -1213,4 +1348,4 @@ bool SDL_SetLinuxThreadPriorityAndPolicy(Sint64 threadID, int sdlPriority, int s
     }
     return SDL_SetError("setpriority() failed");
 }
-#endif /* !_WIN32 */
+#endif /* __linux__ */
