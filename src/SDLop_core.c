@@ -369,6 +369,7 @@ void SDL_Quit(void)
 #endif
     SDLOP_EnvironmentQuit();
     SDLOP_ThreadsQuit();
+    SDLOP_ReleaseTimerHandles();
     memset(&sdlop, 0, sizeof(sdlop));
     sdlop.wake_fd = -1;
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__) && (!defined(SDLOP_HAVE_EVENTFD) || !SDLOP_HAVE_EVENTFD)

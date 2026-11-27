@@ -30,6 +30,7 @@ typedef HGLRC (WINAPI *PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC, HGLRC, const int 
 typedef BOOL (WINAPI *PFNWGLSWAPINTERVALEXTPROC)(int);
 typedef int (WINAPI *PFNWGLGETSWAPINTERVALEXTPROC)(void);
 typedef BOOL (WINAPI *PFNWGLCHOOSEPIXELFORMATARBPROC)(HDC, const int *, const FLOAT *, UINT, int *, UINT *);
+typedef const char *(WINAPI *PFNWGLGETEXTENSIONSSTRINGARBPROC)(HDC);
 
 #define WGL_CONTEXT_MAJOR_VERSION_ARB 0x2091
 #define WGL_CONTEXT_MINOR_VERSION_ARB 0x2092
@@ -52,6 +53,8 @@ static struct
     PFNWGLCREATECONTEXTATTRIBSARBPROC create_context_attribs;
     PFNWGLSWAPINTERVALEXTPROC swap_interval;
     PFNWGLGETSWAPINTERVALEXTPROC get_swap_interval;
+    PFNWGLGETEXTENSIONSSTRINGARBPROC get_extensions_string;
+    bool has_swap_control_tear;
     int current_interval;
 } wgl;
 
@@ -59,6 +62,7 @@ static struct
  * thread that has a current context. */
 static HGLRC bootstrap_context;
 static HDC bootstrap_dc;
+static HWND bootstrap_hwnd;
 
 static void *win32_gl_load(const char *name)
 {
@@ -97,7 +101,18 @@ static void win32_gl_init_extensions(void)
     wgl.create_context_attribs = (PFNWGLCREATECONTEXTATTRIBSARBPROC)win32_gl_get_proc("wglCreateContextAttribsARB");
     wgl.swap_interval = (PFNWGLSWAPINTERVALEXTPROC)win32_gl_get_proc("wglSwapIntervalEXT");
     wgl.get_swap_interval = (PFNWGLGETSWAPINTERVALEXTPROC)win32_gl_get_proc("wglGetSwapIntervalEXT");
+    wgl.get_extensions_string = (PFNWGLGETEXTENSIONSSTRINGARBPROC)win32_gl_get_proc("wglGetExtensionsStringARB");
     wgl.current_interval = 1;
+    /* Adaptive vsync (SDL_GL_SetSwapInterval(-1)) is only legal on a context
+     * whose pixel format was created with
+     * WGL_EXT_swap_control_tear present and wglSwapIntervalEXT(-1) accepted;
+     * asking anyway returns FALSE and, on some drivers, silently pins the
+     * interval at 0. Record whether the extension exists so -1 can be
+     * rejected for the right reason instead of as a generic bad argument. */
+    {
+        const char *exts = wgl.get_extensions_string ? wgl.get_extensions_string(NULL) : NULL;
+        wgl.has_swap_control_tear = (exts && SDL_strstr(exts, "WGL_EXT_swap_control_tear")) ? true : false;
+    }
     wgl.initialized = true;
 }
 
@@ -138,9 +153,34 @@ static bool win32_gl_ensure_bootstrap(void)
         DestroyWindow(hwnd);
         return false;
     }
-    /* the window is leaked deliberately with the context: it lives for the
-     * process, and wglGetProcAddress needs a current context, not a window */
+    /* The window has to outlive the context -- wglGetProcAddress needs a
+     * current context tied to a live DC -- so it is kept for the process, and
+     * released by SDLOP_Win32GLQuit() from SDL_Quit rather than never. */
+    bootstrap_hwnd = hwnd;
     return true;
+}
+
+/* Release the bootstrap context and its window. Only called from SDL_Quit,
+ * where no application context can be current any more. */
+void SDLOP_Win32GLQuit(void)
+{
+    if (bootstrap_context) {
+        /* leave nothing current on this thread before releasing the DC */
+        if (wglGetCurrentContext() == bootstrap_context) {
+            wglMakeCurrent(NULL, NULL);
+        }
+        wglDeleteContext(bootstrap_context);
+    }
+    bootstrap_context = NULL;
+    if (bootstrap_hwnd) {
+        if (bootstrap_dc) {
+            ReleaseDC(bootstrap_hwnd, bootstrap_dc);
+        }
+        DestroyWindow(bootstrap_hwnd);
+        bootstrap_hwnd = NULL;
+    }
+    bootstrap_dc = NULL;
+    wgl.initialized = false;
 }
 
 /* Create it without disturbing an application's current context. */
@@ -257,8 +297,13 @@ void *SDLOP_Win32GLCreateContext(SDLop_VideoDevice *device, SDL_Window *window)
         DescribePixelFormat(hdc, existing, sizeof(pfd), &pfd);
     }
 
+    /* Default to 2.1 only when nothing was requested. A requested minor of 0
+     * is legitimate and must be passed through verbatim: `minor > 0 ? minor : 1`
+     * turned GL 3.0 into "3.1" and GL 4.0 into "4.1", and asked
+     * WGL_EXT_create_context_es2_profile for a non-existent OpenGL ES 2.1
+     * (ERROR_INVALID_VERSION_ARB) when the app asked for ES 2.0. */
     const int major = sdlop_glattrs.major_version > 0 ? sdlop_glattrs.major_version : 2;
-    const int minor = sdlop_glattrs.minor_version > 0 ? sdlop_glattrs.minor_version : 1;
+    const int minor = sdlop_glattrs.major_version > 0 ? sdlop_glattrs.minor_version : 1;
     const int profile = sdlop_glattrs.profile_mask;
     const bool debug = (sdlop_glattrs.flags & SDL_GL_CONTEXT_DEBUG_FLAG) != 0;
     const bool forward = (sdlop_glattrs.flags & SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG) != 0;
@@ -372,6 +417,10 @@ bool SDLOP_Win32GLMakeCurrent(SDLop_VideoDevice *device, SDL_Window *window, voi
         ReleaseDC(data->hwnd, hdc);
         return SDL_SetError("wglMakeCurrent() failed: %lu", (unsigned long)GetLastError());
     }
+    /* The context keeps using the DC it was made current on, but the acquired
+     * HDC itself must be released or every MakeCurrent leaks a DC. Render
+     * calls re-acquire with GetCurrentDC(). */
+    ReleaseDC(data->hwnd, hdc);
     return true;
 }
 
@@ -418,7 +467,10 @@ SDL_FunctionPointer SDLOP_Win32GLGetProcAddress(SDLop_VideoDevice *device, const
 bool SDLOP_Win32GLSetSwapInterval(SDLop_VideoDevice *device, int interval)
 {
     (void)device;
-    if (interval < 0) {
+    /* -1 is adaptive vsync, and it is legal only where the driver advertises
+     * WGL_EXT_swap_control_tear; anything else negative is a caller error.
+     * Stock SDL3 accepts -1 and lets wglSwapIntervalEXT reject it. */
+    if (interval < -1) {
         return SDL_SetError("Negative swap interval");
     }
     if (!wgl.swap_interval) {
@@ -428,6 +480,12 @@ bool SDLOP_Win32GLSetSwapInterval(SDLop_VideoDevice *device, int interval)
         /* WGL_EXT_swap_control is not there: report the failure the way
          * SDL3 does rather than pretending it worked */
         return SDL_SetError("Setting the swap interval is not supported");
+    }
+    if (interval == -1 && !wgl.has_swap_control_tear) {
+        /* don't hand -1 to a driver that never advertised tearing support:
+         * several of them answer TRUE and quietly leave the interval at 0,
+         * which is not adaptive vsync and cannot be detected afterwards */
+        return SDL_SetError("Adaptive vsync (interval -1) needs WGL_EXT_swap_control_tear, which this driver does not support");
     }
     if (!wgl.swap_interval(interval)) {
         return SDL_SetError("wglSwapIntervalEXT() failed");

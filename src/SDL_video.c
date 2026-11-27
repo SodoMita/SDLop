@@ -116,6 +116,7 @@ void SDLOP_VideoQuit(void)
         sdlop.video = NULL;
     }
     SDLOP_RemoveAllPens();
+    SDLOP_IME_DBus_Quit(); /* drivers quit it; this catches any other use */
     SDLOP_Desktop_Quit();
     SDLOP_Dialog_Quit();
     SDLOP_DBus_Quit();
@@ -157,6 +158,7 @@ void SDLOP_RemoveWindow(SDL_Window *window)
     if (sdlop.keyboard_focus == window) {
         sdlop.keyboard_focus = NULL;
     }
+    SDLOP_IME_DBus_WindowDestroyed(window); /* its input context focus goes */
     if (sdlop.mouse_focus == window) {
         sdlop.mouse_focus = NULL;
         SDLOP_RawInputResetPointerFrame();

@@ -20,6 +20,7 @@
 typedef struct SDLop_Win32WindowData
 {
     HWND hwnd;
+    HDC hdc;            /* the window's own DC (CS_OWNDC), stable for its life */
     HDC dc;             /* memory DC holding the software DIB */
     HBITMAP bitmap;     /* the DIB itself */
     void *pixels;       /* its bits, as an SDL surface's pixel pointer */
@@ -29,6 +30,7 @@ typedef struct SDLop_Win32WindowData
     SDLOP_MUTEX_T surfacelock; /* UpdateWindowFramebuffer vs WM_SIZE */
 
     Uint32 dpi;
+    bool mouse_leave_armed; /* TrackMouseEvent(TME_LEAVE) is outstanding */
 
     /* fullscreen bookkeeping */
     bool is_fullscreen;   /* windowed_* below only describe a windowed window */
@@ -102,6 +104,13 @@ void SDLOP_Win32GLDeleteContext(SDLop_VideoDevice *device, void *context);
 SDL_FunctionPointer SDLOP_Win32GLGetProcAddress(SDLop_VideoDevice *device, const char *proc);
 bool SDLOP_Win32GLSetSwapInterval(SDLop_VideoDevice *device, int interval);
 bool SDLOP_Win32GLGetSwapInterval(SDLop_VideoDevice *device, int *interval);
+/* Releases the process-lifetime bootstrap context that wglGetProcAddress
+ * needs. Called from win32_Quit, before the window class is unregistered. */
+void SDLOP_Win32GLQuit(void);
+
+/* sdlop_windows_ime.c: composition events. Returns true when the message was
+ * an IME message and has been handled (the window procedure should stop). */
+bool SDLOP_Win32IMEHandleMessage(SDL_Window *window, UINT msg, WPARAM wparam, LPARAM lparam);
 
 /* sdlop_windows_vulkan.c */
 bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *window,

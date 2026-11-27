@@ -291,11 +291,16 @@ static void restore_cursor_clip(SDL_Window *window)
         GetClientRect(data->hwnd, &rc);
         MapWindowPoints(data->hwnd, NULL, (POINT *)&rc, 2);
         ClipCursor(&rc);
+        /* Record it, or release_cursor_clip() compares against an all-zero
+         * rect, never matches, and leaves the OS cursor trapped after focus
+         * is lost. */
+        data->cursor_clipped_rect = rc;
         SetCapture(data->hwnd);
     } else if (window->flags & SDL_WINDOW_MOUSE_GRABBED) {
         RECT rc;
         GetWindowRect(data->hwnd, &rc);
         ClipCursor(&rc);
+        data->cursor_clipped_rect = rc;
         SetCapture(data->hwnd);
     } else if (window->mouse_rect.w > 0 && window->mouse_rect.h > 0) {
         RECT clip;
@@ -305,6 +310,7 @@ static void restore_cursor_clip(SDL_Window *window)
         clip.bottom = clip.top + window->mouse_rect.h;
         MapWindowPoints(data->hwnd, NULL, (POINT *)&clip, 2);
         ClipCursor(&clip);
+        data->cursor_clipped_rect = clip;
     }
 }
 
@@ -962,6 +968,22 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MOUSEMOVE:
         if (window) {
+            /* Win32 only posts WM_MOUSELEAVE for a window that asked for it,
+             * and the request lapses after each leave. Without this the
+             * WM_MOUSELEAVE handler below could never run, so
+             * SDL_EVENT_WINDOW_MOUSE_LEAVE was never sent and the driver went
+             * on believing the pointer was inside a window it had left. */
+            if (!(window->flags & SDL_WINDOW_MOUSE_FOCUS) ||
+                !(((SDLop_Win32WindowData *)window->driverdata)->mouse_leave_armed)) {
+                TRACKMOUSEEVENT tme;
+                SDL_zero(tme);
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                if (TrackMouseEvent(&tme)) {
+                    ((SDLop_Win32WindowData *)window->driverdata)->mouse_leave_armed = true;
+                }
+            }
             if (!(window->flags & SDL_WINDOW_MOUSE_FOCUS)) {
                 set_mouse_focus(window, true);
             }
@@ -988,7 +1010,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_XBUTTONUP:
     case WM_XBUTTONDBLCLK:
         if (window) {
-            SetFocus(hwnd);
+            /* Focus only on a press: doing it on the button-up too steals focus
+             * from whatever the user clicked into during the drag, and a
+             * not-focusable or tooltip window must never take it at all. */
+            const bool is_press = (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+                                   msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN);
+            if (is_press && !(window->flags & (SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_TOOLTIP))) {
+                SetFocus(hwnd);
+            }
             if (!SDLOP_RawInputIsSource()) {
                 send_mouse_button(&m);
             }
@@ -1017,6 +1046,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MOUSELEAVE:
         if (window) {
+            /* the request covers one leave; re-arm on the next move */
+            ((SDLop_Win32WindowData *)window->driverdata)->mouse_leave_armed = false;
             set_mouse_focus(window, false);
         }
         return 0;
@@ -1159,6 +1190,35 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             win32_update_display_scale(window, dpi);
         }
         return 0;
+
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_COMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+    case WM_IME_NOTIFY:
+        /* Handled or not, these must not reach DefWindowProcW: it consumes the
+         * composition itself, which showed up as every composition event
+         * arriving twice (4 editing events for 2 messages). An IME message we
+         * do not act on is simply one we ignore. */
+        SDLOP_Win32IMEHandleMessage(window, m.message, m.wParam, m.lParam);
+        return 0;
+
+    case WM_INPUTLANGCHANGE:
+        /* The user switched keyboard layout (Alt+Shift, the language bar, a
+         * remote session). Every keycode SDL reports from here on depends on
+         * it, so the character table has to be rebuilt; stock SDL3 does the
+         * same in its WM_INPUTLANGCHANGE handler (WIN_UpdateKeymap(true)).
+         * SDL_EVENT_KEYMAP_CHANGED tells the application, which is what SDL3
+         * sends for this so that cached SDL_GetKeyName results can be
+         * refreshed. */
+        SDLOP_Win32UpdateKeyboardLayout();
+        if (window) {
+            SDL_Event event;
+            SDL_zero(event);
+            event.type = SDL_EVENT_KEYMAP_CHANGED;
+            event.common.timestamp = SDLOP_Win32Timestamp();
+            SDL_PushEvent(&event);
+        }
+        return 1;
 
     case WM_INPUT:
     {
@@ -1358,6 +1418,8 @@ static bool win32_Init(SDLop_VideoDevice *device)
         return false;
     }
     win32_add_displays(device);
+    /* the character each key produces depends on the layout installed now */
+    SDLOP_Win32UpdateKeyboardLayout();
     sdlop_win32.window_count = 0;
     /* Baseline for external clipboard change detection: anything that changes
      * this number afterwards belongs to another application. */
@@ -1383,6 +1445,9 @@ static void win32_Quit(SDLop_VideoDevice *device)
     /* Leave no process-global registration behind for the next SDL_Init(). */
     sdlop_win32.raw_keyboard_enabled = false;
     win32_register_raw_keyboard();
+    /* the GL bootstrap window belongs to the class unregistered just below,
+     * so it has to go first */
+    SDLOP_Win32GLQuit();
     if (sdlop_win32.class_registered) {
         UnregisterClassW(SDLOP_WIN32_CLASS, GetModuleHandleW(NULL));
         sdlop_win32.class_registered = false;
@@ -1477,9 +1542,13 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     if (window->flags & SDL_WINDOW_HIDDEN) {
         style &= ~WS_VISIBLE;
     }
+    /* window->x/y are the client origin (WM_MOVE reports it that way), but
+     * CreateWindowExW positions the frame: apply the same offset
+     * win32_SetWindowPosition() does, or a window created at 100,100 has its
+     * drawing area at the frame's client origin, not at 100,100. */
     HWND hwnd = CreateWindowExW(exstyle, SDLOP_WIN32_CLASS, title_w ? title_w : L"",
                                 style,
-                                window->x, window->y,
+                                window->x + (int)rc.left, window->y + (int)rc.top,
                                 rc.right - rc.left, rc.bottom - rc.top,
                                 NULL, NULL, GetModuleHandleW(NULL), NULL);
     SDL_free(title_alloc);
@@ -1492,6 +1561,12 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     data->hwnd = hwnd;
     SetPropW(hwnd, L"SDLopWindow", (HANDLE)window);
     sdlop_win32.window_count++;
+    /* The class is registered with CS_OWNDC, so this HDC is private to the
+     * window and valid until it is destroyed. It is what SDL_PROP_WINDOW_WIN32_
+     * HDC_POINTER must publish: the old value was data->dc, the memory DC used
+     * for the software framebuffer, which does not exist until the application
+     * asks for a window surface (and is recreated on every resize). */
+    data->hdc = GetDC(hwnd);
 
     /* SDL3 window properties. The X11 and Wayland drivers publish their
      * native handles this way, so applications (and SDL3's own tests) reach
@@ -1502,7 +1577,7 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
     if (window->props) {
         SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, (void *)hwnd);
-        SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HDC_POINTER, (void *)data->dc);
+        SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_HDC_POINTER, (void *)data->hdc);
         SDL_SetPointerProperty(window->props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, (void *)GetModuleHandleW(NULL));
     }
 
@@ -1522,16 +1597,19 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
 static void destroy_dib(SDLop_Win32WindowData *data)
 {
     if (data->surface) {
-        SDL_free(data->surface);
+        /* Created by SDL_CreateSurfaceFrom: SDL_DestroySurface frees the
+         * wrapper and anything attached to it (props, palette). SDL_free only
+         * released the struct and leaked those -- the other drivers do this. */
+        SDL_DestroySurface(data->surface);
         data->surface = NULL;
+    }
+    if (data->dc) {
+        DeleteDC(data->dc); /* first: a bitmap selected into a DC can't be deleted */
+        data->dc = NULL;
     }
     if (data->bitmap) {
         DeleteObject(data->bitmap);
         data->bitmap = NULL;
-    }
-    if (data->dc) {
-        DeleteDC(data->dc);
-        data->dc = NULL;
     }
     data->surface_dirty = false;
 }
@@ -1553,6 +1631,17 @@ static void win32_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window)
     destroy_dib(data);
     SDLOP_MUTEX_UNLOCK(&data->surfacelock);
     if (data->hwnd) {
+        if (data->hdc) {
+            ReleaseDC(data->hwnd, data->hdc);
+            data->hdc = NULL;
+        }
+        /* A grabbed/clipped window that is destroyed would otherwise leave the
+         * OS cursor confined to a rect that no longer exists. */
+        release_cursor_clip(data);
+        if (data->icon) {
+            DestroyIcon(data->icon);
+            data->icon = NULL;
+        }
         RemovePropW(data->hwnd, L"SDLopWindow");
         DestroyWindow(data->hwnd);
         data->hwnd = NULL;
@@ -1990,6 +2079,40 @@ static int win32_GetEventFD(SDLop_VideoDevice *device)
 /* Software framebuffer                                                */
 /* ------------------------------------------------------------------ */
 
+/* a w x h top-down XRGB DIB section selected into a memory DC; on failure
+ * data is unchanged */
+static bool create_dib(SDLop_Win32WindowData *data, int w, int h)
+{
+    BITMAPINFO bmi;
+    SDL_zero(bmi);
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; /* top-down, like SDL surfaces */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void *pixels = NULL;
+    HDC screen = GetDC(data->hwnd);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &pixels, NULL, 0);
+    ReleaseDC(data->hwnd, screen);
+    if (!dc || !bitmap || !pixels) {
+        if (bitmap) {
+            DeleteObject(bitmap);
+        }
+        if (dc) {
+            DeleteDC(dc);
+        }
+        return SDL_SetError("Couldn't create DIB section");
+    }
+    SelectObject(dc, bitmap);
+    data->dc = dc;
+    data->bitmap = bitmap;
+    data->pixels = pixels;
+    return true;
+}
+
 static bool win32_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface)
 {
     (void)device;
@@ -1999,26 +2122,10 @@ static bool win32_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
     }
     SDLOP_MUTEX_LOCK(&data->surfacelock);
     destroy_dib(data);
-
-    BITMAPINFO bmi;
-    SDL_zero(bmi);
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = window->w;
-    bmi.bmiHeader.biHeight = -window->h; /* top-down, like SDL surfaces */
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    HDC screen = GetDC(data->hwnd);
-    data->dc = CreateCompatibleDC(screen);
-    data->bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &data->pixels, NULL, 0);
-    ReleaseDC(data->hwnd, screen);
-    if (!data->dc || !data->bitmap || !data->pixels) {
-        destroy_dib(data);
+    if (!create_dib(data, window->w, window->h)) {
         SDLOP_MUTEX_UNLOCK(&data->surfacelock);
-        return SDL_SetError("Couldn't create DIB section");
+        return false;
     }
-    SelectObject(data->dc, data->bitmap);
 
     SDL_Surface *s = SDL_CreateSurfaceFrom(window->w, window->h, SDL_PIXELFORMAT_XRGB8888,
                                            data->pixels, window->w * 4);
@@ -2042,17 +2149,9 @@ static bool win32_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
         return true;
     }
     SDLOP_MUTEX_LOCK(&data->surfacelock);
-    if (data->surface->w != window->w || data->surface->h != window->h) {
-        /* resized under us: the DIB must be rebuilt at the new size */
-        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
-        SDL_Surface *fresh = NULL;
-        if (!win32_CreateWindowFramebuffer(device, window, &fresh)) {
-            return false;
-        }
-        window->surface = fresh;
-        data = (SDLop_Win32WindowData *)window->driverdata;
-        SDLOP_MUTEX_LOCK(&data->surfacelock);
-    }
+    /* drawn before a resize reached the surface: shown at the size it was
+     * drawn at; the core resizes the surface right after
+     * (win32_ResizeWindowFramebuffer) */
     HDC hdc = GetDC(data->hwnd);
     if (hdc) {
         if (numrects > 0 && rects) {
@@ -2061,11 +2160,49 @@ static bool win32_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
                 BitBlt(hdc, rc.left, rc.top, rects[i].w, rects[i].h, data->dc, rc.left, rc.top, SRCCOPY);
             }
         } else {
-            BitBlt(hdc, 0, 0, window->w, window->h, data->dc, 0, 0, SRCCOPY);
+            BitBlt(hdc, 0, 0, data->surface->w, data->surface->h, data->dc, 0, 0, SRCCOPY);
         }
         ReleaseDC(data->hwnd, hdc);
     }
     data->surface_dirty = false;
+    SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+    return true;
+}
+
+/* the window surface follows the client size, in place: a new DIB behind
+ * the same SDL_Surface (SDLop keeps the pointer valid across resizes) */
+static bool win32_ResizeWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *surface)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data || !data->hwnd || data->surface != surface || window->w <= 0 || window->h <= 0) {
+        return true;
+    }
+    SDLOP_MUTEX_LOCK(&data->surfacelock);
+    if (surface->w == window->w && surface->h == window->h) {
+        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+        return true;
+    }
+    HDC old_dc = data->dc;
+    HBITMAP old_bitmap = data->bitmap;
+    if (!create_dib(data, window->w, window->h)) {
+        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+        return false;
+    }
+    if (old_dc) {
+        DeleteDC(old_dc); /* first: a bitmap selected into a DC can't be deleted */
+    }
+    if (old_bitmap) {
+        DeleteObject(old_bitmap);
+    }
+    /* new contents start at the clear colour, as on X11 / Wayland */
+    const Uint32 clear = ((Uint32)window->clear_r << 16) | ((Uint32)window->clear_g << 8) | window->clear_b;
+    Uint32 *px = (Uint32 *)data->pixels;
+    for (size_t i = 0, n = (size_t)window->w * (size_t)window->h; i < n; i++) {
+        px[i] = clear;
+    }
+    SDLOP_SetSurfacePixels(surface, data->pixels, window->w, window->h, window->w * 4);
+    data->surface_dirty = true;
     SDLOP_MUTEX_UNLOCK(&data->surfacelock);
     return true;
 }
@@ -2210,7 +2347,17 @@ static void win32_SetWindowAspectRatio(SDLop_VideoDevice *device, SDL_Window *wi
     if (!data || !data->hwnd || !GetWindowRect(data->hwnd, &rc)) {
         return;
     }
-    win32_constrain_aspect(window, &rc);
+    RECT constrained = rc;
+    win32_constrain_aspect(window, &constrained);
+    /* Apply it: the constraint above only edits a local RECT, so without this
+     * a new ratio took effect only the next time the user dragged the edge. */
+    if (constrained.right != rc.right || constrained.bottom != rc.bottom) {
+        SetWindowPos(data->hwnd, NULL, 0, 0,
+                     constrained.right - constrained.left,
+                     constrained.bottom - constrained.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        update_metrics(window);
+    }
 }
 
 static void win32_SetWindowResizable(SDLop_VideoDevice *device, SDL_Window *window, bool resizable)
@@ -2501,6 +2648,11 @@ static bool win32_SuspendScreenSaver(SDLop_VideoDevice *device)
 {
     (void)device;
     if (!sdlop.suspend_screensaver) {
+        /* SDL_DisableScreenSaver(): drop the request. Returning early here
+         * left ES_DISPLAY_REQUIRED|ES_SYSTEM_REQUIRED in effect for the life
+         * of the process, so the screen saver and display sleep never came
+         * back after SDL_EnableScreenSaver(). */
+        SetThreadExecutionState(ES_CONTINUOUS);
         return true;
     }
     if (!SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)) {
@@ -2750,8 +2902,14 @@ static bool win32_SetWindowMouseRect(SDLop_VideoDevice *device, SDL_Window *wind
         clip.right = clip.left + window->mouse_rect.w;
         clip.bottom = clip.top + window->mouse_rect.h;
         MapWindowPoints(data->hwnd, NULL, (POINT *)&clip, 2);
-    } else {
+    } else if (window->flags & (SDL_WINDOW_MOUSE_GRABBED | SDL_WINDOW_MOUSE_RELATIVE_MODE)) {
+        /* No rect but the pointer is grabbed: clip to the window, as before. */
         GetWindowRect(data->hwnd, &clip);
+    } else {
+        /* SDL_SetWindowMouseRect(w, NULL) on an ungrabbed window means "stop
+         * confining the pointer", not "confine it to the whole window". */
+        release_cursor_clip(data);
+        return true;
     }
     ClipCursor(&clip);
     data->cursor_clipped_rect = clip;
@@ -2808,33 +2966,19 @@ static bool win32_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL
         break;
     case SDL_FLASH_BRIEFLY:
         fi.dwFlags = FLASHW_TRAY;
-        fi.uCount = 2;
+        fi.uCount = 1;
         break;
     case SDL_FLASH_UNTIL_FOCUSED:
-        fi.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG;
+        fi.dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG;
         break;
     default:
         return SDL_Unsupported();
     }
-    if (!FlashWindowEx(&fi)) {
-        return SDL_SetError("FlashWindowEx() failed");
-    }
-    return true;
-}
-
-static bool win32_SyncWindow(SDLop_VideoDevice *device, SDL_Window *window)
-{
-    (void)device;
-    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
-    if (!data || !data->hwnd) {
-        return true;
-    }
-    /* True once the window has no pending messages; SDL3 returns true when
-     * there is nothing left to do. */
-    MSG msg;
-    if (PeekMessageW(&msg, data->hwnd, 0, 0, PM_NOREMOVE)) {
-        return false;
-    }
+    /* FlashWindowEx() returns the window's *previous* active state, not a
+     * success flag. Treating FALSE as failure reported an error for every
+     * flash of a window that did not have focus -- which is the whole point of
+     * flashing -- and left SDL_GetError() describing a flash that worked. */
+    FlashWindowEx(&fi);
     return true;
 }
 
@@ -2873,9 +3017,30 @@ static bool win32_SetWindowParent(SDLop_VideoDevice *device, SDL_Window *window,
 static bool win32_SetWindowModal(SDLop_VideoDevice *device, SDL_Window *window, bool modal)
 {
     (void)device;
-    (void)window;
-    (void)modal;
-    return true; /* parenting covers SDL3's use; modality is the app's job */
+    /* Modality in Win32 is the parent being *disabled*: with the owner window
+     * blocked, clicks and input go nowhere, which is what "modal" means to the
+     * user. Returning true without touching it -- as this did -- made
+     * SDL_SetWindowModal a no-op that reported success, while stock SDL3
+     * (WIN_SetWindowModal) disables the parent. Re-enable on the way out,
+     * unless the window is hidden: SDL hides a modal window before clearing
+     * the flag, and re-enabling there would leave the parent live with no
+     * dialog on screen. */
+    if (!window->parent || !window->parent->driverdata || !window->driverdata) {
+        return true;
+    }
+    {
+        SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+        SDLop_Win32WindowData *pdata = (SDLop_Win32WindowData *)window->parent->driverdata;
+        if (!data->hwnd || !pdata->hwnd) {
+            return true;
+        }
+        if (modal) {
+            EnableWindow(pdata->hwnd, FALSE);
+        } else if (!(window->flags & SDL_WINDOW_HIDDEN)) {
+            EnableWindow(pdata->hwnd, TRUE);
+        }
+    }
+    return true;
 }
 
 static bool win32_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon)
@@ -2950,8 +3115,19 @@ static bool win32_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, S
     }
     HICON old_small = (HICON)SendMessageW(data->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)handle);
     HICON old_big = (HICON)SendMessageW(data->hwnd, WM_SETICON, ICON_BIG, (LPARAM)handle);
-    if (old_small) DestroyIcon(old_small);
-    if (old_big) DestroyIcon(old_big);
+    /* Both slots held the same handle (the previous call set both), so only
+     * destroy it once; Icons are refcounted by user32, but double-destroying
+     * the same HICON is still a bug. */
+    if (old_small && old_small == old_big) {
+        DestroyIcon(old_small);
+    } else {
+        if (old_small) DestroyIcon(old_small);
+        if (old_big) DestroyIcon(old_big);
+    }
+    /* Replacing an icon must release the one this window owned. */
+    if (data->icon && data->icon != handle && data->icon != old_small && data->icon != old_big) {
+        DestroyIcon(data->icon);
+    }
     data->icon = handle;
     return true;
 }
@@ -3250,6 +3426,11 @@ static bool win32_SetClipboardData(SDLop_VideoDevice *device)
         }
     }
     CloseClipboard();
+    /* Own change: adopt the new sequence number, or the next SDL_PumpEvents
+     * sees a foreign sequence, concludes the clipboard changed hands and
+     * cancels the application's own offer (cleanup callback, MIME data freed,
+     * plus a spurious CLIPBOARD_UPDATE with owner == false). */
+    win32_clipboard_sequence = GetClipboardSequenceNumber();
     return result;
 }
 
@@ -3362,6 +3543,12 @@ static bool win32_HasClipboardData(SDLop_VideoDevice *device, const char *mime_t
 
 SDLop_VideoDevice SDLop_windows_device = {
     .name = "windows",
+    /* Popup windows are implemented here (window_style_for gives tooltips and
+     * popup menus their own styles, and their placement is computed against the
+     * parent), but the flag was never set, so SDL_CreatePopupWindow rejected
+     * every one of them with "That operation is not supported". Win32 input is
+     * not window_system_input: the window message loop is the source. */
+    .supports_popups = true,
     .Init = win32_Init,
     .Quit = win32_Quit,
     .CreateWindow = win32_CreateWindow,
@@ -3418,6 +3605,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .SetWindowHitTest = win32_SetWindowHitTest,
     .UpdateWindowShape = win32_UpdateWindowShape,
     .UpdateTextInputArea = win32_UpdateTextInputArea,
+    .ResizeWindowFramebuffer = win32_ResizeWindowFramebuffer,
     .GetWindowICCProfile = win32_GetWindowICCProfile,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
@@ -3425,7 +3613,11 @@ SDLop_VideoDevice SDLop_windows_device = {
     .WarpMouseGlobal = win32_WarpMouseGlobal,
     .GetGlobalMouseState = win32_GetGlobalMouseState,
     .FlashWindow = win32_FlashWindow,
-    .SyncWindow = win32_SyncWindow,
+    /* No .SyncWindow: window state on Win32 is applied synchronously by
+     * SetWindowPos/ShowWindow, and the core returns true when a driver does
+     * not implement it. A first attempt implemented it as "false while the
+     * window has queued messages", which made SDL_SyncWindow() report failure
+     * for any unrelated pending message -- an ordinary WM_NULL was enough. */
     .SetWindowFocusable = win32_SetWindowFocusable,
     .SetWindowParent = win32_SetWindowParent,
     .SetWindowModal = win32_SetWindowModal,

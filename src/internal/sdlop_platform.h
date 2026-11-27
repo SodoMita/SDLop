@@ -50,6 +50,9 @@
 #ifndef __APPLE__
 #include <semaphore.h>
 #endif
+#if !defined(PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP) && !defined(PTHREAD_RECURSIVE_MUTEX_INITIALIZER)
+#include <stdatomic.h>
+#endif
 
 /* CLOCK_MONOTONIC is POSIX.1-2008 and present on every target SDLop
  * supports now; fall back to CLOCK_REALTIME where a libc is too old
@@ -61,6 +64,10 @@
 #ifndef TIMER_ABSTIME
 #define TIMER_ABSTIME 1
 #endif
+
+/* The sleep path owns a kernel timer on Windows and nothing here; SDL_Quit
+ * calls this unconditionally. */
+static inline void SDLOP_ReleaseTimerHandles(void) { }
 
 /* --- mutex ------------------------------------------------------- */
 
@@ -108,26 +115,30 @@ typedef struct SDLOP_StaticMutex
 typedef struct SDLOP_StaticMutex
 {
     pthread_mutex_t id;
-    int state;
+    /* 0 = uninitialised, 1 = initialising, 2 = ready. */
+    _Atomic int state;
 } SDLOP_StaticMutex;
-static inline pthread_mutex_t *SDLOP_StaticMutexPtr(SDLOP_StaticMutex *m)
+#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER, 0 }
+
+static inline SDLOP_MUTEX_T *SDLOP_StaticMutexGet(SDLOP_StaticMutex *m)
 {
-    if (__builtin_expect(__atomic_load_n(&m->state, __ATOMIC_ACQUIRE) != 2, 0)) {
-        int expected = 0;
-        if (__atomic_compare_exchange_n(&m->state, &expected, 1, false,
-                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    int state = atomic_load_explicit(&m->state, memory_order_acquire);
+    if (state != 2) {
+        if (atomic_compare_exchange_strong_explicit(&m->state, &(int){ 0 }, 1,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
             SDLOP_MUTEX_INIT_RECURSIVE(&m->id);
-            __atomic_store_n(&m->state, 2, __ATOMIC_RELEASE);
+            atomic_store_explicit(&m->state, 2, memory_order_release);
         } else {
-            while (__atomic_load_n(&m->state, __ATOMIC_ACQUIRE) != 2) {
+            /* another thread is building it; it is ready when state hits 2 */
+            while (atomic_load_explicit(&m->state, memory_order_acquire) != 2) {
                 sched_yield();
             }
         }
     }
     return &m->id;
 }
-#define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { PTHREAD_MUTEX_INITIALIZER, 0 }
-#define SDLOP_SM(m)              SDLOP_StaticMutexPtr(m)
+#define SDLOP_SM(m) SDLOP_StaticMutexGet(m)
 #endif
 
 /* --- once -------------------------------------------------------- */
@@ -445,6 +456,9 @@ typedef struct SDLOP_StaticMutex
 BOOL CALLBACK SDLOP_StaticMutexInitTrampoline(PINIT_ONCE once, PVOID param, PVOID *ctx);
 
 #define SDLOP_STATIC_MUTEX(name) SDLOP_StaticMutex name = { { 0 }, INIT_ONCE_STATIC_INIT }
+
+/* Releases the one waitable timer the sleep path allocates, from SDL_Quit. */
+void SDLOP_ReleaseTimerHandles(void);
 
 static inline SDLOP_MUTEX_T *SDLOP_StaticMutexGet(SDLOP_StaticMutex *m)
 {

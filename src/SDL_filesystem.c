@@ -498,6 +498,7 @@ char *SDL_GetPrefPath(const char *org, const char *app)
 /* User folders (XDG user-dirs)                                        */
 /* ------------------------------------------------------------------ */
 
+#ifndef _WIN32
 static char *xdg_user_dir_from_config(const char *type)
 {
     const char *home = SDL_getenv("HOME");
@@ -585,7 +586,9 @@ static char *xdg_user_dir_from_config(const char *type)
     fclose(file);
     return user_dir;
 }
+#endif /* !_WIN32 */
 
+#ifndef _WIN32
 static char *xdg_user_dir_lookup(const char *type)
 {
     char *dir = xdg_user_dir_from_config(type);
@@ -604,12 +607,83 @@ static char *xdg_user_dir_lookup(const char *type)
     }
     return NULL;
 }
+#endif /* !_WIN32 */
 
 static char *lookup_user_folder(SDL_Folder folder)
 {
-    const char *param = NULL;
     char *result = NULL;
+#ifndef _WIN32
+    const char *param = NULL;
+#endif
 
+#ifdef _WIN32
+    /* Windows has no XDG: ask the Shell for the real folder. Before this the
+     * Win32 build fell through to the XDG code below, so every folder came
+     * from $HOME/.config/user-dirs.dirs (absent on Windows) and Saved
+     * Games / Screenshots reported "unavailable on XDG". */
+    {
+        static const struct {
+            SDL_Folder folder;
+            const GUID *id;
+        } known[] = {
+            { SDL_FOLDER_HOME,        &FOLDERID_Profile },
+            { SDL_FOLDER_DESKTOP,     &FOLDERID_Desktop },
+            { SDL_FOLDER_DOCUMENTS,   &FOLDERID_Documents },
+            { SDL_FOLDER_DOWNLOADS,   &FOLDERID_Downloads },
+            { SDL_FOLDER_MUSIC,       &FOLDERID_Music },
+            { SDL_FOLDER_PICTURES,    &FOLDERID_Pictures },
+            { SDL_FOLDER_PUBLICSHARE, &FOLDERID_Public },
+            { SDL_FOLDER_TEMPLATES,   &FOLDERID_Templates },
+            { SDL_FOLDER_VIDEOS,      &FOLDERID_Videos },
+            { SDL_FOLDER_SAVEDGAMES,  &FOLDERID_SavedGames },
+            { SDL_FOLDER_SCREENSHOTS, &FOLDERID_Screenshots },
+        };
+        for (size_t i = 0; i < SDL_arraysize(known); i++) {
+            if (known[i].folder != folder) {
+                continue;
+            }
+            PWSTR wide = NULL;
+            if (FAILED(SHGetKnownFolderPath(known[i].id, 0, NULL, &wide))) {
+                SDL_SetError("Couldn't find folder %d", (int)folder);
+                return NULL;
+            }
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+            if (bytes > 0) {
+                result = (char *)SDL_malloc((size_t)bytes + 1);
+                if (result) {
+                    if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, result, bytes, NULL, NULL) <= 0) {
+                        SDL_free(result);
+                        result = NULL;
+                    }
+                }
+            }
+            CoTaskMemFree(wide);
+            if (!result) {
+                return NULL;
+            }
+            /* SDL reports folders with a trailing separator */
+            for (char *p = result; *p; p++) {
+                if (*p == '\\') {
+                    *p = '/';
+                }
+            }
+            const size_t l = SDL_strlen(result);
+            if (l == 0 || result[l - 1] != '/') {
+                char *with_slash = (char *)SDL_realloc(result, l + 2);
+                if (!with_slash) {
+                    SDL_free(result);
+                    return NULL;
+                }
+                with_slash[l] = '/';
+                with_slash[l + 1] = '\0';
+                result = with_slash;
+            }
+            return result;
+        }
+        SDL_SetError("Invalid SDL_Folder: %d", (int)folder);
+        return NULL;
+    }
+#else
     switch (folder) {
     case SDL_FOLDER_HOME: {
         const char *home = SDL_getenv("HOME");
@@ -658,6 +732,7 @@ static char *lookup_user_folder(SDL_Folder folder)
     with_slash[l] = '/';
     with_slash[l + 1] = '\0';
     return with_slash;
+#endif /* !_WIN32 */
 }
 
 const char *SDL_GetUserFolder(SDL_Folder folder)
@@ -700,10 +775,28 @@ bool SDL_CreateDirectory(const char *path)
     }
 #ifdef _WIN32
     /* SHCreateDirectoryExW creates every missing parent and, unlike
-     * CreateDirectoryW, succeeds when the directory already exists. */
+     * CreateDirectoryW, succeeds when the directory already exists. It is a
+     * Shell API, though: it wants backslashes and a full path. SDL paths are
+     * forward-slashed and may be relative ("a/b"), which used to fail with
+     * ERROR_BAD_PATHNAME -- including every SDL_GetPrefPath() caller. */
     wchar_t *wide = fs_utf8_to_wide(path);
     if (!wide) {
         return SDL_OutOfMemory();
+    }
+    for (wchar_t *w = wide; *w; w++) {
+        if (*w == L'/') {
+            *w = L'\\';
+        }
+    }
+    wchar_t full[32768]; /* Win32 long-path maximum */
+    DWORD full_len = GetFullPathNameW(wide, (DWORD)SDL_arraysize(full), full, NULL);
+    if (full_len > 0 && full_len < (DWORD)SDL_arraysize(full)) {
+        SDL_free(wide);
+        wide = (wchar_t *)SDL_malloc(((size_t)full_len + 1) * sizeof(wchar_t));
+        if (!wide) {
+            return SDL_OutOfMemory();
+        }
+        SDL_memcpy(wide, full, ((size_t)full_len + 1) * sizeof(wchar_t));
     }
     const int rc = SHCreateDirectoryExW(NULL, wide, NULL);
     SDL_free(wide);
@@ -843,21 +936,26 @@ bool SDL_RemovePath(const char *path)
     if (!wide) {
         return SDL_OutOfMemory();
     }
-    /* a directory must go through RemoveDirectoryW; DeleteFileW covers files
-     * (and fails on directories, so try the directory first) */
-    BOOL ok = RemoveDirectoryW(wide);
-    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-    if (!ok && err == ERROR_ACCESS_DENIED) {
-        /* could be "not a directory" or a protected file; try the file case */
-        ok = DeleteFileW(wide);
-        err = ok ? ERROR_SUCCESS : GetLastError();
+    /* Decide by attribute, not by trial and error: RemoveDirectoryW on a
+     * regular file fails with ERROR_DIRECTORY (267), *not* ERROR_ACCESS_DENIED,
+     * so the old fallback never ran and SDL_RemovePath could not delete a
+     * file at all. Ask what the path is first, as stock SDL3's sysfsops does. */
+    DWORD attrs = GetFileAttributesW(wide);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        const DWORD aerr = GetLastError();
+        SDL_free(wide);
+        /* Only "already gone" counts as success; a missing parent directory is
+         * a genuine failure (the path never existed) and must not be masked. */
+        if (aerr == ERROR_FILE_NOT_FOUND) {
+            return true;
+        }
+        return SDL_SetError("Couldn't delete %s: error %lu", path, (unsigned long)aerr);
     }
+    BOOL ok = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? RemoveDirectoryW(wide) : DeleteFileW(wide);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
     SDL_free(wide);
     if (!ok && err == ERROR_FILE_NOT_FOUND) {
-        return true; /* already gone: success, as stock */
-    }
-    if (!ok && err == ERROR_PATH_NOT_FOUND) {
-        return true;
+        return true; /* raced with someone else deleting it */
     }
     if (!ok) {
         /* a non-empty directory surfaces as ERROR_DIR_NOT_EMPTY; deleting it

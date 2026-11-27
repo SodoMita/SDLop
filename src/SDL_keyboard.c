@@ -772,13 +772,29 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
         text_utf8[0] = '\0';
     }
     if (repeats_out) {
-        *repeats_out = true; /* Win32 auto-repeats keys itself */
+        /* Win32 auto-repeats held keys itself, but only character keys: SDL3
+         * never repeats a modifier or a lock, and the software repeat used on
+         * the raw-input path would otherwise emit repeating KEY_DOWNs for
+         * LSHIFT/LCTRL/LALT/CAPSLOCK while any packet kept arriving. */
+        const Uint32 rvk = SDLOP_WIN32_VK(rawcode);
+        const bool modifier_or_lock = (rvk >= VK_SHIFT && rvk <= VK_MENU) || /* SHIFT, CONTROL, MENU(ALT) */
+                                      rvk == VK_LSHIFT || rvk == VK_RSHIFT ||
+                                      rvk == VK_LCONTROL || rvk == VK_RCONTROL ||
+                                      rvk == VK_LMENU || rvk == VK_RMENU ||
+                                      rvk == VK_CAPITAL || rvk == VK_NUMLOCK || rvk == VK_SCROLL;
+        *repeats_out = (rvk != 0) && !modifier_or_lock;
     }
     const Uint32 vk = SDLOP_WIN32_VK(rawcode);
     if (!vk) {
         return SDLK_UNKNOWN;
     }
-    return SDLOP_Win32KeyFromVK(vk, key_event ? SDL_GetModState() : SDL_KMOD_NONE);
+    /* `key_event == true` means the keycode goes into an SDL_EVENT_KEY_*'s
+     * `.key` field, and SDL3 explicitly ignores modifiers there so that a
+     * letter key is always SDLK_A..SDLK_Z (i.e. 'a'..'z') regardless of Shift
+     * or CapsLock; the shifted form belongs in `.text`. Passing the modifiers
+     * through produced 'A' (0x41) -- not a valid SDLK_* letter constant -- and
+     * only on the paths that had a lock held. */
+    return SDLOP_Win32KeyFromVK(vk, key_event ? SDL_KMOD_NONE : SDL_GetModState());
 #else
     if (text_utf8 && text_size) {
         text_utf8[0] = '\0';
@@ -897,6 +913,56 @@ static SDL_Keymod modifier_bit_for(SDL_Scancode sc)
 /* Key events                                                          */
 /* ------------------------------------------------------------------ */
 
+#ifndef _WIN32
+/* X11 keysym of a key for an input method: from the live xkb state, or for
+ * the built-in US table the Latin-1 keysym (equal to the character) plus the
+ * function keys input methods act on */
+static Uint32 ime_keysym(Uint16 rawcode, SDL_Scancode sc)
+{
+#if SDLOP_USE_XKB
+    if (xkb_st) {
+        return SDLOP_XKB_xkb_state_key_get_one_sym(xkb_st, (xkb_keycode_t)rawcode + 8);
+    }
+#else
+    (void)rawcode;
+#endif
+    const SDL_Keycode k = default_key_from_scancode(sc, sdlop.modstate);
+    if (k >= 0x20 && k < 0x7f) {
+        return (Uint32)k;
+    }
+    switch (sc) {
+    case SDL_SCANCODE_RETURN:    return 0xff0d;
+    case SDL_SCANCODE_KP_ENTER:  return 0xff8d;
+    case SDL_SCANCODE_BACKSPACE: return 0xff08;
+    case SDL_SCANCODE_TAB:       return 0xff09;
+    case SDL_SCANCODE_ESCAPE:    return 0xff1b;
+    case SDL_SCANCODE_DELETE:    return 0xffff;
+    case SDL_SCANCODE_HOME:      return 0xff50;
+    case SDL_SCANCODE_LEFT:      return 0xff51;
+    case SDL_SCANCODE_UP:        return 0xff52;
+    case SDL_SCANCODE_RIGHT:     return 0xff53;
+    case SDL_SCANCODE_DOWN:      return 0xff54;
+    case SDL_SCANCODE_PAGEUP:    return 0xff55;
+    case SDL_SCANCODE_PAGEDOWN:  return 0xff56;
+    case SDL_SCANCODE_END:       return 0xff57;
+    case SDL_SCANCODE_LSHIFT:    return 0xffe1;
+    case SDL_SCANCODE_RSHIFT:    return 0xffe2;
+    case SDL_SCANCODE_LCTRL:     return 0xffe3;
+    case SDL_SCANCODE_RCTRL:     return 0xffe4;
+    case SDL_SCANCODE_CAPSLOCK:  return 0xffe5;
+    case SDL_SCANCODE_LALT:      return 0xffe9;
+    case SDL_SCANCODE_RALT:      return 0xffea;
+    case SDL_SCANCODE_LGUI:      return 0xffeb;
+    case SDL_SCANCODE_RGUI:      return 0xffec;
+    default:
+        if (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) {
+            return 0xffbe + (Uint32)(sc - SDL_SCANCODE_F1);
+        }
+        return 0;
+    }
+}
+#endif /* !_WIN32 */
+
 void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16 rawcode, Uint64 timestamp_ns)
 {
     if (scancode == SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
@@ -963,10 +1029,21 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
     (void)xkb_raw;
 #endif
 
+    /* a client-side input method sees the key first (stock: SDL_IME_ProcessKeyEvent);
+     * the key event is still delivered, only its text is the input method's */
+    bool ime_handled = false;
+#ifndef _WIN32
+    if (sdlop.ime_process_key && xkb_raw) {
+        ime_handled = sdlop.ime_process_key(ime_keysym(xkb_raw, scancode), (Uint32)xkb_raw + 8, down);
+    }
+#endif
+
     /* resolve keycode (+ text, only needed for key presses) */
     bool key_repeats = false;
     char text[64];
-    SDL_Keycode key = SDLOP_KeyboardTranslateKey(xkb_raw, down, text, sizeof(text), &key_repeats);
+    text[0] = '\0';
+    SDL_Keycode key = SDLOP_KeyboardTranslateKey(xkb_raw, down, ime_handled ? NULL : text,
+                                                 ime_handled ? 0 : sizeof(text), &key_repeats);
 
     SDL_Event event;
     SDL_zero(event);
@@ -1082,7 +1159,22 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
     if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
         return SDLK_UNKNOWN;
     }
-#if !SDLOP_USE_XKB
+#ifdef _WIN32
+    /* The current keyboard layout decides what a physical key produces; the
+     * scancode table alone is a US answer. Key events ignore modifiers (SDL3
+     * keeps .key at the unshifted key), which is the SDL_KMOD_NONE level here;
+     * everything the layout does not type (F-keys, navigation, modifiers)
+     * falls through to the scancode table. */
+    {
+        const Uint32 c = SDLOP_Win32LayoutCharForScancode(scancode, false);
+        if (c) {
+            /* SDL3 keeps .key at the key the layout puts there, unshifted;
+             * the shifted form is in .text */
+            return (SDL_Keycode)c;
+        }
+        return default_key_from_scancode(scancode, key_event ? SDL_KMOD_NONE : modstate);
+    }
+#elif !SDLOP_USE_XKB
     /* No layout keymap to consult: SDL3's built-in table is the default
      * mapping for a US layout, and key events ignore modifiers. */
     return default_key_from_scancode(scancode, key_event ? SDL_KMOD_NONE : modstate);

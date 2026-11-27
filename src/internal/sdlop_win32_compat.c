@@ -111,8 +111,13 @@ int setenv(const char *name, const char *value, int overwrite)
     if (!overwrite && getenv(name)) {
         return 0;
     }
-    /* _putenv_s copies both strings, unlike _putenv */
-    return _putenv_s(name, value);
+    /* _putenv_s copies both strings, unlike _putenv. It returns an errno_t,
+     * not the -1 POSIX callers test for, so translate. */
+    if (_putenv_s(name, value) != 0) {
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
 }
 
 int unsetenv(const char *name)
@@ -121,7 +126,13 @@ int unsetenv(const char *name)
         errno = EINVAL;
         return -1;
     }
-    return _putenv_s(name, "");
+    /* _putenv_s(name, "") *deletes* name on the MSVCRT/UCRT, which is what
+     * unsetenv wants -- so that part is correct as it stands. */
+    if (_putenv_s(name, "") != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 /* MinGW has no qsort_r; a plain merge sort keeps the comparator contract

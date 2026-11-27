@@ -3168,6 +3168,39 @@ bool SDL_FillSurfaceRects(SDL_Surface *dst, const SDL_Rect *rects, int count, Ui
 /* Window surface plumbing (dispatched to the video driver)            */
 /* ------------------------------------------------------------------ */
 
+void SDLOP_SetSurfacePixels(SDL_Surface *surface, void *pixels, int w, int h, int pitch)
+{
+    if (!surface) {
+        return;
+    }
+    surface->pixels = pixels;
+    surface->w = w;
+    surface->h = h;
+    surface->pitch = pitch;
+    SDL_SetSurfaceClipRect(surface, NULL); /* the old clip may exceed the new size */
+}
+
+/*
+  Window surfaces and resizes (SDLop): unlike stock SDL3, which invalidates
+  the window surface on every pixel-size change and fails
+  SDL_UpdateWindowSurface until SDL_GetWindowSurface is called again, a
+  window surface here stays valid - the same SDL_Surface pointer, resized
+  in place. Drivers do no reallocation while handling resize events; the
+  surface is brought to the current size once, lazily:
+    - SDL_GetWindowSurface resizes a stale surface before returning it
+    - SDL_UpdateWindowSurface(Rects) presents what the application drew at
+      the old size, then resizes, so the next frame is drawn at the new
+      size; a whole interactive resize therefore reallocates at most once
+      per presented frame. The new contents start at the clear colour.
+*/
+static bool window_surface_sync_size(SDL_Window *window)
+{
+    if (window->surface && sdlop.video && sdlop.video->ResizeWindowFramebuffer) {
+        return sdlop.video->ResizeWindowFramebuffer(sdlop.video, window, window->surface);
+    }
+    return true;
+}
+
 SDL_Surface *SDL_GetWindowSurface(SDL_Window *window)
 {
     if (!window) {
@@ -3175,6 +3208,9 @@ SDL_Surface *SDL_GetWindowSurface(SDL_Window *window)
         return NULL;
     }
     if (window->surface) {
+        if (!window_surface_sync_size(window)) {
+            return NULL; /* driver sets error; the old surface stays usable */
+        }
         return window->surface;
     }
     if (!sdlop.video || !sdlop.video->CreateWindowFramebuffer) {
@@ -3198,6 +3234,9 @@ bool SDL_UpdateWindowSurfaceRects(SDL_Window *window, const SDL_Rect *rects, int
         return SDL_SetError("Video driver does not support window surfaces");
     }
     if (!sdlop.video->UpdateWindowFramebuffer(sdlop.video, window, rects, numrects)) {
+        return false;
+    }
+    if (!window_surface_sync_size(window)) {
         return false;
     }
     /* stock SDL3 announces presented content with an expose event */

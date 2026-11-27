@@ -69,20 +69,19 @@ bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *windo
     if (!window || !window->driverdata) {
         return SDL_SetError("No window to create a Vulkan surface for");
     }
-    /* Keep the module loaded: Vulkan dispatch tables point into it, and
-     * unloading after creating a surface would leave dangling pointers. */
-    static HMODULE vulkan_lib;
-    if (!vulkan_lib) {
-        vulkan_lib = LoadLibraryW(L"vulkan-1.dll");
-        if (!vulkan_lib) {
-            return SDL_SetError("Vulkan isn't available (couldn't load vulkan-1.dll)");
-        }
+    /* Resolve the entry point through the instance the application created,
+     * the way the Vulkan loader intends: vkGetInstanceProcAddr comes from
+     * SDL_Vulkan_GetVkGetInstanceProcAddr(), so a loader the application
+     * supplied via SDL_Vulkan_LoadLibrary(path) is the one that answers, and
+     * instance-level layers stay in the dispatch chain. LoadLibraryW(
+     * "vulkan-1.dll") went straight to the system loader instead, which
+     * ignores both -- an application that loaded its own Vulkan got a surface
+     * from a different loader than the instance came from. */
+    PFN_vkGetInstanceProcAddr_ gipa = (PFN_vkGetInstanceProcAddr_)SDL_Vulkan_GetVkGetInstanceProcAddr();
+    PFN_vkCreateWin32SurfaceKHR create = NULL;
+    if (gipa) {
+        create = (PFN_vkCreateWin32SurfaceKHR)gipa((VkInstance_)instance, "vkCreateWin32SurfaceKHR");
     }
-    /* GetProcAddress returns FARPROC; the cast is unavoidable, so make the
-     * intermediate step explicit rather than casting function type to
-     * function type (which is what -Wcast-function-type dislikes). */
-    void *entry = (void *)(uintptr_t)GetProcAddress(vulkan_lib, "vkCreateWin32SurfaceKHR");
-    PFN_vkCreateWin32SurfaceKHR create = (PFN_vkCreateWin32SurfaceKHR)entry;
     if (!create) {
         return SDL_SetError("vkCreateWin32SurfaceKHR is missing from the Vulkan loader");
     }

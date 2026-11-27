@@ -372,6 +372,17 @@ bool SDLOP_DBus_IterGetI32(const SDLop_DBusIter *it, Sint32 *v)
     return true;
 }
 
+bool SDLOP_DBus_IterGetU64(const SDLop_DBusIter *it, Uint64 *v)
+{
+    const Uint8 *p;
+    const int t = SDLOP_DBus_IterType(it);
+    if ((t != 't' && t != 'x') || !get_fixed(it, (char)t, 8, &p)) {
+        return false;
+    }
+    *v = rd64(it, p);
+    return true;
+}
+
 bool SDLOP_DBus_IterGetDouble(const SDLop_DBusIter *it, double *v)
 {
     const Uint8 *p;
@@ -504,6 +515,15 @@ void SDLOP_DBus_PutU32(SDLop_DBusMsg *m, Uint32 v)
 {
     WBuf w = body_of(m);
     w_u32(&w, v);
+    body_back(m, &w);
+}
+
+void SDLOP_DBus_PutU64(SDLop_DBusMsg *m, Uint64 v)
+{
+    WBuf w = body_of(m);
+    w_pad(&w, 8);
+    w_u32(&w, (Uint32)v); /* little endian on output */
+    w_u32(&w, (Uint32)(v >> 32));
     body_back(m, &w);
 }
 

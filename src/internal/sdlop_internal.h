@@ -40,6 +40,7 @@ struct SDL_Window
     Uint8 clear_r, clear_g, clear_b;
     float display_scale;    /* output scale the window currently sits on */
     SDL_Surface *surface;   /* software window surface (owned by window) */
+    bool gl_resize_pending; /* RESIZED seen: GL offload surface follows after the pump */
     void *driverdata;
     struct SDL_Window *next;
     SDL_DisplayID displayID;          /* display the window is currently on */
@@ -223,6 +224,14 @@ struct SDLop_VideoDevice
     bool (*StartTextInput)(SDLop_VideoDevice *device, SDL_Window *window, SDL_PropertiesID props);
     bool (*StopTextInput)(SDLop_VideoDevice *device, SDL_Window *window);
     bool (*ClearComposition)(SDLop_VideoDevice *device, SDL_Window *window);
+
+    /* software rendering: bring an existing window surface to the window's
+     * current size, in place (SDLop keeps the SDL_Surface pointer valid
+     * across resizes). Only called from SDL_GetWindowSurface and after
+     * SDL_UpdateWindowSurface(Rects), never from event handling, so a burst
+     * of resizes costs one reallocation. Returns true when nothing had to
+     * change. NULL = the driver keeps the surface sized itself. */
+    bool (*ResizeWindowFramebuffer)(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *surface);
 };
 
 /* Cursor object (SDL_mouse.c) */
@@ -335,6 +344,10 @@ typedef struct SDLop_Globals
     Uint32 repeat_delay_ms;
     Uint32 repeat_interval_ms;
     bool repeat_disabled;       /* the window system turned key repeat off */
+    /* a client-side input method (SDL_ime_dbus.c) that sees keys first while
+     * it has focus: keysym, xkb keycode (evdev + 8), press/release; true when
+     * it consumed the key (its text then arrives as a commit) */
+    bool (*ime_process_key)(Uint32 keysym, Uint32 keycode, bool down);
 
     /* xkb (set by the wayland driver, else defaults) */
     void *xkb_context;          /* struct xkb_context* */
@@ -564,6 +577,11 @@ typedef struct SDLOP_GLAttributes
 extern SDLOP_GLAttributes sdlop_glattrs;
 SDL_GLContext SDLOP_GL_CurrentContext(void);
 void SDLOP_GL_NotifyWindowResized(SDL_Window *window);
+
+/* point a surface that wraps foreign pixels (SDL_CreateSurfaceFrom) at a
+ * new buffer, keeping the SDL_Surface itself: window surfaces across
+ * resizes. The clip rectangle is reset to the whole surface. */
+void SDLOP_SetSurfacePixels(SDL_Surface *surface, void *pixels, int w, int h, int pitch);
 void SDLOP_GL_NotifyWindowDestroyed(SDL_Window *window);
 void SDLOP_GL_Quit(void);
 bool SDLOP_GL_CanCreateWindow(void);
@@ -682,7 +700,8 @@ int SDLOP_DBus_Parse(const Uint8 *buf, size_t len, SDLop_DBusMsg **out, size_t *
 
 void SDLOP_DBus_PutByte(SDLop_DBusMsg *m, Uint8 v);
 void SDLOP_DBus_PutBool(SDLop_DBusMsg *m, bool v);
-void SDLOP_DBus_PutU32(SDLop_DBusMsg *m, Uint32 v);
+void SDLOP_DBus_PutU32(SDLop_DBusMsg *m, Uint32 v); /* also i (int32) */
+void SDLOP_DBus_PutU64(SDLop_DBusMsg *m, Uint64 v); /* also x (int64) */
 void SDLOP_DBus_PutDouble(SDLop_DBusMsg *m, double v);
 void SDLOP_DBus_PutString(SDLop_DBusMsg *m, const char *s); /* also object paths */
 void SDLOP_DBus_PutSignature(SDLop_DBusMsg *m, const char *sig);
@@ -699,6 +718,7 @@ bool SDLOP_DBus_IterGetByte(const SDLop_DBusIter *it, Uint8 *v);
 bool SDLOP_DBus_IterGetBool(const SDLop_DBusIter *it, bool *v);
 bool SDLOP_DBus_IterGetU32(const SDLop_DBusIter *it, Uint32 *v);
 bool SDLOP_DBus_IterGetI32(const SDLop_DBusIter *it, Sint32 *v);
+bool SDLOP_DBus_IterGetU64(const SDLop_DBusIter *it, Uint64 *v); /* t or x */
 bool SDLOP_DBus_IterGetDouble(const SDLop_DBusIter *it, double *v);
 bool SDLOP_DBus_IterGetString(const SDLop_DBusIter *it, const char **v);
 
@@ -707,6 +727,14 @@ void SDLOP_Desktop_Init(void); /* async theme lookup + change subscription */
 SDL_SystemTheme SDLOP_Desktop_GetSystemTheme(void);
 void SDLOP_Desktop_UpdateProgress(SDL_Window *window);
 void SDLOP_Desktop_Quit(void);
+
+/* SDL_ime_dbus.c: Fcitx 5 / IBus input method over D-Bus, for window systems
+ * without their own input method protocol (Wayland without text-input-v3) */
+void SDLOP_IME_DBus_Update(void); /* follow keyboard focus + text input state */
+void SDLOP_IME_DBus_UpdateArea(SDL_Window *window);
+void SDLOP_IME_DBus_Reset(void);
+void SDLOP_IME_DBus_WindowDestroyed(SDL_Window *window);
+void SDLOP_IME_DBus_Quit(void);
 void SDLOP_Dialog_Quit(void); /* SDL_dialog.c: drops pending portal requests */
 
 /* child processes (SDL_misc.c; not on Emscripten) */

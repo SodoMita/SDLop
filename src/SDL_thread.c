@@ -759,6 +759,7 @@ struct SDL_Thread
     void *userdata;
     SDL_Semaphore *started; /* creator waits until the name/id are set */
     SDL_FunctionPointer pfnEndThread; /* Windows: the CRT's _endthreadex */
+    SDL_FunctionPointer pfnBeginThread; /* Windows: the app's _beginthreadex */
     struct SDL_Thread *registry_next;
 };
 
@@ -879,6 +880,12 @@ static void set_current_thread_name(const char *name)
     (void)name;
 #endif
 }
+#else
+/* The CRT's _beginthreadex, as passed in by <SDL3/SDL_thread.h>. SDL3 keeps
+ * this typedef private to its Windows thread code; so does this file. */
+typedef uintptr_t (__cdecl * SDLop_BeginThreadEx)(void *security, unsigned stacksize,
+                                                  unsigned (__stdcall *startaddr)(void *),
+                                                  void *arglist, unsigned initflag, unsigned *threadaddr);
 #endif
 
 static
@@ -927,16 +934,24 @@ run_thread(void *arg)
 
     SDL_CleanupTLS();
 
+#ifdef _WIN32
+    /* Read this before the detach check below: a detached thread is freed
+     * there, and touching `thread` afterwards reads freed memory. */
+    SDL_FunctionPointer endfn = thread->pfnEndThread;
+#endif
     if (!SDL_CompareAndSwapAtomicInt(&thread->state, SDL_THREAD_ALIVE, SDL_THREAD_COMPLETE)) {
         if (SDL_GetAtomicInt(&thread->state) == SDL_THREAD_DETACHED) {
             free_thread(thread);
+            thread = NULL;
         }
     }
 #ifdef _WIN32
     /* _beginthreadex wants an unsigned return; _endthreadex finishes the CRT's
-     * per-thread bookkeeping the same way a normal return does. */
-    if (thread->pfnEndThread) {
-        ((void (__stdcall *)(unsigned))thread->pfnEndThread)((unsigned)status);
+     * per-thread bookkeeping the same way a normal return does. It must be the
+     * CRT that *created* the thread, which is why the app's pfnEndThread is
+     * only ever paired with the app's pfnBeginThread (see the create path). */
+    if (endfn) {
+        ((void (__stdcall *)(unsigned))endfn)((unsigned)status);
     }
     return (unsigned)status;
 #else
@@ -954,10 +969,6 @@ SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_Fu
         SDL_SetError("_beginthreadex/_endthreadex not supported on this platform");
         return NULL;
     }
-#else
-    (void)pfnBeginThread; /* SDL3 always passes _beginthreadex, which is what
-                           * SDLOP uses for creation; the CRT's matching
-                           * _endthreadex is called from run_thread. */
 #endif
     SDL_ThreadFunction fn = (SDL_ThreadFunction)SDL_GetPointerProperty(props, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER, NULL);
     const char *name = SDL_GetStringProperty(props, SDL_PROP_THREAD_CREATE_NAME_STRING, NULL);
@@ -987,7 +998,20 @@ SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_Fu
     thread->userdata = userdata;
     thread->stacksize = stacksize;
 #ifdef _WIN32
-    thread->pfnEndThread = pfnEndThread;
+    /* The begin and end handlers must come from the same C runtime. SDL3 passes
+     * the caller's _beginthreadex/_endthreadex so that CRT bookkeeping happens
+     * in the CRT the application links; pairing SDLop's _beginthreadex with the
+     * caller's _endthreadex (or the reverse) corrupts per-thread CRT state. So
+     * only remember pfnEndThread when pfnBeginThread will do the creating;
+     * with no pfnBeginThread the thread is made with CreateThread and there is
+     * no per-thread CRT to wind down. */
+    if (pfnBeginThread) {
+        thread->pfnEndThread = pfnEndThread;
+        thread->pfnBeginThread = pfnBeginThread;
+    } else {
+        thread->pfnEndThread = NULL;
+        thread->pfnBeginThread = NULL;
+    }
 #else
     (void)pfnEndThread;
 #endif
@@ -999,8 +1023,16 @@ SDL_Thread *SDL_CreateThreadWithPropertiesRuntime(SDL_PropertiesID props, SDL_Fu
 
     SDL_Semaphore *started = thread->started;
 #ifdef _WIN32
-    thread->handle = (HANDLE)_beginthreadex(NULL, (unsigned)stacksize, run_thread, thread,
-                                            CREATE_SUSPENDED, &thread->handle_id);
+    if (thread->pfnBeginThread) {
+        /* Run in the caller's CRT, which also ends it (see run_thread). */
+        unsigned threadid = 0;
+        thread->handle = (HANDLE)((size_t)((SDLop_BeginThreadEx)thread->pfnBeginThread)(
+            NULL, (unsigned int)stacksize, run_thread, thread, CREATE_SUSPENDED, &threadid));
+        thread->handle_id = threadid;
+    } else {
+        thread->handle = (HANDLE)_beginthreadex(NULL, (unsigned)stacksize, run_thread, thread,
+                                                CREATE_SUSPENDED, &thread->handle_id);
+    }
     if (!thread->handle) {
         SDL_DestroySemaphore(started);
         free_thread(thread);

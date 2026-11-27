@@ -212,50 +212,104 @@ int SDLOP_CondWaitUntilImpl(CONDITION_VARIABLE *cond, CRITICAL_SECTION *mutex,
 /* Sleep                                                               */
 /* ------------------------------------------------------------------ */
 
-/* Sleeps. A waitable timer must be owned by the thread that waits on it: one
- * shared handle makes concurrent sleepers steal each other's signalled state
- * (one thread arms it, another consumes it, and the arming thread blocks
- * forever). So keep one per thread on Windows, and fall back to Sleep() when
- * the thread-local cannot be allocated. */
-static _Thread_local HANDLE sdloP_timer_handle;
-static _Thread_local int sdloP_timer_tried; /* 0 = unknown, 1 = have it, -1 = none */
+/* Sleeps.
+ *
+ * A waitable timer has to belong to the thread that waits on it: with one
+ * shared handle, concurrent sleepers steal each other's signalled state -- one
+ * thread arms it, another consumes it, and the arming thread blocks forever.
+ * (Measured: eight threads doing SDL_Delay(20) under Wine hung outright.)
+ *
+ * So one timer per thread, owned by fiber-local storage rather than a bare
+ * _Thread_local. A _Thread_local HANDLE has no destructor, so every thread
+ * that ever slept leaked its timer for the lifetime of the process -- and a
+ * process that makes a thread per task leaks one handle per task. FlsAlloc's
+ * callback runs at thread exit and closes it (verified: 20 of 20 threads).
+ * The handle is set through the slot immediately after creation, which is what
+ * arms that callback. Falls back to Sleep() if the slot cannot be allocated. */
+static DWORD sdloP_sleep_slot = FLS_OUT_OF_INDEXES;
+static INIT_ONCE sdloP_sleep_slot_once = INIT_ONCE_STATIC_INIT;
+
+static VOID WINAPI sdloP_sleep_slot_free(PVOID param)
+{
+    if (param) {
+        CloseHandle((HANDLE)param);
+    }
+}
+
+static BOOL CALLBACK sdloP_sleep_slot_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    sdloP_sleep_slot = FlsAlloc(sdloP_sleep_slot_free);
+    return TRUE;
+}
+
+static HANDLE sdloP_sleep_timer_get(void)
+{
+    HANDLE h;
+    InitOnceExecuteOnce(&sdloP_sleep_slot_once, sdloP_sleep_slot_init, NULL, NULL);
+    if (sdloP_sleep_slot == FLS_OUT_OF_INDEXES) {
+        return NULL;
+    }
+    h = (HANDLE)FlsGetValue(sdloP_sleep_slot);
+    if (h) {
+        return h;
+    }
+    /* AUTO-RESET: the wait must return the timer to non-signalled by itself,
+     * or every later wait returns immediately and a caller looping on "sleep
+     * until deadline" spins at 100% CPU. */
+    h = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!h) {
+        h = CreateWaitableTimerW(NULL, FALSE, NULL);
+    }
+    if (h && !FlsSetValue(sdloP_sleep_slot, h)) {
+        /* no slot to own it, so no destructor would ever close it: report no
+         * timer and let the caller Sleep(), rather than leaking one per call */
+        CloseHandle(h);
+        h = NULL;
+    }
+    return h;
+}
+
+/* Nothing to do: the timers belong to their threads and are closed by
+ * sdloP_sleep_slot_free() as those threads exit. Kept so SDL_Quit has an
+ * unconditional call site, symmetric with the POSIX side. */
+void SDLOP_ReleaseTimerHandles(void)
+{
+    if (sdloP_sleep_slot != FLS_OUT_OF_INDEXES) {
+        HANDLE h = (HANDLE)FlsGetValue(sdloP_sleep_slot);
+        if (h) {
+            FlsSetValue(sdloP_sleep_slot, NULL);
+            CloseHandle(h);
+        }
+    }
+}
 
 static void sdloP_sleep_ns(Sint64 ns)
 {
     if (ns <= 0) {
         return;
     }
-    if (!sdloP_timer_tried) {
-        sdloP_timer_tried = -1;
-        /* AUTO-RESET: the wait must return the timer to non-signalled by
-         * itself, or every later wait returns immediately and a caller
-         * looping on "sleep until deadline" spins at 100% CPU. */
-        sdloP_timer_handle = CreateWaitableTimerExW(NULL, NULL,
-                                                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                                    TIMER_ALL_ACCESS);
-        if (sdloP_timer_handle) {
-            sdloP_timer_tried = 1;
-        } else {
-            sdloP_timer_handle = CreateWaitableTimerW(NULL, FALSE, NULL);
-            if (sdloP_timer_handle) {
-                sdloP_timer_tried = 1;
+    {
+        HANDLE timer = sdloP_sleep_timer_get();
+        if (timer) {
+            /* The timer takes 100 ns units, negative = relative. */
+            LARGE_INTEGER due;
+            due.QuadPart = -(ns / 100);
+            if (due.QuadPart == 0) {
+                due.QuadPart = -1;
+            }
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+                WaitForSingleObject(timer, INFINITE);
+                return;
             }
         }
     }
-    if (sdloP_timer_handle) {
-        /* The timer takes 100 ns units, negative = relative. */
-        LARGE_INTEGER due;
-        due.QuadPart = -(ns / 100);
-        if (due.QuadPart == 0) {
-            due.QuadPart = -1;
-        }
-        if (SetWaitableTimer(sdloP_timer_handle, &due, 0, NULL, NULL, FALSE)) {
-            WaitForSingleObject(sdloP_timer_handle, INFINITE);
-            return;
-        }
+    {
+        const Uint64 ms = ((Uint64)ns + 999999ull) / 1000000ull;
+        Sleep((DWORD)(ms > 0x7fffffffull ? 0x7fffffffull : ms));
     }
-    const Uint64 ms = ((Uint64)ns + 999999ull) / 1000000ull;
-    Sleep((DWORD)(ms > 0x7fffffffull ? 0x7fffffffull : ms));
 }
 
 void SDLOP_SleepNS(Sint64 ns)
