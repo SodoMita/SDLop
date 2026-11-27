@@ -421,7 +421,7 @@ bool SDLOP_KeyboardSetDefaultKeymap(void)
     return set_keymap(km);
 }
 
-/* rebuild the caps/num/level5/mode bits (and cross-check the L/R bits)
+/* rebuild the caps/num/level5/mode bits and reconcile L/R modifier bits
  * from xkb's effective modifier state; shared by the mask-based wayland
  * path and the key-event-based raw path */
 static void sdlop_sync_mods_from_xkb(void)
@@ -444,15 +444,38 @@ static void sdlop_sync_mods_from_xkb(void)
     if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_altgr, XKB_STATE_MODS_EFFECTIVE) == 1) {
         mod |= SDL_KMOD_MODE;
     }
-    /* keep L/R modifier bits in sync with xkb effective state */
-    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_shift, XKB_STATE_MODS_EFFECTIVE) != 1) {
-        mod &= ~(SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT);
+    /* keep L/R modifier bits in sync with xkb effective state in both
+     * directions (matches SDL3 Wayland_ReconcileModifiers for OSK/sticky/
+     * remapped modifiers) */
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_shift, XKB_STATE_MODS_EFFECTIVE) == 1) {
+        if (!(mod & SDL_KMOD_SHIFT)) {
+            mod |= SDL_KMOD_SHIFT;
+        }
+    } else {
+        mod &= ~SDL_KMOD_SHIFT;
     }
-    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_ctrl, XKB_STATE_MODS_EFFECTIVE) != 1) {
-        mod &= ~(SDL_KMOD_LCTRL | SDL_KMOD_RCTRL);
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_ctrl, XKB_STATE_MODS_EFFECTIVE) == 1) {
+        if (!(mod & SDL_KMOD_CTRL)) {
+            mod |= SDL_KMOD_CTRL;
+        }
+    } else {
+        mod &= ~SDL_KMOD_CTRL;
     }
-    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_super, XKB_STATE_MODS_EFFECTIVE) != 1) {
-        mod &= ~(SDL_KMOD_LGUI | SDL_KMOD_RGUI);
+    if (mod_alt != XKB_MOD_INVALID) {
+        if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_alt, XKB_STATE_MODS_EFFECTIVE) == 1) {
+            if (!(mod & SDL_KMOD_ALT)) {
+                mod |= SDL_KMOD_ALT;
+            }
+        } else {
+            mod &= ~SDL_KMOD_ALT;
+        }
+    }
+    if (SDLOP_XKB_xkb_state_mod_index_is_active(xkb_st, mod_super, XKB_STATE_MODS_EFFECTIVE) == 1) {
+        if (!(mod & SDL_KMOD_GUI)) {
+            mod |= SDL_KMOD_GUI;
+        }
+    } else {
+        mod &= ~SDL_KMOD_GUI;
     }
     sdlop.modstate = mod;
 }
@@ -820,7 +843,9 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
         if (repeats_out) {
             *repeats_out = sc != SDL_SCANCODE_UNKNOWN && !modifier_or_lock;
         }
-        if (key_event && text_utf8 && text_size >= 2 && !(sdlop.modstate & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+        if (key_event && text_utf8 && text_size >= 2 &&
+            sdlop.keyboard_focus && sdlop.keyboard_focus->text_input_active &&
+            !(sdlop.modstate & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI | SDL_KMOD_MODE))) {
             const SDL_Keycode t = default_key_from_scancode(sc, sdlop.modstate);
             if (t >= 0x20 && t < 0x7f) {
                 text_utf8[0] = (char)t;
@@ -1030,10 +1055,10 @@ void SDLOP_SendKeyboardKey(bool down, bool repeat, SDL_Scancode scancode, Uint16
 #endif
 
     /* a client-side input method sees the key first (stock: SDL_IME_ProcessKeyEvent);
-     * the key event is still delivered, only its text is the input method's */
+     * bypass when text input is off so game key paths pay zero IME overhead */
     bool ime_handled = false;
 #ifndef _WIN32
-    if (sdlop.ime_process_key && xkb_raw) {
+    if (sdlop.ime_process_key && xkb_raw && sdlop.keyboard_focus && sdlop.keyboard_focus->text_input_active) {
         ime_handled = sdlop.ime_process_key(ime_keysym(xkb_raw, scancode), (Uint32)xkb_raw + 8, down);
     }
 #endif
@@ -1162,11 +1187,12 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
 #ifdef _WIN32
     /* The current keyboard layout decides what a physical key produces; the
      * scancode table alone is a US answer. Key events ignore modifiers (SDL3
-     * keeps .key at the unshifted key), which is the SDL_KMOD_NONE level here;
-     * everything the layout does not type (F-keys, navigation, modifiers)
-     * falls through to the scancode table. */
+     * keeps .key at the unshifted key) for fast unmodified lookup; when
+     * key_event == false, modstate selects the layout level (Shift/Caps/AltGr). */
     {
-        const Uint32 c = SDLOP_Win32LayoutCharForScancode(scancode, false);
+        const Uint32 c = key_event
+            ? SDLOP_Win32LayoutCharForScancode(scancode, false)
+            : SDLOP_Win32LayoutCharForScancodeMods(scancode, modstate);
         if (c) {
             /* SDL3 keeps .key at the key the layout puts there, unshifted;
              * the shifted form is in .text */
@@ -1193,6 +1219,18 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
 SDL_Keycode SDLOP_KeyboardKeyNameCapital(SDL_Keycode key)
 {
 #if !SDLOP_USE_XKB
+#ifdef _WIN32
+    if ((key >= 'a' && key <= 'z') || (key > 0xBF && key != 0xD7 && key != 0xF7)) {
+        SDL_Keymod mod = SDL_KMOD_NONE;
+        const SDL_Scancode sc = SDLOP_Win32ScancodeForLayoutChar(key, &mod);
+        if (sc != SDL_SCANCODE_UNKNOWN && !(mod & SDL_KMOD_SHIFT)) {
+            const Uint32 capital = SDLOP_Win32LayoutCharForScancodeMods(sc, SDL_KMOD_SHIFT | (mod & SDL_KMOD_MODE));
+            if (capital && capital != (Uint32)key) {
+                return (SDL_Keycode)capital;
+            }
+        }
+    }
+#endif
     return (key >= 'a' && key <= 'z') ? key - ('a' - 'A') : key;
 #else
     if (!((key >= 'a' && key <= 'z') || (key > 0xBF && key != 0xD7 && key != 0xF7))) {
@@ -1244,6 +1282,14 @@ SDL_Scancode SDL_GetScancodeFromKey(SDL_Keycode key, SDL_Keymod *modstate)
     SDL_Keymod found_mod;
 #if SDLOP_USE_XKB
     if (keymap && revtab_get(key, &sc, &found_mod)) {
+        if (modstate) {
+            *modstate = found_mod;
+        }
+        return sc;
+    }
+#elif defined(_WIN32)
+    sc = SDLOP_Win32ScancodeForLayoutChar(key, &found_mod);
+    if (sc != SDL_SCANCODE_UNKNOWN) {
         if (modstate) {
             *modstate = found_mod;
         }

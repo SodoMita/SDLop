@@ -44,6 +44,13 @@ void SDLOP_Win32UpdateKeyboardLayout(void);
  * when the layout gives it none (a dead key, or a key that types nothing). */
 Uint32 SDLOP_Win32LayoutCharForScancode(SDL_Scancode scancode, bool shifted);
 
+/* SDL3-style layout lookup taking full modifier state (SHIFT, CAPS, MODE/AltGr)
+ * with fallback from exact modifier combinations down to base levels. */
+Uint32 SDLOP_Win32LayoutCharForScancodeMods(SDL_Scancode scancode, SDL_Keymod modstate);
+
+/* Reverse lookup on the active Win32 layout (least-modified level first). */
+SDL_Scancode SDLOP_Win32ScancodeForLayoutChar(SDL_Keycode key, SDL_Keymod *modstate);
+
 /* Character a key produces with the given modifiers, for SDL_GetKeyFromName
  * style helpers; 0 when the key has no character. */
 Uint32 SDLOP_Win32CharFromVK(Uint32 vk, bool shifted);
