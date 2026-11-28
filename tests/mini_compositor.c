@@ -77,6 +77,16 @@
   "warp X,Y serial=ok|bad", lock_pointer requests log "lock" and cursor
   position hints "hint X,Y" (the lock script below is off).
 
+  MINI_RESIZE_LOG=<log> for tests/test_wayland_resize.c: frame callbacks
+  of the window surface are held until its next commit (like a compositor
+  that presents each commit), and the log gets "pool SIZE" per wl_shm_pool,
+  "buffer WxH" per wl_buffer, "commit WxH" per commit of the window surface
+  with a new buffer, and "ack WxH resizing=0|1" per ack_configure (the size
+  of the acked configure). MINI_POINTER_CMD lines (no pointer needed):
+  "rburst N W H DW DH" sends N toplevel configures in the resizing state,
+  sizes W+i*DW x H+i*DH, and "rend W H" one without it; each logs
+  "configure WxH resizing=0|1".
+
   Script (driven by client requests + timers):
     - surface commit + buffer attached        -> wl_pointer.enter(100,100) + frame
     - zwp lock_pointer request                -> zwp_locked_pointer.locked
@@ -179,6 +189,7 @@ typedef struct
 } mini_buffer;
 
 static bool B_mode;
+static const char *RZ_log; /* MINI_RESIZE_LOG */
 static const char *TL_log; /* MINI_TOPLEVEL_LOG: icon buffers are read too */
 static struct wl_resource *TL_alpha_surface; /* surface with a pending multiplier */
 static uint32_t TL_alpha_pending;
@@ -380,6 +391,125 @@ static void res_destroy(struct wl_client *client, struct wl_resource *res)
     wl_resource_destroy(res);
 }
 
+/* ---------------- MINI_RESIZE_LOG ---------------- */
+
+static void RZ_logs(const char *line)
+{
+    FILE *f = RZ_log ? fopen(RZ_log, "a") : NULL;
+    if (f) {
+        fprintf(f, "%s\n", line);
+        fclose(f);
+    }
+}
+
+/* configures sent (serial -> size), frame callbacks waiting for a commit */
+static struct
+{
+    uint32_t serial;
+    int w, h;
+    bool resizing;
+} RZ_cfg[512];
+static int RZ_ncfg;
+static struct wl_resource *RZ_frames[64];
+static int RZ_nframes;
+static int RZ_attach_w, RZ_attach_h;
+static bool RZ_attached;
+
+static void RZ_frame_gone(struct wl_resource *res)
+{
+    for (int i = 0; i < RZ_nframes; i++) {
+        if (RZ_frames[i] == res) {
+            RZ_frames[i] = RZ_frames[--RZ_nframes];
+            return;
+        }
+    }
+}
+
+/* the commit is "presented": its frame callbacks are done */
+static void RZ_commit(void)
+{
+    if (RZ_attached) {
+        char line[48];
+        snprintf(line, sizeof(line), "commit %dx%d", RZ_attach_w, RZ_attach_h);
+        RZ_logs(line);
+        RZ_attached = false;
+    }
+    while (RZ_nframes > 0) {
+        struct wl_resource *cb = RZ_frames[0];
+        wl_callback_send_done(cb, 0);
+        wl_resource_destroy(cb); /* RZ_frame_gone removes it */
+    }
+}
+
+static void RZ_ack(uint32_t serial)
+{
+    for (int i = RZ_ncfg - 1; i >= 0; i--) {
+        if (RZ_cfg[i].serial == serial) {
+            char line[64];
+            snprintf(line, sizeof(line), "ack %dx%d resizing=%d", RZ_cfg[i].w, RZ_cfg[i].h, RZ_cfg[i].resizing);
+            RZ_logs(line);
+            return;
+        }
+    }
+    RZ_logs("ack other");
+}
+
+static void RZ_configure(int w, int h, bool resizing)
+{
+    if (!M.xdg_toplevel || !M.xdg_surface || RZ_ncfg >= (int)(sizeof(RZ_cfg) / sizeof(RZ_cfg[0]))) {
+        return;
+    }
+    struct wl_array states;
+    wl_array_init(&states);
+    uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
+    *st = XDG_TOPLEVEL_STATE_ACTIVATED;
+    if (resizing) {
+        st = wl_array_add(&states, sizeof(uint32_t));
+        *st = XDG_TOPLEVEL_STATE_RESIZING;
+    }
+    xdg_toplevel_send_configure(M.xdg_toplevel, w, h, &states);
+    wl_array_release(&states);
+    const uint32_t serial = wl_display_next_serial(M.display);
+    RZ_cfg[RZ_ncfg].serial = serial;
+    RZ_cfg[RZ_ncfg].w = w;
+    RZ_cfg[RZ_ncfg].h = h;
+    RZ_cfg[RZ_ncfg].resizing = resizing;
+    RZ_ncfg++;
+    xdg_surface_send_configure(M.xdg_surface, serial);
+    char line[64];
+    snprintf(line, sizeof(line), "configure %dx%d resizing=%d", w, h, resizing);
+    RZ_logs(line);
+}
+
+/* one MINI_POINTER_CMD line for MINI_RESIZE_LOG; false if it isn't one */
+static bool RZ_command(const char *line)
+{
+    int n, w, h, dw, dh;
+    if (!RZ_log) {
+        return false;
+    }
+    if (sscanf(line, "rburst %d %d %d %d %d", &n, &w, &h, &dw, &dh) == 5) {
+        for (int i = 0; i < n; i++) {
+            RZ_configure(w + i * dw, h + i * dh, true);
+        }
+        return true;
+    }
+    if (sscanf(line, "rend %d %d", &w, &h) == 2) {
+        RZ_configure(w, h, false);
+        return true;
+    }
+    return false;
+}
+
+static void xdg_surface_ack(struct wl_client *client, struct wl_resource *res, uint32_t serial)
+{
+    (void)client;
+    (void)res;
+    if (RZ_log) {
+        RZ_ack(serial);
+    }
+}
+
 /* ---------------- wl_buffer / wl_shm ---------------- */
 
 static void buffer_destroy(struct wl_client *client, struct wl_resource *res)
@@ -424,7 +554,7 @@ static void pool_create_buffer(struct wl_client *client, struct wl_resource *res
     struct wl_resource *buf = wl_resource_create(client, &wl_buffer_interface, 1, id);
     mini_buffer *b = NULL;
     mini_pool *p = wl_resource_get_user_data(res);
-    if ((B_mode || H_mode || TL_log) && p) {
+    if ((B_mode || H_mode || TL_log || RZ_log) && p) {
         b = calloc(1, sizeof(*b));
         b->pool = p;
         p->refs++;
@@ -435,6 +565,11 @@ static void pool_create_buffer(struct wl_client *client, struct wl_resource *res
         b->format = format;
     }
     wl_resource_set_implementation(buf, &buffer_impl, b, buffer_res_destroy);
+    if (RZ_log) {
+        char line[48];
+        snprintf(line, sizeof(line), "buffer %dx%d", width, height);
+        RZ_logs(line);
+    }
 }
 
 static void pool_destroy(struct wl_client *client, struct wl_resource *res)
@@ -463,7 +598,12 @@ static void shm_create_pool(struct wl_client *client, struct wl_resource *res,
 {
     (void)res;
     mini_pool *p = NULL;
-    if (B_mode || H_mode || TL_log) {
+    if (RZ_log) {
+        char line[48];
+        snprintf(line, sizeof(line), "pool %d", size);
+        RZ_logs(line);
+    }
+    if (B_mode || H_mode || TL_log || RZ_log) {
         p = calloc(1, sizeof(*p));
         p->refs = 1;
         p->size = (size_t)size;
@@ -541,6 +681,12 @@ static void surface_attach(struct wl_client *client, struct wl_resource *res,
         return; /* cursor etc.: not checked */
     }
     M.buffer_attached = (buffer != NULL);
+    if (RZ_log && res == M.surface_res) {
+        mini_buffer *rb = buffer ? wl_resource_get_user_data(buffer) : NULL;
+        RZ_attach_w = rb ? rb->w : 0;
+        RZ_attach_h = rb ? rb->h : 0;
+        RZ_attached = true;
+    }
     if (TL_log && res == M.surface_res && buffer) {
         mini_buffer *tb = wl_resource_get_user_data(buffer);
         if (tb && tb->pool && tb->pool->map && (size_t)tb->offset + 4 <= tb->pool->size) {
@@ -666,6 +812,9 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res)
     if (H_mode && res == M.surface_res) {
         H_commit();
     }
+    if (RZ_log && res == M.surface_res) {
+        RZ_commit();
+    }
     if (TL_alpha_surface && res == TL_alpha_surface) {
         char line[32];
         snprintf(line, sizeof(line), "alpha=%u", TL_alpha_pending);
@@ -772,6 +921,12 @@ static void surface_frame(struct wl_client *client, struct wl_resource *res, uin
 {
     (void)res;
     struct wl_resource *cb = wl_resource_create(client, &wl_callback_interface, 1, callback_id);
+    if (RZ_log && res == M.surface_res && RZ_nframes < (int)(sizeof(RZ_frames) / sizeof(RZ_frames[0]))) {
+        /* done with the next commit (it is "presented" right away) */
+        wl_resource_set_implementation(cb, NULL, NULL, RZ_frame_gone);
+        RZ_frames[RZ_nframes++] = cb;
+        return;
+    }
     wl_callback_send_done(cb, 0);
     wl_resource_destroy(cb);
 }
@@ -888,7 +1043,7 @@ static const struct xdg_surface_interface xdg_surface_impl = {
     .get_toplevel = xdg_surface_get_toplevel,
     .get_popup = NULL,
     .set_window_geometry = (void *)noop,
-    .ack_configure = (void *)noop,
+    .ack_configure = xdg_surface_ack,
 };
 
 static void xdg_surface_res_destroy(struct wl_resource *res)
@@ -2279,7 +2434,14 @@ static int P_signal_cb(int signal_number, void *data)
     while (fgets(line, sizeof(line), f)) {
         double x, y;
         unsigned btn;
-        if (TB_command(line) || GS_command(line)) {
+        if (TB_command(line) || GS_command(line) || RZ_command(line)) {
+            continue;
+        }
+        /* the compositor's close button: no pointer needed */
+        if (strncmp(line, "close", 5) == 0 && (line[5] == '\n' || line[5] == '\r' || line[5] == '\0')) {
+            if (M.xdg_toplevel) {
+                xdg_toplevel_send_close(M.xdg_toplevel);
+            }
             continue;
         }
         /* the compositor's close button: no pointer needed */
@@ -2745,6 +2907,7 @@ int main(void)
         wl_global_create(M.display, &wp_cursor_shape_manager_v1_interface, 1, NULL, C_mgr_bind);
     }
     TL_log = getenv("MINI_TOPLEVEL_LOG");
+    RZ_log = getenv("MINI_RESIZE_LOG");
     if (TL_log) {
         wl_global_create(M.display, &xdg_toplevel_icon_manager_v1_interface, 1, NULL, TL_icon_mgr_bind);
         wl_global_create(M.display, &xdg_wm_dialog_v1_interface, 1, NULL, TL_dialog_mgr_bind);

@@ -82,7 +82,14 @@ static char **copy_mime_types(const char *const *mime_types, size_t num_mime_typ
 {
     size_t alloc_size = sizeof(char *);
     for (size_t i = 0; i < num_mime_types; i++) {
-        alloc_size += sizeof(char *) + SDL_strlen(mime_types[i]) + 1;
+        size_t len = SDL_strlen(mime_types[i]);
+        size_t item;
+        if (!SDL_size_add_check_overflow(len, 1, &len) ||
+            !SDL_size_add_check_overflow(sizeof(char *), len, &item) ||
+            !SDL_size_add_check_overflow(alloc_size, item, &alloc_size)) {
+            SDL_SetError("Clipboard mime types too large");
+            return NULL;
+        }
     }
     char *ret = temporary ? (char *)SDLOP_AllocateTemporaryMemory(alloc_size) : (char *)SDL_malloc(alloc_size);
     if (!ret) {
@@ -148,7 +155,13 @@ void *SDLOP_GetInternalClipboardData(const char *mime_type, size_t *size)
         }
         const void *provided = clipboard_callback(clipboard_userdata, mime_type, size);
         if (provided) {
-            data = SDL_malloc(*size + sizeof(Uint32));
+            size_t alloc_size;
+            if (!SDL_size_add_check_overflow(*size, sizeof(Uint32), &alloc_size)) {
+                SDL_SetError("Clipboard data too large");
+                *size = 0;
+                return NULL;
+            }
+            data = SDL_malloc(alloc_size);
             if (data) {
                 SDL_memcpy(data, provided, *size);
                 SDL_memset((Uint8 *)data + *size, 0, sizeof(Uint32));

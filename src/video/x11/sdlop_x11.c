@@ -138,6 +138,7 @@ typedef struct X11WindowData
     /* software framebuffer: XRGB8888, zero copy for SDL_GetWindowSurface */
     uint32_t *pixels;
     int fb_w, fb_h;
+    size_t fb_cap; /* bytes behind pixels (headroom for resizes) */
     bool fb_shm;
     xcb_shm_seg_t shm_seg;
 
@@ -701,6 +702,7 @@ static void fb_free(X11WindowData *wd)
     wd->pixels = NULL;
     wd->fb_shm = false;
     wd->fb_w = wd->fb_h = 0;
+    wd->fb_cap = 0;
 }
 
 static void fb_fill_clear(SDL_Window *window)
@@ -717,14 +719,33 @@ static void fb_fill_clear(SDL_Window *window)
     }
 }
 
+/* the software framebuffer at w x h, cleared. Memory is kept when the new
+ * size fits (new memory, with 25% headroom, only for growth beyond it or
+ * after shrinking to less than a quarter), so resizing costs no SHM
+ * attach/detach round trips most of the time. An existing window surface
+ * is pointed at the result in place. */
 static bool fb_alloc(SDL_Window *window, int w, int h)
 {
     X11WindowData *wd = wdata(window);
     if (wd->pixels && wd->fb_w == w && wd->fb_h == h) {
         return true;
     }
+    size_t need, size;
+    if (!SDL_size_mul_check_overflow((size_t)w, (size_t)h, &need) ||
+        !SDL_size_mul_check_overflow(need, 4, &need) ||
+        !SDL_size_add_check_overflow(need, need / 4, &size)) {
+        return SDL_SetError("SDLop x11: framebuffer size overflow");
+    }
+    if (wd->pixels && wd->fb_cap >= need && wd->fb_cap / 4 <= need) {
+        wd->fb_w = w;
+        wd->fb_h = h;
+        fb_fill_clear(window);
+        if (window->surface) {
+            SDLOP_SetSurfacePixels(window->surface, wd->pixels, w, h, w * 4);
+        }
+        return true;
+    }
     fb_free(wd);
-    size_t size = (size_t)w * (size_t)h * 4;
 
     if (x11.has_shm) {
         int shmid = shmget(IPC_PRIVATE, size, IPC_CREAT | 0600);
@@ -760,15 +781,12 @@ static bool fb_alloc(SDL_Window *window, int w, int h)
     }
     wd->fb_w = w;
     wd->fb_h = h;
+    wd->fb_cap = size;
     fb_fill_clear(window);
 
-    /* SDL3 semantics: an existing window surface survives resizes */
+    /* SDLop: an existing window surface stays valid across resizes */
     if (window->surface) {
-        window->surface->w = w;
-        window->surface->h = h;
-        window->surface->pitch = w * 4;
-        window->surface->pixels = wd->pixels;
-        SDL_SetSurfaceClipRect(window->surface, NULL); /* the old clip may exceed the new size */
+        SDLOP_SetSurfacePixels(window->surface, wd->pixels, w, h, w * 4);
     }
     return true;
 }
@@ -870,6 +888,18 @@ static bool x11_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *w
     }
     *surface = s;
     return true;
+}
+
+static bool x11_ResizeWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *surface)
+{
+    (void)device;
+    (void)surface; /* == window->surface, updated by fb_alloc */
+    X11WindowData *wd = wdata(window);
+    if (!wd || !wd->pixels || window->w <= 0 || window->h <= 0 ||
+        (wd->fb_w == window->w && wd->fb_h == window->h)) {
+        return true;
+    }
+    return fb_alloc(window, window->w, window->h);
 }
 
 static bool x11_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, const SDL_Rect *rects, int numrects)
@@ -1606,7 +1636,7 @@ static void cancel_touches(SDL_Window *window)
     }
 }
 
-static void handle_xi_event(xcb_ge_generic_event_t *ge)
+static void handle_xi_event(xcb_ge_generic_event_t *ge, size_t size)
 {
     if (ge->event_type == XCB_INPUT_TOUCH_BEGIN || ge->event_type == XCB_INPUT_TOUCH_UPDATE ||
         ge->event_type == XCB_INPUT_TOUCH_END) {
@@ -1628,15 +1658,27 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
         return;
     }
     xcb_input_raw_button_press_event_t *raw = (xcb_input_raw_button_press_event_t *)ge;
+    if (size < sizeof(*raw)) {
+        return; /* truncated event: no valuator fields to read */
+    }
     if (SDLOP_X11_Pen_IsPenDevice(raw->sourceid)) {
         return; /* pens are absolute: no relative motion (stock) */
     }
     const uint32_t *mask = X11_xcb_input_raw_button_press_valuator_mask(raw);
+    const size_t mask_off = (size_t)((const uint8_t *)mask - (const uint8_t *)raw);
+    const size_t masks = (size_t)raw->valuators_len * sizeof(*mask);
+    if (mask_off > size || masks > size - mask_off) {
+        return; /* valuator mask does not fit in the event */
+    }
     const xcb_input_fp3232_t *values = X11_xcb_input_raw_button_press_axisvalues_raw(raw);
+    const size_t values_off = (size_t)((const uint8_t *)values - (const uint8_t *)raw);
     double dx = 0.0, dy = 0.0;
     int vi = 0;
     for (int axis = 0; axis < raw->valuators_len * 32 && axis < 16; axis++) {
         if (mask[axis / 32] & (1u << (axis % 32))) {
+            if (values_off > size || (size - values_off) / sizeof(*values) <= (size_t)vi) {
+                break; /* truncated axis values */
+            }
             if (axis == 0) {
                 dx = fp3232(values[vi]);
             } else if (axis == 1) {
@@ -4044,9 +4086,9 @@ static void handle_configure(SDL_Window *window, xcb_configure_notify_event_t *c
     if (size_changed && ce->width > 0 && ce->height > 0) {
         window->w = ce->width;
         window->h = ce->height;
-        if (window->surface) {
-            fb_alloc(window, window->w, window->h);
-        }
+        /* no reallocation here: the window surface follows the size at the
+         * next SDL_GetWindowSurface / SDL_UpdateWindowSurface
+         * (x11_ResizeWindowFramebuffer), once per burst of ConfigureNotify */
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_RESIZED, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, window->w, window->h);
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_SAFE_AREA_CHANGED, 0, 0);
@@ -4317,7 +4359,8 @@ static void x11_dispatch(xcb_generic_event_t *ev)
     case XCB_GE_GENERIC: {
         xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t *)ev;
         if (x11.has_xi2 && ge->extension == x11.xi_opcode) {
-            handle_xi_event(ge);
+            const size_t size = 36 + (size_t)ge->length * 4; /* + xcb's full_sequence */
+            handle_xi_event(ge, size);
         }
         break;
     }
@@ -4511,5 +4554,6 @@ SDLop_VideoDevice SDLop_x11_device = {
     .StartTextInput = x11_StartTextInput,
     .StopTextInput = x11_StopTextInput,
     .UpdateTextInputArea = x11_UpdateTextInputArea,
+    .ResizeWindowFramebuffer = x11_ResizeWindowFramebuffer,
     .ClearComposition = x11_ClearComposition,
 };

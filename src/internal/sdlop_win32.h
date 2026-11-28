@@ -57,6 +57,24 @@
 #undef LoadImage
 #endif
 
+/* Windows 10 APIs that SDLop uses opportunistically. Windows 7 has neither,
+ * so the call sites must keep working when the SDK does not declare them:
+ * CreateWaitableTimerExW simply fails on Win7 (the sleep code already falls
+ * back to CreateWaitableTimerW), and SetThreadDescription is resolved at run
+ * time by sdlop_win32_compat.c. */
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000004
+#endif
+HRESULT SDLOP_SetThreadDescription(HANDLE thread, const wchar_t *name);
+/* Per-monitor DPI APIs (Windows 10 1607+) are likewise optional: the window
+ * code falls back to the classic system-DPI AdjustWindowRectEx on Win7. */
+UINT SDLOP_GetDpiForWindow(HWND hwnd);
+UINT SDLOP_GetDpiForSystem(void);
+BOOL SDLOP_AdjustWindowRectExForDpi(LPRECT rect, DWORD style, BOOL menu, DWORD exstyle, UINT dpi);
+/* shcore.dll (Win8.1+): per-monitor DPI for display enumeration. Returns
+ * FALSE on older systems; callers fall back to the system DPI. */
+BOOL SDLOP_GetDpiForMonitor(HMONITOR monitor, UINT dpiType, UINT *dpiX, UINT *dpiY);
+
 #ifdef __cplusplus
 extern "C" {
 #endif

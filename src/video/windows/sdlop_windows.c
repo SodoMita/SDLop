@@ -23,6 +23,7 @@
 
 #include <windowsx.h>
 #include <imm.h>
+#include <shellapi.h>
 
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
@@ -65,6 +66,24 @@ bool SDLOP_Win32GetClientRectInPixels(SDL_Window *window, RECT *rc)
     return true;
 }
 
+/* With per-monitor DPI awareness GetClientRect() is already in physical
+ * pixels, so use it instead of scaling the logical size by a display's
+ * density (which is wrong on a mixed-DPI monitor). */
+static void win32_GetWindowSizeInPixels(SDLop_VideoDevice *device, SDL_Window *window, int *w, int *h)
+{
+    (void)device;
+    RECT rc;
+    if (SDLOP_Win32GetClientRectInPixels(window, &rc) && rc.right > 0 && rc.bottom > 0) {
+        *w = (int)rc.right;
+        *h = (int)rc.bottom;
+    } else if (window) {
+        *w = window->w;
+        *h = window->h;
+    } else {
+        *w = *h = 0;
+    }
+}
+
 /* The DPI whose border metrics apply to this window. SDL3 asks Win32 for the
  * window's own DPI (AdjustWindowRectExForDpi) because the frame grows with the
  * monitor's scale; the non-DPI AdjustWindowRectEx uses the system DPI and is
@@ -74,10 +93,10 @@ static UINT win32_frame_dpi(SDL_Window *window)
     SDLop_Win32WindowData *data = window ? (SDLop_Win32WindowData *)window->driverdata : NULL;
     UINT dpi = 0;
     if (data && data->hwnd) {
-        dpi = GetDpiForWindow(data->hwnd);
+        dpi = SDLOP_GetDpiForWindow(data->hwnd);
     }
     if (!dpi) {
-        dpi = GetDpiForSystem();
+        dpi = SDLOP_GetDpiForSystem();
     }
     return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
 }
@@ -94,7 +113,7 @@ static void win32_adjust_window_rect_for_style(SDL_Window *window, DWORD style, 
         (window->flags & (SDL_WINDOW_POPUP_MENU | SDL_WINDOW_TOOLTIP))) {
         return;
     }
-    if (!AdjustWindowRectExForDpi(rc, style, FALSE, exstyle, win32_frame_dpi(window))) {
+    if (!SDLOP_AdjustWindowRectExForDpi(rc, style, FALSE, exstyle, win32_frame_dpi(window))) {
         AdjustWindowRectEx(rc, style, FALSE, exstyle);
     }
 }
@@ -330,6 +349,15 @@ static void set_focus(SDL_Window *window, bool focused)
         sdlop.keyboard_focus = NULL;
         window->flags &= ~SDL_WINDOW_INPUT_FOCUS;
         SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_FOCUS_LOST, 0, 0);
+        /* Keys/buttons released while another window has focus never reach
+         * us; without this resync they stay stuck down forever. SDL3's
+         * WIN_UpdateFocus does the same reset. */
+        SDL_ResetKeyboard();
+        for (Uint8 btn = 1; btn <= SDL_BUTTON_X2; btn++) {
+            if (sdlop.mouse_buttons & SDL_BUTTON_MASK(btn)) {
+                SDLOP_SendMouseButton(false, btn, SDLOP_NO_POS, SDLOP_NO_POS, 0);
+            }
+        }
         /* Never leave the pointer trapped in an inactive window (SDL3 does
          * the same in WIN_UpdateFocus). */
         if (data) {
@@ -1063,6 +1091,48 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         return 0;
 
+    case WM_PAINT:
+        if (window) {
+            PAINTSTRUCT paint;
+            BeginPaint(hwnd, &paint);
+            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+        break;
+
+    case WM_DROPFILES:
+        if (window) {
+            HDROP drop = (HDROP)wparam;
+            UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, NULL, 0);
+            for (UINT i = 0; i < count; i++) {
+                UINT len = DragQueryFileW(drop, i, NULL, 0);
+                if (len && len < 0x10000) {
+                    wchar_t *wide = (wchar_t *)SDL_malloc(((size_t)len + 1) * sizeof(wchar_t));
+                    if (wide) {
+                        if (DragQueryFileW(drop, i, wide, len + 1) == len) {
+                            const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                            if (bytes > 0) {
+                                char *file = (char *)SDL_malloc((size_t)bytes);
+                                if (file && WideCharToMultiByte(CP_UTF8, 0, wide, -1, file, bytes, NULL, NULL) == bytes) {
+                                    SDLOP_SendDropFile(window, NULL, file);
+                                }
+                                SDL_free(file);
+                            }
+                        }
+                        SDL_free(wide);
+                    }
+                }
+            }
+            SDLOP_SendDropComplete(window);
+            DragFinish(drop);
+            return 0;
+        }
+        /* The HDROP belongs to the shell even when we have no window for it:
+         * release it before DefWindowProcW sees the message. */
+        DragFinish((HDROP)wparam);
+        break;
+
     case WM_SIZE:
         if (window) {
             handle_size(window, wparam);
@@ -1191,6 +1261,35 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         return 0;
 
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_COMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+    case WM_IME_NOTIFY:
+        /* Handled or not, these must not reach DefWindowProcW: it consumes the
+         * composition itself, which showed up as every composition event
+         * arriving twice (4 editing events for 2 messages). An IME message we
+         * do not act on is simply one we ignore. */
+        SDLOP_Win32IMEHandleMessage(window, m.message, m.wParam, m.lParam);
+        return 0;
+
+    case WM_INPUTLANGCHANGE:
+        /* The user switched keyboard layout (Alt+Shift, the language bar, a
+         * remote session). Every keycode SDL reports from here on depends on
+         * it, so the character table has to be rebuilt; stock SDL3 does the
+         * same in its WM_INPUTLANGCHANGE handler (WIN_UpdateKeymap(true)).
+         * SDL_EVENT_KEYMAP_CHANGED tells the application, which is what SDL3
+         * sends for this so that cached SDL_GetKeyName results can be
+         * refreshed. */
+        SDLOP_Win32UpdateKeyboardLayout();
+        if (window) {
+            SDL_Event event;
+            SDL_zero(event);
+            event.type = SDL_EVENT_KEYMAP_CHANGED;
+            event.common.timestamp = SDLOP_Win32Timestamp();
+            SDL_PushEvent(&event);
+        }
+        return 1;
+
     case WM_INPUT:
     {
         /* One WM_INPUT carries one packet; its header says which kind. The
@@ -1259,14 +1358,29 @@ static bool win32_register_class(void)
  * logical size is the one GetSystemMetrics() reports with DPI awareness on. */
 static UINT win32_system_dpi(void)
 {
-    const UINT dpi = GetDpiForSystem();
+    const UINT dpi = SDLOP_GetDpiForSystem();
     return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
 }
 
-/* Pixel density for a monitor: physical pixels per logical unit. */
-static float win32_monitor_pixel_density(void)
+/* Pixel density for one monitor: physical pixels per logical unit. Per-monitor
+ * DPI is what SDL3 exposes, with the system DPI as the Win7 fallback. */
+#ifndef MDT_EFFECTIVE_DPI
+#define MDT_EFFECTIVE_DPI 0
+#endif
+static float win32_monitor_pixel_density(const DEVMODEW *dm)
 {
-    return (float)win32_system_dpi() / (float)USER_DEFAULT_SCREEN_DPI;
+    UINT dpi = 0, dpi_x = 0, dpi_y = 0;
+    const POINT pt = {
+        dm->dmPosition.x + (LONG)dm->dmPelsWidth / 2,
+        dm->dmPosition.y + (LONG)dm->dmPelsHeight / 2
+    };
+    const HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (SDLOP_GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y) && dpi_x) {
+        dpi = dpi_x;
+    } else {
+        dpi = win32_system_dpi();
+    }
+    return (float)dpi / (float)USER_DEFAULT_SCREEN_DPI;
 }
 
 static void win32_add_displays(SDLop_VideoDevice *device)
@@ -1315,7 +1429,7 @@ static void win32_add_displays(SDLop_VideoDevice *device)
             SDL_snprintf(name, sizeof(name), "\\\\.\\DISPLAY%d", idx + 1);
             /* AddDisplay takes the logical (DPI-independent) size; the
              * driver's GetWindowSizeInPixels applies the density. */
-            const float density = win32_monitor_pixel_density();
+            const float density = win32_monitor_pixel_density(&dm);
             const int logical_w = (int)SDL_lroundf((float)dm.dmPelsWidth / density);
             const int logical_h = (int)SDL_lroundf((float)dm.dmPelsHeight / density);
             SDL_DisplayID id = SDLOP_AddDisplay(name,
@@ -1325,6 +1439,28 @@ static void win32_add_displays(SDLop_VideoDevice *device)
                                                 NULL, sdlop.init_done);
             SDLOP_SetDisplayPixelDensity(id, density);
             mon->displayID = id;
+            /* Expose every mode the monitor reports, not just the desktop
+             * one: SDL_GetFullscreenDisplayModes() and exclusive fullscreen
+             * need the real list. SDLOP_AddFullscreenDisplayMode dedupes the
+             * desktop mode that SDLOP_AddDisplay already registered. */
+            for (DWORD m = 0; ; m++) {
+                DEVMODEW mode;
+                SDL_zero(mode);
+                mode.dmSize = sizeof(mode);
+                if (!EnumDisplaySettingsW(dd.DeviceName, m, &mode)) {
+                    break;
+                }
+                if (!mode.dmPelsWidth || !mode.dmPelsHeight) {
+                    continue;
+                }
+                SDL_DisplayMode sm;
+                SDL_zero(sm);
+                sm.w = (int)mode.dmPelsWidth;
+                sm.h = (int)mode.dmPelsHeight;
+                sm.pixel_density = density;
+                sm.refresh_rate = mode.dmDisplayFrequency > 1 ? (float)mode.dmDisplayFrequency : 0.0f;
+                SDLOP_AddFullscreenDisplayMode(id, &sm);
+            }
             idx++;
         }
     }
@@ -1389,6 +1525,8 @@ static bool win32_Init(SDLop_VideoDevice *device)
         return false;
     }
     win32_add_displays(device);
+    /* the character each key produces depends on the layout installed now */
+    SDLOP_Win32UpdateKeyboardLayout();
     sdlop_win32.window_count = 0;
     /* Baseline for external clipboard change detection: anything that changes
      * this number afterwards belongs to another application. */
@@ -1458,8 +1596,16 @@ static DWORD window_exstyle_for(SDL_Window *window)
     } else if (window->flags & SDL_WINDOW_UTILITY) {
         exstyle |= WS_EX_TOOLWINDOW;
     }
+    /* Layered windows are required for UpdateLayeredWindow(), which is how
+     * SDL_WINDOW_TRANSPARENT gets real per-pixel alpha in the surface path. */
+    if (window->flags & SDL_WINDOW_TRANSPARENT) {
+        exstyle |= WS_EX_LAYERED;
+    }
     return exstyle;
 }
+
+static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *window);
+static void win32_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window);
 
 /* The title is UTF-8; Win32 wants UTF-16. */
 static wchar_t *utf8_to_wide_alloc(const char *text)
@@ -1494,6 +1640,7 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_OutOfMemory();
     }
     SDLOP_MUTEX_INIT_ONCE(&data->surfacelock);
+    data->transparent = (window->flags & SDL_WINDOW_TRANSPARENT) != 0;
     window->driverdata = data;
 
     /* Size with the style this window is actually created with -- the frame
@@ -1558,8 +1705,15 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
      * scale stays at the 1.0 the core sets until the user drags the window to
      * a different monitor (WM_DPICHANGED), and every size in points on a
      * scaled display is reported unscaled. */
-    win32_update_display_scale(window, GetDpiForWindow(hwnd));
+    win32_update_display_scale(window, SDLOP_GetDpiForWindow(hwnd));
     update_metrics(window);
+    /* A window created with SDL_WINDOW_FULLSCREEN never goes through
+     * SDL_SetWindowFullscreen() (the flag is already set), so apply the
+     * borderless/monitor geometry here. */
+    if ((window->flags & SDL_WINDOW_FULLSCREEN) && !win32_SetWindowFullscreen(device, window)) {
+        win32_DestroyWindow(device, window);
+        return false;
+    }
     return true;
 }
 
@@ -1572,13 +1726,13 @@ static void destroy_dib(SDLop_Win32WindowData *data)
         SDL_DestroySurface(data->surface);
         data->surface = NULL;
     }
+    if (data->dc) {
+        DeleteDC(data->dc); /* first: a bitmap selected into a DC can't be deleted */
+        data->dc = NULL;
+    }
     if (data->bitmap) {
         DeleteObject(data->bitmap);
         data->bitmap = NULL;
-    }
-    if (data->dc) {
-        DeleteDC(data->dc);
-        data->dc = NULL;
     }
     data->surface_dirty = false;
 }
@@ -1763,6 +1917,56 @@ static void win32_RestoreWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
 }
 
+static SDLop_Win32Monitor *win32_monitor_for_display(SDL_DisplayID id)
+{
+    for (int i = 0; i < sdlop_win32.monitor_count; i++) {
+        if (sdlop_win32.monitors[i].displayID == id) {
+            return &sdlop_win32.monitors[i];
+        }
+    }
+    return NULL;
+}
+
+/* Real exclusive fullscreen: switch the requested monitor to the mode SDL
+ * chose. Without this hook SDLop only covers the monitor with a borderless
+ * window, which is not an exclusive mode and ignores SDL_SetWindowFullscreenMode. */
+static bool win32_SetDisplayMode(SDLop_VideoDevice *device, SDLop_Display *display, const SDL_DisplayMode *mode)
+{
+    (void)device;
+    if (!display || !mode || mode->w <= 0 || mode->h <= 0) {
+        return SDL_SetError("Invalid display mode");
+    }
+    SDLop_Win32Monitor *mon = win32_monitor_for_display(display->id);
+    if (!mon) {
+        return SDL_SetError("Unknown display");
+    }
+    DEVMODEW dm;
+    SDL_zero(dm);
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(mon->device, ENUM_CURRENT_SETTINGS, &dm)) {
+        return SDL_SetError("EnumDisplaySettingsW() failed: %lu", (unsigned long)GetLastError());
+    }
+    dm.dmPelsWidth = (DWORD)mode->w;
+    dm.dmPelsHeight = (DWORD)mode->h;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    if (mode->refresh_rate > 0.0f) {
+        dm.dmDisplayFrequency = (DWORD)SDL_lroundf(mode->refresh_rate);
+        dm.dmFields |= DM_DISPLAYFREQUENCY;
+    }
+    const LONG result = ChangeDisplaySettingsExW(mon->device, &dm, NULL, CDS_FULLSCREEN, NULL);
+    if (result != DISP_CHANGE_SUCCESSFUL) {
+        return SDL_SetError("ChangeDisplaySettingsExW() failed: %ld", (long)result);
+    }
+    /* Keep our geometry in step so the fullscreen window is sized to the
+     * mode we just switched to. */
+    mon->rect.right = mon->rect.left + (LONG)mode->w;
+    mon->rect.bottom = mon->rect.top + (LONG)mode->h;
+    if (mode->refresh_rate > 0.0f) {
+        mon->refresh_hz = (int)SDL_lroundf(mode->refresh_rate);
+    }
+    return true;
+}
+
 static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -1784,22 +1988,38 @@ static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *win
             data->windowed_exstyle = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_EXSTYLE);
             data->is_fullscreen = true;
         }
+        /* An explicit fullscreen mode names the display it belongs to; the
+         * core already honours it for the mode switch, so the window must
+         * land on that monitor too. */
+        HMONITOR monitor = NULL;
+        if (window->has_fullscreen_mode && window->fullscreen_mode.displayID) {
+            SDLop_Win32Monitor *mon = win32_monitor_for_display(window->fullscreen_mode.displayID);
+            if (mon) {
+                const POINT pt = { (mon->rect.left + mon->rect.right) / 2,
+                                   (mon->rect.top + mon->rect.bottom) / 2 };
+                monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            }
+        }
+        if (!monitor) {
+            monitor = MonitorFromWindow(data->hwnd, MONITOR_DEFAULTTONEAREST);
+        }
         MONITORINFO mi;
         SDL_zero(mi);
         mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(MonitorFromWindow(data->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+        if (GetMonitorInfoW(monitor, &mi)) {
             /* Only a window that asked to stay on top goes topmost. Forcing
              * HWND_TOPMOST here made every fullscreen window topmost, and the
              * Z-order boost is what SDL3 goes out of its way to avoid. */
             const HWND top = (window->flags & SDL_WINDOW_ALWAYS_ON_TOP) ? HWND_TOPMOST : HWND_NOTOPMOST;
-            SetWindowLongPtrW(data->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowLongPtrW(data->hwnd, GWL_STYLE,
+                              WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_VISIBLE);
             SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, data->windowed_exstyle & ~WS_EX_TOPMOST);
             SetWindowPos(data->hwnd, top, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right - mi.rcMonitor.left,
                          mi.rcMonitor.bottom - mi.rcMonitor.top,
                          SWP_NOCOPYBITS | SWP_SHOWWINDOW);
+            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_ENTER_FULLSCREEN, 0, 0);
         }
-        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_ENTER_FULLSCREEN, 0, 0);
     } else {
         data->is_fullscreen = false;
         SetWindowLongPtrW(data->hwnd, GWL_STYLE, (LONG_PTR)data->windowed_style);
@@ -2048,6 +2268,40 @@ static int win32_GetEventFD(SDLop_VideoDevice *device)
 /* Software framebuffer                                                */
 /* ------------------------------------------------------------------ */
 
+/* a w x h top-down XRGB DIB section selected into a memory DC; on failure
+ * data is unchanged */
+static bool create_dib(SDLop_Win32WindowData *data, int w, int h)
+{
+    BITMAPINFO bmi;
+    SDL_zero(bmi);
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; /* top-down, like SDL surfaces */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void *pixels = NULL;
+    HDC screen = GetDC(data->hwnd);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &pixels, NULL, 0);
+    ReleaseDC(data->hwnd, screen);
+    if (!dc || !bitmap || !pixels) {
+        if (bitmap) {
+            DeleteObject(bitmap);
+        }
+        if (dc) {
+            DeleteDC(dc);
+        }
+        return SDL_SetError("Couldn't create DIB section");
+    }
+    SelectObject(dc, bitmap);
+    data->dc = dc;
+    data->bitmap = bitmap;
+    data->pixels = pixels;
+    return true;
+}
+
 static bool win32_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface **surface)
 {
     (void)device;
@@ -2057,26 +2311,10 @@ static bool win32_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
     }
     SDLOP_MUTEX_LOCK(&data->surfacelock);
     destroy_dib(data);
-
-    BITMAPINFO bmi;
-    SDL_zero(bmi);
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = window->w;
-    bmi.bmiHeader.biHeight = -window->h; /* top-down, like SDL surfaces */
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    HDC screen = GetDC(data->hwnd);
-    data->dc = CreateCompatibleDC(screen);
-    data->bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &data->pixels, NULL, 0);
-    ReleaseDC(data->hwnd, screen);
-    if (!data->dc || !data->bitmap || !data->pixels) {
-        destroy_dib(data);
+    if (!create_dib(data, window->w, window->h)) {
         SDLOP_MUTEX_UNLOCK(&data->surfacelock);
-        return SDL_SetError("Couldn't create DIB section");
+        return false;
     }
-    SelectObject(data->dc, data->bitmap);
 
     SDL_Surface *s = SDL_CreateSurfaceFrom(window->w, window->h, SDL_PIXELFORMAT_XRGB8888,
                                            data->pixels, window->w * 4);
@@ -2100,17 +2338,9 @@ static bool win32_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
         return true;
     }
     SDLOP_MUTEX_LOCK(&data->surfacelock);
-    if (data->surface->w != window->w || data->surface->h != window->h) {
-        /* resized under us: the DIB must be rebuilt at the new size */
-        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
-        SDL_Surface *fresh = NULL;
-        if (!win32_CreateWindowFramebuffer(device, window, &fresh)) {
-            return false;
-        }
-        window->surface = fresh;
-        data = (SDLop_Win32WindowData *)window->driverdata;
-        SDLOP_MUTEX_LOCK(&data->surfacelock);
-    }
+    /* drawn before a resize reached the surface: shown at the size it was
+     * drawn at; the core resizes the surface right after
+     * (win32_ResizeWindowFramebuffer) */
     HDC hdc = GetDC(data->hwnd);
     if (hdc) {
         if (numrects > 0 && rects) {
@@ -2119,11 +2349,49 @@ static bool win32_UpdateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window 
                 BitBlt(hdc, rc.left, rc.top, rects[i].w, rects[i].h, data->dc, rc.left, rc.top, SRCCOPY);
             }
         } else {
-            BitBlt(hdc, 0, 0, window->w, window->h, data->dc, 0, 0, SRCCOPY);
+            BitBlt(hdc, 0, 0, data->surface->w, data->surface->h, data->dc, 0, 0, SRCCOPY);
         }
         ReleaseDC(data->hwnd, hdc);
     }
     data->surface_dirty = false;
+    SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+    return true;
+}
+
+/* the window surface follows the client size, in place: a new DIB behind
+ * the same SDL_Surface (SDLop keeps the pointer valid across resizes) */
+static bool win32_ResizeWindowFramebuffer(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *surface)
+{
+    (void)device;
+    SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+    if (!data || !data->hwnd || data->surface != surface || window->w <= 0 || window->h <= 0) {
+        return true;
+    }
+    SDLOP_MUTEX_LOCK(&data->surfacelock);
+    if (surface->w == window->w && surface->h == window->h) {
+        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+        return true;
+    }
+    HDC old_dc = data->dc;
+    HBITMAP old_bitmap = data->bitmap;
+    if (!create_dib(data, window->w, window->h)) {
+        SDLOP_MUTEX_UNLOCK(&data->surfacelock);
+        return false;
+    }
+    if (old_dc) {
+        DeleteDC(old_dc); /* first: a bitmap selected into a DC can't be deleted */
+    }
+    if (old_bitmap) {
+        DeleteObject(old_bitmap);
+    }
+    /* new contents start at the clear colour, as on X11 / Wayland */
+    const Uint32 clear = ((Uint32)window->clear_r << 16) | ((Uint32)window->clear_g << 8) | window->clear_b;
+    Uint32 *px = (Uint32 *)data->pixels;
+    for (size_t i = 0, n = (size_t)window->w * (size_t)window->h; i < n; i++) {
+        px[i] = clear;
+    }
+    SDLOP_SetSurfacePixels(surface, data->pixels, window->w, window->h, window->w * 4);
+    data->surface_dirty = true;
     SDLOP_MUTEX_UNLOCK(&data->surfacelock);
     return true;
 }
@@ -2887,34 +3155,28 @@ static bool win32_FlashWindow(SDLop_VideoDevice *device, SDL_Window *window, SDL
         break;
     case SDL_FLASH_BRIEFLY:
         fi.dwFlags = FLASHW_TRAY;
-        fi.uCount = 2;
+        fi.uCount = 1;
         break;
     case SDL_FLASH_UNTIL_FOCUSED:
-        fi.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG;
+        fi.dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG;
         break;
     default:
         return SDL_Unsupported();
     }
-    if (!FlashWindowEx(&fi)) {
-        return SDL_SetError("FlashWindowEx() failed");
-    }
+    /* FlashWindowEx() returns the window's *previous* active state, not a
+     * success flag. Treating FALSE as failure reported an error for every
+     * flash of a window that did not have focus -- which is the whole point of
+     * flashing -- and left SDL_GetError() describing a flash that worked. */
+    FlashWindowEx(&fi);
     return true;
 }
 
-static bool win32_SyncWindow(SDLop_VideoDevice *device, SDL_Window *window)
+static void win32_AcceptDragAndDrop(SDL_Window *window, bool accept)
 {
-    (void)device;
     SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
-    if (!data || !data->hwnd) {
-        return true;
+    if (data && data->hwnd) {
+        DragAcceptFiles(data->hwnd, accept ? TRUE : FALSE);
     }
-    /* True once the window has no pending messages; SDL3 returns true when
-     * there is nothing left to do. */
-    MSG msg;
-    if (PeekMessageW(&msg, data->hwnd, 0, 0, PM_NOREMOVE)) {
-        return false;
-    }
-    return true;
 }
 
 static bool win32_SetWindowFocusable(SDLop_VideoDevice *device, SDL_Window *window, bool focusable)
@@ -2952,9 +3214,30 @@ static bool win32_SetWindowParent(SDLop_VideoDevice *device, SDL_Window *window,
 static bool win32_SetWindowModal(SDLop_VideoDevice *device, SDL_Window *window, bool modal)
 {
     (void)device;
-    (void)window;
-    (void)modal;
-    return true; /* parenting covers SDL3's use; modality is the app's job */
+    /* Modality in Win32 is the parent being *disabled*: with the owner window
+     * blocked, clicks and input go nowhere, which is what "modal" means to the
+     * user. Returning true without touching it -- as this did -- made
+     * SDL_SetWindowModal a no-op that reported success, while stock SDL3
+     * (WIN_SetWindowModal) disables the parent. Re-enable on the way out,
+     * unless the window is hidden: SDL hides a modal window before clearing
+     * the flag, and re-enabling there would leave the parent live with no
+     * dialog on screen. */
+    if (!window->parent || !window->parent->driverdata || !window->driverdata) {
+        return true;
+    }
+    {
+        SDLop_Win32WindowData *data = (SDLop_Win32WindowData *)window->driverdata;
+        SDLop_Win32WindowData *pdata = (SDLop_Win32WindowData *)window->parent->driverdata;
+        if (!data->hwnd || !pdata->hwnd) {
+            return true;
+        }
+        if (modal) {
+            EnableWindow(pdata->hwnd, FALSE);
+        } else if (!(window->flags & SDL_WINDOW_HIDDEN)) {
+            EnableWindow(pdata->hwnd, TRUE);
+        }
+    }
+    return true;
 }
 
 static bool win32_SetWindowIcon(SDLop_VideoDevice *device, SDL_Window *window, SDL_Surface *icon)
@@ -3348,28 +3631,71 @@ static bool win32_SetClipboardData(SDLop_VideoDevice *device)
     return result;
 }
 
+/* CF_UNICODETEXT is an HGLOBAL owned by another process. -1 makes
+ * WideCharToMultiByte scan for a NUL, so first bound that scan with
+ * GlobalSize() (dropping an odd trailing byte that is not a wchar_t). */
+static char *win32_clipboard_text_from_unicode(HANDLE handle)
+{
+    const size_t chars = (size_t)GlobalSize(handle) / sizeof(wchar_t);
+    const wchar_t *wide = (const wchar_t *)GlobalLock(handle);
+    char *utf8 = NULL;
+    size_t len;
+
+    if (!wide) {
+        return NULL;
+    }
+    for (len = 0; len < chars && wide[len]; ++len) {
+        /* require a terminator inside the block before using cb = -1 */
+    }
+    if (len < chars) {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+        if (bytes > 0) {
+            utf8 = (char *)SDL_malloc((size_t)bytes);
+            if (utf8) {
+                WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+            }
+        }
+    }
+    GlobalUnlock(handle);
+    return utf8;
+}
+
 /* CF_TEXT is the ANSI flavour. Wine and Windows both still expose it, and an
  * app that only understands CF_TEXT has nothing otherwise. */
 static char *win32_clipboard_text_from_ansi(HANDLE handle)
 {
+    const size_t available = (size_t)GlobalSize(handle);
     const char *ansi = (const char *)GlobalLock(handle);
     char *utf8 = NULL;
 
     if (ansi) {
-        const int needed = MultiByteToWideChar(CP_ACP, 0, ansi, -1, NULL, 0);
-        if (needed > 0) {
-            wchar_t *wide = (wchar_t *)SDL_malloc(((size_t)needed) * sizeof(wchar_t));
-            if (wide &&
-                MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide, needed) > 0) {
-                const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
-                if (bytes > 0) {
-                    utf8 = (char *)SDL_malloc((size_t)bytes);
-                    if (utf8) {
-                        WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+        /* MultiByteToWideChar takes an int count, so refuse a block that
+         * cannot be described by one. */
+        if (available <= 0x7FFFFFFFu) {
+            size_t len = 0;
+
+            /* Bound the conversion by GlobalSize(): cb = -1 on a foreign
+             * HGLOBAL can walk past its end if the other app omitted NUL. */
+            while (len < available && ansi[len]) {
+                len++;
+            }
+            if (len < available) {
+                const int needed = MultiByteToWideChar(CP_ACP, 0, ansi, (int)len, NULL, 0);
+                if (needed > 0) {
+                    wchar_t *wide = (wchar_t *)SDL_malloc(((size_t)needed + 1) * sizeof(wchar_t));
+                    if (wide && MultiByteToWideChar(CP_ACP, 0, ansi, (int)len, wide, needed) == needed) {
+                        wide[needed] = 0; /* -1 now stops inside our own buffer */
+                        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                        if (bytes > 0) {
+                            utf8 = (char *)SDL_malloc((size_t)bytes);
+                            if (utf8) {
+                                WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+                            }
+                        }
                     }
+                    SDL_free(wide);
                 }
             }
-            SDL_free(wide);
         }
         GlobalUnlock(handle);
     }
@@ -3387,18 +3713,10 @@ static void *win32_GetClipboardData(SDLop_VideoDevice *device, const char *mime_
             if (win32_open_clipboard()) {
                 HANDLE handle = GetClipboardData(CF_UNICODETEXT);
                 if (handle) {
-                    const wchar_t *wide = (const wchar_t *)GlobalLock(handle);
-                    if (wide) {
-                        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
-                        if (bytes > 0) {
-                            char *utf8 = (char *)SDL_malloc((size_t)bytes);
-                            if (utf8) {
-                                WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
-                                *size = SDL_strlen(utf8);
-                                data = utf8;
-                            }
-                        }
-                        GlobalUnlock(handle);
+                    char *utf8 = win32_clipboard_text_from_unicode(handle);
+                    if (utf8) {
+                        *size = SDL_strlen(utf8);
+                        data = utf8;
                     }
                 }
                 CloseClipboard();
@@ -3476,6 +3794,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .MaximizeWindow = win32_MaximizeWindow,
     .RestoreWindow = win32_RestoreWindow,
     .SetWindowFullscreen = win32_SetWindowFullscreen,
+    .SetDisplayMode = win32_SetDisplayMode,
     .RaiseWindow = win32_RaiseWindow,
     .SetWindowClearColor = win32_SetWindowClearColor,
     .SetWindowRelativeMouseMode = win32_SetWindowRelativeMouseMode,
@@ -3519,14 +3838,21 @@ SDLop_VideoDevice SDLop_windows_device = {
     .SetWindowHitTest = win32_SetWindowHitTest,
     .UpdateWindowShape = win32_UpdateWindowShape,
     .UpdateTextInputArea = win32_UpdateTextInputArea,
+    .ResizeWindowFramebuffer = win32_ResizeWindowFramebuffer,
     .GetWindowICCProfile = win32_GetWindowICCProfile,
+    .GetWindowSizeInPixels = win32_GetWindowSizeInPixels,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
     .WarpMouse = win32_WarpMouse,
     .WarpMouseGlobal = win32_WarpMouseGlobal,
     .GetGlobalMouseState = win32_GetGlobalMouseState,
     .FlashWindow = win32_FlashWindow,
-    .SyncWindow = win32_SyncWindow,
+    /* No .SyncWindow: window state on Win32 is applied synchronously by
+     * SetWindowPos/ShowWindow, and the core returns true when a driver does
+     * not implement it. A first attempt implemented it as "false while the
+     * window has queued messages", which made SDL_SyncWindow() report failure
+     * for any unrelated pending message -- an ordinary WM_NULL was enough. */
+    .AcceptDragAndDrop = win32_AcceptDragAndDrop,
     .SetWindowFocusable = win32_SetWindowFocusable,
     .SetWindowParent = win32_SetWindowParent,
     .SetWindowModal = win32_SetWindowModal,

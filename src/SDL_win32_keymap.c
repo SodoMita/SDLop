@@ -295,6 +295,24 @@ SDL_Scancode SDLOP_Win32ScancodeFromScan(Uint16 scan_code)
     return windows_scancode_table[index];
 }
 
+Uint16 SDLOP_Win32ScanFromScancode(SDL_Scancode sc)
+{
+    size_t i;
+
+    if (sc <= SDL_SCANCODE_UNKNOWN || sc >= SDL_SCANCODE_COUNT) {
+        return 0;
+    }
+    for (i = 0; i < SDL_arraysize(windows_scancode_table); ++i) {
+        if (windows_scancode_table[i] == sc) {
+            /* Undo the E0 prefix encoding above: bit 7 of the table index
+             * means an extended scan code, with 0xE000 | low 7 bits as the
+             * value the driver puts in lParam. */
+            return (Uint16)((i & 0x80u) ? (0xE000u | (i & 0x7Fu)) : i);
+        }
+    }
+    return 0;
+}
+
 Uint32 SDLOP_Win32CharFromVK(Uint32 vk, bool shifted)
 {
     if (vk >= VK_A && vk <= VK_Z) {
@@ -437,6 +455,136 @@ SDL_Keycode SDLOP_Win32KeyFromVK(Uint32 vk, SDL_Keymod modstate)
         return (SDL_Keycode)(SDLK_F1 + (vk - VK_F1_));
     }
     return SDLK_UNKNOWN;
+}
+
+/* --- the active keyboard layout -------------------------------------------
+ *
+ * SDL_GetKeyFromScancode() is documented as "according to the current keyboard
+ * layout", and SDL3 makes it so on Windows by building a keymap with
+ * ToUnicodeEx() for the HKL installed on the thread (WIN_BuildKeymap). The
+ * fixed virtual-key table above can only ever describe a US layout, so on a
+ * German keyboard the key right of T reports SDLK_Y while producing 'z', and
+ * every OEM punctuation key reports the US character. The character a key
+ * actually produces is the honest answer, and ToUnicodeEx gives it per layout.
+ *
+ * Only keys that produce a printable character are recorded; function keys,
+ * navigation, modifiers and dead keys keep the scancode-derived answer, which
+ * does not depend on the layout.
+ */
+
+/* Scancodes that carry a character on some layout: the alphanumeric block plus
+ * the OEM keys. This is a candidate list, not an ordering. */
+static const Uint8 layout_scan_codes[] = {
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+    0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+    0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x39,
+    0x56, /* the extra key next to the left Shift on ISO layouts (VK_OEM_102) */
+};
+
+typedef struct SDLOP_Win32LayoutKey
+{
+    SDL_Scancode scancode;
+    Uint32 plain;   /* character with no shift, 0 when none */
+    Uint32 shifted; /* character with Shift, 0 when none */
+} SDLOP_Win32LayoutKey;
+
+static SDLOP_Win32LayoutKey layout_keys[SDL_arraysize(layout_scan_codes)];
+static bool layout_valid;
+
+/* ToUnicodeEx() is destructive: a dead key stays pending in the kernel state
+ * and the *next* call consumes it, which would corrupt every following probe.
+ * Clearing the state after each probe keeps the probes independent -- the same
+ * trick stock SDL3 uses (WIN_ResetDeadKeys). */
+static void layout_reset_dead_keys(void)
+{
+    BYTE zero_state[256];
+    WCHAR junk[8];
+    Uint32 i;
+
+    SDL_zero(zero_state);
+    for (i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
+        const UINT vk = MapVirtualKeyW(layout_scan_codes[i], MAPVK_VSC_TO_VK);
+        if (vk) {
+            ToUnicodeEx(vk, layout_scan_codes[i], zero_state, junk,
+                        (int)SDL_arraysize(junk), 0, GetKeyboardLayout(0));
+        }
+    }
+}
+
+static void SDLOP_Win32BuildLayout(void)
+{
+    BYTE keystate[256];
+    /* Shift is indexed by its *virtual* key (0x10), not by its scan code:
+     * stock SDL3 uses MapVirtualKey(VK_SHIFT, MAPVK_VK_TO_VSC) here, which is
+     * 0x2A, and measured under Wine that leaves the shifted level reading the
+     * unshifted character ('a' instead of 'A'). Indexing by VK_SHIFT gives the
+     * expected capital. */
+    const Uint32 vk_shift = VK_SHIFT;
+    Uint32 i;
+
+    SDL_zero(keystate);
+    for (i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
+        const UINT vk = MapVirtualKeyW(layout_scan_codes[i], MAPVK_VSC_TO_VK);
+        int level;
+
+        layout_keys[i].scancode = SDLOP_Win32ScancodeFromScan(layout_scan_codes[i]);
+        layout_keys[i].plain = 0;
+        layout_keys[i].shifted = 0;
+        if (!vk) {
+            continue;
+        }
+        for (level = 0; level < 2; ++level) {
+            WCHAR chars[8];
+            int produced;
+
+            if (level) {
+                keystate[vk_shift] = 0x80;
+            }
+            keystate[vk] = 0x80;
+            chars[0] = 0;
+            produced = ToUnicodeEx(vk, layout_scan_codes[i], keystate, chars,
+                                   (int)SDL_arraysize(chars), 0, GetKeyboardLayout(0));
+            keystate[vk] = 0;
+            if (level) {
+                keystate[vk_shift] = 0;
+            }
+            if (produced <= 0 || chars[0] < 0x20) {
+                continue; /* a dead key, a control character, or nothing */
+            }
+            if (level) {
+                layout_keys[i].shifted = (Uint32)chars[0];
+            } else {
+                layout_keys[i].plain = (Uint32)chars[0];
+            }
+        }
+    }
+    layout_reset_dead_keys();
+    layout_valid = true;
+}
+
+void SDLOP_Win32UpdateKeyboardLayout(void)
+{
+    SDLOP_Win32BuildLayout();
+}
+
+/* The layout character for an SDL scancode, or 0. `shifted` selects the level;
+ * a key whose shifted level produces nothing falls back to its plain
+ * character, as SDL3 does. */
+Uint32 SDLOP_Win32LayoutCharForScancode(SDL_Scancode scancode, bool shifted)
+{
+    Uint32 i;
+
+    if (!layout_valid || scancode == SDL_SCANCODE_UNKNOWN) {
+        return 0;
+    }
+    for (i = 0; i < SDL_arraysize(layout_scan_codes); ++i) {
+        if (layout_keys[i].scancode == scancode) {
+            return shifted && layout_keys[i].shifted ? layout_keys[i].shifted
+                                                     : layout_keys[i].plain;
+        }
+    }
+    return 0;
 }
 
 #endif /* _WIN32 */

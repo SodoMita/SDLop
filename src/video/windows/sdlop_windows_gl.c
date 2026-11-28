@@ -358,6 +358,16 @@ void *SDLOP_Win32GLCreateContext(SDLop_VideoDevice *device, SDL_Window *window)
             ctx = wglCreateContext(hdc);
         }
     } else {
+        /* No ARB attribs entry point at all (e.g. Win7's GDI Generic driver):
+         * wglCreateContext cannot express a profile, so handing back a desktop
+         * context for an ES request would be the same silent downgrade the
+         * attribs branch refuses above. Report the unsupported profile. */
+        if (profile != 0) {
+            ReleaseDC(data->hwnd, hdc);
+            SDL_SetError("Could not create a GL context with the requested profile "
+                         "(the driver does not support WGL_ARB_create_context)");
+            return NULL;
+        }
         ctx = wglCreateContext(hdc);
     }
     if (!ctx) {

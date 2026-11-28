@@ -184,8 +184,11 @@ int main(void)
          * absence makes the Linux job skip. Every other VkResult is still a
          * real failure: the extensions came from SDL_Vulkan_GetInstanceExtensions,
          * so a driver that rejects them is the bug this test exists to catch. */
-        if (result == (VkResult)-9) {
-            printf("skipped: no Vulkan driver installed (VK_ERROR_INCOMPATIBLE_DRIVER)\n");
+        /* -9 is VK_ERROR_INCOMPATIBLE_DRIVER; Win7's loader with no ICD
+         * returns -3 (VK_ERROR_INITIALIZATION_FAILED) instead. Both mean no
+         * usable driver here, not a defect in SDL's extension list. */
+        if (result == (VkResult)-9 || result == (VkResult)-3) {
+            printf("skipped: no Vulkan driver installed (VkResult %d)\n", (int)result);
             SDL_Vulkan_UnloadLibrary();
             SDL_DestroyWindow(window);
             SDL_Quit();

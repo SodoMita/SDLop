@@ -327,15 +327,32 @@ static void publish_targets(const xcb_atom_t *atoms, size_t count)
     size_t alloc = sizeof(char *);
     char **names = (char **)SDL_calloc(count ? count : 1, sizeof(char *));
     size_t n = 0;
+    bool overflow = false;
     for (size_t i = 0; names && i < count; i++) {
         if (atoms[i] == cb.atom.TARGETS || atoms[i] == cb.atom.MULTIPLE || atoms[i] == cb.atom.TIMESTAMP) {
             continue;
         }
         names[n] = atom_name(atoms[i]);
         if (names[n]) {
-            alloc += sizeof(char *) + strlen(names[n]) + 1;
+            size_t len = strlen(names[n]);
+            size_t item;
+            if (!SDL_size_add_check_overflow(len, 1, &len) ||
+                !SDL_size_add_check_overflow(sizeof(char *), len, &item) ||
+                !SDL_size_add_check_overflow(alloc, item, &alloc)) {
+                SDL_SetError("Clipboard TARGETS too large");
+                SDL_free(names[n]);
+                overflow = true;
+                break;
+            }
             n++;
         }
+    }
+    if (overflow) {
+        for (size_t i = 0; i < n; i++) {
+            SDL_free(names[i]);
+        }
+        SDL_free(names);
+        return;
     }
     char **types = (char **)SDLOP_AllocateTemporaryMemory(alloc);
     if (types) {

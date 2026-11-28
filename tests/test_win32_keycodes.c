@@ -21,6 +21,38 @@
 #include "internal/sdlop_win32_keymap.h"
 #include <stdio.h>
 #include <string.h>
+#include <windows.h>
+
+/* What Windows says the current layout produces for a scancode. The layout
+ * table is supposed to mirror this -- on a Russian layout the Y key is "н",
+ * not "y" -- so hardcoding US letters here made the test fail on a localized
+ * Windows even though the table was correct. */
+static Uint32 os_layout_char(UINT scan, bool shifted)
+{
+    BYTE state[256];
+    BYTE zero[256];
+    WCHAR chars[8] = { 0 };
+    WCHAR junk[8];
+    const UINT vk = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK);
+    int produced;
+
+    if (!vk) {
+        return 0;
+    }
+    memset(state, 0, sizeof(state));
+    if (shifted) {
+        state[VK_SHIFT] = 0x80;
+    }
+    state[vk] = 0x80;
+    produced = ToUnicodeEx(vk, scan, state, chars, (int)SDL_arraysize(chars), 0, GetKeyboardLayout(0));
+    /* ToUnicodeEx leaves dead keys pending; clear them so probing is repeatable */
+    memset(zero, 0, sizeof(zero));
+    ToUnicodeEx(vk, scan, zero, junk, (int)SDL_arraysize(junk), 0, GetKeyboardLayout(0));
+    if (produced <= 0 || chars[0] < 0x20) {
+        return 0;
+    }
+    return (Uint32)chars[0];
+}
 
 static int failures = 0;
 
@@ -147,6 +179,92 @@ int main(void)
     CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_2, SDL_KMOD_LSHIFT, false) == SDLK_AT, "shift+2 -> '@'");
     CHECK(SDL_GetScancodeFromKey(SDLK_UP, NULL) == SDL_SCANCODE_UP, "SDLK_UP -> UP");
     CHECK(SDL_GetKeyboardFocus() == w, "focus follows the created window (dummy)");
+
+    /* --- the active keyboard layout ------------------------------------ *
+     * SDL_GetKeyFromScancode is documented as following the *current layout*,
+     * and the layout is a character table built with ToUnicodeEx. Wine only
+     * ships the US layout, so the interesting property to pin here is not a
+     * specific translation but the split: keys that type a character take it,
+     * everything else still resolves through the scancode table. If the table
+     * were empty or failed to build, the first group would still pass (both
+     * paths agree on US) -- so also insist the table itself is populated. */
+    {
+        static const struct {
+            SDL_Scancode sc;
+            SDL_Keycode want;
+            const char *what;
+        } typed[] = {
+            { SDL_SCANCODE_A, 'a', "A" },
+            { SDL_SCANCODE_Z, 'z', "Z" },
+            { SDL_SCANCODE_Y, 'y', "Y" },
+            { SDL_SCANCODE_1, '1', "1" },
+            { SDL_SCANCODE_SEMICOLON, ';', "semicolon" },
+            { SDL_SCANCODE_COMMA, ',', "comma" },
+            { SDL_SCANCODE_PERIOD, '.', "period" },
+            { SDL_SCANCODE_SLASH, '/', "slash" },
+            { SDL_SCANCODE_LEFTBRACKET, '[', "left bracket" },
+            { SDL_SCANCODE_GRAVE, '`', "grave" },
+            { SDL_SCANCODE_MINUS, '-', "minus" },
+            { SDL_SCANCODE_EQUALS, '=', "equals" },
+            { SDL_SCANCODE_APOSTROPHE, '\'', "apostrophe" },
+        };
+        for (size_t i = 0; i < SDL_arraysize(typed); ++i) {
+            const SDL_Keycode got = SDL_GetKeyFromScancode(typed[i].sc, SDL_KMOD_NONE, true);
+            CHECK(got == typed[i].want, "%s: got 0x%x, expected '%c'",
+                  typed[i].what, (unsigned)got, (char)typed[i].want);
+        }
+        /* This test runs on the dummy driver, so win32_Init has not built the
+         * table; build it here, which is what the WM_INPUTLANGCHANGE path
+         * does. Without this the checks below failed while the SDL-level ones
+         * passed -- the scancode fallback hides an empty table on a US
+         * layout, and that is precisely the bug this pins. */
+        SDLOP_Win32UpdateKeyboardLayout();
+        /* the layout table itself: characters present, non-keys absent.
+         * MapVirtualKeyW needs the *Windows* scan code; passing SDL's
+         * SDL_SCANCODE_Y (0x1C) would probe the Enter key instead. */
+        const UINT scan_y = (UINT)SDLOP_Win32ScanFromScancode(SDL_SCANCODE_Y);
+        const Uint32 want_plain = os_layout_char(scan_y, false);
+        const Uint32 want_shifted = os_layout_char(scan_y, true);
+        CHECK(scan_y == 0x15, "Windows scan code for Y is 0x%x, want 0x15", scan_y);
+        if (want_plain && want_shifted) {
+            CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == want_plain,
+                  "layout table character for Y is 0x%x, Windows says 0x%x",
+                  SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false), want_plain);
+            CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, true) == want_shifted,
+                  "layout table shifted character for Y is 0x%x, Windows says 0x%x",
+                  SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, true), want_shifted);
+            /* SDL_GetKeyFromScancode must follow the same levels: modstate
+             * selects the shifted char, a key event always the plain one. */
+            CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_SHIFT, false) == (SDL_Keycode)want_shifted,
+                  "shift+Y keycode is 0x%x, layout says 0x%x",
+                  (unsigned)SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_SHIFT, false), want_shifted);
+            CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_NONE, true) == (SDL_Keycode)want_plain,
+                  "Y key event keycode is 0x%x, layout says 0x%x",
+                  (unsigned)SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_NONE, true), want_plain);
+        } else {
+            printf("test_win32_keycodes: layout table character checks skipped "
+                   "(the current layout has no character for Y)\n");
+        }
+        CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_F1, false) == 0,
+              "F1 must not have a layout character");
+        CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_LEFT, false) == 0,
+              "LEFT must not have a layout character");
+        /* keys with no character keep their scancode-derived keycode */
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_F1, SDL_KMOD_NONE, true) == SDLK_F1, "F1 keycode");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_F12, SDL_KMOD_NONE, true) == SDLK_F12, "F12 keycode");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_LEFT, SDL_KMOD_NONE, true) == SDLK_LEFT, "LEFT keycode");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_ESCAPE, SDL_KMOD_NONE, true) == SDLK_ESCAPE, "ESC keycode");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_KP_5, SDL_KMOD_NONE, true) == SDLK_KP_5, "KP_5 keycode");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_TAB, SDL_KMOD_NONE, true) == SDLK_TAB, "TAB keycode");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_RETURN, SDL_KMOD_NONE, true) == SDLK_RETURN, "RETURN keycode");
+        CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_BACKSPACE, SDL_KMOD_NONE, true) == SDLK_BACKSPACE, "BACKSPACE keycode");
+        /* rebuilding is idempotent and must not lose the table */
+        SDLOP_Win32UpdateKeyboardLayout();
+        if (want_plain) {
+            CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == want_plain,
+                  "the layout table was lost on rebuild");
+        }
+    }
 
     SDL_StopTextInput(w);
     SDL_DestroyWindow(w);

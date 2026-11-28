@@ -33,7 +33,7 @@ typedef struct SDLOP_Ring
     _Alignas(SDLOP_CACHELINE) atomic_uint_least64_t head; /* producer writes */
     _Alignas(SDLOP_CACHELINE) atomic_uint_least64_t tail; /* consumer writes */
     uint64_t cached_head; /* consumer-only acquired publication limit */
-    _Alignas(SDLOP_CACHELINE) uint64_t dropped;           /* producer-side stats */
+    _Alignas(SDLOP_CACHELINE) _Atomic uint64_t dropped;   /* producer-side stats */
     uint64_t cached_tail; /* producer-only acquired reclamation limit */
     uint32_t mask;
     uint32_t elem_size;
@@ -45,7 +45,7 @@ static inline void SDLOP_RingInit(SDLOP_Ring *ring, void *storage, uint32_t capa
     /* capacity must be a power of two */
     atomic_store(&ring->head, 0);
     atomic_store(&ring->tail, 0);
-    ring->dropped = 0;
+    atomic_store(&ring->dropped, 0);
     ring->cached_head = ring->cached_tail = 0;
     ring->mask = capacity - 1;
     ring->elem_size = elem_size;
@@ -60,7 +60,7 @@ static inline bool SDLOP_RingPush(SDLOP_Ring *ring, const void *elem)
     if (head - ring->cached_tail > ring->mask) {
         ring->cached_tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
         if (head - ring->cached_tail > ring->mask) {
-            ring->dropped++;
+            atomic_fetch_add_explicit(&ring->dropped, 1, memory_order_relaxed);
             return false;
         }
     }
@@ -131,7 +131,7 @@ static inline uint64_t SDLOP_RingCount(SDLOP_Ring *ring)
 
 static inline uint64_t SDLOP_RingDropped(SDLOP_Ring *ring)
 {
-    return ring->dropped;
+    return atomic_load_explicit(&ring->dropped, memory_order_relaxed);
 }
 
 #endif /* sdlop_ring.h_ */

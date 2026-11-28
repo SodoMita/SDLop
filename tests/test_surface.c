@@ -114,6 +114,22 @@ int main(void)
         SDL_DestroySurface(str);
     }
 
+    /* indexed sources without a palette must be rejected, not dereferenced */
+    {
+        SDL_Surface *idx_src = SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_INDEX8);
+        SDL_Surface *idx_dst = SDL_CreateSurface(4, 4, SDL_PIXELFORMAT_INDEX8);
+        SDL_Palette *pal = SDL_CreatePalette(4);
+        assert(idx_src && idx_dst && pal);
+        assert(SDL_SetSurfacePalette(idx_dst, pal));
+        /* a color mod keeps the blit out of the plain-copy fast paths */
+        assert(SDL_SetSurfaceColorMod(idx_src, 0x80, 0x80, 0x80));
+        assert(!SDL_BlitSurface(idx_src, NULL, idx_dst, NULL));
+        assert(!SDL_BlitSurfaceScaled(idx_src, NULL, idx_dst, NULL, SDL_SCALEMODE_NEAREST));
+        SDL_DestroySurface(idx_src);
+        SDL_DestroySurface(idx_dst);
+        SDL_DestroyPalette(pal);
+    }
+
     /* destroy window surface then recreate */
     assert(SDL_DestroyWindowSurface(w));
     assert(!SDL_WindowHasSurface(w));

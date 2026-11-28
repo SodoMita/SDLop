@@ -150,15 +150,24 @@ static void offer_destroy(Offer *o)
 /* read everything the other end writes into the pipe; NUL-padded */
 static void *read_pipe(int fd, size_t *length)
 {
+    const size_t max_bytes = 16u * 1024u * 1024u; /* overall size cap */
     size_t cap = 4096, len = 0;
     Uint8 *buf = (Uint8 *)SDL_malloc(cap + sizeof(Uint32));
-    const Uint64 deadline = SDLOP_MonotonicNS() + 1000000000ull; /* 1 s without data aborts */
-    Uint64 last = SDLOP_MonotonicNS();
+    const Uint64 start = SDLOP_MonotonicNS();
+    const Uint64 deadline = start + 1000000000ull;   /* 1 s without data aborts */
+    const Uint64 overall = start + 30000000000ull;   /* 30 s for the whole transfer */
+    Uint64 last = start;
     while (buf) {
         struct pollfd pfd = { fd, POLLIN, 0 };
         Uint64 now = SDLOP_MonotonicNS();
-        if (now - last > 1000000000ull || (len == 0 && now > deadline)) {
+        if (now - last > 1000000000ull || now > overall || (len == 0 && now > deadline)) {
             SDL_SetError("Clipboard read timeout");
+            SDL_free(buf);
+            buf = NULL;
+            break;
+        }
+        if (len >= max_bytes) {
+            SDL_SetError("Clipboard data too large");
             SDL_free(buf);
             buf = NULL;
             break;
@@ -172,15 +181,16 @@ static void *read_pipe(int fd, size_t *length)
         if (r <= 0) {
             continue;
         }
-        if (cap - len < 4096) {
-            Uint8 *grown = (Uint8 *)SDL_realloc(buf, cap * 2 + sizeof(Uint32));
+        if (cap - len < 4096 && cap < max_bytes) {
+            const size_t newcap = cap > max_bytes / 2 ? max_bytes : cap * 2;
+            Uint8 *grown = (Uint8 *)SDL_realloc(buf, newcap + sizeof(Uint32));
             if (!grown) {
                 SDL_free(buf);
                 buf = NULL;
                 break;
             }
             buf = grown;
-            cap *= 2;
+            cap = newcap;
         }
         ssize_t n = read(fd, buf + len, cap - len);
         if (n < 0) {

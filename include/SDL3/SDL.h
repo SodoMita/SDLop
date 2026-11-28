@@ -55,6 +55,7 @@
 #include <SDL3/SDL_pen.h>
 #include <SDL3/SDL_power.h>
 #include <SDL3/SDL_sensor.h>
+#include <SDL3/SDL_oldnames.h>
 
 /* SDLop's own version (the SDL API level is SDL_VERSION, SDL_version.h) */
 #define SDLOP_MAJOR_VERSION 0

@@ -182,7 +182,7 @@ int SDLOP_URIToLocal(const char *src, char *dst)
         return -1; /* other scheme */
     }
     bool local = src[0] != '/' || (src[0] != '\0' && src[1] == '/');
-    if (!local && src[0] == '/' && src[2] != '/') {
+    if (!local && src[0] == '/' && src[1] && src[2] != '/') {
         const char *host_end = strchr(src + 1, '/');
         if (host_end) {
             const size_t n = (size_t)(host_end - (src + 1));

@@ -1259,7 +1259,8 @@ bool SDL_BlitSurfaceUncheckedScaled(SDL_Surface *src, const SDL_Rect *srcrect, S
         if (!(SI(src)->map.info.flags & complex_copy_flags) &&
             src->format == dst->format &&
             (!SDL_ISPIXELFORMAT_INDEXED(src->format) ||
-             (SDL_BITSPERPIXEL(src->format) == 8 && SDLOP_IsSamePalette(SI(src)->palette, SI(dst)->palette))) &&
+             (SDL_BITSPERPIXEL(src->format) == 8 && SI(src)->palette && SI(dst)->palette &&
+              SDLOP_IsSamePalette(SI(src)->palette, SI(dst)->palette))) &&
             SDL_BYTESPERPIXEL(src->format) <= 4) {
             return SDL_StretchSurface(src, srcrect, dst, dstrect, SDL_SCALEMODE_NEAREST);
         } else if (SDL_BITSPERPIXEL(src->format) < 8) {
@@ -1968,9 +1969,11 @@ static SDL_Surface *SDL_ConvertSurfaceRectAndColorspace(SDL_Surface *surface, co
             palette_saved_alpha_ncolors = SI(surface)->palette->ncolors;
             if (palette_saved_alpha_ncolors > 0) {
                 palette_saved_alpha = (Uint8 *)SDL_malloc((size_t)palette_saved_alpha_ncolors);
-                for (i = 0; i < palette_saved_alpha_ncolors; i++) {
-                    palette_saved_alpha[i] = SI(surface)->palette->colors[i].a;
-                    SI(surface)->palette->colors[i].a = SDL_ALPHA_OPAQUE;
+                if (palette_saved_alpha) {
+                    for (i = 0; i < palette_saved_alpha_ncolors; i++) {
+                        palette_saved_alpha[i] = SI(surface)->palette->colors[i].a;
+                        SI(surface)->palette->colors[i].a = SDL_ALPHA_OPAQUE;
+                    }
                 }
             }
         }
@@ -2312,6 +2315,12 @@ bool SDL_ConvertPixelsAndColorspace(int width, int height,
     CHECK_PARAM(!dst_pitch) {
         return SDL_InvalidParamError("dst_pitch");
     }
+    CHECK_PARAM(width < 0) {
+        return SDL_InvalidParamError("width");
+    }
+    CHECK_PARAM(height < 0) {
+        return SDL_InvalidParamError("height");
+    }
 
     if (src_colorspace == SDL_COLORSPACE_UNKNOWN) {
         src_colorspace = SDLOP_GetDefaultColorspaceForFormat(src_format);
@@ -2327,7 +2336,7 @@ bool SDL_ConvertPixelsAndColorspace(int width, int height,
     // Fast path for same format copy
     if (src_format == dst_format && src_colorspace == dst_colorspace) {
         if (src_pitch == dst_pitch) {
-            SDL_memcpy(dst, src, height * src_pitch);
+            SDL_memcpy(dst, src, (size_t)height * (size_t)src_pitch);
         } else {
             int i;
             const int bpp = SDL_BYTESPERPIXEL(src_format);
@@ -3168,6 +3177,39 @@ bool SDL_FillSurfaceRects(SDL_Surface *dst, const SDL_Rect *rects, int count, Ui
 /* Window surface plumbing (dispatched to the video driver)            */
 /* ------------------------------------------------------------------ */
 
+void SDLOP_SetSurfacePixels(SDL_Surface *surface, void *pixels, int w, int h, int pitch)
+{
+    if (!surface) {
+        return;
+    }
+    surface->pixels = pixels;
+    surface->w = w;
+    surface->h = h;
+    surface->pitch = pitch;
+    SDL_SetSurfaceClipRect(surface, NULL); /* the old clip may exceed the new size */
+}
+
+/*
+  Window surfaces and resizes (SDLop): unlike stock SDL3, which invalidates
+  the window surface on every pixel-size change and fails
+  SDL_UpdateWindowSurface until SDL_GetWindowSurface is called again, a
+  window surface here stays valid - the same SDL_Surface pointer, resized
+  in place. Drivers do no reallocation while handling resize events; the
+  surface is brought to the current size once, lazily:
+    - SDL_GetWindowSurface resizes a stale surface before returning it
+    - SDL_UpdateWindowSurface(Rects) presents what the application drew at
+      the old size, then resizes, so the next frame is drawn at the new
+      size; a whole interactive resize therefore reallocates at most once
+      per presented frame. The new contents start at the clear colour.
+*/
+static bool window_surface_sync_size(SDL_Window *window)
+{
+    if (window->surface && sdlop.video && sdlop.video->ResizeWindowFramebuffer) {
+        return sdlop.video->ResizeWindowFramebuffer(sdlop.video, window, window->surface);
+    }
+    return true;
+}
+
 SDL_Surface *SDL_GetWindowSurface(SDL_Window *window)
 {
     if (!window) {
@@ -3175,6 +3217,9 @@ SDL_Surface *SDL_GetWindowSurface(SDL_Window *window)
         return NULL;
     }
     if (window->surface) {
+        if (!window_surface_sync_size(window)) {
+            return NULL; /* driver sets error; the old surface stays usable */
+        }
         return window->surface;
     }
     if (!sdlop.video || !sdlop.video->CreateWindowFramebuffer) {
@@ -3200,8 +3245,9 @@ bool SDL_UpdateWindowSurfaceRects(SDL_Window *window, const SDL_Rect *rects, int
     if (!sdlop.video->UpdateWindowFramebuffer(sdlop.video, window, rects, numrects)) {
         return false;
     }
-    /* stock SDL3 announces presented content with an expose event */
-    SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
+    if (!window_surface_sync_size(window)) {
+        return false;
+    }
     return true;
 }
 

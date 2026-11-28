@@ -26,6 +26,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static int failures = 0;
 
@@ -39,9 +40,45 @@ static int failures = 0;
         }                                                       \
     } while (0)
 
+/* SDLop returns UTF-8 paths. The ANSI Win32 calls would misread a profile
+ * directory with non-ASCII characters -- measured on the Win7 test machine,
+ * where the account is "john.123-ПК" -- so convert explicitly here. */
+static wchar_t *wide_path(const char *path)
+{
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (n <= 0) {
+        return NULL;
+    }
+    wchar_t *wide = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+    if (!wide || MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, n) <= 0) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
 static bool file_exists(const char *path)
 {
-    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    wchar_t *wide = wide_path(path);
+    if (!wide) {
+        return false;
+    }
+    const DWORD attrs = GetFileAttributesW(wide);
+    free(wide);
+    return attrs != INVALID_FILE_ATTRIBUTES;
+}
+
+static FILE *open_file(const char *path, const char *mode)
+{
+    wchar_t *wide = wide_path(path);
+    wchar_t wmode[8];
+    if (!wide || MultiByteToWideChar(CP_ACP, 0, mode, -1, wmode, 8) <= 0) {
+        free(wide);
+        return NULL;
+    }
+    FILE *f = _wfopen(wide, wmode);
+    free(wide);
+    return f;
 }
 
 int main(int argc, char *argv[])
@@ -67,7 +104,7 @@ int main(int argc, char *argv[])
         {
             char path[1024];
             SDL_snprintf(path, sizeof(path), "%sremove_me.txt", base);
-            FILE *f = fopen(path, "wb");
+            FILE *f = open_file(path, "wb");
             CHECK(f != NULL, "could not create %s", path);
             if (f) {
                 fputs("x", f);
@@ -107,7 +144,7 @@ int main(int argc, char *argv[])
                 CHECK(SDL_CreateDirectory(nd), "SDL_CreateDirectory(%s): %s", nd, SDL_GetError());
                 SDL_snprintf(inner, sizeof(inner), "%s/inside.txt", nd);
                 {
-                    FILE *f = fopen(inner, "wb");
+                    FILE *f = open_file(inner, "wb");
                     CHECK(f != NULL, "could not create %s", inner);
                     if (f) {
                         fputs("x", f);

@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include "win32_testenv.h"
 
 static int failures = 0;
 
@@ -53,6 +54,10 @@ static BOOL CALLBACK find_window(HWND hwnd, LPARAM param)
 int main(void)
 {
     SDL_Window *window;
+    if (!win32_test_interactive_desktop()) {
+        printf("skipped: no interactive desktop for cursor/capture injection\n");
+        return 77;
+    }
     SDL_Surface *surface;
     SDL_Cursor *image_cursor = NULL;
     float gx = 0.0f, gy = 0.0f;

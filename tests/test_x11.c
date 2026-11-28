@@ -453,6 +453,39 @@ int main(void)
         uint32_t green = 0x30a040;
         CHECK(wait_server(cond_pixel, xid, &green, 500), "clear color reaches the server (0x%06x)",
               read_pixel(xid, 5, 5));
+
+        /* resizes: the window surface stays valid (SDLop) and is resized
+         * lazily - not while ConfigureNotify is handled, but once, by the
+         * next SDL_UpdateWindowSurface (after presenting what was drawn at
+         * the old size) or SDL_GetWindowSurface */
+        if (s) {
+            drain();
+            for (int i = 1; i <= 5; i++) {
+                SDL_SetWindowSize(w, 400 + i * 20, 300 + i * 10);
+            }
+            typed_xy t = { SDL_EVENT_WINDOW_RESIZED, 500, 350 };
+            CHECK(wait_event(is_resized_to, &t, 1000, NULL), "RESIZED 500x350 after a burst of resizes");
+            pump_ms(30);
+            CHECK(s->w == 400 && s->h == 300 && s->pixels, "surface untouched by resize events (%dx%d)", s->w, s->h);
+            SDL_FillSurfaceRect(s, NULL, 0x00ff0000);
+            CHECK(SDL_UpdateWindowSurface(w), "a frame drawn at the old size still presents: %s", SDL_GetError());
+            CHECK(s->w == 500 && s->h == 350 && s->pitch >= 500 * 4, "then resized in place (%dx%d)", s->w, s->h);
+            CHECK(SDL_GetWindowSurface(w) == s, "same SDL_Surface after resizes");
+            SDL_FillSurfaceRect(s, NULL, 0x000000ff);
+            CHECK(SDL_UpdateWindowSurface(w), "present at the new size");
+            uint32_t blue = 0x0000ff;
+            CHECK(wait_server(cond_pixel, xid, &blue, 500), "new size presented");
+            CHECK(read_pixel(xid, 480, 340) == 0x0000ff, "pixels beyond the old size presented (0x%06x)",
+                  read_pixel(xid, 480, 340));
+            /* back to 400x300 for the tests below; SDL_GetWindowSurface
+             * resizes as well */
+            drain();
+            CHECK(SDL_SetWindowSize(w, 400, 300), "set size back");
+            typed_xy back = { SDL_EVENT_WINDOW_RESIZED, 400, 300 };
+            CHECK(wait_event(is_resized_to, &back, 1000, NULL), "RESIZED back to 400x300");
+            CHECK(SDL_GetWindowSurface(w) == s && s->w == 400 && s->h == 300, "SDL_GetWindowSurface resizes (%dx%d)",
+                  s->w, s->h);
+        }
     }
 
     /* --- input via XTest ------------------------------------------------ */

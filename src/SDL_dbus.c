@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #define DBUS_MAX_MESSAGE (64u * 1024u * 1024u)
+#define DBUS_MAX_SIG_LEN 255u /* D-Bus spec: a signature is at most 255 bytes */
 
 struct SDLop_DBusMsg
 {
@@ -78,26 +79,63 @@ static size_t type_align(char t)
     }
 }
 
-/* past one complete type, NULL if malformed */
+/* past one complete type, NULL if malformed. Iterative: a peer-supplied
+ * signature must not be able to exhaust the stack through nesting. */
 static const char *sig_skip(const char *s, const char *end)
 {
+    struct {
+        char close; /* 0 for an array (no closing delimiter) */
+    } stack[64];
+    size_t depth = 0, elements = 0;
+
     if (!s || s >= end) {
         return NULL;
     }
-    switch (*s) {
-    case 'a':
-        return sig_skip(s + 1, end);
-    case '(':
-    case '{': {
-        const char close = *s == '(' ? ')' : '}';
-        s++;
-        while (s && s < end && *s != close) {
-            s = sig_skip(s, end);
+    for (;;) {
+        char t;
+        /* a struct/dict may end right here (including an empty one) */
+        if (depth && stack[depth - 1].close && s < end && *s == stack[depth - 1].close) {
+            s++;
+            depth--;
+            goto complete;
         }
-        return s && s < end ? s + 1 : NULL;
-    }
-    default:
-        return *s && strchr("ybnqiuxtdsogvh", *s) ? s + 1 : NULL;
+        if (s >= end || elements++ >= DBUS_MAX_SIG_LEN || depth >= SDL_arraysize(stack)) {
+            return NULL;
+        }
+        t = *s++;
+        if (t && strchr("ybnqiuxtdsogvh", t)) {
+            goto complete;
+        }
+        if (t == 'a') {
+            stack[depth].close = 0;
+        } else if (t == '(') {
+            stack[depth].close = ')';
+        } else if (t == '{') {
+            stack[depth].close = '}';
+        } else {
+            return NULL;
+        }
+        depth++;
+        continue;
+
+    complete:
+        /* one type is complete: close any finished array/container and
+         * check whether the enclosing struct/dict ends or needs a next type */
+        for (;;) {
+            if (!depth) {
+                return s;
+            }
+            if (stack[depth - 1].close) {
+                if (s >= end) {
+                    return NULL;
+                }
+                if (*s != stack[depth - 1].close) {
+                    break; /* another type in the struct/dict */
+                }
+                s++;
+            }
+            depth--;
+        }
     }
 }
 
@@ -372,6 +410,17 @@ bool SDLOP_DBus_IterGetI32(const SDLop_DBusIter *it, Sint32 *v)
     return true;
 }
 
+bool SDLOP_DBus_IterGetU64(const SDLop_DBusIter *it, Uint64 *v)
+{
+    const Uint8 *p;
+    const int t = SDLOP_DBus_IterType(it);
+    if ((t != 't' && t != 'x') || !get_fixed(it, (char)t, 8, &p)) {
+        return false;
+    }
+    *v = rd64(it, p);
+    return true;
+}
+
 bool SDLOP_DBus_IterGetDouble(const SDLop_DBusIter *it, double *v)
 {
     const Uint8 *p;
@@ -393,8 +442,8 @@ bool SDLOP_DBus_IterGetString(const SDLop_DBusIter *it, const char **v)
 bool SDLOP_DBus_IterInit(const SDLop_DBusMsg *msg, SDLop_DBusIter *it)
 {
     memset(it, 0, sizeof(*it));
-    if (!msg) {
-        return false;
+    if (!msg || (msg->sig && strlen(msg->sig) > DBUS_MAX_SIG_LEN)) {
+        return false; /* reject over-long signatures before walking them */
     }
     it->data = msg->body;
     it->end = msg->body_len;
@@ -504,6 +553,15 @@ void SDLOP_DBus_PutU32(SDLop_DBusMsg *m, Uint32 v)
 {
     WBuf w = body_of(m);
     w_u32(&w, v);
+    body_back(m, &w);
+}
+
+void SDLOP_DBus_PutU64(SDLop_DBusMsg *m, Uint64 v)
+{
+    WBuf w = body_of(m);
+    w_pad(&w, 8);
+    w_u32(&w, (Uint32)v); /* little endian on output */
+    w_u32(&w, (Uint32)(v >> 32));
     body_back(m, &w);
 }
 
@@ -834,6 +892,10 @@ int SDLOP_DBus_Parse(const Uint8 *buf, size_t len, SDLop_DBusMsg **out, size_t *
             break;
         }
         if (slot && SDLOP_DBus_IterGetString(&var, &s)) {
+            if (slot == &m->sig && strlen(s) > DBUS_MAX_SIG_LEN) {
+                ok = false; /* over-long signature from the bus */
+                break;
+            }
             free(*slot);
             *slot = strdup(s);
         } else if (code == 5 && SDLOP_DBus_IterGetU32(&var, &u)) {

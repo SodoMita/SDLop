@@ -52,10 +52,27 @@ HEADERS = [
     # types only (referenced by the above)
     "SDL_audio.h", "SDL_camera.h", "SDL_guid.h", "SDL_iostream.h",
     "SDL_mutex.h", "SDL_pen.h", "SDL_power.h", "SDL_sensor.h",
+    # deprecated SDL2-era name aliases (only #defines; shipped verbatim)
+    "SDL_oldnames.h",
 ]
 
 # Provided by the application, not the library.
 APP_PROVIDED = {"SDL_main", "SDL_AppInit", "SDL_AppIterate", "SDL_AppEvent", "SDL_AppQuit"}
+
+# Local SDLop deviations from upstream text, applied after stripping. Keeping
+# them here makes regeneration idempotent instead of silently dropping a
+# hand-patched header (the original patch was lost this way once already).
+HEADER_PATCHES = {
+    "SDL_system.h": [
+        ("/* Platform specific functions for Linux*/\n#ifdef SDL_PLATFORM_LINUX\n",
+         "/* Platform specific functions for Linux*/\n"
+         "/* SDLop: the Windows build also exports these two (as the honest \"only\n"
+         " * available on Linux\" error) because tools/api_exports_check.sh compares the\n"
+         " * declared header set against the DLL and cannot evaluate this #ifdef. They\n"
+         " * are still NOT declared to Windows applications, like stock SDL3. */\n"
+         "#if defined(SDL_PLATFORM_LINUX) || (defined(SDL_PLATFORM_WINDOWS) && defined(SDLOP_EXPORT_LINUX_API))\n"),
+    ],
+}
 
 NOTE = (" *\n"
         " * SDLop: generated from SDL {ver} by tools/gen_headers.py - declarations of\n"
@@ -149,7 +166,8 @@ def add_note(text, ver):
 
 def gen_sdl_h(ver):
     inc = [h for h in HEADERS if h not in ("SDL.h", "SDL_begin_code.h", "SDL_close_code.h",
-                                           "SDL_platform_defines.h", "SDL_main.h", "SDL_main_impl.h")]
+                                           "SDL_platform_defines.h", "SDL_main.h", "SDL_main_impl.h",
+                                           "SDL_oldnames.h")]
     lines = ["/*",
              "  SDLop - a lean, fast, SDL3-compatible windowing + input library.",
              "",
@@ -166,7 +184,8 @@ def gen_sdl_h(ver):
              "#define SDL_h_",
              ""]
     lines += ["#include <SDL3/%s>" % h for h in inc]
-    lines += ["",
+    lines += ["#include <SDL3/SDL_oldnames.h>",  # last in stock SDL.h, too
+              "",
               "/* SDLop's own version (the SDL API level is SDL_VERSION, SDL_version.h) */",
               "#define SDLOP_MAJOR_VERSION 0",
               "#define SDLOP_MINOR_VERSION 2",
@@ -200,6 +219,12 @@ def main():
             texts[h] = strip_inlines(texts[h], removed_all)
         if len(removed_all) == n:
             break
+    for name, patches in HEADER_PATCHES.items():
+        for old, new in patches:
+            if old not in texts[name]:
+                sys.exit("gen_headers: patch anchor missing in %s: %r" % (name, old))
+            texts[name] = texts[name].replace(old, new, 1)
+
     declared = set()
     for h, text in texts.items():
         declared |= set(re.findall(r"SDLCALL\s+\**\s*(SDL_\w+)\s*\(", text))

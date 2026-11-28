@@ -347,6 +347,10 @@ void SDLOP_SendMouseWheel(float x, float y, Uint64 timestamp_ns)
     SDLOP_SendMouseWheelDirection(x, y, SDL_MOUSEWHEEL_NORMAL, timestamp_ns);
 }
 
+/* Fractional wheel ticks left over after emitting whole ticks, as in stock
+ * SDL3 (mouse->residual_scroll_x/y). */
+static float wheel_residual_x, wheel_residual_y;
+
 /* FLIPPED: natural scrolling; like stock the values are not negated, the
  * application multiplies by -1 if it wants the physical direction */
 void SDLOP_SendMouseWheelDirection(float x, float y, SDL_MouseWheelDirection direction, Uint64 timestamp_ns)
@@ -354,6 +358,9 @@ void SDLOP_SendMouseWheelDirection(float x, float y, SDL_MouseWheelDirection dir
     if (x == 0.0f && y == 0.0f) {
         return;
     }
+    float integer_x, integer_y;
+    wheel_residual_x = SDL_modff(wheel_residual_x + x, &integer_x);
+    wheel_residual_y = SDL_modff(wheel_residual_y + y, &integer_y);
     SDL_Event event;
     SDL_zero(event);
     event.wheel.type = SDL_EVENT_MOUSE_WHEEL;
@@ -362,6 +369,8 @@ void SDLOP_SendMouseWheelDirection(float x, float y, SDL_MouseWheelDirection dir
     event.wheel.which = 0;
     event.wheel.x = x;
     event.wheel.y = y;
+    event.wheel.integer_x = (Sint32)integer_x;
+    event.wheel.integer_y = (Sint32)integer_y;
     event.wheel.direction = direction;
     event.wheel.mouse_x = sdlop.mouse_x;
     event.wheel.mouse_y = sdlop.mouse_y;
@@ -681,6 +690,7 @@ void SDLOP_MouseQuit(void)
     update_mouse_capture(true);
     capture_desired = false;
     capture_window = NULL;
+    wheel_residual_x = wheel_residual_y = 0.0f;
     if (sdlop.video && sdlop.video->ShowCursor && cursors_initialized) {
         sdlop.video->ShowCursor(sdlop.video, NULL);
     }

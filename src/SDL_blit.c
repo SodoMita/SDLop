@@ -541,7 +541,7 @@ bool SDLOP_BlitUnchecked(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface 
     if (!GetPixelAccess(s->fmt, false, &src_access) || !GetPixelAccess(d->fmt, true, &dst_access)) {
         return false;
     }
-    if ((src_access == ACCESS_INDEX8 || src_access == ACCESS_INDEX_SUB) && dst_access != ACCESS_INDEX8 && !s->palette) {
+    if ((src_access == ACCESS_INDEX8 || src_access == ACCESS_INDEX_SUB) && !s->palette) {
         return SDL_SetError("src does not have a palette set");
     }
     if (dstrect->w <= 0 || dstrect->h <= 0 || srcrect->w < 0 || srcrect->h < 0) {

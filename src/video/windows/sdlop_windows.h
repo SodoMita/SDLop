@@ -27,6 +27,13 @@ typedef struct SDLop_Win32WindowData
     SDL_Surface *surface; /* SDL_CreateSurfaceFrom over `pixels` */
     bool surface_dirty;   /* resized under the caller: rebuild before blit */
 
+    /* SDL_WINDOW_TRANSPARENT: a second DIB with premultiplied ARGB bits for
+     * UpdateLayeredWindow(), since GDI's BitBlt drops the alpha channel. */
+    bool transparent;
+    HDC layer_dc;
+    HBITMAP layer_bitmap;
+    void *layer_pixels;
+
     SDLOP_MUTEX_T surfacelock; /* UpdateWindowFramebuffer vs WM_SIZE */
 
     Uint32 dpi;
@@ -107,6 +114,10 @@ bool SDLOP_Win32GLGetSwapInterval(SDLop_VideoDevice *device, int *interval);
 /* Releases the process-lifetime bootstrap context that wglGetProcAddress
  * needs. Called from win32_Quit, before the window class is unregistered. */
 void SDLOP_Win32GLQuit(void);
+
+/* sdlop_windows_ime.c: composition events. Returns true when the message was
+ * an IME message and has been handled (the window procedure should stop). */
+bool SDLOP_Win32IMEHandleMessage(SDL_Window *window, UINT msg, WPARAM wparam, LPARAM lparam);
 
 /* sdlop_windows_vulkan.c */
 bool SDLOP_Win32VulkanCreateSurface(SDLop_VideoDevice *device, SDL_Window *window,

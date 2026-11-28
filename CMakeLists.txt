@@ -392,6 +392,7 @@ set(SDLop_SOURCES
   src/SDL_devices.c
   src/SDL_video.c
   src/SDL_dbus.c
+  src/SDL_ime_dbus.c
   src/SDL_desktop.c
   src/internal/sdlop_platform.c
   src/SDL_dialog.c
@@ -450,6 +451,7 @@ if(WIN32)
     src/SDL_win32_keymap.c
     src/video/windows/sdlop_windows.c
     src/video/windows/sdlop_windows_gl.c
+    src/video/windows/sdlop_windows_ime.c
     src/video/windows/sdlop_windows_vulkan.c
     src/video/sdlop_gl_offload_win32.c
     src/video/sdlop_vk_offload_win32.c
@@ -661,7 +663,7 @@ if(SDLop_BUILD_TESTS)
     set(SDLOP_PORTABLE_TESTS test_ring test_scancode test_events test_surface
         test_web test_keycodes test_layouts test_core test_main_callbacks
         test_misc test_threads test_vt_mask test_fbdev_device test_options
-        test_dropin_compat test_iconv test_raw_translate test_dbus test_ime_txn)
+        test_dropin_compat test_iconv test_raw_translate test_dbus test_ime_dbus test_ime_txn)
   endif()
   foreach(t ${SDLOP_PORTABLE_TESTS})
     add_executable(${t} tests/${t}.c)
@@ -686,6 +688,9 @@ if(SDLop_BUILD_TESTS)
       target_include_directories(${t} PRIVATE src)
       target_compile_options(${t} PRIVATE -UNDEBUG)
       add_test(NAME ${t} COMMAND ${t})
+      # Input-injection tests return 77 when there is no visible desktop
+      # (e.g. an SSH/service session on Windows), like the Vulkan skip.
+      set_tests_properties(${t} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
     set_tests_properties(test_win32_scancodes PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
     # These two inject keyboard input through SendInput and assert exactly one
@@ -696,18 +701,21 @@ if(SDLop_BUILD_TESTS)
     # These inject input or drive global OS state (clipboard, foreground
     # window, system-wide button mask), so they must not run beside anything.
     foreach(t test_win32_cursor test_win32_hittest test_win32_shape
-              test_win32_close test_win32_windowsize test_win32_fileops
+              test_win32_close test_win32_windowsize test_win32_windowmgmt
+              test_win32_fileops
               test_win32_raw_keyboard_e2e test_win32_raw_mouse_e2e
-              test_win32_gl test_win32_vulkan test_win32_clipboard)
+              test_win32_gl test_win32_vulkan test_win32_clipboard
+              test_win32_ime test_win32_attention test_win32_dnd_exposed)
       add_executable(${t} tests/${t}.c)
       target_link_libraries(${t} PRIVATE sdlop)
       target_include_directories(${t} PRIVATE src)
       target_compile_options(${t} PRIVATE -UNDEBUG)
       add_test(NAME ${t} COMMAND ${t})
-      set_tests_properties(${t} PROPERTIES RUN_SERIAL TRUE)
+      set_tests_properties(${t} PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
     endforeach()
     target_link_libraries(test_win32_shape PRIVATE gdi32)
     target_link_libraries(test_win32_gl PRIVATE opengl32)
+    target_link_libraries(test_win32_ime PRIVATE imm32)
     set_tests_properties(test_win32_gl test_win32_vulkan PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
@@ -1037,6 +1045,13 @@ if(SDLop_BUILD_TESTS)
       add_dependencies(test_wayland_buffers mini_compositor)
       add_test(NAME test_wayland_buffers COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor>)
       add_test(NAME test_wayland_buffers_viewporter COMMAND test_wayland_buffers $<TARGET_FILE:mini_compositor> viewporter)
+
+      # interactive resizes: configure throttling, lazy window surface resize
+      add_executable(test_wayland_resize tests/test_wayland_resize.c)
+      target_link_libraries(test_wayland_resize PRIVATE sdlop)
+      target_compile_options(test_wayland_resize PRIVATE -UNDEBUG)
+      add_dependencies(test_wayland_resize mini_compositor)
+      add_test(NAME test_wayland_resize COMMAND test_wayland_resize $<TARGET_FILE:mini_compositor>)
 
       # clipboard + primary selection between two SDL processes
       add_executable(test_wayland_clipboard tests/test_wayland_clipboard.c)

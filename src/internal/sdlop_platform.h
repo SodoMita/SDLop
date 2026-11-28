@@ -375,6 +375,10 @@ Uint32 SDLOP_ThreadIDOfHandle(HANDLE h);
  * Implemented in sdlop_platform.c on both platforms. */
 Sint64 SDLOP_MonotonicNowNS(void);
 
+/* Fix the SDL tick origin on the main thread before timers/input workers can
+ * push timestamped events from their own threads. */
+void SDLOP_InitTicks(void);
+
 /* Split a monotonic deadline into a struct timespec (the absolute-deadline
  * form the condition/semaphore waits take). */
 void SDLOP_DeadlineFromNS(struct timespec *ts, Sint64 deadline_ns);

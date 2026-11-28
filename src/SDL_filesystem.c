@@ -54,6 +54,33 @@ static wchar_t *fs_utf8_to_wide(const char *utf8)
     return wide;
 }
 
+/* Windows environment variables are ANSI (the process ACP), not UTF-8. On a
+ * localized profile ("john.123-\u041f\u041a") copying %APPDATA% verbatim made
+ * the later CP_UTF8 conversion fail with ERROR_INVALID_NAME. */
+static char *fs_acp_to_utf8(const char *ansi)
+{
+    if (!ansi) {
+        return NULL;
+    }
+    const int wlen = MultiByteToWideChar(CP_ACP, 0, ansi, -1, NULL, 0);
+    if (wlen <= 0) {
+        return NULL;
+    }
+    wchar_t *wide = (wchar_t *)SDL_malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wide || MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide, wlen) <= 0) {
+        SDL_free(wide);
+        return NULL;
+    }
+    const int ulen = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    char *utf8 = ulen > 0 ? (char *)SDL_malloc((size_t)ulen) : NULL;
+    if (utf8 && WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, ulen, NULL, NULL) <= 0) {
+        SDL_free(utf8);
+        utf8 = NULL;
+    }
+    SDL_free(wide);
+    return utf8;
+}
+
 static char *fs_wide_to_utf8(const wchar_t *wide)
 {
     if (!wide) {
@@ -220,7 +247,11 @@ char *SDL_GetPrefPath(const char *org, const char *app)
     /* SDL3 on Windows: %APPDATA%\org\app\ (FOLDERID_RoamingAppData) */
     PWSTR roaming = NULL;
     char *envr;
-    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_CREATE, NULL, &roaming))) {
+    /* DONT_VERIFY avoids an intermittent Win7 Shell existence check failure
+     * for the localized profile path. A failed call here used to fall back to
+     * the ANSI-encoded %APPDATA%, which was then misread as UTF-8 and made
+     * SDL_CreateDirectory fail with ERROR_INVALID_NAME (123). */
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_CREATE | KF_FLAG_DONT_VERIFY, NULL, &roaming))) {
         envr = fs_wide_to_utf8(roaming);
         CoTaskMemFree(roaming);
         if (!envr) {
@@ -229,7 +260,7 @@ char *SDL_GetPrefPath(const char *org, const char *app)
         }
     } else {
         const char *appdata = SDL_getenv("APPDATA");
-        envr = appdata ? SDL_strdup(appdata) : NULL;
+        envr = fs_acp_to_utf8(appdata);
         if (!envr) {
             SDL_SetError("Couldn't find the Roaming AppData folder");
             return NULL;
@@ -452,8 +483,13 @@ static char *lookup_user_folder(SDL_Folder folder)
                 continue;
             }
             PWSTR wide = NULL;
-            if (FAILED(SHGetKnownFolderPath(known[i].id, 0, NULL, &wide))) {
-                SDL_SetError("Couldn't find folder %d", (int)folder);
+            /* KF_FLAG_DONT_VERIFY: the Shell's existence check can fail with
+             * ERROR_FILE_NOT_FOUND on Win7 for a localized profile path even
+             * though the directory exists (measured under ctest). Returning
+             * the configured path is the useful behaviour for an app. */
+            const HRESULT hr = SHGetKnownFolderPath(known[i].id, KF_FLAG_DONT_VERIFY, NULL, &wide);
+            if (FAILED(hr)) {
+                SDL_SetError("Couldn't find folder %d (HRESULT 0x%08lx)", (int)folder, (unsigned long)hr);
                 return NULL;
             }
             const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
@@ -597,6 +633,12 @@ bool SDL_CreateDirectory(const char *path)
             *w = L'\\';
         }
     }
+    /* SHCreateDirectoryExW on Win7 can return ERROR_INVALID_NAME (123) for a
+     * path ending in a separator. SDL_GetPrefPath always appends one, so trim
+     * it (but keep a drive root like "C:\\"). */
+    for (size_t len = wcslen(wide); len > 3 && wide[len - 1] == L'\\'; len--) {
+        wide[len - 1] = L'\0';
+    }
     wchar_t full[32768]; /* Win32 long-path maximum */
     DWORD full_len = GetFullPathNameW(wide, (DWORD)SDL_arraysize(full), full, NULL);
     if (full_len > 0 && full_len < (DWORD)SDL_arraysize(full)) {
@@ -612,7 +654,7 @@ bool SDL_CreateDirectory(const char *path)
     if (rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS || rc == ERROR_FILE_EXISTS) {
         return true;
     }
-    return SDL_SetError("Can't create directory: error %d", rc);
+    return SDL_SetError("Can't create directory '%s': error %d", path, rc);
 #else
     /* stock SDL3 creates missing parents too */
     char *copy = SDL_strdup(path);

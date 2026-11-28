@@ -63,8 +63,8 @@ const char *SDL_GetRevision(void)
 {
 #define SDLOP_STR2(x) #x
 #define SDLOP_STR(x) SDLOP_STR2(x)
-    return "SDLop-" SDLOP_STR(SDLOP_MAJOR_VERSION) "." SDLOP_STR(SDLOP_MINOR_VERSION) "." SDLOP_STR(SDLOP_PATCHLEVEL)
-           " (SDL " SDLOP_STR(SDL_MAJOR_VERSION) "." SDLOP_STR(SDL_MINOR_VERSION) "." SDLOP_STR(SDL_MICRO_VERSION) " API)";
+    /* our own revision string; it does not claim to identify an SDL3 build */
+    return "SDLop-" SDLOP_STR(SDLOP_MAJOR_VERSION) "." SDLOP_STR(SDLOP_MINOR_VERSION) "." SDLOP_STR(SDLOP_PATCHLEVEL);
 #undef SDLOP_STR
 #undef SDLOP_STR2
 }
@@ -249,6 +249,7 @@ bool SDL_Init(SDL_InitFlags flags)
     SDLOP_InitMainThread();
     if (!sdlop.init_done) {
         sdlop.init_monotonic_ns = SDLOP_MonotonicNS();
+        SDLOP_InitTicks();
         sdlop.next_window_id = 0;
         sdlop.next_user_event = SDL_EVENT_USER;
         sdlop.repeat_delay_ms = 500;
