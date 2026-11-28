@@ -730,7 +730,12 @@ static bool fb_alloc(SDL_Window *window, int w, int h)
     if (wd->pixels && wd->fb_w == w && wd->fb_h == h) {
         return true;
     }
-    const size_t need = (size_t)w * (size_t)h * 4;
+    size_t need, size;
+    if (!SDL_size_mul_check_overflow((size_t)w, (size_t)h, &need) ||
+        !SDL_size_mul_check_overflow(need, 4, &need) ||
+        !SDL_size_add_check_overflow(need, need / 4, &size)) {
+        return SDL_SetError("SDLop x11: framebuffer size overflow");
+    }
     if (wd->pixels && wd->fb_cap >= need && wd->fb_cap / 4 <= need) {
         wd->fb_w = w;
         wd->fb_h = h;
@@ -741,7 +746,6 @@ static bool fb_alloc(SDL_Window *window, int w, int h)
         return true;
     }
     fb_free(wd);
-    const size_t size = need + need / 4;
 
     if (x11.has_shm) {
         int shmid = shmget(IPC_PRIVATE, size, IPC_CREAT | 0600);
@@ -1632,7 +1636,7 @@ static void cancel_touches(SDL_Window *window)
     }
 }
 
-static void handle_xi_event(xcb_ge_generic_event_t *ge)
+static void handle_xi_event(xcb_ge_generic_event_t *ge, size_t size)
 {
     if (ge->event_type == XCB_INPUT_TOUCH_BEGIN || ge->event_type == XCB_INPUT_TOUCH_UPDATE ||
         ge->event_type == XCB_INPUT_TOUCH_END) {
@@ -1654,15 +1658,27 @@ static void handle_xi_event(xcb_ge_generic_event_t *ge)
         return;
     }
     xcb_input_raw_button_press_event_t *raw = (xcb_input_raw_button_press_event_t *)ge;
+    if (size < sizeof(*raw)) {
+        return; /* truncated event: no valuator fields to read */
+    }
     if (SDLOP_X11_Pen_IsPenDevice(raw->sourceid)) {
         return; /* pens are absolute: no relative motion (stock) */
     }
     const uint32_t *mask = X11_xcb_input_raw_button_press_valuator_mask(raw);
+    const size_t mask_off = (size_t)((const uint8_t *)mask - (const uint8_t *)raw);
+    const size_t masks = (size_t)raw->valuators_len * sizeof(*mask);
+    if (mask_off > size || masks > size - mask_off) {
+        return; /* valuator mask does not fit in the event */
+    }
     const xcb_input_fp3232_t *values = X11_xcb_input_raw_button_press_axisvalues_raw(raw);
+    const size_t values_off = (size_t)((const uint8_t *)values - (const uint8_t *)raw);
     double dx = 0.0, dy = 0.0;
     int vi = 0;
     for (int axis = 0; axis < raw->valuators_len * 32 && axis < 16; axis++) {
         if (mask[axis / 32] & (1u << (axis % 32))) {
+            if (values_off > size || (size - values_off) / sizeof(*values) <= (size_t)vi) {
+                break; /* truncated axis values */
+            }
             if (axis == 0) {
                 dx = fp3232(values[vi]);
             } else if (axis == 1) {
@@ -4343,7 +4359,8 @@ static void x11_dispatch(xcb_generic_event_t *ev)
     case XCB_GE_GENERIC: {
         xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t *)ev;
         if (x11.has_xi2 && ge->extension == x11.xi_opcode) {
-            handle_xi_event(ge);
+            const size_t size = 36 + (size_t)ge->length * 4; /* + xcb's full_sequence */
+            handle_xi_event(ge, size);
         }
         break;
     }

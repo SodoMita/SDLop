@@ -63,7 +63,11 @@ int main(void)
     }
 
     /* --- a real HDROP, delivered through the window procedure --------- */
-    CHECK(SDL_AcceptDragAndDrop(window, true), "SDL_AcceptDragAndDrop: %s", SDL_GetError());
+    /* This SDL3 subset enables events with SDL_SetEventEnabled (no SDL2-style
+     * SDL_EventState/SDL_ENABLE); enabling DROP_FILE is what opts into DnD. */
+    SDL_SetEventEnabled(SDL_EVENT_DROP_FILE, true);
+    CHECK(SDL_EventEnabled(SDL_EVENT_DROP_FILE),
+          "could not opt into SDL_EVENT_DROP_FILE: %s", SDL_GetError());
     {
         const wchar_t *path = L"C:\\headless\\drop-test.txt";
         const size_t chars = wcslen(path) + 1;

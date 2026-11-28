@@ -27,6 +27,13 @@ typedef struct SDLop_Win32WindowData
     SDL_Surface *surface; /* SDL_CreateSurfaceFrom over `pixels` */
     bool surface_dirty;   /* resized under the caller: rebuild before blit */
 
+    /* SDL_WINDOW_TRANSPARENT: a second DIB with premultiplied ARGB bits for
+     * UpdateLayeredWindow(), since GDI's BitBlt drops the alpha channel. */
+    bool transparent;
+    HDC layer_dc;
+    HBITMAP layer_bitmap;
+    void *layer_pixels;
+
     SDLOP_MUTEX_T surfacelock; /* UpdateWindowFramebuffer vs WM_SIZE */
 
     Uint32 dpi;

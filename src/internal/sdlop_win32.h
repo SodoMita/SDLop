@@ -71,6 +71,9 @@ HRESULT SDLOP_SetThreadDescription(HANDLE thread, const wchar_t *name);
 UINT SDLOP_GetDpiForWindow(HWND hwnd);
 UINT SDLOP_GetDpiForSystem(void);
 BOOL SDLOP_AdjustWindowRectExForDpi(LPRECT rect, DWORD style, BOOL menu, DWORD exstyle, UINT dpi);
+/* shcore.dll (Win8.1+): per-monitor DPI for display enumeration. Returns
+ * FALSE on older systems; callers fall back to the system DPI. */
+BOOL SDLOP_GetDpiForMonitor(HMONITOR monitor, UINT dpiType, UINT *dpiX, UINT *dpiY);
 
 #ifdef __cplusplus
 extern "C" {

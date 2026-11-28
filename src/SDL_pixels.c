@@ -1139,6 +1139,9 @@ void SDL_GetRGBA(Uint32 pixelvalue, const SDL_PixelFormatDetails *format, const 
 
 bool SDLOP_IsSamePalette(const SDL_Palette *src, const SDL_Palette *dst)
 {
+    if (!src || !dst) {
+        return false;
+    }
     if (src->ncolors <= dst->ncolors) {
         // If an identical palette, no need to map
         if (src == dst ||

@@ -448,19 +448,19 @@ static void *worker_main(void *arg)
                 }
                 dev->snapshot_ok = result >= 0;
                 dev->snapshot_boundary = atomic_load_explicit(&raw.sdl_ring.head, memory_order_relaxed);
-                dev->snapshot_dropped = raw.sdl_ring.dropped;
+                dev->snapshot_dropped = atomic_load_explicit(&raw.sdl_ring.dropped, memory_order_relaxed);
                 atomic_store_explicit(&dev->snapshot_ready, true, memory_order_release);
                 recovered = true;
             }
         }
         /* Publish only changed counters at batch boundaries. Unconditional
          * zero stores would invalidate the consumer's cache on every pump. */
-        if (raw.sdl_ring.dropped != published_sdl_dropped) {
-            published_sdl_dropped = raw.sdl_ring.dropped;
+        if (atomic_load_explicit(&raw.sdl_ring.dropped, memory_order_relaxed) != published_sdl_dropped) {
+            published_sdl_dropped = atomic_load_explicit(&raw.sdl_ring.dropped, memory_order_relaxed);
             atomic_store_explicit(&raw.sdl_dropped, published_sdl_dropped, memory_order_release);
         }
-        if (raw.poll_ring.dropped != published_poll_dropped) {
-            published_poll_dropped = raw.poll_ring.dropped;
+        if (atomic_load_explicit(&raw.poll_ring.dropped, memory_order_relaxed) != published_poll_dropped) {
+            published_poll_dropped = atomic_load_explicit(&raw.poll_ring.dropped, memory_order_relaxed);
             atomic_store_explicit(&raw.poll_dropped, published_poll_dropped, memory_order_relaxed);
         }
         if (((atomic_load_explicit(&raw.sdl_ring.head, memory_order_relaxed) != sdl_head_before &&
@@ -1212,6 +1212,12 @@ static void pump_recovery(void)
                     for (int axis = 0; axis < 2; axis++) {
                         dev->abs_min[axis] = dev->snapshot_abs[axis].minimum;
                         dev->abs_max[axis] = dev->snapshot_abs[axis].maximum;
+                        /* abs_motion divides by this; keep it in step with the
+                         * refreshed min/max and never let it be zero/negative. */
+                        dev->abs_range[axis] = dev->abs_max[axis] - dev->abs_min[axis];
+                        if (dev->abs_range[axis] <= 0) {
+                            dev->abs_range[axis] = 1;
+                        }
                         st->cur[axis] = dev->snapshot_abs[axis].value;
                         st->has_cur[axis] = true;
                     }

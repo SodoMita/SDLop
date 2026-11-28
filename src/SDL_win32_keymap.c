@@ -295,6 +295,24 @@ SDL_Scancode SDLOP_Win32ScancodeFromScan(Uint16 scan_code)
     return windows_scancode_table[index];
 }
 
+Uint16 SDLOP_Win32ScanFromScancode(SDL_Scancode sc)
+{
+    size_t i;
+
+    if (sc <= SDL_SCANCODE_UNKNOWN || sc >= SDL_SCANCODE_COUNT) {
+        return 0;
+    }
+    for (i = 0; i < SDL_arraysize(windows_scancode_table); ++i) {
+        if (windows_scancode_table[i] == sc) {
+            /* Undo the E0 prefix encoding above: bit 7 of the table index
+             * means an extended scan code, with 0xE000 | low 7 bits as the
+             * value the driver puts in lParam. */
+            return (Uint16)((i & 0x80u) ? (0xE000u | (i & 0x7Fu)) : i);
+        }
+    }
+    return 0;
+}
+
 Uint32 SDLOP_Win32CharFromVK(Uint32 vk, bool shifted)
 {
     if (vk >= VK_A && vk <= VK_Z) {

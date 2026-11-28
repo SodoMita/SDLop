@@ -219,9 +219,13 @@ int main(void)
          * passed -- the scancode fallback hides an empty table on a US
          * layout, and that is precisely the bug this pins. */
         SDLOP_Win32UpdateKeyboardLayout();
-        /* the layout table itself: characters present, non-keys absent */
-        const Uint32 want_plain = os_layout_char((UINT)SDL_SCANCODE_Y, false);
-        const Uint32 want_shifted = os_layout_char((UINT)SDL_SCANCODE_Y, true);
+        /* the layout table itself: characters present, non-keys absent.
+         * MapVirtualKeyW needs the *Windows* scan code; passing SDL's
+         * SDL_SCANCODE_Y (0x1C) would probe the Enter key instead. */
+        const UINT scan_y = (UINT)SDLOP_Win32ScanFromScancode(SDL_SCANCODE_Y);
+        const Uint32 want_plain = os_layout_char(scan_y, false);
+        const Uint32 want_shifted = os_layout_char(scan_y, true);
+        CHECK(scan_y == 0x15, "Windows scan code for Y is 0x%x, want 0x15", scan_y);
         if (want_plain && want_shifted) {
             CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, false) == want_plain,
                   "layout table character for Y is 0x%x, Windows says 0x%x",
@@ -229,6 +233,14 @@ int main(void)
             CHECK(SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, true) == want_shifted,
                   "layout table shifted character for Y is 0x%x, Windows says 0x%x",
                   SDLOP_Win32LayoutCharForScancode(SDL_SCANCODE_Y, true), want_shifted);
+            /* SDL_GetKeyFromScancode must follow the same levels: modstate
+             * selects the shifted char, a key event always the plain one. */
+            CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_SHIFT, false) == (SDL_Keycode)want_shifted,
+                  "shift+Y keycode is 0x%x, layout says 0x%x",
+                  (unsigned)SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_SHIFT, false), want_shifted);
+            CHECK(SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_NONE, true) == (SDL_Keycode)want_plain,
+                  "Y key event keycode is 0x%x, layout says 0x%x",
+                  (unsigned)SDL_GetKeyFromScancode(SDL_SCANCODE_Y, SDL_KMOD_NONE, true), want_plain);
         } else {
             printf("test_win32_keycodes: layout table character checks skipped "
                    "(the current layout has no character for Y)\n");

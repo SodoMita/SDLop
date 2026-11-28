@@ -2794,23 +2794,6 @@ extern SDL_DECLSPEC bool SDLCALL SDL_SetWindowModal(SDL_Window *window, bool mod
  */
 extern SDL_DECLSPEC bool SDLCALL SDL_SetWindowFocusable(SDL_Window *window, bool focusable);
 
-/**
- * Use a window as a drag and drop target.
- *
- * By default, SDL windows are drag and drop targets on platforms that support
- * it. This function lets an application opt out (or back in) per window.
- *
- * \param window the window to change.
- * \param accept true to accept drag and drop events, false otherwise.
- * \returns true on success or false on failure; call SDL_GetError() for more
- *          information.
- *
- * \threadsafety This function should only be called on the main thread.
- *
- * \since This function is available since SDL 3.2.0.
- */
-extern SDL_DECLSPEC bool SDLCALL SDL_AcceptDragAndDrop(SDL_Window *window, bool accept);
-
 
 /**
  * Display the system-level window menu.

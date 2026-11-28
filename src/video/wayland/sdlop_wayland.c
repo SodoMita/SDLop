@@ -39,6 +39,7 @@
 #include "../sdlop_xcursor.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -51,6 +52,19 @@
 #ifndef XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION
 #define XDG_TOPLEVEL_STATE_SUSPENDED 9
 #endif
+
+/* SDL surface pitches and wl_shm strides are int/int32_t even though the
+ * byte counts are computed in size_t; never let w * 4 wrap on the way in. */
+static bool wayland_rgb_pitch(int w, int *pitch)
+{
+    size_t p;
+
+    if (w <= 0 || !SDL_size_mul_check_overflow((size_t)w, 4, &p) || p > INT_MAX) {
+        return false;
+    }
+    *pitch = (int)p;
+    return true;
+}
 
 /* one wl_shm buffer of a window's software-presentation cycle */
 #define SDLOP_WL_SHM_MAX_BUFFERS 3
@@ -429,10 +443,24 @@ static bool shm_buffer_prepare(WaylandWindowData *wd, WaylandShmBuffer *b)
     if (b->buffer) {
         return true;
     }
-    const size_t stride = (size_t)wd->buffer_w * 4;
-    const size_t need = stride * (size_t)wd->buffer_h;
+    size_t stride, need;
+    if (!SDL_size_mul_check_overflow((size_t)wd->buffer_w, 4, &stride) ||
+        !SDL_size_mul_check_overflow(stride, (size_t)wd->buffer_h, &need)) {
+        return SDL_SetError("Window size overflow");
+    }
     if (!b->pool || b->size < need || b->size / 4 > need) {
         /* new memory: growth beyond the headroom, or a large shrink */
+        const size_t page = 4096;
+        size_t headroom, rounded;
+        if (!SDL_size_add_check_overflow(need, need / 4, &headroom) ||
+            !SDL_size_add_check_overflow(headroom, page - 1, &rounded)) {
+            return SDL_SetError("Window size overflow");
+        }
+        const size_t size = rounded / page * page;
+        /* wl_shm_create_pool takes an int32_t size */
+        if (size > (size_t)INT32_MAX) {
+            return SDL_SetError("Window size overflow");
+        }
         if (b->pool) {
             wl_shm_pool_destroy(b->pool);
             b->pool = NULL;
@@ -441,8 +469,6 @@ static bool shm_buffer_prepare(WaylandWindowData *wd, WaylandShmBuffer *b)
             munmap(b->map, b->size);
             b->map = NULL;
         }
-        const size_t page = 4096;
-        const size_t size = ((need + need / 4) + page - 1) / page * page;
         int fd = memfd_create("sdlop-shm", MFD_CLOEXEC);
         if (fd < 0) {
             return SDL_SetError("memfd_create failed: %s", strerror(errno));
@@ -516,7 +542,11 @@ static WaylandShmBuffer *shm_pick_free(WaylandWindowData *wd)
 {
     /* the free buffer that missed the least: smallest copy - after a
      * resize preferably one whose memory already fits the new size */
-    const size_t need = (size_t)wd->buffer_w * 4 * (size_t)wd->buffer_h;
+    size_t stride, need;
+    if (!SDL_size_mul_check_overflow((size_t)wd->buffer_w, 4, &stride) ||
+        !SDL_size_mul_check_overflow(stride, (size_t)wd->buffer_h, &need)) {
+        return NULL;
+    }
     WaylandShmBuffer *best = NULL;
     Sint64 best_score = 0;
     for (int i = 0; i < wd->num_shm; i++) {
@@ -602,7 +632,15 @@ static double window_buffer_scale(SDL_Window *window)
 
 static int point_to_pixel(int points, double scale)
 {
-    const int p = (int)SDL_lround((double)points * scale);
+    double v = (double)points * scale;
+    /* SDL_lround() is undefined outside long's range and the int cast would
+     * overflow outside int's range. Clamp before rounding; map non-finite
+     * values to the low bound, which the existing check turns into a safe 1. */
+    if (SDL_isnan(v) || SDL_isinf(v)) {
+        v = (double)INT_MIN;
+    }
+    v = SDL_clamp(v, (double)INT_MIN, (double)INT_MAX);
+    const int p = (int)SDL_lround(v);
     return p > 0 ? p : 1;
 }
 
@@ -881,11 +919,16 @@ static bool wayland_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     SDLOP_Wayland_GetWindowPixelSize(window, &w, &h);
     shm_set_size(wd, w, h);
     if (!wd->shadow || wd->shadow_w != w || wd->shadow_h != h) {
-        void *shadow = malloc((size_t)w * (size_t)h * 4);
+        size_t pixels, bytes;
+        if (!SDL_size_mul_check_overflow((size_t)w, (size_t)h, &pixels) ||
+            !SDL_size_mul_check_overflow(pixels, 4, &bytes)) {
+            return SDL_SetError("Window size overflow");
+        }
+        void *shadow = malloc(bytes);
         if (!shadow) {
             return SDL_OutOfMemory();
         }
-        fill_xrgb(shadow, (size_t)w * (size_t)h, window_clear_xrgb(window));
+        fill_xrgb(shadow, pixels, window_clear_xrgb(window));
         free(wd->shadow);
         wd->shadow = shadow;
         wd->shadow_w = w;
@@ -899,8 +942,12 @@ static bool wayland_CreateWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     }
     /* transparent windows: ARGB8888 (wl_shm's is premultiplied, as stock
      * hands it to the app) */
+    int pitch;
+    if (!wayland_rgb_pitch(w, &pitch)) {
+        return SDL_SetError("Window size overflow");
+    }
     SDL_Surface *s = SDL_CreateSurfaceFrom(w, h, wd->transparent ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_XRGB8888,
-                                           wd->shadow, w * 4);
+                                           wd->shadow, pitch);
     if (!s) {
         return false;
     }
@@ -963,16 +1010,25 @@ static bool wayland_ResizeWindowFramebuffer(SDLop_VideoDevice *device, SDL_Windo
     if (w <= 0 || h <= 0 || (wd->shadow_w == w && wd->shadow_h == h)) {
         return true;
     }
-    void *shadow = malloc((size_t)w * (size_t)h * 4);
+    size_t pixels, bytes;
+    if (!SDL_size_mul_check_overflow((size_t)w, (size_t)h, &pixels) ||
+        !SDL_size_mul_check_overflow(pixels, 4, &bytes)) {
+        return SDL_SetError("Window size overflow");
+    }
+    int pitch;
+    if (!wayland_rgb_pitch(w, &pitch)) {
+        return SDL_SetError("Window size overflow");
+    }
+    void *shadow = malloc(bytes);
     if (!shadow) {
         return SDL_OutOfMemory();
     }
-    fill_xrgb(shadow, (size_t)w * (size_t)h, window_clear_xrgb(window));
+    fill_xrgb(shadow, pixels, window_clear_xrgb(window));
     free(wd->shadow);
     wd->shadow = shadow;
     wd->shadow_w = w;
     wd->shadow_h = h;
-    SDLOP_SetSurfacePixels(surface, shadow, w, h, w * 4);
+    SDLOP_SetSurfacePixels(surface, shadow, w, h, pitch);
     return true;
 }
 
@@ -1102,7 +1158,11 @@ bool SDLOP_Wayland_AcquireOffloadShm(SDL_Window *window, void **pixels_out, int 
         *pixels_out = b->map;
     }
     if (pitch_out) {
-        *pitch_out = wd->buffer_w * 4;
+        int pitch;
+        if (!wayland_rgb_pitch(wd->buffer_w, &pitch)) {
+            return SDL_SetError("Window size overflow");
+        }
+        *pitch_out = pitch;
     }
     if (w_out) {
         *w_out = wd->buffer_w;
@@ -1588,7 +1648,15 @@ static struct wl_buffer *create_shm_argb_buffer(const uint32_t *argb, int w, int
     if (!wl_data.shm) {
         return NULL;
     }
-    const size_t size = (size_t)bw * (size_t)bh * 4;
+    size_t pixels, size;
+    int pitch;
+    if (bw <= 0 || bh <= 0 ||
+        !SDL_size_mul_check_overflow((size_t)bw, (size_t)bh, &pixels) ||
+        !SDL_size_mul_check_overflow(pixels, 4, &size) ||
+        size > (size_t)INT_MAX ||
+        !wayland_rgb_pitch(bw, &pitch)) {
+        return NULL;
+    }
     int fd = memfd_create("sdlop-argb", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, (off_t)size) < 0) {
         if (fd >= 0) {
@@ -1612,7 +1680,7 @@ static struct wl_buffer *create_shm_argb_buffer(const uint32_t *argb, int w, int
         }
     }
     struct wl_shm_pool *pool = wl_shm_create_pool(wl_data.shm, fd, (int32_t)size);
-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, bw, bh, bw * 4, WL_SHM_FORMAT_ARGB8888);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, bw, bh, pitch, WL_SHM_FORMAT_ARGB8888);
     wl_shm_pool_destroy(pool);
     munmap(map, size);
     close(fd);

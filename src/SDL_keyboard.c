@@ -755,7 +755,8 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
 {
 #ifdef _WIN32
     /* `rawcode` is the driver's (VK << 8) | scan pair; the keycode comes from
-     * the VK and text is sent by the driver from WM_CHAR. */
+     * the VK (or from the scan code when there is no VK), and text is sent by
+     * the driver from WM_CHAR. */
     if (text_utf8 && text_size) {
         text_utf8[0] = '\0';
     }
@@ -774,6 +775,13 @@ SDL_Keycode SDLOP_KeyboardTranslateKey(Uint16 rawcode, bool key_event, char *tex
     }
     const Uint32 vk = SDLOP_WIN32_VK(rawcode);
     if (!vk) {
+        /* Focus loss has no VK to report: SDL_ResetKeyboard() packs only the
+         * Windows scan code. Recover the keycode from that so the synthetic
+         * release carries the same .key as the original press. */
+        const SDL_Scancode sc = SDLOP_Win32ScancodeFromScan((Uint16)(rawcode & 0xFFu));
+        if (sc != SDL_SCANCODE_UNKNOWN) {
+            return SDL_GetKeyFromScancode(sc, SDL_KMOD_NONE, true);
+        }
         return SDLK_UNKNOWN;
     }
     /* `key_event == true` means the keycode goes into an SDL_EVENT_KEY_*'s
@@ -1097,7 +1105,13 @@ void SDL_ResetKeyboard(void)
     for (int i = 0; i < SDL_SCANCODE_COUNT; i++) {
         if (sdlop.keystate[i]) {
 #ifdef _WIN32
-            SDLOP_SendKeyboardKey(false, false, (SDL_Scancode)i, 0, 0);
+            /* A key-up still needs the driver's (VK << 8) | scan rawcode or
+             * the translator cannot name the key. There is no VK on focus
+             * loss, so supply the scan code alone; the translator falls back
+             * to the scancode for the keycode. */
+            const Uint16 scan = SDLOP_Win32ScanFromScancode((SDL_Scancode)i);
+            SDLOP_SendKeyboardKey(false, false, (SDL_Scancode)i,
+                                  SDLOP_WIN32_RAWCODE(0, scan), 0);
 #else
             SDLOP_SendKeyboardKey(false, false, (SDL_Scancode)i, evdev_from_scancode((SDL_Scancode)i), 0);
 #endif
@@ -1135,14 +1149,18 @@ SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, b
 #ifdef _WIN32
     /* The current keyboard layout decides what a physical key produces; the
      * scancode table alone is a US answer. Key events ignore modifiers (SDL3
-     * keeps .key at the unshifted key), which is the SDL_KMOD_NONE level here;
-     * everything the layout does not type (F-keys, navigation, modifiers)
-     * falls through to the scancode table. */
+     * keeps .key at the unshifted key); outside an event the modifiers select
+     * the layout level. Everything the layout does not type (F-keys,
+     * navigation, modifiers) falls through to the scancode table. */
     {
-        const Uint32 c = SDLOP_Win32LayoutCharForScancode(scancode, false);
+        const bool shifted = !key_event && (modstate & (SDL_KMOD_SHIFT | SDL_KMOD_CAPS)) != 0;
+        Uint32 c = shifted ? SDLOP_Win32LayoutCharForScancode(scancode, true) : 0;
+        if (!c) {
+            c = SDLOP_Win32LayoutCharForScancode(scancode, false);
+        }
         if (c) {
-            /* SDL3 keeps .key at the key the layout puts there, unshifted;
-             * the shifted form is in .text */
+            /* The layout's character wins over the US scancode answer; a key
+             * with no shifted entry uses its unshifted one. */
             return (SDL_Keycode)c;
         }
         return default_key_from_scancode(scancode, key_event ? SDL_KMOD_NONE : modstate);

@@ -35,6 +35,11 @@ SDL_Keycode SDLOP_Win32KeyFromVK(Uint32 vk, SDL_Keymod modstate);
  * SDL_Scancode uses USB HID numbering, so it is never the identity. */
 SDL_Scancode SDLOP_Win32ScancodeFromScan(Uint16 scan_code);
 
+/* The reverse mapping, for callers that have an SDL scancode but need the
+ * Windows scan code (the driver's rawcode packs it in the low byte). Returns
+ * 0 when the scancode is not in the table. */
+Uint16 SDLOP_Win32ScanFromScancode(SDL_Scancode sc);
+
 /* Rebuild the character table for the keyboard layout currently installed on
  * this thread. Call on init and on WM_INPUTLANGCHANGE, which is what tells the
  * window that the user switched layout (stock SDL3's WIN_UpdateKeymap). */

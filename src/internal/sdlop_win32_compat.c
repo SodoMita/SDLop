@@ -226,24 +226,36 @@ int isatty(int fd)
     return _isatty(fd);
 }
 
+/* The optional APIs below are resolved once, thread-safely, with InitOnce
+ * (available since Win7). A missing export resolves to a NULL pointer and
+ * keeps the graceful fallback -- the one-time init still completes, so later
+ * calls do not repeat the lookup. */
+
 /* SetThreadDescription is Windows 10 1607+; Win7 has no such export. Resolve
  * it lazily from kernel32 so the same binary keeps the nicer debugger thread
  * names on newer systems and silently no-ops on older ones. SDL3 does the
  * same dynamic lookup for this API. */
+typedef HRESULT (WINAPI *SetThreadDescriptionFn)(HANDLE, PCWSTR);
+static SetThreadDescriptionFn set_description_fn = NULL;
+
+static BOOL CALLBACK resolve_set_thread_description(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    union { FARPROC raw; SetThreadDescriptionFn fn; } resolved_fn;
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    (void)once;
+    (void)parameter;
+    (void)context;
+    resolved_fn.raw = kernel32 ? GetProcAddress(kernel32, "SetThreadDescription") : NULL;
+    set_description_fn = resolved_fn.fn;
+    return TRUE;
+}
+
 HRESULT SDLOP_SetThreadDescription(HANDLE thread, const wchar_t *name)
 {
-    typedef HRESULT (WINAPI *SetThreadDescriptionFn)(HANDLE, PCWSTR);
-    union { FARPROC raw; SetThreadDescriptionFn fn; } resolved_fn;
-    static SetThreadDescriptionFn set_description = NULL;
-    static BOOL resolved = FALSE;
-    if (!resolved) {
-        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-        resolved_fn.raw = kernel32 ? GetProcAddress(kernel32, "SetThreadDescription") : NULL;
-        set_description = resolved_fn.fn;
-        resolved = TRUE;
-    }
-    if (set_description) {
-        return set_description(thread, name);
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, resolve_set_thread_description, NULL, NULL);
+    if (set_description_fn) {
+        return set_description_fn(thread, name);
     }
     return E_NOTIMPL;
 }
@@ -251,52 +263,106 @@ HRESULT SDLOP_SetThreadDescription(HANDLE thread, const wchar_t *name)
 /* Per-monitor DPI support is absent on Windows 7. Resolving these from
  * user32.dll avoids a hard import that would stop SDLop.dll from loading at
  * all there; callers already handle a 0 DPI / FALSE result. */
+typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+static GetDpiForWindowFn get_dpi_for_window_fn = NULL;
+
+static BOOL CALLBACK resolve_get_dpi_for_window(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    union { FARPROC raw; GetDpiForWindowFn fn; } resolved_fn;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    (void)once;
+    (void)parameter;
+    (void)context;
+    resolved_fn.raw = user32 ? GetProcAddress(user32, "GetDpiForWindow") : NULL;
+    get_dpi_for_window_fn = resolved_fn.fn;
+    return TRUE;
+}
+
 UINT SDLOP_GetDpiForWindow(HWND hwnd)
 {
-    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
-    union { FARPROC raw; GetDpiForWindowFn fn; } resolved_fn;
-    static GetDpiForWindowFn fn = NULL;
-    static BOOL resolved = FALSE;
-    if (!resolved) {
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        resolved_fn.raw = user32 ? GetProcAddress(user32, "GetDpiForWindow") : NULL;
-        fn = resolved_fn.fn;
-        resolved = TRUE;
-    }
-    return fn ? fn(hwnd) : 0;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, resolve_get_dpi_for_window, NULL, NULL);
+    return get_dpi_for_window_fn ? get_dpi_for_window_fn(hwnd) : 0;
+}
+
+typedef UINT (WINAPI *GetDpiForSystemFn)(void);
+static GetDpiForSystemFn get_dpi_for_system_fn = NULL;
+
+static BOOL CALLBACK resolve_get_dpi_for_system(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    union { FARPROC raw; GetDpiForSystemFn fn; } resolved_fn;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    (void)once;
+    (void)parameter;
+    (void)context;
+    resolved_fn.raw = user32 ? GetProcAddress(user32, "GetDpiForSystem") : NULL;
+    get_dpi_for_system_fn = resolved_fn.fn;
+    return TRUE;
 }
 
 UINT SDLOP_GetDpiForSystem(void)
 {
-    typedef UINT (WINAPI *GetDpiForSystemFn)(void);
-    union { FARPROC raw; GetDpiForSystemFn fn; } resolved_fn;
-    static GetDpiForSystemFn fn = NULL;
-    static BOOL resolved = FALSE;
-    if (!resolved) {
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        resolved_fn.raw = user32 ? GetProcAddress(user32, "GetDpiForSystem") : NULL;
-        fn = resolved_fn.fn;
-        resolved = TRUE;
-    }
-    return fn ? fn() : 0;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, resolve_get_dpi_for_system, NULL, NULL);
+    return get_dpi_for_system_fn ? get_dpi_for_system_fn() : 0;
+}
+
+typedef BOOL (WINAPI *AdjustWindowRectExForDpiFn)(LPRECT, DWORD, BOOL, DWORD, UINT);
+static AdjustWindowRectExForDpiFn adjust_window_rect_ex_for_dpi_fn = NULL;
+
+static BOOL CALLBACK resolve_adjust_window_rect_ex_for_dpi(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    union { FARPROC raw; AdjustWindowRectExForDpiFn fn; } resolved_fn;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    (void)once;
+    (void)parameter;
+    (void)context;
+    resolved_fn.raw = user32 ? GetProcAddress(user32, "AdjustWindowRectExForDpi") : NULL;
+    adjust_window_rect_ex_for_dpi_fn = resolved_fn.fn;
+    return TRUE;
 }
 
 BOOL SDLOP_AdjustWindowRectExForDpi(LPRECT rect, DWORD style, BOOL menu, DWORD exstyle, UINT dpi)
 {
-    typedef BOOL (WINAPI *AdjustWindowRectExForDpiFn)(LPRECT, DWORD, BOOL, DWORD, UINT);
-    union { FARPROC raw; AdjustWindowRectExForDpiFn fn; } resolved_fn;
-    static AdjustWindowRectExForDpiFn fn = NULL;
-    static BOOL resolved = FALSE;
-    if (!resolved) {
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        resolved_fn.raw = user32 ? GetProcAddress(user32, "AdjustWindowRectExForDpi") : NULL;
-        fn = resolved_fn.fn;
-        resolved = TRUE;
-    }
-    if (fn) {
-        return fn(rect, style, menu, exstyle, dpi);
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, resolve_adjust_window_rect_ex_for_dpi, NULL, NULL);
+    if (adjust_window_rect_ex_for_dpi_fn) {
+        return adjust_window_rect_ex_for_dpi_fn(rect, style, menu, exstyle, dpi);
     }
     return AdjustWindowRectEx(rect, style, menu, exstyle);
+}
+
+/* GetDpiForMonitor lives in shcore.dll (Win8.1+) and has no Win7 equivalent.
+ * Display enumeration uses it when available; otherwise the system DPI is a
+ * reasonable single-monitor approximation. */
+#ifndef MDT_EFFECTIVE_DPI
+#define MDT_EFFECTIVE_DPI 0
+#endif
+typedef HRESULT(WINAPI *GetDpiForMonitorFn)(HMONITOR, UINT, UINT *, UINT *);
+static GetDpiForMonitorFn get_dpi_for_monitor_fn = NULL;
+
+static BOOL CALLBACK resolve_get_dpi_for_monitor(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    union { FARPROC raw; GetDpiForMonitorFn fn; } resolved_fn;
+    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    (void)once;
+    (void)parameter;
+    (void)context;
+    resolved_fn.raw = shcore ? GetProcAddress(shcore, "GetDpiForMonitor") : NULL;
+    /* Keep shcore loaded for the process lifetime: a function pointer into a
+     * freed DLL would crash on the next display refresh. */
+    get_dpi_for_monitor_fn = resolved_fn.fn;
+    return TRUE;
+}
+
+BOOL SDLOP_GetDpiForMonitor(HMONITOR monitor, UINT dpiType, UINT *dpiX, UINT *dpiY)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, resolve_get_dpi_for_monitor, NULL, NULL);
+    if (!get_dpi_for_monitor_fn || !monitor || !dpiX || !dpiY) {
+        return FALSE;
+    }
+    return get_dpi_for_monitor_fn(monitor, dpiType, dpiX, dpiY) == S_OK;
 }
 
 #endif /* _WIN32 */

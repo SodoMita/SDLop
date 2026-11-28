@@ -12,11 +12,8 @@
 #include <stdbool.h>
 #include <windows.h>
 
-#ifdef __MINGW32__
+/* USEROBJECTFLAGS has dwFlags on MSVC and Wine as well as MinGW. */
 #define SDLOP_USEROBJECT_FLAGS(f) ((f).dwFlags)
-#else
-#define SDLOP_USEROBJECT_FLAGS(f) ((f).fFlags)
-#endif
 
 static bool win32_test_interactive_desktop(void)
 {

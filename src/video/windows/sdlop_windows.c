@@ -66,6 +66,24 @@ bool SDLOP_Win32GetClientRectInPixels(SDL_Window *window, RECT *rc)
     return true;
 }
 
+/* With per-monitor DPI awareness GetClientRect() is already in physical
+ * pixels, so use it instead of scaling the logical size by a display's
+ * density (which is wrong on a mixed-DPI monitor). */
+static void win32_GetWindowSizeInPixels(SDLop_VideoDevice *device, SDL_Window *window, int *w, int *h)
+{
+    (void)device;
+    RECT rc;
+    if (SDLOP_Win32GetClientRectInPixels(window, &rc) && rc.right > 0 && rc.bottom > 0) {
+        *w = (int)rc.right;
+        *h = (int)rc.bottom;
+    } else if (window) {
+        *w = window->w;
+        *h = window->h;
+    } else {
+        *w = *h = 0;
+    }
+}
+
 /* The DPI whose border metrics apply to this window. SDL3 asks Win32 for the
  * window's own DPI (AdjustWindowRectExForDpi) because the frame grows with the
  * monitor's scale; the non-DPI AdjustWindowRectEx uses the system DPI and is
@@ -1110,6 +1128,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             DragFinish(drop);
             return 0;
         }
+        /* The HDROP belongs to the shell even when we have no window for it:
+         * release it before DefWindowProcW sees the message. */
+        DragFinish((HDROP)wparam);
         break;
 
     case WM_SIZE:
@@ -1341,10 +1362,25 @@ static UINT win32_system_dpi(void)
     return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
 }
 
-/* Pixel density for a monitor: physical pixels per logical unit. */
-static float win32_monitor_pixel_density(void)
+/* Pixel density for one monitor: physical pixels per logical unit. Per-monitor
+ * DPI is what SDL3 exposes, with the system DPI as the Win7 fallback. */
+#ifndef MDT_EFFECTIVE_DPI
+#define MDT_EFFECTIVE_DPI 0
+#endif
+static float win32_monitor_pixel_density(const DEVMODEW *dm)
 {
-    return (float)win32_system_dpi() / (float)USER_DEFAULT_SCREEN_DPI;
+    UINT dpi = 0, dpi_x = 0, dpi_y = 0;
+    const POINT pt = {
+        dm->dmPosition.x + (LONG)dm->dmPelsWidth / 2,
+        dm->dmPosition.y + (LONG)dm->dmPelsHeight / 2
+    };
+    const HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (SDLOP_GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y) && dpi_x) {
+        dpi = dpi_x;
+    } else {
+        dpi = win32_system_dpi();
+    }
+    return (float)dpi / (float)USER_DEFAULT_SCREEN_DPI;
 }
 
 static void win32_add_displays(SDLop_VideoDevice *device)
@@ -1393,7 +1429,7 @@ static void win32_add_displays(SDLop_VideoDevice *device)
             SDL_snprintf(name, sizeof(name), "\\\\.\\DISPLAY%d", idx + 1);
             /* AddDisplay takes the logical (DPI-independent) size; the
              * driver's GetWindowSizeInPixels applies the density. */
-            const float density = win32_monitor_pixel_density();
+            const float density = win32_monitor_pixel_density(&dm);
             const int logical_w = (int)SDL_lroundf((float)dm.dmPelsWidth / density);
             const int logical_h = (int)SDL_lroundf((float)dm.dmPelsHeight / density);
             SDL_DisplayID id = SDLOP_AddDisplay(name,
@@ -1403,6 +1439,28 @@ static void win32_add_displays(SDLop_VideoDevice *device)
                                                 NULL, sdlop.init_done);
             SDLOP_SetDisplayPixelDensity(id, density);
             mon->displayID = id;
+            /* Expose every mode the monitor reports, not just the desktop
+             * one: SDL_GetFullscreenDisplayModes() and exclusive fullscreen
+             * need the real list. SDLOP_AddFullscreenDisplayMode dedupes the
+             * desktop mode that SDLOP_AddDisplay already registered. */
+            for (DWORD m = 0; ; m++) {
+                DEVMODEW mode;
+                SDL_zero(mode);
+                mode.dmSize = sizeof(mode);
+                if (!EnumDisplaySettingsW(dd.DeviceName, m, &mode)) {
+                    break;
+                }
+                if (!mode.dmPelsWidth || !mode.dmPelsHeight) {
+                    continue;
+                }
+                SDL_DisplayMode sm;
+                SDL_zero(sm);
+                sm.w = (int)mode.dmPelsWidth;
+                sm.h = (int)mode.dmPelsHeight;
+                sm.pixel_density = density;
+                sm.refresh_rate = mode.dmDisplayFrequency > 1 ? (float)mode.dmDisplayFrequency : 0.0f;
+                SDLOP_AddFullscreenDisplayMode(id, &sm);
+            }
             idx++;
         }
     }
@@ -1538,8 +1596,16 @@ static DWORD window_exstyle_for(SDL_Window *window)
     } else if (window->flags & SDL_WINDOW_UTILITY) {
         exstyle |= WS_EX_TOOLWINDOW;
     }
+    /* Layered windows are required for UpdateLayeredWindow(), which is how
+     * SDL_WINDOW_TRANSPARENT gets real per-pixel alpha in the surface path. */
+    if (window->flags & SDL_WINDOW_TRANSPARENT) {
+        exstyle |= WS_EX_LAYERED;
+    }
     return exstyle;
 }
+
+static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *window);
+static void win32_DestroyWindow(SDLop_VideoDevice *device, SDL_Window *window);
 
 /* The title is UTF-8; Win32 wants UTF-16. */
 static wchar_t *utf8_to_wide_alloc(const char *text)
@@ -1574,6 +1640,7 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
         return SDL_OutOfMemory();
     }
     SDLOP_MUTEX_INIT_ONCE(&data->surfacelock);
+    data->transparent = (window->flags & SDL_WINDOW_TRANSPARENT) != 0;
     window->driverdata = data;
 
     /* Size with the style this window is actually created with -- the frame
@@ -1640,6 +1707,13 @@ static bool win32_CreateWindow(SDLop_VideoDevice *device, SDL_Window *window)
      * scaled display is reported unscaled. */
     win32_update_display_scale(window, SDLOP_GetDpiForWindow(hwnd));
     update_metrics(window);
+    /* A window created with SDL_WINDOW_FULLSCREEN never goes through
+     * SDL_SetWindowFullscreen() (the flag is already set), so apply the
+     * borderless/monitor geometry here. */
+    if ((window->flags & SDL_WINDOW_FULLSCREEN) && !win32_SetWindowFullscreen(device, window)) {
+        win32_DestroyWindow(device, window);
+        return false;
+    }
     return true;
 }
 
@@ -1843,6 +1917,56 @@ static void win32_RestoreWindow(SDLop_VideoDevice *device, SDL_Window *window)
     }
 }
 
+static SDLop_Win32Monitor *win32_monitor_for_display(SDL_DisplayID id)
+{
+    for (int i = 0; i < sdlop_win32.monitor_count; i++) {
+        if (sdlop_win32.monitors[i].displayID == id) {
+            return &sdlop_win32.monitors[i];
+        }
+    }
+    return NULL;
+}
+
+/* Real exclusive fullscreen: switch the requested monitor to the mode SDL
+ * chose. Without this hook SDLop only covers the monitor with a borderless
+ * window, which is not an exclusive mode and ignores SDL_SetWindowFullscreenMode. */
+static bool win32_SetDisplayMode(SDLop_VideoDevice *device, SDLop_Display *display, const SDL_DisplayMode *mode)
+{
+    (void)device;
+    if (!display || !mode || mode->w <= 0 || mode->h <= 0) {
+        return SDL_SetError("Invalid display mode");
+    }
+    SDLop_Win32Monitor *mon = win32_monitor_for_display(display->id);
+    if (!mon) {
+        return SDL_SetError("Unknown display");
+    }
+    DEVMODEW dm;
+    SDL_zero(dm);
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(mon->device, ENUM_CURRENT_SETTINGS, &dm)) {
+        return SDL_SetError("EnumDisplaySettingsW() failed: %lu", (unsigned long)GetLastError());
+    }
+    dm.dmPelsWidth = (DWORD)mode->w;
+    dm.dmPelsHeight = (DWORD)mode->h;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    if (mode->refresh_rate > 0.0f) {
+        dm.dmDisplayFrequency = (DWORD)SDL_lroundf(mode->refresh_rate);
+        dm.dmFields |= DM_DISPLAYFREQUENCY;
+    }
+    const LONG result = ChangeDisplaySettingsExW(mon->device, &dm, NULL, CDS_FULLSCREEN, NULL);
+    if (result != DISP_CHANGE_SUCCESSFUL) {
+        return SDL_SetError("ChangeDisplaySettingsExW() failed: %ld", (long)result);
+    }
+    /* Keep our geometry in step so the fullscreen window is sized to the
+     * mode we just switched to. */
+    mon->rect.right = mon->rect.left + (LONG)mode->w;
+    mon->rect.bottom = mon->rect.top + (LONG)mode->h;
+    if (mode->refresh_rate > 0.0f) {
+        mon->refresh_hz = (int)SDL_lroundf(mode->refresh_rate);
+    }
+    return true;
+}
+
 static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *window)
 {
     (void)device;
@@ -1864,22 +1988,38 @@ static bool win32_SetWindowFullscreen(SDLop_VideoDevice *device, SDL_Window *win
             data->windowed_exstyle = (DWORD)GetWindowLongPtrW(data->hwnd, GWL_EXSTYLE);
             data->is_fullscreen = true;
         }
+        /* An explicit fullscreen mode names the display it belongs to; the
+         * core already honours it for the mode switch, so the window must
+         * land on that monitor too. */
+        HMONITOR monitor = NULL;
+        if (window->has_fullscreen_mode && window->fullscreen_mode.displayID) {
+            SDLop_Win32Monitor *mon = win32_monitor_for_display(window->fullscreen_mode.displayID);
+            if (mon) {
+                const POINT pt = { (mon->rect.left + mon->rect.right) / 2,
+                                   (mon->rect.top + mon->rect.bottom) / 2 };
+                monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            }
+        }
+        if (!monitor) {
+            monitor = MonitorFromWindow(data->hwnd, MONITOR_DEFAULTTONEAREST);
+        }
         MONITORINFO mi;
         SDL_zero(mi);
         mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(MonitorFromWindow(data->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+        if (GetMonitorInfoW(monitor, &mi)) {
             /* Only a window that asked to stay on top goes topmost. Forcing
              * HWND_TOPMOST here made every fullscreen window topmost, and the
              * Z-order boost is what SDL3 goes out of its way to avoid. */
             const HWND top = (window->flags & SDL_WINDOW_ALWAYS_ON_TOP) ? HWND_TOPMOST : HWND_NOTOPMOST;
-            SetWindowLongPtrW(data->hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowLongPtrW(data->hwnd, GWL_STYLE,
+                              WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_VISIBLE);
             SetWindowLongPtrW(data->hwnd, GWL_EXSTYLE, data->windowed_exstyle & ~WS_EX_TOPMOST);
             SetWindowPos(data->hwnd, top, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right - mi.rcMonitor.left,
                          mi.rcMonitor.bottom - mi.rcMonitor.top,
                          SWP_NOCOPYBITS | SWP_SHOWWINDOW);
+            SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_ENTER_FULLSCREEN, 0, 0);
         }
-        SDLOP_SendWindowEvent(window, SDL_EVENT_WINDOW_ENTER_FULLSCREEN, 0, 0);
     } else {
         data->is_fullscreen = false;
         SetWindowLongPtrW(data->hwnd, GWL_STYLE, (LONG_PTR)data->windowed_style);
@@ -3491,28 +3631,71 @@ static bool win32_SetClipboardData(SDLop_VideoDevice *device)
     return result;
 }
 
+/* CF_UNICODETEXT is an HGLOBAL owned by another process. -1 makes
+ * WideCharToMultiByte scan for a NUL, so first bound that scan with
+ * GlobalSize() (dropping an odd trailing byte that is not a wchar_t). */
+static char *win32_clipboard_text_from_unicode(HANDLE handle)
+{
+    const size_t chars = (size_t)GlobalSize(handle) / sizeof(wchar_t);
+    const wchar_t *wide = (const wchar_t *)GlobalLock(handle);
+    char *utf8 = NULL;
+    size_t len;
+
+    if (!wide) {
+        return NULL;
+    }
+    for (len = 0; len < chars && wide[len]; ++len) {
+        /* require a terminator inside the block before using cb = -1 */
+    }
+    if (len < chars) {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+        if (bytes > 0) {
+            utf8 = (char *)SDL_malloc((size_t)bytes);
+            if (utf8) {
+                WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+            }
+        }
+    }
+    GlobalUnlock(handle);
+    return utf8;
+}
+
 /* CF_TEXT is the ANSI flavour. Wine and Windows both still expose it, and an
  * app that only understands CF_TEXT has nothing otherwise. */
 static char *win32_clipboard_text_from_ansi(HANDLE handle)
 {
+    const size_t available = (size_t)GlobalSize(handle);
     const char *ansi = (const char *)GlobalLock(handle);
     char *utf8 = NULL;
 
     if (ansi) {
-        const int needed = MultiByteToWideChar(CP_ACP, 0, ansi, -1, NULL, 0);
-        if (needed > 0) {
-            wchar_t *wide = (wchar_t *)SDL_malloc(((size_t)needed) * sizeof(wchar_t));
-            if (wide &&
-                MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide, needed) > 0) {
-                const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
-                if (bytes > 0) {
-                    utf8 = (char *)SDL_malloc((size_t)bytes);
-                    if (utf8) {
-                        WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+        /* MultiByteToWideChar takes an int count, so refuse a block that
+         * cannot be described by one. */
+        if (available <= 0x7FFFFFFFu) {
+            size_t len = 0;
+
+            /* Bound the conversion by GlobalSize(): cb = -1 on a foreign
+             * HGLOBAL can walk past its end if the other app omitted NUL. */
+            while (len < available && ansi[len]) {
+                len++;
+            }
+            if (len < available) {
+                const int needed = MultiByteToWideChar(CP_ACP, 0, ansi, (int)len, NULL, 0);
+                if (needed > 0) {
+                    wchar_t *wide = (wchar_t *)SDL_malloc(((size_t)needed + 1) * sizeof(wchar_t));
+                    if (wide && MultiByteToWideChar(CP_ACP, 0, ansi, (int)len, wide, needed) == needed) {
+                        wide[needed] = 0; /* -1 now stops inside our own buffer */
+                        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+                        if (bytes > 0) {
+                            utf8 = (char *)SDL_malloc((size_t)bytes);
+                            if (utf8) {
+                                WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+                            }
+                        }
                     }
+                    SDL_free(wide);
                 }
             }
-            SDL_free(wide);
         }
         GlobalUnlock(handle);
     }
@@ -3530,18 +3713,10 @@ static void *win32_GetClipboardData(SDLop_VideoDevice *device, const char *mime_
             if (win32_open_clipboard()) {
                 HANDLE handle = GetClipboardData(CF_UNICODETEXT);
                 if (handle) {
-                    const wchar_t *wide = (const wchar_t *)GlobalLock(handle);
-                    if (wide) {
-                        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
-                        if (bytes > 0) {
-                            char *utf8 = (char *)SDL_malloc((size_t)bytes);
-                            if (utf8) {
-                                WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
-                                *size = SDL_strlen(utf8);
-                                data = utf8;
-                            }
-                        }
-                        GlobalUnlock(handle);
+                    char *utf8 = win32_clipboard_text_from_unicode(handle);
+                    if (utf8) {
+                        *size = SDL_strlen(utf8);
+                        data = utf8;
                     }
                 }
                 CloseClipboard();
@@ -3619,6 +3794,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .MaximizeWindow = win32_MaximizeWindow,
     .RestoreWindow = win32_RestoreWindow,
     .SetWindowFullscreen = win32_SetWindowFullscreen,
+    .SetDisplayMode = win32_SetDisplayMode,
     .RaiseWindow = win32_RaiseWindow,
     .SetWindowClearColor = win32_SetWindowClearColor,
     .SetWindowRelativeMouseMode = win32_SetWindowRelativeMouseMode,
@@ -3664,6 +3840,7 @@ SDLop_VideoDevice SDLop_windows_device = {
     .UpdateTextInputArea = win32_UpdateTextInputArea,
     .ResizeWindowFramebuffer = win32_ResizeWindowFramebuffer,
     .GetWindowICCProfile = win32_GetWindowICCProfile,
+    .GetWindowSizeInPixels = win32_GetWindowSizeInPixels,
     .ShowWindowSystemMenu = win32_ShowWindowSystemMenu,
     .SetWindowAspectRatio = win32_SetWindowAspectRatio,
     .WarpMouse = win32_WarpMouse,

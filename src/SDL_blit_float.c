@@ -186,10 +186,15 @@ static void ReadFloatPixel(Uint8 *pixels, SlowBlitPixelAccess access, const SDL_
     switch (access) {
     case SlowBlitPixelAccess_Index8:
         pixelvalue = *pixels;
-        fR = (float)pal->colors[pixelvalue].r / 255.0f;
-        fG = (float)pal->colors[pixelvalue].g / 255.0f;
-        fB = (float)pal->colors[pixelvalue].b / 255.0f;
-        fA = (float)pal->colors[pixelvalue].a / 255.0f;
+        if (pal && (int)pixelvalue < pal->ncolors) {
+            fR = (float)pal->colors[pixelvalue].r / 255.0f;
+            fG = (float)pal->colors[pixelvalue].g / 255.0f;
+            fB = (float)pal->colors[pixelvalue].b / 255.0f;
+            fA = (float)pal->colors[pixelvalue].a / 255.0f;
+        } else {
+            /* out-of-range index (or no palette): transparent black */
+            fR = fG = fB = fA = 0.0f;
+        }
         break;
     case SlowBlitPixelAccess_RGB:
         DISEMBLE_RGB(pixels, fmt->bytes_per_pixel, fmt, pixelvalue, R, G, B);
